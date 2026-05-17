@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 03003789583a1f8d4164a284f8bb3c9ed726c5fdb43aff6612c0687b92470ad1 # shrinks to e = VersionMismatch(VersionMismatch { client: ProtocolVersion(0), daemon: ProtocolVersion(0) })

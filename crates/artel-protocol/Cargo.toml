@@ -8,5 +8,19 @@ repository.workspace = true
 rust-version.workspace = true
 publish = false
 
+[dependencies]
+serde = { workspace = true }
+serde_bytes = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+postcard = { workspace = true }
+pretty_assertions = { workspace = true }
+proptest = { workspace = true }
+proptest-derive = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+
 [lints]
 workspace = true
