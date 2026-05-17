@@ -8,10 +8,22 @@ repository.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+default = []
+# Enables the async tokio-based IPC transport (length-prefixed postcard
+# codec + Framed helpers). Off by default so dependents that only need the
+# wire types stay dep-light.
+tokio = ["dep:bytes", "dep:futures-util", "dep:postcard", "dep:tokio", "dep:tokio-util"]
+
 [dependencies]
+bytes = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+postcard = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_bytes = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true, optional = true, features = ["io-util"] }
+tokio-util = { workspace = true, optional = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
@@ -20,6 +32,7 @@ pretty_assertions = { workspace = true }
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
 uuid = { workspace = true, features = ["v4"] }
 
 [lints]

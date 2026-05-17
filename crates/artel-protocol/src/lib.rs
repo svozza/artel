@@ -28,6 +28,8 @@ pub mod error;
 pub mod ids;
 pub mod message;
 pub mod rpc;
+#[cfg(feature = "tokio")]
+pub mod transport;
 pub mod version;
 
 pub use error::ProtocolError;
