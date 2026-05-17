@@ -3,6 +3,7 @@
 **Status**: Accepted
 **Date**: 2026-05-15
 **Accepted**: 2026-05-17
+**Updated**: 2026-05-17 (state dir renamed `~/.collab/` → `~/.artel/`; Windows support deferred to v2)
 
 > Originally drafted as ADR-012 in the [`leandrodamascena/harness`](https://github.com/leandrodamascena/harness) repository ([PR #8](https://github.com/leandrodamascena/harness/pull/8)). Adopted as ADR-001 here as the founding design document for `artel`.
 
@@ -22,7 +23,7 @@ This ADR proposes extracting the substrate into a standalone platform — a daem
 - **Scope creep in the daemon.** A daemon that owns "everything collaborative" risks becoming a feature warehouse: chat logs, workspace sync, presence, capabilities, app-specific state. Each addition raises the IPC surface and locks in opinions that may not match a future app.
 - **Trait design with one example.** Today's only workspace is filesystem sync. Defining a `Workspace` trait now would bake filesystem assumptions into a contract meant to be polymorphic. But shipping nothing reusable means each future app reinvents file watching, echo guards, gitignore filtering.
 - **Adoption friction.** Asking new users to install a service before they can run `harness --host` is a real adoption tax. The substrate must feel as "single-binary just works" as today's harness, even though it gains a daemon.
-- **Cross-platform IPC.** Unix domain sockets work on Mac and Linux; Windows needs named pipes. The substrate must work on the platforms harness already supports.
+- **Cross-platform IPC.** Unix domain sockets work on Mac and Linux; Windows needs named pipes. v1 ships Unix-only (Linux + macOS); Windows named-pipe support is deferred until a real user requests it (see § "Open questions").
 - **Version skew.** Two installed apps may depend on different `collab-client` versions, and the daemon binary may be newer or older than either. Silent breakage is not acceptable.
 
 ## Decision
@@ -90,10 +91,10 @@ Each session is owned by one app at a time. The platform is not a shared bus whe
 
 ### Auto-spawned daemon lifecycle
 
-The first client connect spawns the daemon if it is not running. The daemon writes its PID and binds a Unix socket (or named pipe on Windows) under the user's home directory:
+The first client connect spawns the daemon if it is not running. The daemon writes its PID and binds a Unix socket under the user's home directory:
 
 ```
-~/.collab/
+~/.artel/
   daemon.sock     ← Unix socket apps connect to
   daemon.pid      ← daemon's PID
   daemon.log      ← stdout/stderr
@@ -172,7 +173,7 @@ The persistence guarantee is what makes the daemon worth its cost. Examples enab
 │  └─────────────────────┘    │  │                              │
 └──────────────┬──────────────┘  └──────────────┬──────────────┘
                │                                  │
-               │   IPC (Unix socket / named pipe) │
+               │            IPC (Unix socket)     │
                │                                  │
                └──────────────┬───────────────────┘
                               │
@@ -207,7 +208,7 @@ The transport, auth, and session abstractions from ADR-011 carry forward — the
 ## Consequences
 
 - **The harness binary gains a runtime dependency on the daemon.** First-run UX still feels like a single binary because the client auto-spawns the daemon, but advanced users (debugging, sandboxed CI environments) need to know the daemon exists.
-- **Cross-platform work.** Unix socket on Mac/Linux, named pipe on Windows. Crates like `interprocess` cover this but it is real surface area.
+- **Cross-platform work.** Unix socket on Mac/Linux. Windows named-pipe support is deferred (the wire types in `artel-protocol` are platform-agnostic; only the socket layer needs to grow). Crates like `interprocess` cover this if/when it becomes a v2 deliverable.
 - **The substrate becomes versioned independently of harness.** `collab-client` releases, `collab-daemon` releases, and harness releases are now three coordinated streams. Version negotiation between them must be explicit.
 - **Sessions can outlive apps.** This is the entire point but also a new failure mode: orphaned sessions that nobody is paying attention to. `collab-daemon list` and a TTL/cleanup story will be needed.
 - **`fs-workspace` is reusable but not yet polymorphic.** Apps that want filesystem sync get it for free. Apps that want a different workspace type write their own crate. There is no trait to swap implementations through — this is a deliberate v1 simplification.
