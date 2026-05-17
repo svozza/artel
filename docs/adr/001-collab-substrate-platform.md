@@ -1,0 +1,250 @@
+# ADR-001: Collaborative Substrate as a Platform
+
+**Status**: Proposed
+**Date**: 2026-05-15
+
+> Originally drafted as ADR-012 in the [`leandrodamascena/harness`](https://github.com/leandrodamascena/harness) repository ([PR #8](https://github.com/leandrodamascena/harness/pull/8)). Adopted as ADR-001 here as the founding design document for `artel`.
+
+## Context
+
+ADR-011 introduced collaborative sessions for harness: peers connect over iroh, share a chat, and (optionally) sync a workspace. The implementation lives inside the harness binary and is shaped to harness's needs — a chat log, a filesystem-backed workspace doc, a TUI to render both.
+
+While building this, it became clear that the collaborative substrate is more general than harness. The combination of "discoverable, persistent, NAT-traversed peer messaging plus optional shared state" is a useful primitive in its own right. A shared-doc app, a multi-agent orchestrator, a remote pair-programming tool, and harness itself are all variations on the same theme. Today, none of them can be built without re-implementing what harness already has — or forking harness and ripping the AI parts out.
+
+A second pressure: sessions today live and die with the host process. Closing the harness TUI ends the session, kills any in-flight agent work, and disconnects every peer. Long-running agents, async multi-agent pipelines, headless watcher agents, and reconnect-from-another-device workflows are all blocked by this. Persistence is a requirement, not a nice-to-have, for the workflows we want to enable next.
+
+This ADR proposes extracting the substrate into a standalone platform — a daemon plus client crate — so that harness becomes one consumer of the platform among potentially many, and so that sessions can outlive any single app process.
+
+## Challenges
+
+- **Persistence model.** A library can persist *state* to disk, but cannot keep an iroh node *online* between app runs. Reconnect-from-anywhere agents and cloud subagents that outlive the requester both require something on the user's machine to hold the connection open while no app is attached.
+- **Scope creep in the daemon.** A daemon that owns "everything collaborative" risks becoming a feature warehouse: chat logs, workspace sync, presence, capabilities, app-specific state. Each addition raises the IPC surface and locks in opinions that may not match a future app.
+- **Trait design with one example.** Today's only workspace is filesystem sync. Defining a `Workspace` trait now would bake filesystem assumptions into a contract meant to be polymorphic. But shipping nothing reusable means each future app reinvents file watching, echo guards, gitignore filtering.
+- **Adoption friction.** Asking new users to install a service before they can run `harness --host` is a real adoption tax. The substrate must feel as "single-binary just works" as today's harness, even though it gains a daemon.
+- **Cross-platform IPC.** Unix domain sockets work on Mac and Linux; Windows needs named pipes. The substrate must work on the platforms harness already supports.
+- **Version skew.** Two installed apps may depend on different `collab-client` versions, and the daemon binary may be newer or older than either. Silent breakage is not acceptable.
+
+## Decision
+
+### Three-crate split
+
+The substrate is delivered as three Rust crates:
+
+1. **`collab-daemon`** — a long-running local process that owns iroh node(s) and persists session state.
+2. **`collab-client`** — a Rust crate that apps depend on. Wraps the IPC, exposes an idiomatic async API. Apps do not speak the wire protocol directly.
+3. **`fs-workspace`** — an opt-in crate providing today's filesystem sync. Apps that want filesystem mirroring depend on this; apps that don't, don't.
+
+Harness becomes an app that depends on `collab-client` and `fs-workspace`, plus its existing AI/chat/tool/permission code (which is unrelated to the substrate). A future shared-doc app would depend on `collab-client` and ship its own CRDT logic — not `fs-workspace`.
+
+### Repository layout
+
+The substrate lives in its own repository as a Cargo workspace; each consumer (including harness) lives in a separate repository.
+
+```
+collab/                    ← substrate repo (workspace)
+  Cargo.toml
+  crates/
+    collab-daemon/
+    collab-client/
+    fs-workspace/
+    collab-protocol/       ← shared types / wire format
+
+harness/                   ← consumer repo
+  → depends on `collab-client` + `fs-workspace` from crates.io
+```
+
+**The substrate knows nothing about its consumers.** Harness is treated as a third-party consumer, identical to any other app. The substrate does not have harness-specific code paths, harness-shaped APIs, or harness-aware tests. This is what makes it a platform rather than a shared library extracted from harness.
+
+Concretely:
+
+- Substrate releases on its own cadence (slower, protocol-stability-driven). Consumers pull in versions when they choose to upgrade.
+- Cross-repo coordination is the consumer's responsibility. If a substrate API changes, consumers pin to the older version until they're ready, then upgrade.
+- The substrate's CI tests the substrate. Each consumer's CI tests that consumer against whatever substrate version it pins.
+- Local development across the boundary uses Cargo's `[patch.crates-io]` to point at a local checkout — the consumer opts in temporarily, the substrate doesn't know it happened.
+
+**First-party consumers don't get special treatment.** A future first-party app (e.g. a shared-doc app) lives in its own repository too, not bundled into the substrate or into a consumers monorepo. Independent release cadence, focused contributor base, and focused issue tracker matter more than the convenience of cross-repo refactors.
+
+A monorepo for first-party consumers was considered and rejected: the convenience would come at the cost of blurring the platform/consumer boundary that this ADR is specifically establishing.
+
+### Daemon scope: medium
+
+The daemon owns:
+
+- iroh node(s) and the network connections they represent
+- per-session state: peers, sequence numbers, ordered message log
+- on-disk persistence of the above so sessions survive daemon restarts
+- a small RPC surface (~5–7 verbs): `host_session`, `join_session`, `list_sessions`, `subscribe(session_id)`, `send(session_id, msg)`, `leave_session`, plus management commands
+
+The daemon does **not** own:
+
+- workspace sync of any kind
+- app-specific message schemas (payloads are opaque bytes)
+- AI/agent/tool concerns
+
+The unit of persistence is a session. Workspace sync is one possible thing to layer on top, not something every app needs.
+
+### One app per session
+
+Each session is owned by one app at a time. The platform is not a shared bus where many apps live in the same session. This matches today's substrate shape, keeps the IPC surface small, and avoids inventing a routing model before there is a real second-app requirement that needs it.
+
+### Auto-spawned daemon lifecycle
+
+The first client connect spawns the daemon if it is not running. The daemon writes its PID and binds a Unix socket (or named pipe on Windows) under the user's home directory:
+
+```
+~/.collab/
+  daemon.sock     ← Unix socket apps connect to
+  daemon.pid      ← daemon's PID
+  daemon.log      ← stdout/stderr
+  sessions/       ← per-session state, message logs
+```
+
+Stale state recovery follows standard daemon conventions: if a connect fails and the PID file points at a dead process, the client deletes the stale socket and PID file and spawns a fresh daemon.
+
+Explicit management commands (`collab-daemon status / stop / restart`) are available for users who want them, but no install step is required for the demo path. Running `harness --host` continues to "just work" with no prerequisites beyond the binary.
+
+The daemon may also be installed as a launchd / systemd service by users who prefer that, but this is not required.
+
+### Versioned message envelope, opaque payload
+
+The daemon understands today's `SessionMessage` shape so it can offer useful tooling (`collab-daemon list`, `collab-daemon tail <session>`, deduplication on reconnect, "messages since seq N" queries):
+
+```rust
+struct SessionMessage {
+    version: u8,        // protocol version
+    seq: u64,           // assigned by host
+    timestamp: u64,
+    peer: PeerInfo,
+    kind: MessageKind,  // Chat, Tool, System (and future categories)
+    action: String,
+    payload: Vec<u8>,   // opaque bytes; app chooses serialization
+}
+```
+
+The `payload` field is opaque bytes rather than today's `serde_json::Value`. Apps choose their own serialization (JSON, postcard, protobuf, raw) and the daemon never inspects it. Tooling that wants to display payloads renders them as `<N bytes>` unless the app provides a separate description channel later.
+
+This is a small narrowing of today's ADR-011 model and preserves the path to stricter typing the existing model already anticipates.
+
+### Version mismatch is an explicit error
+
+The client sends its protocol version on connect. The daemon either accepts or replies with `unsupported version: client=N, daemon=M, restart required`. The client surfaces this clearly to the user. No silent breakage; no falling back to a partial protocol.
+
+For v1, "restart the daemon" is the resolution. Side-by-side daemon versions and N-1 backwards compatibility are deferred.
+
+### No `Workspace` trait yet
+
+`fs-workspace` ships as a concrete crate following a *convention* — take a session handle, return a ticket plus an event stream, run in the background, support graceful shutdown — but there is no `Workspace` trait. With only one workspace type, a trait would bake filesystem assumptions into a contract meant to be polymorphic. The convention establishes the shape; the trait can emerge once a second workspace type (e.g. a CRDT doc) exists and the common API is obvious from real usage.
+
+This is a deliberate deferral, not an oversight.
+
+### Doc handles across IPC
+
+`fs-workspace` (and any future workspace crate) needs to drive `iroh-docs` directly. There are two viable shapes:
+
+- **Daemon proxies the doc API.** Clients call `set_bytes`, `subscribe`, etc. through the IPC. Larger protocol surface, single source of truth for iroh state.
+- **Daemon hands out doc tickets.** Clients spin up their own (small) iroh node *just for docs*, import the ticket, and drive the doc directly. Smaller protocol, but apps end up with two iroh nodes.
+
+The ticket-handout path is leaner and keeps the daemon ignorant of doc semantics. The cost is that workspace-using apps still bind a node. We propose ticket-handout for v1 and revisit if it causes real problems.
+
+### Use cases this unlocks
+
+The persistence guarantee is what makes the daemon worth its cost. Examples enabled (and impossible today):
+
+- **Long-running agents you reconnect to.** Kick off a 4-hour refactor before lunch, close the laptop, rejoin from a cafe.
+- **Headless agents with no human attached.** Watcher agents that react to file changes or peer messages with no TUI.
+- **Async multi-agent pipelines.** Agent A posts a plan; Agent B (perhaps on a beefier cloud machine) wakes up later, consumes it, posts results.
+- **Cloud subagents that outlive the requester.** Spawn an EC2 peer, disconnect entirely, the peer keeps working and posts results when ready. (Strengthens `docs/ideas/remote-subagents.md`.)
+- **Cross-device intervention.** Cancel from your phone what your laptop started.
+- **Resumable workflows.** Network blip, app crash, machine reboot — the session and message log are on disk; whoever rejoins picks up from the last sequence number.
+
+### Architecture
+
+```
+┌─────────────────────────────┐  ┌─────────────────────────────┐
+│  harness (app)              │  │  shared-doc (hypothetical)  │
+│  ┌─────────────────────┐    │  │  ┌─────────────────────┐    │
+│  │ TUI, chat, tools,   │    │  │  │ TUI, doc CRDT, ...  │    │
+│  │ permissions, hooks  │    │  │  └─────────────────────┘    │
+│  └─────────────────────┘    │  │  ┌─────────────────────┐    │
+│  ┌─────────────────────┐    │  │  │   collab-client     │    │
+│  │ collab-client │ fs-ws│   │  │  └─────────────────────┘    │
+│  └─────────────────────┘    │  │                              │
+└──────────────┬──────────────┘  └──────────────┬──────────────┘
+               │                                  │
+               │   IPC (Unix socket / named pipe) │
+               │                                  │
+               └──────────────┬───────────────────┘
+                              │
+                ┌─────────────▼─────────────┐
+                │      collab-daemon        │
+                │  ┌─────────────────────┐  │
+                │  │ session log on disk │  │
+                │  │ peer state          │  │
+                │  └─────────────────────┘  │
+                │  ┌─────────────────────┐  │
+                │  │ iroh node(s)        │  │
+                │  └─────────────────────┘  │
+                └───────────────────────────┘
+                              │
+                              │  iroh (NAT-traversed P2P)
+                              │
+                       ┌──────┴──────┐
+                       │ remote peers │
+                       └──────────────┘
+```
+
+The transport, auth, and session abstractions from ADR-011 carry forward — they are now the daemon's internals rather than harness's. The harness chat loop, tools, hooks, and permissions are unchanged in shape; they just hold a `collab-client` handle instead of a `SessionHandle`.
+
+## Open questions
+
+- **Doc handles across IPC** (proxy vs. ticket-handout). Proposal: ticket-handout for v1, revisit if the dual-node cost bites.
+- **Auth and capability model.** Today anyone with a ticket can read and write. The daemon makes it easier to add capabilities (read-only tickets, signed messages) but ADR-011 deferred this. Should be revisited deliberately, not bolted on.
+- **Multi-version daemon coexistence.** "Restart the daemon" is fine for v1, but if multiple apps from multiple installers end up disagreeing on protocol versions, side-by-side daemons or N-1 compatibility may become necessary.
+- **Relationship to ADR-011 open questions.** Execution model (local / host / sandbox), workspace write model (unrestricted vs. agent-only), host migration, and cancellation are all still open and orthogonal to this ADR. Some of them get easier with a persistent daemon (host migration in particular); none are resolved by it.
+- **Telemetry and observability.** A daemon makes it natural to expose introspection (`collab-daemon list`, log files, metrics endpoint). What level of observability ships in v1 vs. later is undecided.
+
+## Consequences
+
+- **The harness binary gains a runtime dependency on the daemon.** First-run UX still feels like a single binary because the client auto-spawns the daemon, but advanced users (debugging, sandboxed CI environments) need to know the daemon exists.
+- **Cross-platform work.** Unix socket on Mac/Linux, named pipe on Windows. Crates like `interprocess` cover this but it is real surface area.
+- **The substrate becomes versioned independently of harness.** `collab-client` releases, `collab-daemon` releases, and harness releases are now three coordinated streams. Version negotiation between them must be explicit.
+- **Sessions can outlive apps.** This is the entire point but also a new failure mode: orphaned sessions that nobody is paying attention to. `collab-daemon list` and a TTL/cleanup story will be needed.
+- **`fs-workspace` is reusable but not yet polymorphic.** Apps that want filesystem sync get it for free. Apps that want a different workspace type write their own crate. There is no trait to swap implementations through — this is a deliberate v1 simplification.
+- **The opaque-payload move slightly narrows ADR-011's loose-message-model intent.** Apps still get full flexibility within their payload, but cross-app introspection of payloads requires per-app tooling. We accept this trade — apps don't share sessions today.
+- **No backwards compatibility with today's in-process collab code.** The substrate is a clean break. The project is in alpha, so a major refactor of `SessionHandle`, `WorkspaceSync`, and the chat-loop integration is acceptable — and probably desirable — over staged migration. ADR-011 sessions started before the cutover cannot be resumed by daemon-era clients.
+- **Several future improvements become straightforward.** Host migration (the daemon already holds the message log), cloud subagents (just another peer that talks to a daemon), cross-device sessions (any device with the ticket can join the daemon), and cancellation semantics (daemon mediates) all fit naturally.
+- **Non-Rust clients become possible (but are not a v1 deliverable).** Because apps speak to the daemon over a local socket, the wire protocol is language-agnostic by definition. Two viable routes for getting clients into other languages:
+  - *Per-language native clients.* Hand-write a client library in each target language (Python, TypeScript, Go, etc.) that opens the socket and speaks the protocol directly. Native types, native async, native packaging — at the cost of N libraries to keep in sync as the protocol evolves.
+  - *WASM client.* Compile `collab-client` (or a stripped core) to WASM once, and have host languages call into it via a WASM runtime. One canonical client kept in lockstep with the daemon automatically. The streaming/subscription APIs are awkward across the WASM↔host boundary today, but the WIT / component-model direction (`wit-bindgen`) is specifically designed to make this idiomatic and could be revisited as the ecosystem matures.
+
+  Either route requires committing to a stable, documented wire protocol, which is itself a non-trivial deliverable. v1 only ships `collab-client` for Rust. The architectural door is open; the work is not scoped.
+- **Decisions intentionally deferred:** `Workspace` trait, doc-API proxying, auth/capabilities beyond tickets, multi-version daemon coexistence, observability surface. These are listed as open questions, not undefined behavior.
+
+## Future evolution
+
+The daemon is a prerequisite for several directions that are out of scope for this ADR but worth naming so the v1 design is understood as enabling, not foreclosing, them.
+
+### Symmetric peer-to-peer (no designated host)
+
+Today's session model has a host that assigns sequence numbers and a workspace doc the host originates. Once every peer runs a daemon, every peer is *always online* with a stable iroh identity and local storage for the session log — which is exactly what's needed to drop the host role entirely.
+
+The hard parts that remain are not infrastructural but design:
+
+- **Ordering without a sequencer.** CRDTs (good for state, awkward for human-readable chat timelines), Lamport / vector clocks with deterministic tiebreak (partial order with consistent display), or an event-DAG model (Matrix-style). Each has real UX implications.
+- **Discovery and join.** Today the host generates the ticket. Symmetric P2P needs gossip, DHT, or invite-tree models for finding the session.
+- **Trust and sandboxing.** A symmetric mesh where any peer's agent can trigger tool calls makes sandboxed execution (ADR-011's libkrun direction) load-bearing rather than optional.
+- **Session lifecycle.** No host means no obvious "session ended" signal. TTLs or explicit closure replace host-disconnect.
+
+### Capability-discoverable agent mesh
+
+Symmetric P2P unlocks a different model: peers don't just exchange messages, they advertise *capabilities* ("this peer has a beefy machine and can run the test suite", "this peer has access to that codebase", "this peer is good at Rust refactors"). Other peers query the mesh — "I need an agent that can run cargo build, who's free?" — and the mesh routes the request.
+
+Agents become a discoverable, swappable resource pool rather than per-task spawned subprocesses. This composes naturally with the cloud-subagent direction in `docs/ideas/remote-subagents.md`: a cloud peer is just a daemon advertising different capabilities than a laptop peer.
+
+The v1 daemon does not implement any of this, but the architecture is compatible with it: capabilities would be a new message kind (or a small dedicated channel), discovery would be a routing layer above the existing transport, and the daemon's always-on identity gives the mesh the stable participants it needs.
+
+### Why this is in "future evolution" and not the proposal
+
+These directions all require a designed-for-symmetry session model, not just a daemon. Committing to them in ADR-012 would balloon the scope and prematurely freeze decisions (ordering model, discovery model, capability schema) that need their own analysis. The v1 daemon design deliberately keeps the host-as-sequencer model from ADR-011 because it works and because changing it is a separate decision.
+
+What ADR-012 *does* commit to is not foreclosing these directions: per-user daemons, persisted message logs, and opaque payloads all carry forward unchanged into a symmetric P2P world.

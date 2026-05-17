@@ -1,0 +1,9 @@
+[package]
+name = "artel-protocol"
+description = "Wire protocol types shared between artel-daemon and artel-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false

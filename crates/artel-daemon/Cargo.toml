@@ -1,0 +1,16 @@
+[package]
+name = "artel-daemon"
+description = "Long-running local process that owns iroh node(s) and persists session state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+artel-protocol.workspace = true
+
+[[bin]]
+name = "artel-daemon"
+path = "src/main.rs"

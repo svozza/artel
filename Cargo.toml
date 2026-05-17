@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/artel-daemon",
+    "crates/artel-client",
+    "crates/artel-protocol",
+    "crates/artel-fs",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/svozza/artel"
+rust-version = "1.85"
+
+[workspace.dependencies]
+artel-protocol = { path = "crates/artel-protocol", version = "0.0.0" }
+artel-client = { path = "crates/artel-client", version = "0.0.0" }
+artel-fs = { path = "crates/artel-fs", version = "0.0.0" }
