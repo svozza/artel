@@ -1,7 +1,8 @@
 # ADR-001: Collaborative Substrate as a Platform
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-05-15
+**Accepted**: 2026-05-17
 
 > Originally drafted as ADR-012 in the [`leandrodamascena/harness`](https://github.com/leandrodamascena/harness) repository ([PR #8](https://github.com/leandrodamascena/harness/pull/8)). Adopted as ADR-001 here as the founding design document for `artel`.
 

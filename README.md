@@ -13,7 +13,7 @@ The substrate is consumer-agnostic. Any app — an AI harness, a shared-doc edit
 
 ## Status
 
-Pre-alpha. The design lives at [`docs/adr/012-collab-substrate-platform.md`](docs/adr/012-collab-substrate-platform.md). Implementation has not started.
+Pre-alpha. The design lives at [`docs/adr/001-collab-substrate-platform.md`](docs/adr/001-collab-substrate-platform.md). Implementation has not started.
 
 ## Crates
 

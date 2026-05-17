@@ -14,3 +14,6 @@ artel-protocol.workspace = true
 [[bin]]
 name = "artel-daemon"
 path = "src/main.rs"
+
+[lints]
+workspace = true

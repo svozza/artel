@@ -10,3 +10,6 @@ publish = false
 
 [dependencies]
 artel-client.workspace = true
+
+[lints]
+workspace = true
