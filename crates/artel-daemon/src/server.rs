@@ -37,10 +37,17 @@ pub struct DaemonConfig {
     /// Directory holding per-session subdirectories. Loaded at startup
     /// so sessions outlive the daemon process; created if missing.
     pub sessions_dir: PathBuf,
-    /// Peer id the daemon advertises to clients in `Hello`. For v1 this
-    /// is whatever the caller supplies; iroh integration will replace
-    /// it with the real iroh node id.
+    /// Fallback peer id, used when no iroh key path is supplied
+    /// (or when the `iroh` feature is disabled at compile time).
+    /// Tests and headless embeds set this directly to avoid spinning
+    /// up an iroh `Endpoint`.
     pub daemon_peer_id: artel_protocol::PeerId,
+    /// Path to the persisted iroh secret key. When `Some` and the
+    /// `iroh` feature is enabled, the daemon loads (or generates) the
+    /// key, binds an `Endpoint`, and uses the resulting `EndpointId`
+    /// in place of [`Self::daemon_peer_id`]. When `None`, the daemon
+    /// stays local-only and advertises the synthetic peer id.
+    pub iroh_key_path: Option<PathBuf>,
 }
 
 /// Errors returned from [`Daemon::start`].
@@ -67,6 +74,12 @@ pub enum StartError {
     /// Could not load persisted sessions from disk.
     #[error("load sessions: {0}")]
     LoadSessions(#[source] io::Error),
+
+    /// Could not load or persist the iroh secret key, or could not
+    /// bind the iroh `Endpoint`.
+    #[cfg(feature = "iroh")]
+    #[error("iroh: {0}")]
+    Iroh(String),
 }
 
 /// A running daemon. Hold the value to keep the daemon alive; drop it
@@ -77,6 +90,13 @@ pub struct Daemon {
     listener: Listener,
     pid: PidFile,
     shutdown: Arc<Shutdown>,
+    /// iroh `Endpoint` when the feature is on and an
+    /// [`DaemonConfig::iroh_key_path`] was supplied. We hold it here
+    /// (rather than dropping it after `start`) so the network identity
+    /// stays alive for the daemon's lifetime; closing happens in
+    /// [`Self::run`] before returning.
+    #[cfg(feature = "iroh")]
+    endpoint: Option<iroh::Endpoint>,
 }
 
 impl Daemon {
@@ -103,12 +123,26 @@ impl Daemon {
                 source,
             })?;
 
+        // Resolve the daemon's network identity. Two paths:
+        //
+        // - `iroh` feature on AND an iroh_key_path supplied: load (or
+        //   generate-and-persist) the secret, bind an Endpoint, use
+        //   the EndpointId as the daemon peer id.
+        // - Otherwise: use the caller-supplied peer id and don't
+        //   stand up an Endpoint. Keeps tests fast and lets embeds
+        //   opt out of the network stack entirely.
+        #[cfg(feature = "iroh")]
+        let (daemon_peer_id, endpoint) =
+            resolve_iroh_identity(config.iroh_key_path.as_deref(), config.daemon_peer_id).await?;
+        #[cfg(not(feature = "iroh"))]
+        let daemon_peer_id = config.daemon_peer_id;
+
         let store: crate::store::DynStore = Arc::new(
             crate::store::FsLogStore::open(&config.sessions_dir)
                 .map_err(StartError::LoadSessions)?,
         );
         let registry = Arc::new(
-            Registry::load(config.daemon_peer_id, store)
+            Registry::load(daemon_peer_id, store)
                 .await
                 .map_err(StartError::LoadSessions)?,
         );
@@ -124,6 +158,7 @@ impl Daemon {
             pid = pid.pid(),
             sessions_dir = %config.sessions_dir.display(),
             sessions_loaded = session_count,
+            peer_id = %daemon_peer_id,
             "daemon started"
         );
 
@@ -132,6 +167,8 @@ impl Daemon {
             listener,
             pid,
             shutdown,
+            #[cfg(feature = "iroh")]
+            endpoint,
         })
     }
 
@@ -177,6 +214,8 @@ impl Daemon {
             listener,
             pid,
             shutdown,
+            #[cfg(feature = "iroh")]
+            endpoint,
         } = self;
 
         let mut connections = JoinSet::new();
@@ -215,6 +254,14 @@ impl Daemon {
         // Drain outstanding connection tasks so we don't leave clients
         // half-served.
         while connections.join_next().await.is_some() {}
+
+        // Close the iroh endpoint cleanly so peers see a graceful
+        // shutdown rather than a hung connection. Best-effort: even
+        // if it errors, we still want to release the PID file.
+        #[cfg(feature = "iroh")]
+        if let Some(ep) = endpoint {
+            ep.close().await;
+        }
 
         // Explicit release lets us surface I/O errors from PID-file
         // removal; drop would swallow them.
@@ -419,6 +466,30 @@ async fn dispatch(
     }
 }
 
+/// Load or generate the persisted iroh secret key, bind an
+/// `Endpoint`, and return its `EndpointId` cast to a [`PeerId`]. When
+/// no key path is supplied, the daemon stays local-only and returns
+/// the caller-supplied fallback id with no `Endpoint`.
+#[cfg(feature = "iroh")]
+async fn resolve_iroh_identity(
+    key_path: Option<&std::path::Path>,
+    fallback_peer_id: artel_protocol::PeerId,
+) -> Result<(artel_protocol::PeerId, Option<iroh::Endpoint>), StartError> {
+    let Some(path) = key_path else {
+        return Ok((fallback_peer_id, None));
+    };
+    let secret =
+        crate::iroh_key::load_or_create(path).map_err(|e| StartError::Iroh(e.to_string()))?;
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        .secret_key(secret)
+        .bind()
+        .await
+        .map_err(|e| StartError::Iroh(format!("bind endpoint: {e}")))?;
+    let id = endpoint.id();
+    let peer_id = artel_protocol::PeerId::from_bytes(*id.as_bytes());
+    Ok((peer_id, Some(endpoint)))
+}
+
 /// Wall-clock milliseconds since the Unix epoch. Used for stamping
 /// outgoing [`SessionMessage`]s. Returns 0 if the clock is before the
 /// epoch (impossible on a sanely-configured machine, but we don't
@@ -543,6 +614,7 @@ mod tests {
             pid_path: pid,
             sessions_dir,
             daemon_peer_id: PeerId::from_bytes([0xee; 32]),
+            iroh_key_path: None,
         }
     }
 

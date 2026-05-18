@@ -8,13 +8,22 @@ repository.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+default = ["iroh"]
+# iroh integration: real Endpoint + persisted secret key. Off-mode keeps
+# the daemon a local-only IPC bus with a synthetic peer id, useful for
+# tests and embeds that don't want the network stack.
+iroh = ["dep:iroh", "dep:rand"]
+
 [dependencies]
 artel-protocol = { workspace = true, features = ["tokio"] }
 async-trait = { workspace = true }
 clap = { workspace = true }
 futures-util = { workspace = true }
+iroh = { workspace = true, optional = true }
 nix = { workspace = true }
 postcard = { workspace = true }
+rand = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

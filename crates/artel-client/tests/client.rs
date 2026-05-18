@@ -39,6 +39,7 @@ impl DaemonHarness {
             pid_path: pid,
             sessions_dir: tempdir.path().join("sessions"),
             daemon_peer_id: DAEMON_PEER,
+            iroh_key_path: None,
         })
         .await
         .expect("daemon start");

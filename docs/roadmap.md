@@ -85,11 +85,25 @@ Add `Client::connect_or_spawn(socket_path, daemon_binary)` to
   `artel-daemon` first" error (decide during implementation).
 - New unit tests + 1 integration test in `artel-client/tests/`.
 
-## Phase 2: iroh integration (largest, multi-day)
+## Phase 2: iroh integration (multi-slice)
 
 This is the slice that turns artel from a fancy local IPC bus into the
-P2P substrate ADR-001 promises. Until this lands, the only daemons that
-can talk to each other are local mock peers.
+P2P substrate ADR-001 promises. Sliced into 2a..2d to keep blast
+radius small.
+
+### 2a — Endpoint + persisted secret key — DONE
+
+- iroh 0.98 added as a default-on `iroh` cargo feature on
+  `artel-daemon`. Without the feature the daemon is local-only with a
+  synthetic peer id.
+- New `iroh_key.rs`: `load_or_create(path)` that reads or generates an
+  ed25519 secret with `OsRng`, persists 32 bytes atomically at mode
+  0600 next to `daemon.pid` (`~/.artel/iroh.key` by default).
+- `Daemon::start` builds an `Endpoint` from the loaded key when
+  `DaemonConfig::iroh_key_path` is `Some` and uses the resulting
+  `EndpointId` as the wire peer id. `Daemon::run` calls
+  `endpoint.close()` on shutdown.
+- 11 new tests (8 unit, 3 e2e); 197 -> 208 total.
 
 Today's placeholders:
 

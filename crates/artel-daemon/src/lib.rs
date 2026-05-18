@@ -4,6 +4,8 @@
 //! library shape exists so end-to-end tests can spin the daemon up
 //! in-process without going through `fork`/`exec`.
 
+#[cfg(feature = "iroh")]
+pub(crate) mod iroh_key;
 pub mod pidfile;
 pub mod server;
 pub mod session;
