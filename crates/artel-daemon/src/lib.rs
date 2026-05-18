@@ -1,0 +1,12 @@
+//! Library crate for the artel daemon.
+//!
+//! The binary in `src/main.rs` is a thin wrapper around this library. The
+//! library shape exists so end-to-end tests can spin the daemon up
+//! in-process without going through `fork`/`exec`.
+
+pub mod pidfile;
+pub mod server;
+pub mod session;
+pub mod shutdown;
+
+pub use server::{Daemon, DaemonConfig, StartError};
