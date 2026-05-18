@@ -8,6 +8,8 @@
 
 mod client;
 mod error;
+mod spawn;
 
 pub use client::{Client, EventStream};
 pub use error::ClientError;
+pub use spawn::{SpawnError, SpawnOptions};

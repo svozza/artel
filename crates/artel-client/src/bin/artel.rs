@@ -10,11 +10,11 @@
 //! All accept `--socket` / `--state-dir` for path overrides; `status`
 //! and `list` accept `--json` for orchestrator-friendly output.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use artel_client::Client;
+use artel_client::{Client, ClientError, SpawnOptions};
 use artel_protocol::transport::path::{default_pid_path, default_socket_path};
 use artel_protocol::{Request, Response, SessionSummary};
 use clap::{Args, Parser, Subcommand};
@@ -84,6 +84,53 @@ struct ListArgs {
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
+    #[command(flatten)]
+    spawn: SpawnArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+struct SpawnArgs {
+    /// If set and the daemon is not running, spawn one before
+    /// connecting.
+    #[arg(long)]
+    auto_spawn: bool,
+
+    /// Path to the `artel-daemon` binary used by `--auto-spawn`. When
+    /// omitted, the CLI looks up `artel-daemon` on `$PATH`.
+    #[arg(long, requires = "auto_spawn")]
+    daemon_binary: Option<PathBuf>,
+}
+
+impl SpawnArgs {
+    /// Resolve the daemon binary path from the CLI flags, falling
+    /// back to `$PATH`. Returns `Ok(None)` when `--auto-spawn` was
+    /// not requested.
+    fn resolve_daemon_binary(&self) -> Result<Option<PathBuf>, String> {
+        if !self.auto_spawn {
+            return Ok(None);
+        }
+        if let Some(p) = &self.daemon_binary {
+            return Ok(Some(p.clone()));
+        }
+        which("artel-daemon")
+            .map(Some)
+            .map_err(|e| format!("locate artel-daemon: {e}"))
+    }
+}
+
+/// Find an executable on `$PATH` by name. Minimal, intentionally
+/// dumb: walks `$PATH` and returns the first hit that exists and is
+/// a file. Doesn't probe the exec bit; the spawn step will surface a
+/// permission error if it isn't executable.
+fn which(name: &str) -> Result<PathBuf, String> {
+    let path = std::env::var_os("PATH").ok_or_else(|| "$PATH is not set".to_string())?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    Err(format!("{name} not found on $PATH"))
 }
 
 fn resolve_paths(args: &ConnectionArgs) -> Result<(PathBuf, PathBuf), String> {
@@ -210,7 +257,7 @@ async fn stop(args: StopArgs) -> ExitCode {
 }
 
 async fn list(args: ListArgs) -> ExitCode {
-    let (socket, _pid) = match resolve_paths(&args.conn) {
+    let (socket, pid) = match resolve_paths(&args.conn) {
         Ok(p) => p,
         Err(err) => {
             eprintln!("artel: {err}");
@@ -218,10 +265,18 @@ async fn list(args: ListArgs) -> ExitCode {
         }
     };
 
-    let client = match Client::connect(&socket).await {
+    let daemon_binary = match args.spawn.resolve_daemon_binary() {
+        Ok(p) => p,
+        Err(err) => {
+            eprintln!("artel: {err}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let client = match connect_with_spawn(&socket, &pid, daemon_binary.as_ref()).await {
         Ok(c) => c,
         Err(err) => {
-            eprintln!("artel: connect {}: {err}", socket.display());
+            print_connect_error(&socket, args.spawn.auto_spawn, &err);
             return ExitCode::from(1);
         }
     };
@@ -247,6 +302,40 @@ async fn list(args: ListArgs) -> ExitCode {
         print_summaries(&summaries);
     }
     ExitCode::SUCCESS
+}
+
+/// Connect, optionally spawning the daemon. When `daemon_binary` is
+/// `None`, this is just `Client::connect`; when supplied, it routes
+/// through `Client::connect_or_spawn`.
+async fn connect_with_spawn(
+    socket: &Path,
+    pid: &Path,
+    daemon_binary: Option<&PathBuf>,
+) -> Result<Client, ClientError> {
+    if let Some(binary) = daemon_binary {
+        Client::connect_or_spawn(SpawnOptions::new(socket, pid, binary)).await
+    } else {
+        Client::connect(socket).await
+    }
+}
+
+/// Print a connect error with a hint about `--auto-spawn` when the
+/// daemon was simply absent.
+fn print_connect_error(socket: &Path, auto_spawn: bool, err: &ClientError) {
+    eprintln!("artel: connect {}: {err}", socket.display());
+    let recoverable = matches!(
+        err,
+        ClientError::Transport(artel_protocol::transport::TransportError::Io(io_err))
+            if matches!(
+                io_err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused,
+            )
+    );
+    if recoverable && !auto_spawn {
+        eprintln!(
+            "artel: hint: pass --auto-spawn to launch the daemon, or run `artel-daemon` first",
+        );
+    }
 }
 
 fn print_summaries(summaries: &[SessionSummary]) {

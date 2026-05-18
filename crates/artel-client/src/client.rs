@@ -97,6 +97,19 @@ impl Client {
         Self::handshake(framed).await
     }
 
+    /// Connect to a daemon, launching one if it isn't running.
+    ///
+    /// Tries [`Self::connect`] first. If the socket is missing or
+    /// nothing is listening, the daemon binary at
+    /// [`SpawnOptions::daemon_binary`] is spawned detached, the client
+    /// waits for the socket to come up, and a fresh `connect` is
+    /// retried. See [`crate::spawn`] for the lifecycle details.
+    ///
+    /// [`SpawnOptions::daemon_binary`]: crate::SpawnOptions::daemon_binary
+    pub async fn connect_or_spawn(opts: crate::SpawnOptions) -> Result<Self, ClientError> {
+        crate::spawn::connect_or_spawn(opts).await
+    }
+
     async fn handshake(framed: Framed<UnixStream>) -> Result<Self, ClientError> {
         let (mut sink, mut stream) = framed.split();
 

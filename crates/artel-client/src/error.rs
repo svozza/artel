@@ -13,6 +13,8 @@
 use artel_protocol::transport::TransportError;
 use artel_protocol::{ProtocolError, Response};
 
+use crate::spawn::SpawnError;
+
 /// Anything the [`crate::Client`] may surface to its caller.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -41,4 +43,9 @@ pub enum ClientError {
     /// callers still hold pending request futures.
     #[error("client is shutting down")]
     Shutdown,
+
+    /// Auto-spawning a daemon via [`crate::Client::connect_or_spawn`]
+    /// failed.
+    #[error(transparent)]
+    Spawn(#[from] SpawnError),
 }

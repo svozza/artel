@@ -16,16 +16,24 @@ along the way.
 |---|---|
 | `artel-protocol` | Wire types + Unix-socket transport. Done. |
 | `artel-daemon` | Persistent in-memory daemon + `artel-daemon` binary. Done. |
-| `artel-client` | Stateless multiplexed client + `artel` CLI binary. Done. |
+| `artel-client` | Stateless multiplexed client + `artel` CLI binary + `connect_or_spawn`. Done. |
 | `artel-fs` | Stub. |
 
-180 tests passing. fmt + clippy clean in both feature modes (with and
+197 tests passing. fmt + clippy clean in both feature modes (with and
 without `--all-features`). CI runs ubuntu + macos × stable + MSRV 1.85.
 
 The substrate works end-to-end on a single machine with synthetic peer
 ids — not yet a real P2P system. The remaining work makes it one.
 
-## Phase 1: client auto-spawn (small, ~half day)
+## Phase 1: client auto-spawn — DONE
+
+Shipped `Client::connect_or_spawn(SpawnOptions)` plus daemon-side
+stale-socket cleanup and an opt-in `--auto-spawn` flag on the `artel`
+CLI. The original design notes follow for reference; for the actual
+behaviour, read `crates/artel-client/src/spawn.rs` and the
+integration tests in `crates/artel-daemon/tests/auto_spawn.rs`.
+
+### Original design (preserved for reference)
 
 ADR-001 § "Auto-spawned daemon lifecycle" calls for "the first client
 connect spawns the daemon if it is not running." Today,

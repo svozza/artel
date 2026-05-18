@@ -84,6 +84,18 @@ impl Daemon {
     /// Returns immediately; call [`Self::run`] to drive the accept loop.
     pub async fn start(config: DaemonConfig) -> Result<Self, StartError> {
         let pid = PidFile::acquire(config.pid_path)?;
+        // Holding the PID file lock means no other daemon owns this
+        // state dir, so any leftover socket file is from a crashed
+        // predecessor and is safe to remove. Without this, a hard kill
+        // would block the next start with AddrInUse.
+        if let Err(err) = std::fs::remove_file(&config.socket_path)
+            && err.kind() != io::ErrorKind::NotFound
+        {
+            return Err(StartError::Bind {
+                path: config.socket_path,
+                source: err,
+            });
+        }
         let listener = Listener::bind(&config.socket_path)
             .await
             .map_err(|source| StartError::Bind {
@@ -718,6 +730,33 @@ mod tests {
 
         drop(framed);
         shutdown_handle.trigger();
+        timeout(Duration::from_secs(2), run)
+            .await
+            .expect("daemon did not exit")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_socket_file_is_replaced_on_start() {
+        // A crashed predecessor can leave the socket file behind. Once
+        // we have the PID lock, the daemon should overwrite it rather
+        // than fail with AddrInUse.
+        let (_dir, sock, pid, sessions) = unused_socket();
+        std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+        std::fs::write(&sock, b"junk").unwrap();
+        assert!(sock.exists());
+
+        let daemon = Daemon::start(config(sock.clone(), pid, sessions))
+            .await
+            .unwrap();
+        assert!(sock.exists(), "fresh socket should now exist");
+        // Should be a real listening socket: a client can connect.
+        let _ = artel_protocol::transport::client::connect(&sock)
+            .await
+            .unwrap();
+        daemon.trigger_shutdown();
+        let run = tokio::spawn(daemon.run());
         timeout(Duration::from_secs(2), run)
             .await
             .expect("daemon did not exit")
