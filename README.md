@@ -13,7 +13,9 @@ The substrate is consumer-agnostic. Any app — an AI harness, a shared-doc edit
 
 ## Status
 
-Pre-alpha. The design lives at [`docs/adr/001-collab-substrate-platform.md`](docs/adr/001-collab-substrate-platform.md). Implementation has not started.
+Pre-alpha. The design lives at [`docs/adr/001-collab-substrate-platform.md`](docs/adr/001-collab-substrate-platform.md). The forward-looking plan is in [`docs/roadmap.md`](docs/roadmap.md).
+
+Local-only IPC, persistence, daemon, and client are working today. iroh integration and `artel-fs` are the next two phases.
 
 ## Crates
 
