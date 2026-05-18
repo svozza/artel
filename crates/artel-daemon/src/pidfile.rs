@@ -107,12 +107,11 @@ impl PidFile {
         // process that took over the slot.
         match fs::read_to_string(&self.path) {
             Ok(raw) => {
-                if raw.trim().parse::<i32>().ok() == Some(self.our_pid) {
-                    if let Err(err) = fs::remove_file(&self.path) {
-                        if err.kind() != io::ErrorKind::NotFound {
-                            return Err(err);
-                        }
-                    }
+                if raw.trim().parse::<i32>().ok() == Some(self.our_pid)
+                    && let Err(err) = fs::remove_file(&self.path)
+                    && err.kind() != io::ErrorKind::NotFound
+                {
+                    return Err(err);
                 }
                 Ok(())
             }

@@ -20,7 +20,8 @@ along the way.
 | `artel-fs` | Stub. |
 
 197 tests passing. fmt + clippy clean in both feature modes (with and
-without `--all-features`). CI runs ubuntu + macos × stable + MSRV 1.85.
+without `--all-features`). CI runs ubuntu + macos on stable; workspace
+`rust-version` is 1.95.
 
 The substrate works end-to-end on a single machine with synthetic peer
 ids — not yet a real P2P system. The remaining work makes it one.

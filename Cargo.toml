@@ -12,7 +12,7 @@ version = "0.0.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/svozza/artel"
-rust-version = "1.85"
+rust-version = "1.95"
 
 [workspace.dependencies]
 artel-protocol = { path = "crates/artel-protocol", version = "0.0.0" }

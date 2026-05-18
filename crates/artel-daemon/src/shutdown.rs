@@ -190,7 +190,7 @@ mod tests {
         let shutdown = Shutdown::new();
         let mut token = shutdown.token();
         let work = async {
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            tokio::time::sleep(Duration::from_mins(1)).await;
             "should not happen"
         };
 
