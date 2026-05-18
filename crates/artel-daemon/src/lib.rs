@@ -8,5 +8,6 @@ pub mod pidfile;
 pub mod server;
 pub mod session;
 pub mod shutdown;
+pub(crate) mod store;
 
 pub use server::{Daemon, DaemonConfig, StartError};

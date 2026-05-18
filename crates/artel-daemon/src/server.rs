@@ -34,6 +34,9 @@ pub struct DaemonConfig {
     /// Path of the PID file. Acquired before binding to refuse a second
     /// daemon on the same path.
     pub pid_path: PathBuf,
+    /// Directory holding per-session subdirectories. Loaded at startup
+    /// so sessions outlive the daemon process; created if missing.
+    pub sessions_dir: PathBuf,
     /// Peer id the daemon advertises to clients in `Hello`. For v1 this
     /// is whatever the caller supplies; iroh integration will replace
     /// it with the real iroh node id.
@@ -60,6 +63,10 @@ pub enum StartError {
     /// Could not install signal handlers.
     #[error("install signal handlers: {0}")]
     Signal(#[source] io::Error),
+
+    /// Could not load persisted sessions from disk.
+    #[error("load sessions: {0}")]
+    LoadSessions(#[source] io::Error),
 }
 
 /// A running daemon. Hold the value to keep the daemon alive; drop it
@@ -84,15 +91,27 @@ impl Daemon {
                 source,
             })?;
 
-        let registry = Arc::new(Registry::new(config.daemon_peer_id));
+        let store: crate::store::DynStore = Arc::new(
+            crate::store::FsLogStore::open(&config.sessions_dir)
+                .map_err(StartError::LoadSessions)?,
+        );
+        let registry = Arc::new(
+            Registry::load(config.daemon_peer_id, store)
+                .await
+                .map_err(StartError::LoadSessions)?,
+        );
+
         let shutdown = Arc::new(Shutdown::new());
         shutdown
             .install_signal_handlers()
             .map_err(StartError::Signal)?;
 
+        let session_count = registry.list().await.len();
         info!(
             socket = %listener.path().display(),
             pid = pid.pid(),
+            sessions_dir = %config.sessions_dir.display(),
+            sessions_loaded = session_count,
             "daemon started"
         );
 
@@ -310,11 +329,15 @@ async fn dispatch(
         Request::Hello { .. } => Response::Error {
             error: ProtocolError::Internal("Hello sent twice on one connection".into()),
         },
-        Request::HostSession { peer } => {
-            let (session, ticket) = registry.host(peer.clone()).await;
-            memberships.insert(session, peer);
-            Response::HostSession { session, ticket }
-        }
+        Request::HostSession { peer } => match registry.host(peer.clone()).await {
+            Ok((session, ticket)) => {
+                memberships.insert(session, peer);
+                Response::HostSession { session, ticket }
+            }
+            Err(err) => Response::Error {
+                error: session_error_to_protocol(&err),
+            },
+        },
         Request::JoinSession { peer, ticket } => match registry.join(&ticket, peer.clone()).await {
             Ok((session, head)) => {
                 memberships.insert(session, peer);
@@ -463,6 +486,7 @@ fn session_error_to_protocol(err: &SessionError) -> ProtocolError {
         SessionError::NotMember(_) => ProtocolError::Internal("not a member".into()),
         SessionError::AlreadyJoined(s) => ProtocolError::AlreadyJoined(*s),
         SessionError::InvalidTicket => ProtocolError::InvalidTicket,
+        SessionError::Storage(io_err) => ProtocolError::Internal(format!("storage: {io_err}")),
     }
 }
 
@@ -494,25 +518,27 @@ mod tests {
 
     use super::*;
 
-    fn unused_socket() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    fn unused_socket() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
         let dir = tempdir().unwrap();
         let sock = dir.path().join("daemon.sock");
         let pid = dir.path().join("daemon.pid");
-        (dir, sock, pid)
+        let sessions = dir.path().join("sessions");
+        (dir, sock, pid, sessions)
     }
 
-    fn config(sock: PathBuf, pid: PathBuf) -> DaemonConfig {
+    fn config(sock: PathBuf, pid: PathBuf, sessions_dir: PathBuf) -> DaemonConfig {
         DaemonConfig {
             socket_path: sock,
             pid_path: pid,
+            sessions_dir,
             daemon_peer_id: PeerId::from_bytes([0xee; 32]),
         }
     }
 
     #[tokio::test]
     async fn start_then_immediate_shutdown_is_clean() {
-        let (_dir, sock, pid) = unused_socket();
-        let daemon = Daemon::start(config(sock.clone(), pid.clone()))
+        let (_dir, sock, pid, sessions) = unused_socket();
+        let daemon = Daemon::start(config(sock.clone(), pid.clone(), sessions.clone()))
             .await
             .unwrap();
         daemon.trigger_shutdown();
@@ -530,8 +556,10 @@ mod tests {
 
     #[tokio::test]
     async fn hello_succeeds_against_running_daemon() {
-        let (_dir, sock, pid) = unused_socket();
-        let daemon = Daemon::start(config(sock.clone(), pid)).await.unwrap();
+        let (_dir, sock, pid, sessions) = unused_socket();
+        let daemon = Daemon::start(config(sock.clone(), pid, sessions.clone()))
+            .await
+            .unwrap();
         let shutdown_handle = Arc::clone(&daemon.shutdown);
         let run = tokio::spawn(daemon.run());
 
@@ -573,8 +601,10 @@ mod tests {
 
     #[tokio::test]
     async fn version_mismatch_returns_error_then_closes() {
-        let (_dir, sock, pid) = unused_socket();
-        let daemon = Daemon::start(config(sock.clone(), pid)).await.unwrap();
+        let (_dir, sock, pid, sessions) = unused_socket();
+        let daemon = Daemon::start(config(sock.clone(), pid, sessions.clone()))
+            .await
+            .unwrap();
         let shutdown_handle = Arc::clone(&daemon.shutdown);
         let run = tokio::spawn(daemon.run());
 
@@ -627,8 +657,10 @@ mod tests {
 
     #[tokio::test]
     async fn host_then_list_round_trip() {
-        let (_dir, sock, pid) = unused_socket();
-        let daemon = Daemon::start(config(sock.clone(), pid)).await.unwrap();
+        let (_dir, sock, pid, sessions) = unused_socket();
+        let daemon = Daemon::start(config(sock.clone(), pid, sessions.clone()))
+            .await
+            .unwrap();
         let shutdown_handle = Arc::clone(&daemon.shutdown);
         let run = tokio::spawn(daemon.run());
 
@@ -695,13 +727,15 @@ mod tests {
 
     #[tokio::test]
     async fn second_daemon_on_same_pid_path_errors() {
-        let (_dir, sock, pid) = unused_socket();
-        let _first = Daemon::start(config(sock.clone(), pid.clone()))
+        let (_dir, sock, pid, sessions) = unused_socket();
+        let _first = Daemon::start(config(sock.clone(), pid.clone(), sessions.clone()))
             .await
             .unwrap();
         // Use a different socket path so we hit the PID check, not bind.
         let other_sock = sock.with_extension("other");
-        let err = Daemon::start(config(other_sock, pid)).await.unwrap_err();
+        let err = Daemon::start(config(other_sock, pid, sessions))
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, StartError::Pid(PidError::AlreadyRunning { .. })),
             "{err:?}"

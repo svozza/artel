@@ -86,20 +86,24 @@ async fn run(args: Args) -> ExitCode {
 }
 
 fn build_config(args: &Args) -> Result<DaemonConfig, String> {
-    let (socket_path, pid_path) = match &args.state_dir {
-        Some(dir) => (
+    let (socket_path, pid_path, sessions_dir) = if let Some(dir) = &args.state_dir {
+        (
             args.socket
                 .clone()
                 .unwrap_or_else(|| dir.join("daemon.sock")),
             dir.join("daemon.pid"),
-        ),
-        None => (
-            args.socket.clone().map_or_else(
-                || default_socket_path().map_err(|e| format!("resolve socket path: {e}")),
-                Ok,
-            )?,
-            default_pid_path().map_err(|e| format!("resolve pid path: {e}"))?,
-        ),
+            dir.join("sessions"),
+        )
+    } else {
+        let socket = args.socket.clone().map_or_else(
+            || default_socket_path().map_err(|e| format!("resolve socket path: {e}")),
+            Ok,
+        )?;
+        let pid = default_pid_path().map_err(|e| format!("resolve pid path: {e}"))?;
+        let sessions = artel_protocol::transport::path::default_dir()
+            .map_err(|e| format!("resolve state dir: {e}"))?
+            .join("sessions");
+        (socket, pid, sessions)
     };
 
     let daemon_peer_id = match &args.peer_id {
@@ -110,6 +114,7 @@ fn build_config(args: &Args) -> Result<DaemonConfig, String> {
     Ok(DaemonConfig {
         socket_path,
         pid_path,
+        sessions_dir,
         daemon_peer_id,
     })
 }

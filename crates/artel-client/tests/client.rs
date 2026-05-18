@@ -37,6 +37,7 @@ impl DaemonHarness {
         let daemon = Daemon::start(DaemonConfig {
             socket_path: socket.clone(),
             pid_path: pid,
+            sessions_dir: tempdir.path().join("sessions"),
             daemon_peer_id: DAEMON_PEER,
         })
         .await

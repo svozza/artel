@@ -23,6 +23,8 @@ use artel_protocol::{
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, broadcast};
 
+use crate::store::{DynStore, SessionRecord};
+
 /// Capacity of the per-session broadcast channel.
 ///
 /// Slow subscribers that lag by more than this lose old events; the
@@ -40,7 +42,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 const LOCAL_TICKET_PREFIX: &str = "artel-local:";
 
 /// Errors the registry may return from RPC handlers.
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Error)]
 pub enum SessionError {
     /// The referenced session does not exist.
     #[error("unknown session: {0}")]
@@ -57,7 +59,27 @@ pub enum SessionError {
     /// Join ticket malformed or revoked.
     #[error("invalid join ticket")]
     InvalidTicket,
+
+    /// Backing storage failed. The in-memory state was not changed.
+    #[error("storage: {0}")]
+    Storage(#[source] std::io::Error),
 }
+
+// io::Error doesn't impl PartialEq, so we hand-roll one for the
+// Storage-free variants tests rely on.
+impl PartialEq for SessionError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::UnknownSession(a), Self::UnknownSession(b))
+            | (Self::NotMember(a), Self::NotMember(b))
+            | (Self::AlreadyJoined(a), Self::AlreadyJoined(b)) => a == b,
+            (Self::InvalidTicket, Self::InvalidTicket) => true,
+            (Self::Storage(a), Self::Storage(b)) => a.kind() == b.kind(),
+            _ => false,
+        }
+    }
+}
+impl Eq for SessionError {}
 
 /// Outcome of a successful `subscribe`: a snapshot of the log to
 /// replay, plus a live event receiver for everything that follows.
@@ -97,15 +119,28 @@ impl Session {
         }
     }
 
-    const fn next_seq(&mut self) -> Seq {
-        // ZERO is reserved as "before any message". The first real
-        // message gets Seq(1). overflow is panic-worthy: that's
-        // 18 quintillion messages.
-        let Some(next) = self.head.next() else {
-            panic!("session sequence number overflowed u64");
-        };
-        self.head = next;
-        next
+    /// Hydrate from a persisted [`SessionRecord`].
+    fn from_record(record: SessionRecord) -> Self {
+        let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        Self {
+            id: record.id,
+            host: record.host,
+            members: record.members,
+            log: record.log,
+            head: record.head,
+            events_tx,
+        }
+    }
+
+    /// Take a snapshot suitable for [`crate::store::SessionStore::create`].
+    fn record(&self) -> SessionRecord {
+        SessionRecord {
+            id: self.id,
+            host: self.host,
+            members: self.members.clone(),
+            head: self.head,
+            log: self.log.clone(),
+        }
     }
 
     /// Summary suitable for [`Registry::list`].
@@ -123,21 +158,45 @@ impl Session {
     }
 }
 
-/// In-memory session registry.
+/// In-memory session registry, backed by a [`crate::store::SessionStore`]
+/// for durability.
 #[derive(Debug)]
 pub struct Registry {
     daemon_peer_id: PeerId,
     sessions: RwLock<HashMap<SessionId, Arc<Mutex<Session>>>>,
+    store: DynStore,
 }
 
 impl Registry {
-    /// Create an empty registry advertising `daemon_peer_id`.
-    #[must_use]
-    pub fn new(daemon_peer_id: PeerId) -> Self {
+    /// Create a registry backed by `store`. The store is consulted only
+    /// for mutations; in-memory state holds the live runtime view
+    /// (broadcast channels, subscribers).
+    ///
+    /// Used by unit tests; production code goes through
+    /// [`Registry::load`] which also rehydrates from the store.
+    #[cfg(test)]
+    pub(crate) fn new(daemon_peer_id: PeerId, store: DynStore) -> Self {
         Self {
             daemon_peer_id,
             sessions: RwLock::new(HashMap::new()),
+            store,
         }
+    }
+
+    /// Build a registry whose initial state is the records the store
+    /// returned from `load_all`. Called once at daemon startup.
+    pub(crate) async fn load(daemon_peer_id: PeerId, store: DynStore) -> std::io::Result<Self> {
+        let records = store.load_all().await?;
+        let mut sessions = HashMap::with_capacity(records.len());
+        for record in records {
+            let id = record.id;
+            sessions.insert(id, Arc::new(Mutex::new(Session::from_record(record))));
+        }
+        Ok(Self {
+            daemon_peer_id,
+            sessions: RwLock::new(sessions),
+            store,
+        })
     }
 
     /// The daemon's own peer id, returned in the `Hello` response.
@@ -148,15 +207,24 @@ impl Registry {
 
     /// Host a new session. Returns the new session's id and a join
     /// ticket the host distributes out-of-band.
-    pub async fn host(&self, host_peer: PeerInfo) -> (SessionId, JoinTicket) {
+    ///
+    /// On store-write failure, the session is **not** added to the
+    /// in-memory map and the error propagates. This keeps "registry
+    /// thinks it has session X but disk doesn't" from happening.
+    pub async fn host(&self, host_peer: PeerInfo) -> Result<(SessionId, JoinTicket), SessionError> {
         let session_id = SessionId::new_random();
         let ticket = JoinTicket::from(format!("{LOCAL_TICKET_PREFIX}{session_id}"));
         let session = Session::new(session_id, &host_peer);
+        let record = session.record();
+        self.store
+            .create(&record)
+            .await
+            .map_err(SessionError::Storage)?;
         self.sessions
             .write()
             .await
             .insert(session_id, Arc::new(Mutex::new(session)));
-        (session_id, ticket)
+        Ok((session_id, ticket))
     }
 
     /// Join an existing session via its ticket. Returns the session id
@@ -175,10 +243,20 @@ impl Registry {
                 .ok_or(SessionError::UnknownSession(session_id))?
         };
 
+        // Hold the session lock across the store write so a concurrent
+        // join with the same peer doesn't race past the membership
+        // check. This is the simplest correct shape; the store is fast
+        // and uncontended in practice.
         let mut s = session.lock().await;
-        if !s.members.insert(peer.id) {
+        if s.members.contains(&peer.id) {
             return Err(SessionError::AlreadyJoined(session_id));
         }
+        self.store
+            .add_member(session_id, &peer)
+            .await
+            .map_err(SessionError::Storage)?;
+        s.members.insert(peer.id);
+
         // Notify other peers of the join. broadcast::send returns Err
         // when there are no receivers; that's fine, we treat it as a
         // "nobody listening" no-op.
@@ -210,11 +288,27 @@ impl Registry {
         let session_closed;
         {
             let mut s = session_arc.lock().await;
-            if !s.members.remove(&peer) {
+            if !s.members.contains(&peer) {
                 return Err(SessionError::NotMember(session));
             }
             host = s.host;
             session_closed = peer == host;
+
+            // Persist before mutating in-memory state. If this fails,
+            // the registry stays consistent with the store.
+            if session_closed {
+                self.store
+                    .delete(session)
+                    .await
+                    .map_err(SessionError::Storage)?;
+            } else {
+                self.store
+                    .remove_member(session, peer)
+                    .await
+                    .map_err(SessionError::Storage)?;
+            }
+
+            s.members.remove(&peer);
             if session_closed {
                 let _ = s.events_tx.send(Event::SessionClosed { session });
             } else {
@@ -264,16 +358,28 @@ impl Registry {
         if !s.members.contains(&peer.id) {
             return Err(SessionError::NotMember(session));
         }
-        let seq = s.next_seq();
-        let message = SessionMessage::new(seq, timestamp_ms, peer, kind, action, payload);
+        // Build the message under the session lock (so seq is stable),
+        // then persist before bumping in-memory state and fanning out.
+        // If the store fails, head and log are unchanged; the request
+        // is rejected, the client gets a Storage error.
+        //
+        // We compute the prospective seq without committing it. If the
+        // store write succeeds we commit; if not, we leave head alone.
+        let prospective = s.head.next().expect("seq overflow");
+        let message = SessionMessage::new(prospective, timestamp_ms, peer, kind, action, payload);
+        if let Err(err) = self.store.append(session, &message).await {
+            return Err(SessionError::Storage(err));
+        }
+        s.head = prospective;
         s.log.push(message.clone());
+
         // Snapshot the broadcast handle so we can drop the per-session
         // lock before fanning out — `broadcast::send` is cheap but
         // there's no reason to hold the session mutex across it.
         let events_tx = s.events_tx.clone();
         drop(s);
         let _ = events_tx.send(Event::Message { session, message });
-        Ok(seq)
+        Ok(prospective)
     }
 
     /// Subscribe to live events for `session`, optionally backfilling
@@ -326,7 +432,12 @@ mod tests {
     }
 
     fn registry() -> Registry {
-        Registry::new(PeerId::from_bytes([0xff; 32]))
+        registry_with_peer(PeerId::from_bytes([0xff; 32]))
+    }
+
+    fn registry_with_peer(daemon_peer_id: PeerId) -> Registry {
+        let store: DynStore = Arc::new(crate::store::MemoryStore::new());
+        Registry::new(daemon_peer_id, store)
     }
 
     // ---- host ----
@@ -334,7 +445,7 @@ mod tests {
     #[tokio::test]
     async fn host_creates_session_and_returns_local_ticket() {
         let r = registry();
-        let (id, ticket) = r.host(peer(1, "alice")).await;
+        let (id, ticket) = r.host(peer(1, "alice")).await.unwrap();
         assert!(ticket.as_str().starts_with(LOCAL_TICKET_PREFIX));
         assert!(ticket.as_str().ends_with(&id.to_string()));
         let summaries = r.list().await;
@@ -350,7 +461,7 @@ mod tests {
     async fn join_local_ticket_succeeds_and_emits_peer_joined() {
         let r = registry();
         let host = peer(1, "alice");
-        let (id, ticket) = r.host(host).await;
+        let (id, ticket) = r.host(host).await.unwrap();
 
         // Subscribe before second peer joins so we observe the event.
         let mut sub = r.subscribe(id, None).await.unwrap();
@@ -408,7 +519,7 @@ mod tests {
     #[tokio::test]
     async fn join_twice_errors() {
         let r = registry();
-        let (_id, ticket) = r.host(peer(1, "alice")).await;
+        let (_id, ticket) = r.host(peer(1, "alice")).await.unwrap();
         r.join(&ticket, peer(2, "bob")).await.unwrap();
         let err = r.join(&ticket, peer(2, "bob")).await.unwrap_err();
         assert!(matches!(err, SessionError::AlreadyJoined(_)), "{err:?}");
@@ -420,7 +531,7 @@ mod tests {
     async fn send_assigns_strictly_monotonic_seq() {
         let r = registry();
         let host = peer(1, "alice");
-        let (id, _) = r.host(host.clone()).await;
+        let (id, _) = r.host(host.clone()).await.unwrap();
 
         let s1 = r
             .send(id, host.clone(), MessageKind::Chat, "a".into(), vec![], 1)
@@ -445,7 +556,7 @@ mod tests {
     async fn send_by_non_member_errors() {
         let r = registry();
         let host = peer(1, "alice");
-        let (id, _) = r.host(host).await;
+        let (id, _) = r.host(host).await.unwrap();
         let err = r
             .send(
                 id,
@@ -482,7 +593,7 @@ mod tests {
     async fn send_emits_message_event() {
         let r = registry();
         let host = peer(1, "alice");
-        let (id, _) = r.host(host.clone()).await;
+        let (id, _) = r.host(host.clone()).await.unwrap();
 
         let mut sub = r.subscribe(id, None).await.unwrap();
         let seq = r
@@ -519,7 +630,7 @@ mod tests {
     async fn subscribe_replays_messages_after_since() {
         let r = registry();
         let host = peer(1, "alice");
-        let (id, _) = r.host(host.clone()).await;
+        let (id, _) = r.host(host.clone()).await.unwrap();
 
         let s1 = r
             .send(id, host.clone(), MessageKind::Chat, "1".into(), vec![], 0)
@@ -545,7 +656,7 @@ mod tests {
     async fn subscribe_with_no_since_replays_full_log() {
         let r = registry();
         let host = peer(1, "alice");
-        let (id, _) = r.host(host.clone()).await;
+        let (id, _) = r.host(host.clone()).await.unwrap();
         for n in 0..5 {
             r.send(
                 id,
@@ -577,7 +688,7 @@ mod tests {
         let r = registry();
         let host = peer(1, "alice");
         let bob = peer(2, "bob");
-        let (id, ticket) = r.host(host).await;
+        let (id, ticket) = r.host(host).await.unwrap();
         r.join(&ticket, bob.clone()).await.unwrap();
 
         let mut sub = r.subscribe(id, None).await.unwrap();
@@ -601,7 +712,7 @@ mod tests {
     async fn host_leave_emits_session_closed_and_removes_session() {
         let r = registry();
         let host = peer(1, "alice");
-        let (id, _) = r.host(host.clone()).await;
+        let (id, _) = r.host(host.clone()).await.unwrap();
         let mut sub = r.subscribe(id, None).await.unwrap();
         r.leave(id, host.id).await.unwrap();
 
@@ -617,7 +728,7 @@ mod tests {
     #[tokio::test]
     async fn leave_non_member_errors() {
         let r = registry();
-        let (id, _) = r.host(peer(1, "alice")).await;
+        let (id, _) = r.host(peer(1, "alice")).await.unwrap();
         let err = r.leave(id, peer(9, "intruder").id).await.unwrap_err();
         assert_eq!(err, SessionError::NotMember(id));
     }
@@ -637,7 +748,7 @@ mod tests {
         let r = registry();
         let host = peer(1, "alice");
         let bob = peer(2, "bob");
-        let (id, ticket) = r.host(host.clone()).await;
+        let (id, ticket) = r.host(host.clone()).await.unwrap();
         r.join(&ticket, bob).await.unwrap();
         r.send(id, host, MessageKind::Chat, "x".into(), vec![], 0)
             .await
@@ -657,9 +768,9 @@ mod tests {
     #[tokio::test]
     async fn list_marks_is_host_when_daemon_is_session_host() {
         let daemon_peer = PeerId::from_bytes([7; 32]);
-        let r = Registry::new(daemon_peer);
+        let r = registry_with_peer(daemon_peer);
         let host = PeerInfo::new(daemon_peer, "self");
-        r.host(host).await;
+        r.host(host).await.unwrap();
         let summaries = r.list().await;
         assert!(summaries[0].is_host);
     }
