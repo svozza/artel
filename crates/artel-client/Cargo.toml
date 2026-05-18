@@ -9,7 +9,25 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-artel-protocol.workspace = true
+artel-protocol = { workspace = true, features = ["tokio"] }
+clap = { workspace = true }
+futures-util = { workspace = true }
+nix = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+artel-daemon = { path = "../artel-daemon" }
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util", "time"] }
+
+[[bin]]
+name = "artel"
+path = "src/bin/artel.rs"
 
 [lints]
 workspace = true

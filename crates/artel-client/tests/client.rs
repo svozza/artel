@@ -1,0 +1,308 @@
+//! Integration tests for [`artel_client::Client`].
+//!
+//! These spin up an in-process [`artel_daemon::Daemon`] on a tempdir
+//! socket and drive it through the public Client API. That keeps the
+//! tests honest about what the API actually exposes (vs what the
+//! reader/writer tasks happen to do internally).
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use artel_client::{Client, ClientError};
+use artel_daemon::shutdown::Shutdown;
+use artel_daemon::{Daemon, DaemonConfig};
+use artel_protocol::{
+    Event, MessageKind, PROTOCOL_VERSION, PeerId, PeerInfo, ProtocolError, Request, Response,
+    SendPayload,
+};
+use pretty_assertions::assert_eq;
+use tempfile::TempDir;
+use tokio::time::timeout;
+
+const DAEMON_PEER: PeerId = PeerId::from_bytes([0xee; 32]);
+
+struct DaemonHarness {
+    _tempdir: TempDir,
+    socket: PathBuf,
+    shutdown: Arc<Shutdown>,
+    join: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+impl DaemonHarness {
+    async fn spawn() -> Self {
+        let tempdir = tempfile::tempdir().unwrap();
+        let socket = tempdir.path().join("daemon.sock");
+        let pid = tempdir.path().join("daemon.pid");
+        let daemon = Daemon::start(DaemonConfig {
+            socket_path: socket.clone(),
+            pid_path: pid,
+            daemon_peer_id: DAEMON_PEER,
+        })
+        .await
+        .expect("daemon start");
+        let shutdown = daemon.shutdown_handle();
+        let join = tokio::spawn(daemon.run());
+        Self {
+            _tempdir: tempdir,
+            socket,
+            shutdown,
+            join,
+        }
+    }
+
+    async fn shutdown(self) {
+        self.shutdown.trigger();
+        timeout(Duration::from_secs(5), self.join)
+            .await
+            .expect("daemon did not exit within 5s")
+            .expect("daemon panicked")
+            .expect("daemon returned error");
+    }
+}
+
+fn alice() -> PeerInfo {
+    PeerInfo::new(PeerId::from_bytes([1; 32]), "alice")
+}
+
+fn bob() -> PeerInfo {
+    PeerInfo::new(PeerId::from_bytes([2; 32]), "bob")
+}
+
+#[tokio::test]
+async fn connect_does_handshake_and_records_daemon_info() {
+    let h = DaemonHarness::spawn().await;
+    let client = Client::connect(&h.socket).await.unwrap();
+    assert_eq!(client.daemon_peer_id(), DAEMON_PEER);
+    assert_eq!(client.daemon_version(), PROTOCOL_VERSION);
+    drop(client);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn connect_against_missing_socket_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let bogus = dir.path().join("absent.sock");
+    let err = Client::connect(&bogus).await.unwrap_err();
+    assert!(
+        matches!(err, ClientError::Transport(_)),
+        "expected transport error, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn list_sessions_returns_empty_on_fresh_daemon() {
+    let h = DaemonHarness::spawn().await;
+    let client = Client::connect(&h.socket).await.unwrap();
+
+    let resp = client.request(Request::ListSessions).await.unwrap();
+    match resp {
+        Response::ListSessions { sessions } => assert!(sessions.is_empty()),
+        other => panic!("expected ListSessions, got {other:?}"),
+    }
+
+    drop(client);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn host_then_list_sees_the_session() {
+    let h = DaemonHarness::spawn().await;
+    let client = Client::connect(&h.socket).await.unwrap();
+
+    let resp = client
+        .request(Request::HostSession { peer: alice() })
+        .await
+        .unwrap();
+    let session_id = match resp {
+        Response::HostSession { session, .. } => session,
+        other => panic!("expected HostSession, got {other:?}"),
+    };
+
+    let resp = client.request(Request::ListSessions).await.unwrap();
+    match resp {
+        Response::ListSessions { sessions } => {
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].id, session_id);
+        }
+        other => panic!("expected ListSessions, got {other:?}"),
+    }
+
+    drop(client);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn concurrent_requests_correlate_independently() {
+    // Fire many requests in parallel through the same Client and make
+    // sure each future sees its own response, not someone else's.
+    let h = DaemonHarness::spawn().await;
+    let client = Arc::new(Client::connect(&h.socket).await.unwrap());
+
+    // Prime: host a session so the daemon has something to look at.
+    let resp = client
+        .request(Request::HostSession { peer: alice() })
+        .await
+        .unwrap();
+    let session_id = match resp {
+        Response::HostSession { session, .. } => session,
+        other => panic!("got {other:?}"),
+    };
+
+    let mut joins = Vec::new();
+    for _ in 0..32 {
+        let c = Arc::clone(&client);
+        joins.push(tokio::spawn(async move {
+            c.request(Request::ListSessions).await
+        }));
+    }
+    for j in joins {
+        let resp = j.await.unwrap().unwrap();
+        match resp {
+            Response::ListSessions { sessions } => {
+                assert_eq!(sessions.len(), 1);
+                assert_eq!(sessions[0].id, session_id);
+            }
+            other => panic!("expected ListSessions, got {other:?}"),
+        }
+    }
+
+    drop(client);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn protocol_error_surfaces_as_client_error_protocol() {
+    // Trying to JoinSession with a malformed ticket triggers
+    // ProtocolError::InvalidTicket from the daemon.
+    let h = DaemonHarness::spawn().await;
+    let client = Client::connect(&h.socket).await.unwrap();
+
+    let err = client
+        .request(Request::JoinSession {
+            peer: bob(),
+            ticket: "iroh-fake:abc".into(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ClientError::Protocol(ProtocolError::InvalidTicket)),
+        "got {err:?}"
+    );
+
+    drop(client);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn events_stream_delivers_message_events() {
+    let h = DaemonHarness::spawn().await;
+    let alice_client = Client::connect(&h.socket).await.unwrap();
+    let bob_client = Client::connect(&h.socket).await.unwrap();
+
+    // Alice hosts and subscribes.
+    let resp = alice_client
+        .request(Request::HostSession { peer: alice() })
+        .await
+        .unwrap();
+    let (session_id, ticket) = match resp {
+        Response::HostSession { session, ticket } => (session, ticket),
+        other => panic!("got {other:?}"),
+    };
+    let _ = alice_client
+        .request(Request::Subscribe {
+            session: session_id,
+            since: None,
+        })
+        .await
+        .unwrap();
+    let mut alice_events = alice_client.take_events().await.expect("events");
+
+    // Bob joins and sends.
+    let _ = bob_client
+        .request(Request::JoinSession {
+            peer: bob(),
+            ticket,
+        })
+        .await
+        .unwrap();
+    let _ = bob_client
+        .request(Request::Send {
+            session: session_id,
+            payload: SendPayload {
+                kind: MessageKind::Chat,
+                action: "chat.message".into(),
+                payload: b"hi".to_vec(),
+            },
+        })
+        .await
+        .unwrap();
+
+    // Alice should observe PeerJoined then Message.
+    let event = timeout(Duration::from_secs(2), alice_events.recv())
+        .await
+        .expect("event timeout")
+        .expect("event channel closed");
+    assert!(matches!(event, Event::PeerJoined { .. }), "{event:?}");
+    let event = timeout(Duration::from_secs(2), alice_events.recv())
+        .await
+        .expect("event timeout")
+        .expect("event channel closed");
+    match event {
+        Event::Message { message, .. } => assert_eq!(message.payload, b"hi"),
+        other => panic!("expected Message, got {other:?}"),
+    }
+
+    drop(alice_client);
+    drop(bob_client);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn take_events_is_single_consumer() {
+    let h = DaemonHarness::spawn().await;
+    let client = Client::connect(&h.socket).await.unwrap();
+
+    let first = client.take_events().await;
+    let second = client.take_events().await;
+    assert!(first.is_some());
+    assert!(second.is_none(), "second take_events should return None");
+
+    drop(client);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn drop_resolves_pending_requests_to_connection_closed() {
+    // Shut the daemon while a request is in-flight. The pending
+    // future should resolve to ConnectionClosed.
+    let h = DaemonHarness::spawn().await;
+    let client = Client::connect(&h.socket).await.unwrap();
+
+    // Trigger daemon shutdown immediately. The connection drops out
+    // from under us; subsequent requests should fail.
+    h.shutdown.trigger();
+    timeout(Duration::from_secs(5), h.join)
+        .await
+        .expect("daemon shutdown")
+        .expect("daemon panic")
+        .expect("daemon io");
+
+    // Give the reader task a moment to observe EOF.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let err = client.request(Request::ListSessions).await.unwrap_err();
+    assert!(
+        matches!(err, ClientError::ConnectionClosed),
+        "expected ConnectionClosed, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn dropping_client_does_not_panic() {
+    // Just make sure Drop is well-behaved.
+    let h = DaemonHarness::spawn().await;
+    let client = Client::connect(&h.socket).await.unwrap();
+    drop(client);
+    h.shutdown().await;
+}

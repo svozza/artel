@@ -71,13 +71,25 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 name = "artel-client"
 version = "0.0.0"
 dependencies = [
+ "artel-daemon",
  "artel-protocol",
+ "clap",
+ "futures-util",
+ "nix",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
 name = "artel-daemon"
 version = "0.0.0"
 dependencies = [
+ "artel-client",
  "artel-protocol",
  "clap",
  "futures-util",

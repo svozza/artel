@@ -1,3 +1,13 @@
 //! Rust client for connecting to the `artel-daemon`.
 //!
-//! Stub. See `docs/adr/012-collab-substrate-platform.md` for the design.
+//! Thin async wrapper over the IPC transport. Handles the version
+//! handshake, demultiplexes responses against in-flight requests, and
+//! exposes incoming events as a `Stream`. Apps that want a richer
+//! ergonomic layer (session handles, typed payload helpers, etc.)
+//! build on top of this.
+
+mod client;
+mod error;
+
+pub use client::{Client, EventStream};
+pub use error::ClientError;

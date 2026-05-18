@@ -1,51 +1,20 @@
 //! End-to-end integration test: two clients drive a real daemon
 //! through Hello -> Host/Join -> Subscribe -> Send -> Leave.
+//!
+//! Uses `artel_client::Client` so we exercise the public client API
+//! and not raw IPC framing.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use artel_client::Client;
 use artel_daemon::shutdown::Shutdown;
 use artel_daemon::{Daemon, DaemonConfig};
-use artel_protocol::transport::client::connect;
-use artel_protocol::{
-    Event, MessageKind, PROTOCOL_VERSION, PeerId, PeerInfo, Request, RequestId, Response,
-    SendPayload, WireMessage,
-};
-use futures_util::{SinkExt, StreamExt};
+use artel_protocol::{Event, MessageKind, PeerId, PeerInfo, Request, Response, SendPayload};
+use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use tokio::time::timeout;
-
-type Client = artel_protocol::transport::Framed<tokio::net::UnixStream>;
-
-/// Send a request, receive its response. Panics on unrelated frames.
-async fn rpc(client: &mut Client, id: RequestId, request: Request) -> Response {
-    client
-        .send(WireMessage::Request { id, request })
-        .await
-        .unwrap();
-    let frame = timeout(Duration::from_secs(2), client.next())
-        .await
-        .expect("timed out waiting for response")
-        .expect("stream ended early")
-        .unwrap();
-    match frame {
-        WireMessage::Response { id: rid, response } if rid == id => response,
-        other => panic!("unexpected frame waiting for {id:?}: {other:?}"),
-    }
-}
-
-async fn next_event(client: &mut Client) -> Event {
-    let frame = timeout(Duration::from_secs(2), client.next())
-        .await
-        .expect("timed out waiting for event")
-        .expect("stream ended early")
-        .unwrap();
-    match frame {
-        WireMessage::Event { event } => event,
-        other => panic!("expected event, got {other:?}"),
-    }
-}
 
 struct DaemonHarness {
     _tempdir: TempDir,
@@ -86,73 +55,51 @@ impl DaemonHarness {
     }
 }
 
+async fn next_event(events: &mut artel_client::EventStream) -> Event {
+    timeout(Duration::from_secs(2), events.recv())
+        .await
+        .expect("timed out waiting for event")
+        .expect("event channel closed")
+}
+
 #[tokio::test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "linear e2e walkthrough is clearer flat than split into helpers"
-)]
 async fn two_clients_chat_end_to_end() {
-    let harness = DaemonHarness::spawn().await;
+    let h = DaemonHarness::spawn().await;
 
-    // ---- Alice (host) ----
-    let mut alice = connect(&harness.socket).await.unwrap();
-    let resp = rpc(
-        &mut alice,
-        RequestId::new(1),
-        Request::Hello {
-            client_version: PROTOCOL_VERSION,
-        },
-    )
-    .await;
-    assert!(matches!(resp, Response::Hello { .. }), "{resp:?}");
+    let alice_client = Client::connect(&h.socket).await.unwrap();
+    let bob_client = Client::connect(&h.socket).await.unwrap();
 
+    // Alice hosts.
     let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
-    let resp = rpc(
-        &mut alice,
-        RequestId::new(2),
-        Request::HostSession {
-            peer: alice_peer.clone(),
-        },
-    )
-    .await;
+    let resp = alice_client
+        .request(Request::HostSession { peer: alice_peer })
+        .await
+        .unwrap();
     let (session, ticket) = match resp {
         Response::HostSession { session, ticket } => (session, ticket),
         other => panic!("expected HostSession, got {other:?}"),
     };
 
-    let resp = rpc(
-        &mut alice,
-        RequestId::new(3),
-        Request::Subscribe {
+    // Alice subscribes so she observes peer-joined and the message.
+    let resp = alice_client
+        .request(Request::Subscribe {
             session,
             since: None,
-        },
-    )
-    .await;
+        })
+        .await
+        .unwrap();
     assert!(matches!(resp, Response::Subscribed { .. }), "{resp:?}");
+    let mut alice_events = alice_client.take_events().await.expect("events");
 
-    // ---- Bob (joiner) ----
-    let mut bob = connect(&harness.socket).await.unwrap();
-    let resp = rpc(
-        &mut bob,
-        RequestId::new(1),
-        Request::Hello {
-            client_version: PROTOCOL_VERSION,
-        },
-    )
-    .await;
-    assert!(matches!(resp, Response::Hello { .. }), "{resp:?}");
-
+    // Bob joins.
     let bob_peer = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
-    let resp = rpc(
-        &mut bob,
-        RequestId::new(2),
-        Request::JoinSession {
+    let resp = bob_client
+        .request(Request::JoinSession {
             peer: bob_peer.clone(),
             ticket,
-        },
-    )
-    .await;
+        })
+        .await
+        .unwrap();
     match resp {
         Response::JoinSession { session: got, head } => {
             assert_eq!(got, session);
@@ -162,7 +109,7 @@ async fn two_clients_chat_end_to_end() {
     }
 
     // Alice observes Bob joining.
-    match next_event(&mut alice).await {
+    match next_event(&mut alice_events).await {
         Event::PeerJoined { session: got, peer } => {
             assert_eq!(got, session);
             assert_eq!(peer, bob_peer);
@@ -170,20 +117,18 @@ async fn two_clients_chat_end_to_end() {
         other => panic!("expected PeerJoined, got {other:?}"),
     }
 
-    // ---- Bob sends; Alice receives ----
-    let resp = rpc(
-        &mut bob,
-        RequestId::new(3),
-        Request::Send {
+    // Bob sends; Alice receives.
+    let resp = bob_client
+        .request(Request::Send {
             session,
             payload: SendPayload {
                 kind: MessageKind::Chat,
                 action: "chat.message".into(),
                 payload: b"hi alice".to_vec(),
             },
-        },
-    )
-    .await;
+        })
+        .await
+        .unwrap();
     let bob_seq = match resp {
         Response::Sent { session: got, seq } => {
             assert_eq!(got, session);
@@ -192,7 +137,7 @@ async fn two_clients_chat_end_to_end() {
         other => panic!("expected Sent, got {other:?}"),
     };
 
-    match next_event(&mut alice).await {
+    match next_event(&mut alice_events).await {
         Event::Message {
             session: got,
             message,
@@ -206,16 +151,14 @@ async fn two_clients_chat_end_to_end() {
         other => panic!("expected Message event, got {other:?}"),
     }
 
-    // ---- Bob leaves; Alice observes PeerLeft ----
-    let resp = rpc(
-        &mut bob,
-        RequestId::new(4),
-        Request::LeaveSession { session },
-    )
-    .await;
+    // Bob leaves; Alice observes PeerLeft.
+    let resp = bob_client
+        .request(Request::LeaveSession { session })
+        .await
+        .unwrap();
     assert!(matches!(resp, Response::Left { .. }), "{resp:?}");
 
-    match next_event(&mut alice).await {
+    match next_event(&mut alice_events).await {
         Event::PeerLeft { session: got, peer } => {
             assert_eq!(got, session);
             assert_eq!(peer, bob_peer.id);
@@ -223,48 +166,33 @@ async fn two_clients_chat_end_to_end() {
         other => panic!("expected PeerLeft, got {other:?}"),
     }
 
-    // ---- Alice (host) leaves; session closes ----
-    let resp = rpc(
-        &mut alice,
-        RequestId::new(4),
-        Request::LeaveSession { session },
-    )
-    .await;
+    // Alice (host) leaves; session closes.
+    let resp = alice_client
+        .request(Request::LeaveSession { session })
+        .await
+        .unwrap();
     assert!(matches!(resp, Response::Left { .. }), "{resp:?}");
 
-    match next_event(&mut alice).await {
+    match next_event(&mut alice_events).await {
         Event::SessionClosed { session: got } => assert_eq!(got, session),
         other => panic!("expected SessionClosed, got {other:?}"),
     }
 
-    drop(alice);
-    drop(bob);
-    harness.shutdown().await;
+    drop(alice_client);
+    drop(bob_client);
+    h.shutdown().await;
 }
 
 #[tokio::test]
 async fn subscribe_replays_history() {
-    let harness = DaemonHarness::spawn().await;
+    let h = DaemonHarness::spawn().await;
 
-    // Alice hosts, sends three messages, then Bob joins and subscribes
-    // since the first sent seq. Bob should see the last two replayed.
-    let mut alice = connect(&harness.socket).await.unwrap();
-    let _ = rpc(
-        &mut alice,
-        RequestId::new(1),
-        Request::Hello {
-            client_version: PROTOCOL_VERSION,
-        },
-    )
-    .await;
-
+    let alice_client = Client::connect(&h.socket).await.unwrap();
     let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
-    let resp = rpc(
-        &mut alice,
-        RequestId::new(2),
-        Request::HostSession { peer: alice_peer },
-    )
-    .await;
+    let resp = alice_client
+        .request(Request::HostSession { peer: alice_peer })
+        .await
+        .unwrap();
     let (session, ticket) = match resp {
         Response::HostSession { session, ticket } => (session, ticket),
         other => panic!("expected HostSession, got {other:?}"),
@@ -272,61 +200,50 @@ async fn subscribe_replays_history() {
 
     let mut sent_seqs = Vec::new();
     for n in 0..3u32 {
-        let resp = rpc(
-            &mut alice,
-            RequestId::new(u64::from(10 + n)),
-            Request::Send {
+        let resp = alice_client
+            .request(Request::Send {
                 session,
                 payload: SendPayload {
                     kind: MessageKind::Chat,
                     action: format!("m{n}"),
                     payload: vec![],
                 },
-            },
-        )
-        .await;
+            })
+            .await
+            .unwrap();
         match resp {
             Response::Sent { seq, .. } => sent_seqs.push(seq),
             other => panic!("expected Sent, got {other:?}"),
         }
     }
 
-    let mut bob = connect(&harness.socket).await.unwrap();
-    let _ = rpc(
-        &mut bob,
-        RequestId::new(1),
-        Request::Hello {
-            client_version: PROTOCOL_VERSION,
-        },
-    )
-    .await;
-    let _ = rpc(
-        &mut bob,
-        RequestId::new(2),
-        Request::JoinSession {
+    // Bob joins and subscribes since the first seq. He should see m1
+    // and m2 replayed.
+    let bob_client = Client::connect(&h.socket).await.unwrap();
+    let _ = bob_client
+        .request(Request::JoinSession {
             peer: PeerInfo::new(PeerId::from_bytes([2; 32]), "bob"),
             ticket,
-        },
-    )
-    .await;
-    let _ = rpc(
-        &mut bob,
-        RequestId::new(3),
-        Request::Subscribe {
+        })
+        .await
+        .unwrap();
+    let _ = bob_client
+        .request(Request::Subscribe {
             session,
             since: Some(sent_seqs[0]),
-        },
-    )
-    .await;
+        })
+        .await
+        .unwrap();
+    let mut bob_events = bob_client.take_events().await.expect("events");
 
     for expected_action in ["m1", "m2"] {
-        match next_event(&mut bob).await {
+        match next_event(&mut bob_events).await {
             Event::Message { message, .. } => assert_eq!(message.action, expected_action),
             other => panic!("expected Message {expected_action:?}, got {other:?}"),
         }
     }
 
-    drop(alice);
-    drop(bob);
-    harness.shutdown().await;
+    drop(alice_client);
+    drop(bob_client);
+    h.shutdown().await;
 }
