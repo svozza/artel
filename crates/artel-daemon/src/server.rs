@@ -194,12 +194,25 @@ impl Daemon {
         #[cfg(not(feature = "iroh"))]
         let daemon_peer_id = config.daemon_peer_id;
 
+        // Snapshot the daemon's network addr so the registry can
+        // stamp it into outbound tickets. Without iroh (or before
+        // the endpoint has discovered any addrs), we fall back to
+        // an id-only addr — joiners will need an address-lookup
+        // service of their own to dial us.
+        #[cfg(feature = "iroh")]
+        let daemon_addr = iroh.as_ref().map_or_else(
+            || artel_protocol::WireEndpointAddr::id_only(daemon_peer_id),
+            |rt| iroh_endpoint_to_wire(&rt.endpoint.addr()),
+        );
+        #[cfg(not(feature = "iroh"))]
+        let daemon_addr = artel_protocol::WireEndpointAddr::id_only(daemon_peer_id);
+
         let store: crate::store::DynStore = Arc::new(
             crate::store::FsLogStore::open(&config.sessions_dir)
                 .map_err(StartError::LoadSessions)?,
         );
         let registry = Arc::new(
-            Registry::load(daemon_peer_id, store)
+            Registry::load(daemon_peer_id, daemon_addr, store)
                 .await
                 .map_err(StartError::LoadSessions)?,
         );
@@ -582,6 +595,24 @@ async fn resolve_iroh_runtime(
             router,
         }),
     ))
+}
+
+/// Convert an `iroh::EndpointAddr` into the wire-friendly form used
+/// in tickets. Direct UDP addresses become `SocketAddr`; the (zero
+/// or one) home relay URL becomes a `String`.
+#[cfg(feature = "iroh")]
+fn iroh_endpoint_to_wire(addr: &iroh::EndpointAddr) -> artel_protocol::WireEndpointAddr {
+    let direct_addrs = addr.ip_addrs().copied().collect();
+    let relay_url = addr
+        .relay_urls()
+        .next()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    artel_protocol::WireEndpointAddr {
+        peer_id: artel_protocol::PeerId::from_bytes(*addr.id.as_bytes()),
+        relay_url,
+        direct_addrs,
+    }
 }
 
 /// Wall-clock milliseconds since the Unix epoch. Used for stamping

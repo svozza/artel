@@ -17,7 +17,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use artel_protocol::ticket::{self, SessionTicket};
+use artel_protocol::ticket::{self, SessionTicket, WireEndpointAddr};
 use artel_protocol::{
     Event, JoinTicket, MessageKind, PeerId, PeerInfo, Seq, SessionId, SessionMessage,
     SessionSummary,
@@ -158,6 +158,11 @@ impl Session {
 #[derive(Debug)]
 pub struct Registry {
     daemon_peer_id: PeerId,
+    /// The daemon's own [`WireEndpointAddr`], stamped into every
+    /// outbound `host` ticket so joiners can dial back. Either a
+    /// snapshot of the live iroh `Endpoint::addr()` or an
+    /// `id_only` placeholder when the daemon is local-only.
+    daemon_addr: WireEndpointAddr,
     sessions: RwLock<HashMap<SessionId, Arc<Mutex<Session>>>>,
     store: DynStore,
 }
@@ -173,6 +178,7 @@ impl Registry {
     pub(crate) fn new(daemon_peer_id: PeerId, store: DynStore) -> Self {
         Self {
             daemon_peer_id,
+            daemon_addr: WireEndpointAddr::id_only(daemon_peer_id),
             sessions: RwLock::new(HashMap::new()),
             store,
         }
@@ -180,7 +186,11 @@ impl Registry {
 
     /// Build a registry whose initial state is the records the store
     /// returned from `load_all`. Called once at daemon startup.
-    pub(crate) async fn load(daemon_peer_id: PeerId, store: DynStore) -> std::io::Result<Self> {
+    pub(crate) async fn load(
+        daemon_peer_id: PeerId,
+        daemon_addr: WireEndpointAddr,
+        store: DynStore,
+    ) -> std::io::Result<Self> {
         let records = store.load_all().await?;
         let mut sessions = HashMap::with_capacity(records.len());
         for record in records {
@@ -189,6 +199,7 @@ impl Registry {
         }
         Ok(Self {
             daemon_peer_id,
+            daemon_addr,
             sessions: RwLock::new(sessions),
             store,
         })
@@ -211,6 +222,7 @@ impl Registry {
         let ticket = JoinTicket::from(ticket::encode(&SessionTicket {
             session_id,
             host_peer_id: self.daemon_peer_id,
+            host_addr: self.daemon_addr.clone(),
         }));
         let session = Session::new(session_id, &host_peer);
         let record = session.record();
@@ -450,10 +462,15 @@ mod tests {
         let r = registry_with_peer(daemon_peer);
         let (id, ticket) = r.host(peer(1, "alice")).await.unwrap();
         assert!(ticket.as_str().starts_with("artel:"));
-        // The ticket round-trips and embeds this daemon's peer id.
+        // The ticket round-trips and embeds this daemon's identity.
         let decoded = ticket::decode(ticket.as_str()).unwrap();
         assert_eq!(decoded.session_id, id);
         assert_eq!(decoded.host_peer_id, daemon_peer);
+        // Without an iroh runtime the addr is id-only — the daemon
+        // is local-only in this test path.
+        assert_eq!(decoded.host_addr.peer_id, daemon_peer);
+        assert!(decoded.host_addr.relay_url.is_empty());
+        assert!(decoded.host_addr.direct_addrs.is_empty());
         let summaries = r.list().await;
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].id, id);
@@ -521,9 +538,11 @@ mod tests {
     async fn join_unknown_session_errors() {
         let r = registry();
         let bogus = SessionId::new_random();
+        let host_peer_id = PeerId::from_bytes([0xff; 32]);
         let ticket = JoinTicket::from(ticket::encode(&SessionTicket {
             session_id: bogus,
-            host_peer_id: PeerId::from_bytes([0xff; 32]),
+            host_peer_id,
+            host_addr: WireEndpointAddr::id_only(host_peer_id),
         }));
         let err = r.join(&ticket, peer(2, "bob")).await.unwrap_err();
         assert_eq!(err, SessionError::UnknownSession(bogus));

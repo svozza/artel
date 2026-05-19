@@ -5,12 +5,14 @@
 //! `artel:<base32-nopad-lowercase>` where the base32 body is a
 //! `postcard`-encoded [`SessionTicket`].
 //!
-//! The bytes carry a wire version, the [`SessionId`], and the host
-//! daemon's [`PeerId`]. `NodeAddr` / topic / doc-ticket fields are
-//! deliberately absent at this stage — they land in Phase 2c (P2P
-//! transport) and Phase 3 (workspace docs) when there's something
-//! concrete to put in them. The wire version makes that extension
-//! safe.
+//! The bytes carry a wire version, the [`SessionId`], the host
+//! daemon's [`PeerId`], and a [`WireEndpointAddr`] describing how to
+//! reach the host on the iroh network. The doc-ticket extension
+//! lands in Phase 3 (workspace docs).
+//!
+//! The gossip topic id is **not** in the ticket — joiners derive it
+//! deterministically from the session id, so the ticket only carries
+//! data the joiner couldn't otherwise compute.
 //!
 //! ## Why postcard + base32
 //!
@@ -21,6 +23,9 @@
 //!   inspection and lets old `artel-local:<uuid>` strings be rejected
 //!   cleanly.
 
+use std::collections::BTreeSet;
+use std::net::SocketAddr;
+
 use data_encoding::BASE32_NOPAD;
 use serde::{Deserialize, Serialize};
 
@@ -29,7 +34,7 @@ use crate::ids::{PeerId, SessionId};
 /// Current ticket envelope version. Incremented when the structure
 /// of the [`Wire`] payload changes in a way old daemons can't
 /// understand.
-pub const TICKET_VERSION: u8 = 1;
+pub const TICKET_VERSION: u8 = 2;
 
 /// Prefix shared by every well-formed ticket. Distinguishes artel
 /// tickets from raw base32 input and makes obsolete `artel-local:`
@@ -42,10 +47,46 @@ pub struct SessionTicket {
     /// The host session's id. Joiners use this to identify which
     /// session they're joining.
     pub session_id: SessionId,
-    /// The host daemon's [`PeerId`]. In Phase 2c, joiners use this to
-    /// dial the host over iroh; today it serves as a stable identifier
-    /// for routing and audit.
+    /// The host daemon's [`PeerId`]. Identical to
+    /// `host_addr.peer_id`; kept as a top-level field so callers can
+    /// route by id without parsing the addr.
     pub host_peer_id: PeerId,
+    /// How to reach the host daemon on the iroh network: zero or one
+    /// home-relay URL, plus zero or more direct socket addresses.
+    /// May be empty if the host has no published transport addresses
+    /// yet, in which case dialers fall back to whatever address-
+    /// lookup mechanism is configured.
+    pub host_addr: WireEndpointAddr,
+}
+
+/// Wire-friendly mirror of `iroh::EndpointAddr`. Lives in
+/// `artel-protocol` so the wire format stays iroh-free; the daemon
+/// converts to/from the iroh type at the boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireEndpointAddr {
+    /// Same bytes as the parent ticket's `host_peer_id`. Carried here
+    /// too so the addr is self-contained — the daemon can hand the
+    /// whole struct to iroh without re-stitching.
+    pub peer_id: PeerId,
+    /// Home relay URL as a string (we don't pull `url::Url` into the
+    /// protocol crate). Empty when the host has no relay configured.
+    pub relay_url: String,
+    /// Direct UDP socket addresses where the host is reachable.
+    /// Sorted into a `BTreeSet` for deterministic encoding.
+    pub direct_addrs: BTreeSet<SocketAddr>,
+}
+
+impl WireEndpointAddr {
+    /// Construct an addr with no relay and no direct addrs. Useful
+    /// for tests that only care about the peer id.
+    #[must_use]
+    pub const fn id_only(peer_id: PeerId) -> Self {
+        Self {
+            peer_id,
+            relay_url: String::new(),
+            direct_addrs: BTreeSet::new(),
+        }
+    }
 }
 
 /// Errors [`decode`] may return.
@@ -79,6 +120,7 @@ struct Wire {
     version: u8,
     session_id: SessionId,
     host_peer_id: PeerId,
+    host_addr: WireEndpointAddr,
 }
 
 /// Encode `ticket` to its `artel:<base32>` text form.
@@ -88,6 +130,7 @@ pub fn encode(ticket: &SessionTicket) -> String {
         version: TICKET_VERSION,
         session_id: ticket.session_id,
         host_peer_id: ticket.host_peer_id,
+        host_addr: ticket.host_addr.clone(),
     };
     let bytes = postcard::to_stdvec(&wire).expect("postcard encode of fixed-size types");
     let body = BASE32_NOPAD.encode(&bytes).to_ascii_lowercase();
@@ -109,9 +152,18 @@ pub fn decode(raw: &str) -> Result<SessionTicket, TicketError> {
     if wire.version != TICKET_VERSION {
         return Err(TicketError::UnsupportedVersion(wire.version));
     }
+    if wire.host_addr.peer_id != wire.host_peer_id {
+        // Self-consistency check: the addr's peer id has to match
+        // the ticket-level host id. A mismatch means tampering or
+        // cross-version drift; either way, refuse it.
+        return Err(TicketError::Malformed(
+            "host_addr.peer_id does not match host_peer_id".into(),
+        ));
+    }
     Ok(SessionTicket {
         session_id: wire.session_id,
         host_peer_id: wire.host_peer_id,
+        host_addr: wire.host_addr,
     })
 }
 
@@ -123,9 +175,27 @@ mod tests {
     use super::*;
 
     fn sample() -> SessionTicket {
+        let peer = PeerId::from_bytes([0x42; 32]);
         SessionTicket {
             session_id: SessionId::from_bytes([0xab; 16]),
-            host_peer_id: PeerId::from_bytes([0x42; 32]),
+            host_peer_id: peer,
+            host_addr: WireEndpointAddr::id_only(peer),
+        }
+    }
+
+    fn sample_with_addrs() -> SessionTicket {
+        let peer = PeerId::from_bytes([0x77; 32]);
+        let mut addrs = BTreeSet::new();
+        addrs.insert("127.0.0.1:7777".parse().unwrap());
+        addrs.insert("[::1]:7778".parse().unwrap());
+        SessionTicket {
+            session_id: SessionId::from_bytes([0xcd; 16]),
+            host_peer_id: peer,
+            host_addr: WireEndpointAddr {
+                peer_id: peer,
+                relay_url: "https://relay.example.com".into(),
+                direct_addrs: addrs,
+            },
         }
     }
 
@@ -204,10 +274,12 @@ mod tests {
         // Hand-craft a Wire with version != TICKET_VERSION, encode it
         // ourselves, and verify the decoder rejects it without
         // touching the inner fields.
+        let peer = PeerId::from_bytes([0; 32]);
         let bogus = Wire {
             version: 0xff,
             session_id: SessionId::from_bytes([0; 16]),
-            host_peer_id: PeerId::from_bytes([0; 32]),
+            host_peer_id: peer,
+            host_addr: WireEndpointAddr::id_only(peer),
         };
         let bytes = postcard::to_stdvec(&bogus).unwrap();
         let body = BASE32_NOPAD.encode(&bytes).to_ascii_lowercase();
@@ -216,17 +288,48 @@ mod tests {
     }
 
     #[test]
-    fn ticket_text_is_short_enough_to_paste() {
-        // 1 (version) + 16 (UUID) + 32 (peer id) = 49 bytes.
-        // base32 of 49 bytes = ceil(49 * 8 / 5) = 79 chars.
-        // Plus the "artel:" prefix → 85 chars total. Comfortable
-        // copy-paste range.
+    fn host_peer_id_addr_mismatch_errors_as_malformed() {
+        // Hand-craft a v2 Wire whose host_addr.peer_id differs from
+        // the top-level host_peer_id and verify decode rejects it.
+        let bad = Wire {
+            version: TICKET_VERSION,
+            session_id: SessionId::from_bytes([1; 16]),
+            host_peer_id: PeerId::from_bytes([0xaa; 32]),
+            host_addr: WireEndpointAddr::id_only(PeerId::from_bytes([0xbb; 32])),
+        };
+        let bytes = postcard::to_stdvec(&bad).unwrap();
+        let body = BASE32_NOPAD.encode(&bytes).to_ascii_lowercase();
+        let raw = format!("{TICKET_PREFIX}{body}");
+        match decode(&raw) {
+            Err(TicketError::Malformed(msg)) => assert!(
+                msg.contains("host_addr.peer_id"),
+                "msg should mention the field: {msg}",
+            ),
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ticket_text_for_id_only_is_paste_friendly() {
+        // id-only (no relay, no direct addrs) = 1 (ver) + 16 (UUID) +
+        // 32 (peer id) + 32 (addr peer id) + 0 (empty relay) +
+        // 0 (empty addrs) ≈ ~82 bytes postcard. base32-encoded plus
+        // the "artel:" prefix lands well under 200 chars — fits on
+        // one terminal line.
         let encoded = encode(&sample());
         assert!(
-            encoded.len() <= 96,
-            "ticket text too long ({} chars): {encoded}",
+            encoded.len() <= 200,
+            "id-only ticket too long ({} chars): {encoded}",
             encoded.len(),
         );
+    }
+
+    #[test]
+    fn ticket_with_relay_and_two_addrs_round_trips() {
+        let original = sample_with_addrs();
+        let encoded = encode(&original);
+        let decoded = decode(&encoded).unwrap();
+        assert_eq!(decoded, original);
     }
 
     proptest! {
@@ -235,9 +338,11 @@ mod tests {
             sid in any::<[u8; 16]>(),
             peer in any::<[u8; 32]>(),
         ) {
+            let host_peer_id = PeerId::from_bytes(peer);
             let original = SessionTicket {
                 session_id: SessionId::from_bytes(sid),
-                host_peer_id: PeerId::from_bytes(peer),
+                host_peer_id,
+                host_addr: WireEndpointAddr::id_only(host_peer_id),
             };
             let encoded = encode(&original);
             let decoded = decode(&encoded).expect("round trip");

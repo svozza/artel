@@ -13,7 +13,8 @@ use std::time::Duration;
 use artel_client::Client;
 use artel_daemon::shutdown::Shutdown;
 use artel_daemon::{Daemon, DaemonConfig};
-use artel_protocol::PeerId;
+use artel_protocol::ticket;
+use artel_protocol::{PeerId, PeerInfo, Request, Response};
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -98,6 +99,40 @@ async fn endpoint_id_is_stable_across_daemon_restarts() {
         first_id, second_id,
         "EndpointId must be stable across restarts",
     );
+    drop(client);
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn host_ticket_carries_a_real_endpoint_addr() {
+    // When iroh is wired up, the ticket the daemon emits via
+    // HostSession should carry the daemon's actual EndpointId in
+    // host_addr.peer_id. We don't assert anything stronger about
+    // direct addrs / relay url because those are environment-
+    // dependent — but the addr must be self-consistent and match
+    // the live peer id.
+    let state = fresh_state_dir();
+    let daemon = spawn_at(&state).await;
+    let client = Client::connect(&state.socket).await.unwrap();
+    let daemon_id = client.daemon_peer_id();
+
+    let resp = client
+        .request(Request::HostSession {
+            peer: PeerInfo::new(PeerId::from_bytes([1; 32]), "alice"),
+        })
+        .await
+        .unwrap();
+    let raw = match resp {
+        Response::HostSession { ticket, .. } => ticket,
+        other => panic!("expected HostSession, got {other:?}"),
+    };
+    let decoded = ticket::decode(raw.as_str()).expect("ticket decodes");
+    assert_eq!(decoded.host_peer_id, daemon_id);
+    assert_eq!(
+        decoded.host_addr.peer_id, daemon_id,
+        "host_addr.peer_id must match the daemon's live id",
+    );
+
     drop(client);
     daemon.stop().await;
 }

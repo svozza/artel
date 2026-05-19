@@ -39,5 +39,5 @@ pub use message::{MESSAGE_FORMAT, MessageFormat, MessageKind, PeerInfo, SessionM
 pub use rpc::{
     Event, JoinTicket, Request, RequestId, Response, SendPayload, SessionSummary, WireMessage,
 };
-pub use ticket::{SessionTicket, TICKET_PREFIX, TICKET_VERSION, TicketError};
+pub use ticket::{SessionTicket, TICKET_PREFIX, TICKET_VERSION, TicketError, WireEndpointAddr};
 pub use version::{PROTOCOL_VERSION, ProtocolVersion, VersionMismatch};

@@ -91,6 +91,22 @@ This is the slice that turns artel from a fancy local IPC bus into the
 P2P substrate ADR-001 promises. Sliced into 2a..2d to keep blast
 radius small.
 
+### 2c-2a — Tickets carry host NodeAddr — DONE
+
+- Bumped `TICKET_VERSION` 1 → 2.
+- New `WireEndpointAddr { peer_id, relay_url, direct_addrs }`
+  in `artel-protocol::ticket`. Iroh-free mirror of
+  `iroh::EndpointAddr`. Postcard-encodes inside the ticket body.
+- `Registry` gains a `daemon_addr: WireEndpointAddr` field;
+  `Daemon::start` snapshots `iroh::Endpoint::addr()` into it via a
+  new `iroh_endpoint_to_wire` boundary. Falls back to id-only when
+  the daemon is local-only.
+- Ticket decode does a self-consistency check
+  (`host_addr.peer_id == host_peer_id`) so tampered or
+  cross-version tickets surface as `Malformed`.
+- 220 → 223 tests (+2 ticket unit tests, +1 e2e identity test).
+  No routing yet — that's 2c-2b.
+
 ### 2c-1 — iroh-gossip wiring + accept loop — DONE
 
 - iroh-gossip 0.98 added behind the existing `iroh` feature.
