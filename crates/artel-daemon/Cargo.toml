@@ -10,10 +10,11 @@ publish = false
 
 [features]
 default = ["iroh"]
-# iroh integration: real Endpoint + persisted secret key. Off-mode keeps
-# the daemon a local-only IPC bus with a synthetic peer id, useful for
-# tests and embeds that don't want the network stack.
-iroh = ["dep:iroh", "dep:rand"]
+# iroh integration: real Endpoint + persisted secret key + gossip
+# substrate. Off-mode keeps the daemon a local-only IPC bus with a
+# synthetic peer id, useful for tests and embeds that don't want the
+# network stack.
+iroh = ["dep:iroh", "dep:iroh-gossip", "dep:rand"]
 
 [dependencies]
 artel-protocol = { workspace = true, features = ["tokio"] }
@@ -21,6 +22,7 @@ async-trait = { workspace = true }
 clap = { workspace = true }
 futures-util = { workspace = true }
 iroh = { workspace = true, optional = true }
+iroh-gossip = { workspace = true, optional = true }
 nix = { workspace = true }
 postcard = { workspace = true }
 rand = { workspace = true, optional = true }
@@ -34,6 +36,9 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 artel-client = { workspace = true }
+bytes = { workspace = true }
+iroh = { workspace = true }
+iroh-gossip = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "time"] }

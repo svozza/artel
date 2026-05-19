@@ -50,6 +50,7 @@ async fn spawn_at(state: &StateDir) -> RunningDaemon {
         sessions_dir: state.sessions.clone(),
         daemon_peer_id: DAEMON_PEER,
         iroh_key_path: None,
+        address_lookup: None,
     })
     .await
     .expect("daemon start");

@@ -91,6 +91,25 @@ This is the slice that turns artel from a fancy local IPC bus into the
 P2P substrate ADR-001 promises. Sliced into 2a..2d to keep blast
 radius small.
 
+### 2c-1 — iroh-gossip wiring + accept loop — DONE
+
+- iroh-gossip 0.98 added behind the existing `iroh` feature.
+- The daemon now stands up an `IrohRuntime` ({ Endpoint, Gossip,
+  Router }) at start; `Router::shutdown` cleans up everything,
+  including the underlying Endpoint, on the way out.
+- `DaemonConfig` gains an opaque `address_lookup:
+  Option<AddressLookupOverride>` so integration tests can seed
+  `MemoryLookup` for direct localhost dialing without touching the
+  n0 relay infrastructure. The override is `pub`-but-uninhabited
+  when the `iroh` feature is off so the struct literal stays
+  feature-flag-free.
+- `Daemon::iroh()` returns the runtime to embedders/tests. No
+  `Registry` changes yet — that comes with 2c-2.
+- 1 new smoke test (`tests/iroh_gossip_smoke.rs`): two in-process
+  daemons cross-seed addresses, subscribe to a topic, exchange a
+  payload. Real QUIC handshake, ~3 s.
+- 219 -> 220 tests; both feature modes still clean.
+
 ### 2b — Real artel:-prefixed ticket format — DONE
 
 - `artel-protocol::ticket`: postcard-encoded payload of

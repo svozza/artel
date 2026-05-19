@@ -121,6 +121,7 @@ fn build_config(args: &Args) -> Result<DaemonConfig, String> {
         sessions_dir,
         daemon_peer_id,
         iroh_key_path,
+        address_lookup: None,
     })
 }
 

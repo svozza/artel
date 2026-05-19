@@ -12,4 +12,6 @@ pub mod session;
 pub mod shutdown;
 pub(crate) mod store;
 
-pub use server::{Daemon, DaemonConfig, StartError};
+#[cfg(feature = "iroh")]
+pub use server::IrohRuntime;
+pub use server::{AddressLookupOverride, Daemon, DaemonConfig, StartError};

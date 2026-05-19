@@ -48,7 +48,37 @@ pub struct DaemonConfig {
     /// in place of [`Self::daemon_peer_id`]. When `None`, the daemon
     /// stays local-only and advertises the synthetic peer id.
     pub iroh_key_path: Option<PathBuf>,
+    /// Optional override for the iroh endpoint's address-lookup
+    /// system. Real deployments leave this `None` and let iroh
+    /// discover peers via DNS/relay; integration tests that run two
+    /// in-process daemons on `localhost` use it to seed each
+    /// daemon with the other's [`iroh::EndpointAddr`] and skip
+    /// network discovery.
+    ///
+    /// Only meaningful when the `iroh` feature is on and an
+    /// [`Self::iroh_key_path`] is supplied. The field is
+    /// unconditionally present so callers can construct
+    /// [`DaemonConfig`] with the same struct literal regardless of
+    /// feature flags; without `iroh`, the inner type is a unit
+    /// placeholder and the option must be `None`.
+    pub address_lookup: Option<AddressLookupOverride>,
 }
+
+/// Iroh-feature-conditional payload for
+/// [`DaemonConfig::address_lookup`].
+///
+/// With the `iroh` feature on, this wraps a
+/// [`iroh::address_lookup::memory::MemoryLookup`]; without the
+/// feature it's an uninhabited type, so the option always
+/// serialises to `None`.
+#[cfg(feature = "iroh")]
+#[derive(Debug, Clone)]
+pub struct AddressLookupOverride(pub iroh::address_lookup::memory::MemoryLookup);
+
+/// Iroh-feature-off placeholder — uninhabited.
+#[cfg(not(feature = "iroh"))]
+#[derive(Debug, Clone)]
+pub enum AddressLookupOverride {}
 
 /// Errors returned from [`Daemon::start`].
 #[derive(Debug, thiserror::Error)]
@@ -82,6 +112,29 @@ pub enum StartError {
     Iroh(String),
 }
 
+/// iroh-side state held for the daemon's lifetime: the `Endpoint`
+/// (network identity), a `Gossip` instance attached to it, and a
+/// `Router` accepting `iroh_gossip::ALPN`.
+///
+/// Held as a unit because the three are constructed together at
+/// startup and torn down together at shutdown via
+/// [`iroh::protocol::Router::shutdown`], which closes the underlying
+/// `Endpoint` for us. Keeping them together also means the
+/// daemon doesn't have to thread three separate options through
+/// every codepath that wants to know "is iroh on?".
+#[cfg(feature = "iroh")]
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // endpoint + gossip are read by Phase 2c-2 onwards.
+pub struct IrohRuntime {
+    /// QUIC endpoint owning the daemon's ed25519 identity.
+    pub endpoint: iroh::Endpoint,
+    /// Gossip handle. `Clone` is cheap (it's an `Arc` inside).
+    pub gossip: iroh_gossip::net::Gossip,
+    /// Protocol router; calling `.shutdown().await` cleans up both
+    /// the accept loop and the endpoint.
+    pub router: iroh::protocol::Router,
+}
+
 /// A running daemon. Hold the value to keep the daemon alive; drop it
 /// to release the PID file and unbind the socket.
 #[derive(Debug)]
@@ -90,13 +143,12 @@ pub struct Daemon {
     listener: Listener,
     pid: PidFile,
     shutdown: Arc<Shutdown>,
-    /// iroh `Endpoint` when the feature is on and an
-    /// [`DaemonConfig::iroh_key_path`] was supplied. We hold it here
-    /// (rather than dropping it after `start`) so the network identity
-    /// stays alive for the daemon's lifetime; closing happens in
-    /// [`Self::run`] before returning.
+    /// iroh state when the feature is on and an
+    /// [`DaemonConfig::iroh_key_path`] was supplied. We hold it for
+    /// the daemon's lifetime; teardown happens in [`Self::run`] before
+    /// returning.
     #[cfg(feature = "iroh")]
-    endpoint: Option<iroh::Endpoint>,
+    iroh: Option<IrohRuntime>,
 }
 
 impl Daemon {
@@ -126,14 +178,19 @@ impl Daemon {
         // Resolve the daemon's network identity. Two paths:
         //
         // - `iroh` feature on AND an iroh_key_path supplied: load (or
-        //   generate-and-persist) the secret, bind an Endpoint, use
-        //   the EndpointId as the daemon peer id.
+        //   generate-and-persist) the secret, bind an Endpoint, spawn
+        //   a Gossip handle, and start a protocol Router accepting
+        //   the gossip ALPN. EndpointId becomes the daemon peer id.
         // - Otherwise: use the caller-supplied peer id and don't
-        //   stand up an Endpoint. Keeps tests fast and lets embeds
-        //   opt out of the network stack entirely.
+        //   stand up any iroh runtime. Keeps tests fast and lets
+        //   embeds opt out of the network stack entirely.
         #[cfg(feature = "iroh")]
-        let (daemon_peer_id, endpoint) =
-            resolve_iroh_identity(config.iroh_key_path.as_deref(), config.daemon_peer_id).await?;
+        let (daemon_peer_id, iroh) = resolve_iroh_runtime(
+            config.iroh_key_path.as_deref(),
+            config.daemon_peer_id,
+            config.address_lookup,
+        )
+        .await?;
         #[cfg(not(feature = "iroh"))]
         let daemon_peer_id = config.daemon_peer_id;
 
@@ -168,8 +225,21 @@ impl Daemon {
             pid,
             shutdown,
             #[cfg(feature = "iroh")]
-            endpoint,
+            iroh,
         })
+    }
+
+    /// iroh runtime if the daemon stood one up. `None` when the
+    /// feature is off or no `iroh_key_path` was supplied.
+    ///
+    /// Exposed so embedders and integration tests can talk to the
+    /// daemon's `Endpoint` and `Gossip` directly. Phase 2c-2 will
+    /// keep this surface but route most session traffic through
+    /// `Registry`.
+    #[cfg(feature = "iroh")]
+    #[must_use]
+    pub const fn iroh(&self) -> Option<&IrohRuntime> {
+        self.iroh.as_ref()
     }
 
     /// Path of the bound IPC socket.
@@ -215,7 +285,7 @@ impl Daemon {
             pid,
             shutdown,
             #[cfg(feature = "iroh")]
-            endpoint,
+            iroh,
         } = self;
 
         let mut connections = JoinSet::new();
@@ -255,12 +325,15 @@ impl Daemon {
         // half-served.
         while connections.join_next().await.is_some() {}
 
-        // Close the iroh endpoint cleanly so peers see a graceful
-        // shutdown rather than a hung connection. Best-effort: even
+        // Tear down the iroh stack cleanly so peers see a graceful
+        // shutdown rather than a hung connection. Router::shutdown
+        // closes the underlying Endpoint for us. Best-effort: even
         // if it errors, we still want to release the PID file.
         #[cfg(feature = "iroh")]
-        if let Some(ep) = endpoint {
-            ep.close().await;
+        if let Some(IrohRuntime { router, .. }) = iroh
+            && let Err(err) = router.shutdown().await
+        {
+            warn!(error = %err, "iroh router shutdown failed");
         }
 
         // Explicit release lets us surface I/O errors from PID-file
@@ -466,28 +539,49 @@ async fn dispatch(
     }
 }
 
-/// Load or generate the persisted iroh secret key, bind an
-/// `Endpoint`, and return its `EndpointId` cast to a [`PeerId`]. When
-/// no key path is supplied, the daemon stays local-only and returns
-/// the caller-supplied fallback id with no `Endpoint`.
+/// Stand up the daemon's iroh runtime: load (or generate) the secret
+/// key, bind an `Endpoint`, spawn a `Gossip` instance attached to it,
+/// and start a protocol `Router` accepting the gossip ALPN. Returns
+/// the resulting `EndpointId` (cast to [`PeerId`]) plus the bundle.
+///
+/// When no key path is supplied, returns the caller-supplied fallback
+/// peer id and `None` — the daemon stays local-only.
 #[cfg(feature = "iroh")]
-async fn resolve_iroh_identity(
+async fn resolve_iroh_runtime(
     key_path: Option<&std::path::Path>,
     fallback_peer_id: artel_protocol::PeerId,
-) -> Result<(artel_protocol::PeerId, Option<iroh::Endpoint>), StartError> {
+    address_lookup: Option<AddressLookupOverride>,
+) -> Result<(artel_protocol::PeerId, Option<IrohRuntime>), StartError> {
     let Some(path) = key_path else {
         return Ok((fallback_peer_id, None));
     };
     let secret =
         crate::iroh_key::load_or_create(path).map_err(|e| StartError::Iroh(e.to_string()))?;
-    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-        .secret_key(secret)
+    let mut builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0).secret_key(secret);
+    if let Some(AddressLookupOverride(lookup)) = address_lookup {
+        builder = builder.address_lookup(lookup);
+    }
+    let endpoint = builder
         .bind()
         .await
         .map_err(|e| StartError::Iroh(format!("bind endpoint: {e}")))?;
-    let id = endpoint.id();
-    let peer_id = artel_protocol::PeerId::from_bytes(*id.as_bytes());
-    Ok((peer_id, Some(endpoint)))
+    let peer_id = artel_protocol::PeerId::from_bytes(*endpoint.id().as_bytes());
+
+    // Gossip needs a clone of the endpoint to register itself for the
+    // ALPN; the Router does the actual accepting.
+    let gossip = iroh_gossip::net::Gossip::builder().spawn(endpoint.clone());
+    let router = iroh::protocol::Router::builder(endpoint.clone())
+        .accept(iroh_gossip::ALPN, gossip.clone())
+        .spawn();
+
+    Ok((
+        peer_id,
+        Some(IrohRuntime {
+            endpoint,
+            gossip,
+            router,
+        }),
+    ))
 }
 
 /// Wall-clock milliseconds since the Unix epoch. Used for stamping
@@ -615,6 +709,7 @@ mod tests {
             sessions_dir,
             daemon_peer_id: PeerId::from_bytes([0xee; 32]),
             iroh_key_path: None,
+            address_lookup: None,
         }
     }
 
