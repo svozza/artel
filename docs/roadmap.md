@@ -91,6 +91,19 @@ This is the slice that turns artel from a fancy local IPC bus into the
 P2P substrate ADR-001 promises. Sliced into 2a..2d to keep blast
 radius small.
 
+### 2b — Real artel:-prefixed ticket format — DONE
+
+- `artel-protocol::ticket`: postcard-encoded payload of
+  `{version, session_id, host_peer_id}` wrapped in
+  `artel:<base32-nopad-lowercase>`. ~85-char text form.
+- `Registry::host` emits the new format; `Registry::join` decodes via
+  the new module. Old `artel-local:<uuid>` strings now hit
+  `MissingPrefix` → wire `InvalidTicket`.
+- 12 ticket unit tests (1 proptest); 208 -> 219 total.
+- Deferred to 2c: `NodeAddr` and topic id in the wire payload.
+  Wire version slot is reserved so adding them is non-breaking for
+  this build (it'll bump TICKET_VERSION).
+
 ### 2a — Endpoint + persisted secret key — DONE
 
 - iroh 0.98 added as a default-on `iroh` cargo feature on

@@ -10,6 +10,7 @@ use std::time::Duration;
 use artel_client::Client;
 use artel_daemon::shutdown::Shutdown;
 use artel_daemon::{Daemon, DaemonConfig};
+use artel_protocol::ticket::{self, SessionTicket};
 use artel_protocol::{Event, MessageKind, PeerId, PeerInfo, Request, Response, SendPayload, Seq};
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
@@ -130,7 +131,11 @@ async fn session_and_log_survive_daemon_restart() {
     let _ = recovered
         .request(Request::JoinSession {
             peer: alice_peer.clone(),
-            ticket: format!("artel-local:{session_id}").into(),
+            ticket: ticket::encode(&SessionTicket {
+                session_id,
+                host_peer_id: DAEMON_PEER,
+            })
+            .into(),
         })
         .await;
     // She might already be a member of the session per persisted state

@@ -13,12 +13,13 @@ default = []
 # Enables the async tokio-based IPC transport (length-prefixed postcard
 # codec + Framed helpers). Off by default so dependents that only need the
 # wire types stay dep-light.
-tokio = ["dep:bytes", "dep:futures-util", "dep:postcard", "dep:tokio", "dep:tokio-util"]
+tokio = ["dep:bytes", "dep:futures-util", "dep:tokio", "dep:tokio-util"]
 
 [dependencies]
 bytes = { workspace = true, optional = true }
+data-encoding = { workspace = true }
 futures-util = { workspace = true, optional = true }
-postcard = { workspace = true, optional = true }
+postcard = { workspace = true }
 serde = { workspace = true }
 serde_bytes = { workspace = true }
 thiserror = { workspace = true }

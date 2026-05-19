@@ -183,6 +183,7 @@ name = "artel-protocol"
 version = "0.0.0"
 dependencies = [
  "bytes",
+ "data-encoding",
  "futures-util",
  "postcard",
  "pretty_assertions",

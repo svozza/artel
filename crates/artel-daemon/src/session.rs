@@ -7,15 +7,17 @@
 //! transport layer can supply it (peer identity comes from the IPC
 //! handshake rather than the message).
 //!
-//! No iroh, no on-disk persistence yet. The placeholder
-//! [`JoinTicket`] format is `artel-local:<session-uuid>` — only this
-//! daemon understands it. The shape is deliberately distinct from
-//! whatever real iroh-encoded tickets will look like, so misuse fails
-//! loudly.
+//! [`JoinTicket`]s emitted here use the `artel:` text format defined
+//! in [`artel_protocol::ticket`]. Phase 2c will extend the payload
+//! with iroh `NodeAddr` and topic info; today the ticket carries the
+//! session id and the host daemon's peer id, which is enough for a
+//! local-only daemon to route a join request and rejects all
+//! pre-2b ticket forms.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use artel_protocol::ticket::{self, SessionTicket};
 use artel_protocol::{
     Event, JoinTicket, MessageKind, PeerId, PeerInfo, Seq, SessionId, SessionMessage,
     SessionSummary,
@@ -33,13 +35,6 @@ use crate::store::{DynStore, SessionRecord};
 /// right shape — we do not want to back-pressure publishers because of
 /// one slow subscriber.
 const EVENT_CHANNEL_CAPACITY: usize = 256;
-
-/// Prefix on local-only join tickets.
-///
-/// Real iroh tickets will be opaque base32-or-similar blobs. Local
-/// tickets are deliberately unmistakable so a misrouted ticket fails
-/// fast.
-const LOCAL_TICKET_PREFIX: &str = "artel-local:";
 
 /// Errors the registry may return from RPC handlers.
 #[derive(Debug, Error)]
@@ -213,7 +208,10 @@ impl Registry {
     /// thinks it has session X but disk doesn't" from happening.
     pub async fn host(&self, host_peer: PeerInfo) -> Result<(SessionId, JoinTicket), SessionError> {
         let session_id = SessionId::new_random();
-        let ticket = JoinTicket::from(format!("{LOCAL_TICKET_PREFIX}{session_id}"));
+        let ticket = JoinTicket::from(ticket::encode(&SessionTicket {
+            session_id,
+            host_peer_id: self.daemon_peer_id,
+        }));
         let session = Session::new(session_id, &host_peer);
         let record = session.record();
         self.store
@@ -234,7 +232,7 @@ impl Registry {
         ticket: &JoinTicket,
         peer: PeerInfo,
     ) -> Result<(SessionId, Option<Seq>), SessionError> {
-        let session_id = parse_local_ticket(ticket)?;
+        let SessionTicket { session_id, .. } = parse_ticket(ticket)?;
         let session = {
             let guard = self.sessions.read().await;
             guard
@@ -407,14 +405,18 @@ impl Registry {
     }
 }
 
-/// Parse a local-only join ticket (`artel-local:<uuid>`).
-fn parse_local_ticket(ticket: &JoinTicket) -> Result<SessionId, SessionError> {
-    let s = ticket.as_str();
-    let rest = s
-        .strip_prefix(LOCAL_TICKET_PREFIX)
-        .ok_or(SessionError::InvalidTicket)?;
-    rest.parse::<SessionId>()
-        .map_err(|_| SessionError::InvalidTicket)
+/// Parse an artel join ticket. Phase 2b: returns the session id; the
+/// host peer id is decoded but not yet used (Phase 2c will route on
+/// it). Any decode failure surfaces as [`SessionError::InvalidTicket`]
+/// so the daemon doesn't leak parser internals over the wire.
+fn parse_ticket(ticket: &JoinTicket) -> Result<SessionTicket, SessionError> {
+    ticket::decode(ticket.as_str()).map_err(|err| {
+        // Log the underlying TicketError at debug; the wire-facing
+        // error stays generic so version-mismatch doesn't double as
+        // an oracle.
+        tracing::debug!(?err, "ticket decode failed");
+        SessionError::InvalidTicket
+    })
 }
 
 #[cfg(test)]
@@ -443,11 +445,15 @@ mod tests {
     // ---- host ----
 
     #[tokio::test]
-    async fn host_creates_session_and_returns_local_ticket() {
-        let r = registry();
+    async fn host_creates_session_and_returns_artel_ticket() {
+        let daemon_peer = PeerId::from_bytes([0xff; 32]);
+        let r = registry_with_peer(daemon_peer);
         let (id, ticket) = r.host(peer(1, "alice")).await.unwrap();
-        assert!(ticket.as_str().starts_with(LOCAL_TICKET_PREFIX));
-        assert!(ticket.as_str().ends_with(&id.to_string()));
+        assert!(ticket.as_str().starts_with("artel:"));
+        // The ticket round-trips and embeds this daemon's peer id.
+        let decoded = ticket::decode(ticket.as_str()).unwrap();
+        assert_eq!(decoded.session_id, id);
+        assert_eq!(decoded.host_peer_id, daemon_peer);
         let summaries = r.list().await;
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].id, id);
@@ -458,7 +464,7 @@ mod tests {
     // ---- join ----
 
     #[tokio::test]
-    async fn join_local_ticket_succeeds_and_emits_peer_joined() {
+    async fn join_artel_ticket_succeeds_and_emits_peer_joined() {
         let r = registry();
         let host = peer(1, "alice");
         let (id, ticket) = r.host(host).await.unwrap();
@@ -495,11 +501,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn join_invalid_uuid_errors() {
+    async fn join_legacy_artel_local_ticket_errors() {
+        // Pre-2b strings are no longer accepted. We surface them as
+        // InvalidTicket rather than UnknownSession so users get a
+        // crisper signal when they paste old data.
         let r = registry();
+        let bogus = SessionId::new_random();
         let err = r
             .join(
-                &JoinTicket::from(format!("{LOCAL_TICKET_PREFIX}not-a-uuid")),
+                &JoinTicket::from(format!("artel-local:{bogus}")),
                 peer(2, "bob"),
             )
             .await
@@ -511,7 +521,10 @@ mod tests {
     async fn join_unknown_session_errors() {
         let r = registry();
         let bogus = SessionId::new_random();
-        let ticket = JoinTicket::from(format!("{LOCAL_TICKET_PREFIX}{bogus}"));
+        let ticket = JoinTicket::from(ticket::encode(&SessionTicket {
+            session_id: bogus,
+            host_peer_id: PeerId::from_bytes([0xff; 32]),
+        }));
         let err = r.join(&ticket, peer(2, "bob")).await.unwrap_err();
         assert_eq!(err, SessionError::UnknownSession(bogus));
     }

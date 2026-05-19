@@ -28,6 +28,7 @@ pub mod error;
 pub mod ids;
 pub mod message;
 pub mod rpc;
+pub mod ticket;
 #[cfg(feature = "tokio")]
 pub mod transport;
 pub mod version;
@@ -38,4 +39,5 @@ pub use message::{MESSAGE_FORMAT, MessageFormat, MessageKind, PeerInfo, SessionM
 pub use rpc::{
     Event, JoinTicket, Request, RequestId, Response, SendPayload, SessionSummary, WireMessage,
 };
+pub use ticket::{SessionTicket, TICKET_PREFIX, TICKET_VERSION, TicketError};
 pub use version::{PROTOCOL_VERSION, ProtocolVersion, VersionMismatch};
