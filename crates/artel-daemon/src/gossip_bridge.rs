@@ -7,19 +7,24 @@
 //!
 //! - **Host side.** When [`crate::session::Registry::send`] commits
 //!   a [`SessionMessage`], the bridge wraps it in a
-//!   [`GossipFrame::Message`](`artel_protocol::gossip::GossipBody::Message`)
-//!   and broadcasts it on the session's gossip topic.
+//!   [`GossipBody::Message`] and broadcasts it on the session's
+//!   gossip topic. Inbound [`GossipBody::SendRequest`] frames from
+//!   joiners get routed back into [`crate::session::Registry::send`]
+//!   on the host's behalf, and the result published as a
+//!   [`GossipBody::SendAck`].
 //! - **Joiner side.** When the registry detects a remote ticket
 //!   (`host_peer_id` ≠ self), the bridge subscribes to the topic,
 //!   spawns a forwarder task that decodes inbound frames and feeds
 //!   them into the local `Session`'s `events_tx` and `log` so the
-//!   joiner's IPC subscribers see the host's messages.
+//!   joiner's IPC subscribers see the host's messages. Outbound
+//!   IPC `Send` calls go through [`GossipBridge::send_remote`],
+//!   which publishes a [`GossipBody::SendRequest`] and awaits the
+//!   matching [`GossipBody::SendAck`] on a `pending_sends` map.
 //!
-//! Phase 2c-2b ships **host → joiner only**: a joiner's `Send`
-//! returns [`SessionError::NotSupported`]. The reverse path needs
-//! request/reply correlation across gossip and is deferred to 2c-2c.
-//!
-//! [`SessionError::NotSupported`]: crate::session::SessionError::NotHost
+//! All inter-daemon traffic — both directions — rides the same
+//! gossip topic so the protocol stays symmetric. ADR-001's "future
+//! evolution" toward a sequencer-less P2P model only has to change
+//! the protocol, not the transport.
 
 #![allow(clippy::redundant_pub_crate)]
 //!
@@ -32,11 +37,12 @@
 //! same id lands on the same topic by construction.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use artel_protocol::gossip::{self, GossipBody};
-use artel_protocol::{PeerId, SessionId, SessionMessage};
+use artel_protocol::gossip::{self, GossipBody, GossipFrame};
+use artel_protocol::rpc::SendPayload;
+use artel_protocol::{PeerId, PeerInfo, ProtocolError, SessionId, SessionMessage};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use iroh::EndpointAddr;
@@ -44,14 +50,22 @@ use iroh::address_lookup::memory::MemoryLookup;
 use iroh_gossip::api::Event as IrohGossipEvent;
 use iroh_gossip::net::Gossip;
 use iroh_gossip::proto::TopicId;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 use tokio::time::timeout;
 use tracing::{debug, warn};
+use uuid::Uuid;
+
+use crate::session::{Registry, SessionError};
 
 /// Bounded wait for the gossip mesh to form on the joiner side. If
 /// no `NeighborUp` arrives in this window the join fails — a longer
 /// fallback would just hide a real connectivity problem.
 const JOIN_READY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Bounded wait for the host's `SendAck` reply to a joiner-initiated
+/// send. One gossip RTT in the common case; the ceiling is a
+/// fail-loud upper bound for connectivity drops mid-request.
+const SEND_REMOTE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Inter-daemon plumbing. One instance per daemon, shared across
 /// every session it joins or hosts.
@@ -68,6 +82,18 @@ pub(crate) struct GossipBridge {
     /// receiver is owned by a forwarder task whose `JoinHandle` lives
     /// here too.
     sessions: Mutex<HashMap<SessionId, SessionState>>,
+    /// In-flight joiner-side sends keyed by their `req_id`. The
+    /// forwarder resolves the matching oneshot when a `SendAck`
+    /// arrives. The map is shared across sessions because `req_id`
+    /// is globally unique (Uuid v4).
+    pending_sends: Mutex<HashMap<Uuid, oneshot::Sender<Result<SessionMessage, ProtocolError>>>>,
+    /// Back-reference to the Registry, set once via [`Self::attach_registry`]
+    /// after the registry is wrapped in [`Arc`]. Held as a `Weak` to
+    /// avoid an Arc cycle: the registry already owns an `Arc<Self>`.
+    /// The host-side forwarder upgrades it on every inbound
+    /// `SendRequest`; if the registry has been dropped, the request
+    /// is silently ignored (the daemon is shutting down).
+    registry: Mutex<Weak<Registry>>,
 }
 
 #[derive(Debug)]
@@ -84,6 +110,22 @@ fn topic_for(session: SessionId) -> TopicId {
     TopicId::from_bytes(bytes)
 }
 
+/// Per-session role on this daemon. Drives which inbound gossip
+/// frames the forwarder dispatches to which handler.
+enum SessionRole {
+    /// We host this session locally. Inbound `SendRequest` frames
+    /// route into `Registry::send` via the bridge's back-reference;
+    /// `Message` and `SendAck` frames are ignored (the host's IPC
+    /// subscribers are served by `Registry`'s local broadcast).
+    Host,
+    /// We mirror a session whose authoritative log lives on
+    /// another daemon. Inbound `Message` frames push into
+    /// `on_message`; `SendAck` frames are looked up against
+    /// `pending_sends`; `SendRequest` frames are ignored (only
+    /// the host services them).
+    Joiner { on_message: MessageHandler },
+}
+
 impl GossipBridge {
     /// Construct a bridge wrapping `gossip`. `address_lookup` is the
     /// same handle the daemon's [`iroh::Endpoint`] was built with;
@@ -94,7 +136,17 @@ impl GossipBridge {
             gossip,
             address_lookup,
             sessions: Mutex::new(HashMap::new()),
+            pending_sends: Mutex::new(HashMap::new()),
+            registry: Mutex::new(Weak::new()),
         }
+    }
+
+    /// Inject the back-reference to the [`Registry`] this bridge
+    /// serves. Called once at daemon startup, after the registry is
+    /// wrapped in an [`Arc`]. Held as a [`Weak`] so the bridge
+    /// doesn't keep the registry alive past shutdown.
+    pub(crate) async fn attach_registry(&self, registry: Weak<Registry>) {
+        *self.registry.lock().await = registry;
     }
 
     /// Subscribe to a session's gossip topic as **host**. No
@@ -102,8 +154,12 @@ impl GossipBridge {
     /// once the topic handle is registered; broadcasts via
     /// [`Self::publish_message`] start working immediately, although
     /// they reach no-one until at least one joiner connects.
-    pub(crate) async fn host_session(&self, session: SessionId) -> Result<(), BridgeError> {
-        self.subscribe_inner(session, vec![], None).await
+    pub(crate) async fn host_session(
+        self: &Arc<Self>,
+        session: SessionId,
+    ) -> Result<(), BridgeError> {
+        self.subscribe_inner(session, vec![], SessionRole::Host)
+            .await
     }
 
     /// Subscribe to a session's gossip topic as **joiner**. Seeds
@@ -113,7 +169,7 @@ impl GossipBridge {
     /// gossip frames and pushes the resulting [`SessionMessage`]s
     /// into `on_message`.
     pub(crate) async fn join_session(
-        &self,
+        self: &Arc<Self>,
         session: SessionId,
         host_peer: PeerId,
         host_addr: EndpointAddr,
@@ -124,13 +180,74 @@ impl GossipBridge {
         }
         let host_endpoint_id = iroh::EndpointId::from_bytes(host_peer.as_bytes())
             .map_err(|e| BridgeError::Iroh(format!("bad host peer id: {e}")))?;
-        self.subscribe_inner(session, vec![host_endpoint_id], Some(Arc::new(on_message)))
-            .await
+        self.subscribe_inner(
+            session,
+            vec![host_endpoint_id],
+            SessionRole::Joiner {
+                on_message: Arc::new(on_message),
+            },
+        )
+        .await
     }
 
-    /// Common subscribe path. When `on_message` is `Some`, the
-    /// forwarder is wired up; when `None`, we just hold the topic
-    /// open (host case — the host fans out via `publish_message`).
+    /// Joiner-side `Send`: publish a [`GossipBody::SendRequest`] on
+    /// the session's topic and await the matching `SendAck`. The
+    /// host's response carries the assigned [`SessionMessage`] (on
+    /// success) or a [`ProtocolError`] (on rejection). Returns a
+    /// [`BridgeError::SendTimeout`] if no ack arrives within
+    /// [`SEND_REMOTE_TIMEOUT`].
+    pub(crate) async fn send_remote(
+        &self,
+        session: SessionId,
+        peer: PeerInfo,
+        payload: SendPayload,
+    ) -> Result<SessionMessage, BridgeError> {
+        let sender = self
+            .sessions
+            .lock()
+            .await
+            .get(&session)
+            .map(|s| s.sender.clone())
+            .ok_or(BridgeError::UnknownSession(session))?;
+
+        let req_id = Uuid::new_v4();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.pending_sends.lock().await.insert(req_id, reply_tx);
+
+        let frame = GossipFrame {
+            version: gossip::GOSSIP_FRAME_VERSION,
+            body: GossipBody::SendRequest {
+                req_id,
+                peer,
+                payload,
+            },
+        };
+        let bytes = Bytes::from(gossip::encode(&frame));
+        if let Err(err) = sender.broadcast(bytes).await {
+            // Drop the pending entry so it doesn't leak; nobody is
+            // ever going to resolve it.
+            self.pending_sends.lock().await.remove(&req_id);
+            return Err(BridgeError::Iroh(format!("send_remote broadcast: {err}")));
+        }
+
+        match timeout(SEND_REMOTE_TIMEOUT, reply_rx).await {
+            Ok(Ok(Ok(message))) => Ok(message),
+            Ok(Ok(Err(err))) => Err(BridgeError::HostRejected(err)),
+            Ok(Err(_canceled)) => {
+                // Sender dropped without resolving — bridge tearing
+                // down. Surface as a generic failure.
+                Err(BridgeError::Iroh(
+                    "send_remote: pending entry dropped without ack".into(),
+                ))
+            }
+            Err(_elapsed) => {
+                self.pending_sends.lock().await.remove(&req_id);
+                Err(BridgeError::SendTimeout)
+            }
+        }
+    }
+
+    /// Common subscribe path.
     ///
     /// Joiners (those with a non-empty bootstrap) additionally wait
     /// for [`GossipReceiver::joined`] before returning so the gossip
@@ -142,10 +259,10 @@ impl GossipBridge {
     ///
     /// [`GossipReceiver::joined`]: iroh_gossip::api::GossipReceiver::joined
     async fn subscribe_inner(
-        &self,
+        self: &Arc<Self>,
         session: SessionId,
         bootstrap: Vec<iroh::EndpointId>,
-        on_message: Option<MessageHandler>,
+        role: SessionRole,
     ) -> Result<(), BridgeError> {
         let topic_id = topic_for(session);
         let wait_for_neighbor = !bootstrap.is_empty();
@@ -161,26 +278,19 @@ impl GossipBridge {
                 .map_err(|_| BridgeError::Iroh("timed out waiting for gossip neighbor".into()))?
                 .map_err(|e| BridgeError::Iroh(format!("joined: {e}")))?;
         }
+        let bridge = Arc::clone(self);
+        let session_for_log = session;
         let forwarder = tokio::spawn(async move {
-            // The host case has on_message = None: drain the receiver
-            // anyway so the channel doesn't fill up and back-pressure
-            // gossip; we just discard the frames. The host's IPC
-            // subscribers are served by Registry's local broadcast
-            // and don't need re-decoding from the wire.
             while let Some(item) = receiver.next().await {
                 match item {
-                    Ok(IrohGossipEvent::Received(msg)) => {
-                        if let Some(handler) = on_message.as_ref() {
-                            match gossip::decode(&msg.content) {
-                                Ok(frame) => match frame.body {
-                                    GossipBody::Message(m) => handler(m),
-                                },
-                                Err(err) => {
-                                    warn!(?err, "gossip frame decode failed; dropping");
-                                }
-                            }
+                    Ok(IrohGossipEvent::Received(msg)) => match gossip::decode(&msg.content) {
+                        Ok(frame) => {
+                            handle_inbound_frame(&bridge, session_for_log, &role, frame.body).await;
                         }
-                    }
+                        Err(err) => {
+                            warn!(?err, "gossip frame decode failed; dropping");
+                        }
+                    },
                     Ok(_) => {} // NeighborUp/Down/Lagged: nothing to forward.
                     Err(err) => {
                         warn!(error = %err, "gossip receiver error; forwarder exiting");
@@ -188,7 +298,7 @@ impl GossipBridge {
                     }
                 }
             }
-            debug!(?session, "gossip forwarder exited");
+            debug!(?session_for_log, "gossip forwarder exited");
         });
         self.sessions
             .lock()
@@ -222,6 +332,149 @@ impl GossipBridge {
             warn!(error = %err, "gossip broadcast failed");
         }
     }
+
+    /// Broadcast a [`GossipBody::SendAck`] on the topic for
+    /// `session`. Called from the host's inbound forwarder after
+    /// driving `Registry::send` for a joiner-issued request.
+    async fn publish_send_ack(
+        &self,
+        session: SessionId,
+        req_id: Uuid,
+        result: Result<SessionMessage, ProtocolError>,
+    ) {
+        let sender = self
+            .sessions
+            .lock()
+            .await
+            .get(&session)
+            .map(|s| s.sender.clone());
+        let Some(sender) = sender else {
+            debug!(
+                ?session,
+                "publish_send_ack: session has no gossip topic; dropping ack",
+            );
+            return;
+        };
+        let frame = GossipFrame {
+            version: gossip::GOSSIP_FRAME_VERSION,
+            body: GossipBody::SendAck { req_id, result },
+        };
+        let bytes = Bytes::from(gossip::encode(&frame));
+        if let Err(err) = sender.broadcast(bytes).await {
+            warn!(error = %err, "send_ack broadcast failed");
+        }
+    }
+}
+
+/// Dispatch an inbound gossip frame body for `session` based on the
+/// local role. Lives outside the impl so the spawned forwarder task
+/// can call it without re-borrowing `self`.
+async fn handle_inbound_frame(
+    bridge: &Arc<GossipBridge>,
+    session: SessionId,
+    role: &SessionRole,
+    body: GossipBody,
+) {
+    match (role, body) {
+        // Host receives a joiner's send request — drive Registry::send,
+        // broadcast the SendAck.
+        (
+            SessionRole::Host,
+            GossipBody::SendRequest {
+                req_id,
+                peer,
+                payload,
+            },
+        ) => {
+            let result = run_host_send(bridge, session, peer, payload).await;
+            bridge.publish_send_ack(session, req_id, result).await;
+        }
+        // Host ignores its own Message+SendAck broadcasts (Registry
+        // already fanned out locally) and joiners ignore each other's
+        // SendRequests (only the host services them).
+        (SessionRole::Host, GossipBody::Message(_) | GossipBody::SendAck { .. })
+        | (SessionRole::Joiner { .. }, GossipBody::SendRequest { .. }) => {}
+
+        // Joiner receives the host's broadcast — push into the local
+        // mirror's events_tx + log.
+        (SessionRole::Joiner { on_message }, GossipBody::Message(m)) => on_message(m),
+        // Joiner receives the host's reply to one of our outbound
+        // sends — resolve the matching pending oneshot.
+        (SessionRole::Joiner { .. }, GossipBody::SendAck { req_id, result }) => {
+            let pending = bridge.pending_sends.lock().await.remove(&req_id);
+            if let Some(tx) = pending {
+                let _ = tx.send(result);
+            } else {
+                debug!(?req_id, "SendAck for unknown req_id; dropping");
+            }
+        }
+    }
+}
+
+/// Run the host-side `Registry::send` corresponding to an inbound
+/// `SendRequest`. Translates [`SessionError`] into the wire form
+/// the joiner expects to see in `SendAck.result`.
+async fn run_host_send(
+    bridge: &Arc<GossipBridge>,
+    session: SessionId,
+    peer: PeerInfo,
+    payload: SendPayload,
+) -> Result<SessionMessage, ProtocolError> {
+    let registry_weak = bridge.registry.lock().await.clone();
+    let Some(registry) = registry_weak.upgrade() else {
+        // Daemon shutting down; nothing useful to say.
+        return Err(ProtocolError::Internal("daemon shutting down".into()));
+    };
+    // Lazy admission: a joiner's first SendRequest doubles as their
+    // arrival on this host. Without this, `Registry::send` would
+    // bounce the request as `NotMember`. A future slice can replace
+    // this with an explicit `JoinAnnouncement` gossip frame so the
+    // host emits `PeerJoined` proactively.
+    if let Err(err) = registry.ensure_member(session, peer.clone()).await {
+        return Err(session_error_to_wire(&err));
+    }
+    let SendPayload {
+        kind,
+        action,
+        payload,
+    } = payload;
+    match registry
+        .send(session, peer, kind, action, payload, now_ms())
+        .await
+    {
+        Ok(message) => Ok(message),
+        Err(err) => Err(session_error_to_wire(&err)),
+    }
+}
+
+/// Wall-clock millis since the Unix epoch. The host stamps its own
+/// clock on messages (joiners trust the host as sequencer here).
+fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// Mirror of `server::session_error_to_protocol` — same translation
+/// rules, but living next to the bridge to avoid a circular
+/// `pub(crate)` dance with the server module. Keep in sync if the
+/// other one grows variants.
+fn session_error_to_wire(err: &SessionError) -> ProtocolError {
+    match err {
+        SessionError::UnknownSession(s) => ProtocolError::UnknownSession(*s),
+        SessionError::NotMember(_) => ProtocolError::Internal("not a member".into()),
+        SessionError::AlreadyJoined(s) => ProtocolError::AlreadyJoined(*s),
+        SessionError::InvalidTicket => ProtocolError::InvalidTicket,
+        SessionError::Storage(io_err) => ProtocolError::Internal(format!("storage: {io_err}")),
+        SessionError::InvalidAddr(msg) => ProtocolError::Internal(format!("invalid addr: {msg}")),
+        SessionError::Internal(msg) => ProtocolError::Internal(msg.clone()),
+        SessionError::NotHost => ProtocolError::NotHost,
+        // Should never occur on the host side — only joiners
+        // receive HostRejected from `send_remote`. Surface
+        // defensively so a future bug doesn't silently swallow it.
+        SessionError::HostRejected(err) => err.clone(),
+    }
 }
 
 type MessageHandler = Arc<dyn Fn(SessionMessage) + Send + Sync + 'static>;
@@ -231,8 +484,31 @@ type MessageHandler = Arc<dyn Fn(SessionMessage) + Send + Sync + 'static>;
 /// to fold them in.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum BridgeError {
+    /// Underlying iroh / gossip plumbing failure. The string is for
+    /// diagnostics only; the registry maps this to
+    /// [`ProtocolError::Internal`] so iroh detail doesn't leak to
+    /// clients.
     #[error("iroh: {0}")]
     Iroh(String),
+
+    /// `send_remote` was called for a session this bridge has no
+    /// gossip topic for. Indicates a logic bug in the registry —
+    /// remote sends should only be issued after `join_session`
+    /// succeeded.
+    #[error("no gossip topic registered for session {0}")]
+    UnknownSession(SessionId),
+
+    /// `send_remote` got no `SendAck` from the host within
+    /// [`SEND_REMOTE_TIMEOUT`]. Surfaces to the joiner's IPC
+    /// client as a transport timeout.
+    #[error("timed out waiting for host send_ack")]
+    SendTimeout,
+
+    /// The host accepted the request and explicitly rejected it
+    /// (e.g., `SessionClosed`, `Storage` error). The joiner forwards
+    /// this exact error back through its IPC reply.
+    #[error("host rejected send: {0}")]
+    HostRejected(#[source] ProtocolError),
 }
 
 #[cfg(test)]

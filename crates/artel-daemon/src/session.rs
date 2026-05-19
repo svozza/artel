@@ -70,11 +70,20 @@ pub enum SessionError {
     Internal(String),
 
     /// `Send` issued for a session whose host is a different
-    /// daemon. Phase 2c-2b ships host→joiner one-way fanout only;
-    /// the reverse path with request/reply correlation arrives in
-    /// 2c-2c.
+    /// daemon AND the daemon is built without the `iroh` feature
+    /// (so there's no transport to forward through). With `iroh`
+    /// on, joiner sends are routed through the gossip bridge.
     #[error("send is only supported on the host side in this build")]
     NotHost,
+
+    /// A joiner-side `Send` that we forwarded to the host over
+    /// gossip came back with a wire-form rejection. The wrapped
+    /// [`artel_protocol::ProtocolError`] is what the host
+    /// authoritatively decided; we forward it verbatim to the
+    /// IPC client so they see the host's actual reason rather than
+    /// a flattened `Internal` shrug.
+    #[error("host rejected send: {0}")]
+    HostRejected(#[source] artel_protocol::ProtocolError),
 }
 
 // io::Error doesn't impl PartialEq, so we hand-roll one for the
@@ -88,6 +97,7 @@ impl PartialEq for SessionError {
             (Self::Storage(a), Self::Storage(b)) => a.kind() == b.kind(),
             (Self::InvalidAddr(a), Self::InvalidAddr(b))
             | (Self::Internal(a), Self::Internal(b)) => a == b,
+            (Self::HostRejected(a), Self::HostRejected(b)) => a == b,
             (Self::InvalidTicket, Self::InvalidTicket) | (Self::NotHost, Self::NotHost) => true,
             _ => false,
         }
@@ -526,8 +536,64 @@ impl Registry {
         out
     }
 
-    /// Append a message to a session. Returns the assigned sequence
-    /// number. Also broadcasts an [`Event::Message`] to subscribers.
+    /// Ensure `peer` is a member of `session`. No-op if they
+    /// already are. Used by the gossip bridge on the host side to
+    /// lazily admit a remote joiner the first time their inbound
+    /// `SendRequest` lands — we don't yet have a `JoinAnnouncement`
+    /// frame, so the host's `Registry` learns about the joiner via
+    /// their first send. Persists the membership change and emits
+    /// [`Event::PeerJoined`] when the peer is newly added.
+    ///
+    /// Returns `Err(UnknownSession)` if `session` doesn't exist on
+    /// this daemon. Other failures surface the underlying
+    /// [`SessionError`].
+    #[cfg(feature = "iroh")]
+    pub(crate) async fn ensure_member(
+        &self,
+        session: SessionId,
+        peer: PeerInfo,
+    ) -> Result<(), SessionError> {
+        let session_arc = {
+            let guard = self.sessions.read().await;
+            guard
+                .get(&session)
+                .cloned()
+                .ok_or(SessionError::UnknownSession(session))?
+        };
+        let mut s = session_arc.lock().await;
+        if s.members.contains(&peer.id) {
+            return Ok(());
+        }
+        // Persist before mutating in-memory state — same shape as
+        // `Registry::join`. If the store fails, the registry stays
+        // consistent with disk.
+        self.store
+            .add_member(session, &peer)
+            .await
+            .map_err(SessionError::Storage)?;
+        s.members.insert(peer.id);
+        let events_tx = s.events_tx.clone();
+        drop(s);
+        let _ = events_tx.send(Event::PeerJoined { session, peer });
+        Ok(())
+    }
+
+    /// Append a message to a session. Returns the freshly-built
+    /// [`SessionMessage`] (with its host-assigned `seq`). Also
+    /// broadcasts an [`Event::Message`] to local IPC subscribers and
+    /// (when the bridge is wired up and this is a `Local` session)
+    /// fans out over gossip.
+    ///
+    /// Remote-mirror sessions return [`SessionError::NotHost`] —
+    /// the joiner-side path goes through
+    /// [`crate::gossip_bridge::GossipBridge::send_remote`] which
+    /// publishes a [`GossipBody::SendRequest`] and awaits a
+    /// host-published [`GossipBody::SendAck`]. The outer registry
+    /// caller (the IPC dispatch) is responsible for choosing the
+    /// right path based on the session kind.
+    ///
+    /// [`GossipBody::SendRequest`]: artel_protocol::gossip::GossipBody::SendRequest
+    /// [`GossipBody::SendAck`]: artel_protocol::gossip::GossipBody::SendAck
     pub async fn send(
         &self,
         session: SessionId,
@@ -536,7 +602,7 @@ impl Registry {
         action: String,
         payload: Vec<u8>,
         timestamp_ms: u64,
-    ) -> Result<Seq, SessionError> {
+    ) -> Result<SessionMessage, SessionError> {
         let session_arc = {
             let guard = self.sessions.read().await;
             guard
@@ -545,16 +611,55 @@ impl Registry {
                 .ok_or(SessionError::UnknownSession(session))?
         };
 
-        let mut s = session_arc.lock().await;
-        if !s.members.contains(&peer.id) {
-            return Err(SessionError::NotMember(session));
+        let kind_snapshot;
+        {
+            let s = session_arc.lock().await;
+            if !s.members.contains(&peer.id) {
+                return Err(SessionError::NotMember(session));
+            }
+            kind_snapshot = s.kind;
         }
-        // Phase 2c-2b only supports host-side Send. If this is a
-        // remote mirror, refuse — the joiner-side path (correlated
-        // request/reply over gossip) lands in 2c-2c.
-        if s.kind == SessionKind::Remote {
+
+        // Remote-mirror sessions can't append locally — the host is
+        // the sequencer. Forward via gossip (`SendRequest`) and wait
+        // for the host's `SendAck`. The host's local `Registry::send`
+        // will produce the broadcast `Message` frame we'll see on
+        // our own forwarder; the IPC reply uses the assigned
+        // `SessionMessage` from the ack.
+        #[cfg(feature = "iroh")]
+        if kind_snapshot == SessionKind::Remote {
+            let bridge = self.bridge.as_ref().ok_or_else(|| {
+                SessionError::Internal("remote send requires gossip bridge".into())
+            })?;
+            let send_payload = artel_protocol::rpc::SendPayload {
+                kind,
+                action,
+                payload,
+            };
+            return match bridge.send_remote(session, peer, send_payload).await {
+                Ok(message) => Ok(message),
+                Err(crate::gossip_bridge::BridgeError::HostRejected(err)) => {
+                    Err(SessionError::HostRejected(err))
+                }
+                Err(crate::gossip_bridge::BridgeError::SendTimeout) => Err(SessionError::Internal(
+                    "send_remote: timed out waiting for host ack".into(),
+                )),
+                Err(crate::gossip_bridge::BridgeError::UnknownSession(_)) => Err(
+                    SessionError::Internal("send_remote: bridge missing session topic".into()),
+                ),
+                Err(crate::gossip_bridge::BridgeError::Iroh(msg)) => {
+                    Err(SessionError::Internal(format!("gossip: {msg}")))
+                }
+            };
+        }
+        #[cfg(not(feature = "iroh"))]
+        if kind_snapshot == SessionKind::Remote {
+            // Without the iroh feature we have no transport; remote
+            // sessions can't even be materialised here, but keep the
+            // arm for completeness.
             return Err(SessionError::NotHost);
         }
+        let mut s = session_arc.lock().await;
         // Build the message under the session lock (so seq is stable),
         // then persist before bumping in-memory state and fanning out.
         // If the store fails, head and log are unchanged; the request
@@ -585,10 +690,10 @@ impl Registry {
         // fan-out has already happened so IPC clients are served.
         #[cfg(feature = "iroh")]
         if let Some(bridge) = &self.bridge {
-            bridge.publish_message(session, message).await;
+            bridge.publish_message(session, message.clone()).await;
         }
 
-        Ok(prospective)
+        Ok(message)
     }
 
     /// Subscribe to live events for `session`, optionally backfilling
@@ -806,10 +911,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(s1 < s2);
-        assert!(s2 < s3);
+        assert!(s1.seq < s2.seq);
+        assert!(s2.seq < s3.seq);
         // First real seq is 1 (Seq::ZERO is reserved as "no messages").
-        assert_eq!(s1, Seq::new(1));
+        assert_eq!(s1.seq, Seq::new(1));
     }
 
     #[tokio::test]
@@ -856,7 +961,7 @@ mod tests {
         let (id, _) = r.host(host.clone()).await.unwrap();
 
         let mut sub = r.subscribe(id, None).await.unwrap();
-        let seq = r
+        let sent = r
             .send(
                 id,
                 host.clone(),
@@ -875,7 +980,7 @@ mod tests {
         match event {
             Event::Message { session, message } => {
                 assert_eq!(session, id);
-                assert_eq!(message.seq, seq);
+                assert_eq!(message.seq, sent.seq);
                 assert_eq!(message.action, "hello");
                 assert_eq!(message.payload, b"world");
                 assert_eq!(message.peer, host);
@@ -907,7 +1012,7 @@ mod tests {
 
         // Subscribe with since = s1: replay should hold s2, s3 (in
         // order, no s1).
-        let sub = r.subscribe(id, Some(s1)).await.unwrap();
+        let sub = r.subscribe(id, Some(s1.seq)).await.unwrap();
         let actions: Vec<&str> = sub.replay.iter().map(|m| m.action.as_str()).collect();
         assert_eq!(actions, vec!["2", "3"]);
     }

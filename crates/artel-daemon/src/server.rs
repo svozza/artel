@@ -233,11 +233,20 @@ impl Daemon {
                 daemon_addr,
                 store,
                 #[cfg(feature = "iroh")]
-                bridge,
+                bridge.clone(),
             )
             .await
             .map_err(StartError::LoadSessions)?,
         );
+
+        // Inject the back-reference now that the registry is in an
+        // Arc. The bridge holds it as a Weak so we don't form a
+        // cycle. Without this the host-side forwarder has no way to
+        // call back into `Registry::send` for inbound SendRequests.
+        #[cfg(feature = "iroh")]
+        if let Some(bridge) = &bridge {
+            bridge.attach_registry(Arc::downgrade(&registry)).await;
+        }
 
         let shutdown = Arc::new(Shutdown::new());
         shutdown
@@ -544,7 +553,10 @@ async fn dispatch(
                 .send(session, peer, kind, action, payload, now_ms())
                 .await
             {
-                Ok(seq) => Response::Sent { session, seq },
+                Ok(message) => Response::Sent {
+                    session,
+                    seq: message.seq,
+                },
                 Err(err) => Response::Error {
                     error: session_error_to_protocol(&err),
                 },
@@ -719,6 +731,10 @@ fn session_error_to_protocol(err: &SessionError) -> ProtocolError {
         SessionError::InvalidAddr(msg) => ProtocolError::Internal(format!("invalid addr: {msg}")),
         SessionError::Internal(msg) => ProtocolError::Internal(msg.clone()),
         SessionError::NotHost => ProtocolError::NotHost,
+        // Forward the host's verdict verbatim so the IPC client
+        // sees the actual reason (e.g., UnknownSession after a
+        // session close) instead of a generic Internal.
+        SessionError::HostRejected(err) => err.clone(),
     }
 }
 

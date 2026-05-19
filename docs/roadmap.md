@@ -91,6 +91,46 @@ This is the slice that turns artel from a fancy local IPC bus into the
 P2P substrate ADR-001 promises. Sliced into 2a..2d to keep blast
 radius small.
 
+### 2c-2c — Joiner→host send over gossip — DONE
+
+- `artel-protocol::gossip` v1 → v2: adds
+  `GossipBody::SendRequest { req_id, peer, payload }` and
+  `GossipBody::SendAck { req_id, result }`. Joiner publishes the
+  request; host's bridge picks it up, drives `Registry::send`,
+  publishes the ack with the assigned `SessionMessage` (or the
+  host's `ProtocolError` on rejection). Joiner correlates via the
+  `req_id` Uuid.
+- All inter-daemon traffic stays on the gossip topic. No
+  dedicated direct-QUIC sidechannel — preserves the option of
+  symmetric P2P later (ADR-001 § "Future evolution") since the
+  transport doesn't bake in the host-as-sequencer assumption.
+- `GossipBridge` gains `pending_sends: HashMap<Uuid, oneshot::Sender>`
+  and a `Weak<Registry>` injected at startup via
+  `attach_registry`. Per-session `SessionRole { Host, Joiner }`
+  drives the inbound forwarder's dispatch. `send_remote` allocates
+  a req_id, registers the oneshot, broadcasts the request, awaits
+  the ack with a 10s ceiling.
+- `Registry::send` now returns the freshly-built `SessionMessage`
+  (not just `Seq`) so the bridge can package it into `SendAck.Ok`.
+  IPC dispatch reads `.seq` from the result.
+- Lazy membership: a joiner's first `SendRequest` doubles as their
+  arrival on the host. `Registry::ensure_member` admits + persists
+  + emits `PeerJoined` before delegating to `send`. A future slice
+  can replace this with an explicit `JoinAnnouncement` frame.
+- `SessionError::HostRejected(ProtocolError)` carries the host's
+  verdict back through the joiner's IPC response verbatim — a
+  joiner that sends after the host closes the session sees
+  `UnknownSession` rather than a generic `Internal`.
+- 2 new e2e tests:
+  - `tests/iroh_joiner_send_fanout.rs`: Bob joins Alice's session,
+    Bob sends, Alice and Bob both observe the `Message` with the
+    host-assigned seq. Bob's IPC reply carries the same
+    `SessionMessage`.
+  - `tests/iroh_joiner_send_rejected.rs` (rewritten): Alice
+    closes the session, Bob sends → IPC error surfaces the host's
+    `ProtocolError::UnknownSession` via the `SendAck.Err` path.
+- 230 → 235 tests; clippy + fmt clean both feature modes.
+
 ### 2c-2b — Host→joiner one-way gossip fanout — DONE
 
 - New `artel-protocol::gossip` module: `GossipFrame` + `GossipBody`
