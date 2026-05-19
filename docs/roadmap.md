@@ -91,6 +91,35 @@ This is the slice that turns artel from a fancy local IPC bus into the
 P2P substrate ADR-001 promises. Sliced into 2a..2d to keep blast
 radius small.
 
+### 2c-2b — Host→joiner one-way gossip fanout — DONE
+
+- New `artel-protocol::gossip` module: `GossipFrame` + `GossipBody`
+  envelope (postcard) carrying `SessionMessage` between daemons on
+  a topic. v1 wire version; bumped on structural change.
+- New `gossip_bridge.rs`: `GossipBridge` owns per-session
+  `(GossipSender, forwarder JoinHandle)` pairs. Topic id is
+  derived deterministically from session id (first 16 bytes), so
+  no topic field needed in tickets.
+- `Registry` gains an optional `bridge`. `Registry::host` opens a
+  topic; `Registry::send` (host side) publishes each new
+  `SessionMessage`; `Registry::join` for a remote ticket
+  materialises a local mirror, seeds the host's addr into the
+  endpoint's address book, and spawns a forwarder that decodes
+  inbound frames into the mirror's log + broadcast.
+- `Session` gains a `kind: Local | Remote` discriminator. `Send`
+  on a remote session returns `ProtocolError::NotHost` (joiner
+  send arrives in 2c-2c with request/reply correlation).
+- Joiner-side `subscribe` waits on `GossipReceiver::joined` (15 s
+  ceiling) before `JoinSession` returns, so the gossip mesh is
+  formed by the time the host can publish. Without it a host that
+  sent immediately after the joiner's IPC handshake landed
+  silently lost the message.
+- 2 e2e tests split across binaries to avoid in-process iroh
+  contention: `tests/iroh_gossip_fanout.rs` (host→joiner round
+  trip) and `tests/iroh_joiner_send_rejected.rs` (joiner `Send`
+  surfaces `NotHost`). Each ~3.4 s.
+- 223 → 230 tests; clippy clean both feature modes.
+
 ### 2c-2a — Tickets carry host NodeAddr — DONE
 
 - Bumped `TICKET_VERSION` 1 → 2.

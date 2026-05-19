@@ -5,6 +5,8 @@
 //! in-process without going through `fork`/`exec`.
 
 #[cfg(feature = "iroh")]
+pub(crate) mod gossip_bridge;
+#[cfg(feature = "iroh")]
 pub(crate) mod iroh_key;
 pub mod pidfile;
 pub mod server;

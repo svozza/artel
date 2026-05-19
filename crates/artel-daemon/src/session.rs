@@ -58,6 +58,23 @@ pub enum SessionError {
     /// Backing storage failed. The in-memory state was not changed.
     #[error("storage: {0}")]
     Storage(#[source] std::io::Error),
+
+    /// Ticket carried a host addr the daemon couldn't parse.
+    #[error("invalid host address in ticket: {0}")]
+    InvalidAddr(String),
+
+    /// Internal failure inside iroh gossip plumbing. Surfaces over
+    /// the wire as `ProtocolError::Internal` — the joiner gets a
+    /// generic error rather than iroh-specific detail.
+    #[error("internal: {0}")]
+    Internal(String),
+
+    /// `Send` issued for a session whose host is a different
+    /// daemon. Phase 2c-2b ships host→joiner one-way fanout only;
+    /// the reverse path with request/reply correlation arrives in
+    /// 2c-2c.
+    #[error("send is only supported on the host side in this build")]
+    NotHost,
 }
 
 // io::Error doesn't impl PartialEq, so we hand-roll one for the
@@ -68,8 +85,10 @@ impl PartialEq for SessionError {
             (Self::UnknownSession(a), Self::UnknownSession(b))
             | (Self::NotMember(a), Self::NotMember(b))
             | (Self::AlreadyJoined(a), Self::AlreadyJoined(b)) => a == b,
-            (Self::InvalidTicket, Self::InvalidTicket) => true,
             (Self::Storage(a), Self::Storage(b)) => a.kind() == b.kind(),
+            (Self::InvalidAddr(a), Self::InvalidAddr(b))
+            | (Self::Internal(a), Self::Internal(b)) => a == b,
+            (Self::InvalidTicket, Self::InvalidTicket) | (Self::NotHost, Self::NotHost) => true,
             _ => false,
         }
     }
@@ -88,11 +107,24 @@ pub struct Subscription {
     pub events: broadcast::Receiver<Event>,
 }
 
+/// Whether this daemon owns the authoritative log for the session
+/// or is mirroring another daemon's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionKind {
+    /// Originated via [`Registry::host`] on this daemon. We assign
+    /// seqs and serve the canonical log.
+    Local,
+    /// Materialised via [`Registry::join`] for a ticket whose host
+    /// lives elsewhere. Log entries flow in over gossip.
+    Remote,
+}
+
 /// One active session.
 #[derive(Debug)]
 pub struct Session {
     id: SessionId,
     host: PeerId,
+    kind: SessionKind,
     members: HashSet<PeerId>,
     log: Vec<SessionMessage>,
     head: Seq,
@@ -100,13 +132,14 @@ pub struct Session {
 }
 
 impl Session {
-    fn new(id: SessionId, host: &PeerInfo) -> Self {
+    fn new(id: SessionId, host: &PeerInfo, kind: SessionKind) -> Self {
         let mut members = HashSet::new();
         members.insert(host.id);
         let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Self {
             id,
             host: host.id,
+            kind,
             members,
             log: Vec::new(),
             head: Seq::ZERO,
@@ -114,12 +147,15 @@ impl Session {
         }
     }
 
-    /// Hydrate from a persisted [`SessionRecord`].
+    /// Hydrate from a persisted [`SessionRecord`]. Kind defaults to
+    /// `Local` for now; Phase 2c-2c will persist the discriminator
+    /// so remote mirrors survive daemon restart.
     fn from_record(record: SessionRecord) -> Self {
         let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Self {
             id: record.id,
             host: record.host,
+            kind: SessionKind::Local,
             members: record.members,
             log: record.log,
             head: record.head,
@@ -165,6 +201,11 @@ pub struct Registry {
     daemon_addr: WireEndpointAddr,
     sessions: RwLock<HashMap<SessionId, Arc<Mutex<Session>>>>,
     store: DynStore,
+    /// Plumbing to the iroh gossip substrate. `Some` when the daemon
+    /// is running with the `iroh` feature on and an `iroh_key_path`
+    /// supplied; `None` for local-only embeds and unit tests.
+    #[cfg(feature = "iroh")]
+    bridge: Option<Arc<crate::gossip_bridge::GossipBridge>>,
 }
 
 impl Registry {
@@ -181,6 +222,8 @@ impl Registry {
             daemon_addr: WireEndpointAddr::id_only(daemon_peer_id),
             sessions: RwLock::new(HashMap::new()),
             store,
+            #[cfg(feature = "iroh")]
+            bridge: None,
         }
     }
 
@@ -190,6 +233,7 @@ impl Registry {
         daemon_peer_id: PeerId,
         daemon_addr: WireEndpointAddr,
         store: DynStore,
+        #[cfg(feature = "iroh")] bridge: Option<Arc<crate::gossip_bridge::GossipBridge>>,
     ) -> std::io::Result<Self> {
         let records = store.load_all().await?;
         let mut sessions = HashMap::with_capacity(records.len());
@@ -202,6 +246,8 @@ impl Registry {
             daemon_addr,
             sessions: RwLock::new(sessions),
             store,
+            #[cfg(feature = "iroh")]
+            bridge,
         })
     }
 
@@ -224,7 +270,7 @@ impl Registry {
             host_peer_id: self.daemon_peer_id,
             host_addr: self.daemon_addr.clone(),
         }));
-        let session = Session::new(session_id, &host_peer);
+        let session = Session::new(session_id, &host_peer, SessionKind::Local);
         let record = session.record();
         self.store
             .create(&record)
@@ -234,23 +280,61 @@ impl Registry {
             .write()
             .await
             .insert(session_id, Arc::new(Mutex::new(session)));
+
+        // If iroh is wired up, open a gossip topic for this session
+        // so future Sends can fan out to remote joiners. Bridge
+        // failure is non-fatal: the local session still works; we
+        // just won't reach the network. Surface as a warn for ops.
+        #[cfg(feature = "iroh")]
+        if let Some(bridge) = &self.bridge
+            && let Err(err) = bridge.host_session(session_id).await
+        {
+            tracing::warn!(?err, ?session_id, "gossip host_session failed");
+        }
+
         Ok((session_id, ticket))
     }
 
     /// Join an existing session via its ticket. Returns the session id
     /// and the head seq at join time.
+    ///
+    /// Two cases:
+    ///
+    /// - **Local session.** The session is already in `self.sessions`
+    ///   (we're the host or an earlier joiner-on-the-same-daemon).
+    ///   Just adds the peer to membership and emits `PeerJoined`.
+    /// - **Remote session** (`host_peer_id != self.daemon_peer_id`).
+    ///   The session doesn't exist locally yet; we materialise a
+    ///   mirror, ask the bridge to subscribe to the host's gossip
+    ///   topic, and feed inbound messages into the mirror. Without
+    ///   the iroh feature this is rejected as `InvalidTicket`.
     pub async fn join(
         &self,
         ticket: &JoinTicket,
         peer: PeerInfo,
     ) -> Result<(SessionId, Option<Seq>), SessionError> {
-        let SessionTicket { session_id, .. } = parse_ticket(ticket)?;
+        let parsed = parse_ticket(ticket)?;
+        let session_id = parsed.session_id;
+
         let session = {
             let guard = self.sessions.read().await;
-            guard
-                .get(&session_id)
-                .cloned()
-                .ok_or(SessionError::UnknownSession(session_id))?
+            guard.get(&session_id).cloned()
+        };
+
+        let session = if let Some(existing) = session {
+            existing
+        } else {
+            if parsed.host_peer_id == self.daemon_peer_id {
+                // Same-daemon ticket but the session id isn't
+                // registered locally — that's a stale or forged
+                // ticket, not a "join a remote" request.
+                return Err(SessionError::UnknownSession(session_id));
+            }
+            // Remote session: not yet known locally. Materialise
+            // a mirror and wire up the gossip bridge so the host's
+            // messages start flowing in.
+            self.materialise_remote_session(session_id, &parsed.host_peer_id, &parsed.host_addr)
+                .await?
         };
 
         // Hold the session lock across the store write so a concurrent
@@ -281,6 +365,103 @@ impl Registry {
             Some(s.head)
         };
         Ok((session_id, head))
+    }
+
+    /// Stand up a local mirror of a session whose authoritative log
+    /// lives on another daemon. Inserts a new [`Session`] keyed by
+    /// `session_id`, persists it, and asks the bridge to subscribe
+    /// to the host's gossip topic. Inbound gossip messages land in
+    /// the mirror's `log` and `events_tx`.
+    async fn materialise_remote_session(
+        &self,
+        session_id: SessionId,
+        host_peer_id: &PeerId,
+        host_addr: &WireEndpointAddr,
+    ) -> Result<Arc<Mutex<Session>>, SessionError> {
+        // Without the `iroh` feature, there's no way to actually
+        // reach the host; refuse cleanly rather than silently
+        // creating an unreachable session.
+        #[cfg(not(feature = "iroh"))]
+        {
+            let _ = (host_peer_id, host_addr);
+            tracing::debug!(
+                ?session_id,
+                "remote ticket received but iroh feature is off",
+            );
+            return Err(SessionError::InvalidTicket);
+        }
+
+        #[cfg(feature = "iroh")]
+        {
+            let bridge = self
+                .bridge
+                .as_ref()
+                .ok_or(SessionError::InvalidTicket)?
+                .clone();
+
+            // Persist the new session so a later daemon restart
+            // doesn't lose the membership / log we're about to start
+            // populating from the host. Host field is the *remote*
+            // peer's id, which lets `summary` distinguish remote
+            // sessions in `list` output.
+            let mut session_obj = Session::new(
+                session_id,
+                &PeerInfo::new(*host_peer_id, "remote-host"),
+                SessionKind::Remote,
+            );
+            // The constructor adds the host to `members`; for a
+            // remote session that's right (the host is a member of
+            // its own session) but we'll never see local Send from
+            // them — Sends arrive via gossip and route through the
+            // forwarder.
+            session_obj.host = *host_peer_id;
+            self.store
+                .create(&session_obj.record())
+                .await
+                .map_err(SessionError::Storage)?;
+            let arc = Arc::new(Mutex::new(session_obj));
+            self.sessions
+                .write()
+                .await
+                .insert(session_id, Arc::clone(&arc));
+
+            // Hand the bridge a callback that writes into this very
+            // mirror. We deliberately keep a strong Arc in the
+            // closure so the session outlives the forwarder task
+            // until forget_session aborts it.
+            let mirror = Arc::clone(&arc);
+            let session_for_log = session_id;
+            let on_message = move |msg: SessionMessage| {
+                let mirror = Arc::clone(&mirror);
+                let session_for_log = session_for_log;
+                // Spawn so the gossip forwarder doesn't block on
+                // each message. Acceptable for now; if ordering
+                // ever matters we can replace with a per-session
+                // mpsc.
+                tokio::spawn(async move {
+                    let mut s = mirror.lock().await;
+                    if msg.seq <= s.head {
+                        // Duplicate or out-of-order replay; drop.
+                        return;
+                    }
+                    s.head = msg.seq;
+                    s.log.push(msg.clone());
+                    let _ = s.events_tx.send(Event::Message {
+                        session: session_for_log,
+                        message: msg,
+                    });
+                });
+            };
+
+            let host_endpoint_addr =
+                wire_addr_to_iroh(host_peer_id, host_addr).map_err(SessionError::InvalidAddr)?;
+            bridge
+                .join_session(session_id, *host_peer_id, host_endpoint_addr, on_message)
+                .await
+                .map_err(|e| SessionError::Internal(e.to_string()))?;
+
+            Ok(arc)
+        }
     }
 
     /// Remove `peer` from `session`. If `peer` is the host, the entire
@@ -368,6 +549,12 @@ impl Registry {
         if !s.members.contains(&peer.id) {
             return Err(SessionError::NotMember(session));
         }
+        // Phase 2c-2b only supports host-side Send. If this is a
+        // remote mirror, refuse — the joiner-side path (correlated
+        // request/reply over gossip) lands in 2c-2c.
+        if s.kind == SessionKind::Remote {
+            return Err(SessionError::NotHost);
+        }
         // Build the message under the session lock (so seq is stable),
         // then persist before bumping in-memory state and fanning out.
         // If the store fails, head and log are unchanged; the request
@@ -388,7 +575,19 @@ impl Registry {
         // there's no reason to hold the session mutex across it.
         let events_tx = s.events_tx.clone();
         drop(s);
-        let _ = events_tx.send(Event::Message { session, message });
+        let _ = events_tx.send(Event::Message {
+            session,
+            message: message.clone(),
+        });
+
+        // Forward to remote joiners over gossip. Best-effort: if the
+        // bridge isn't available (no iroh, or it errored), the local
+        // fan-out has already happened so IPC clients are served.
+        #[cfg(feature = "iroh")]
+        if let Some(bridge) = &self.bridge {
+            bridge.publish_message(session, message).await;
+        }
+
         Ok(prospective)
     }
 
@@ -421,6 +620,35 @@ impl Registry {
 /// host peer id is decoded but not yet used (Phase 2c will route on
 /// it). Any decode failure surfaces as [`SessionError::InvalidTicket`]
 /// so the daemon doesn't leak parser internals over the wire.
+/// Convert a wire-form host addr into an iroh `EndpointAddr`. The
+/// relay URL string parses as a [`iroh::RelayUrl`]; direct addrs
+/// pass through. Surfaces parse errors as a [`String`] so the
+/// caller can map to [`SessionError::InvalidAddr`] without leaking
+/// iroh types.
+#[cfg(feature = "iroh")]
+fn wire_addr_to_iroh(
+    host_peer_id: &PeerId,
+    addr: &WireEndpointAddr,
+) -> Result<iroh::EndpointAddr, String> {
+    use iroh::TransportAddr;
+
+    let id = iroh::EndpointId::from_bytes(host_peer_id.as_bytes())
+        .map_err(|e| format!("bad endpoint id: {e}"))?;
+    let mut endpoint_addr = iroh::EndpointAddr::new(id);
+    if !addr.relay_url.is_empty() {
+        let relay: iroh::RelayUrl = addr
+            .relay_url
+            .parse()
+            .map_err(|e| format!("relay url: {e}"))?;
+        endpoint_addr = endpoint_addr.with_relay_url(relay);
+    }
+    if !addr.direct_addrs.is_empty() {
+        endpoint_addr =
+            endpoint_addr.with_addrs(addr.direct_addrs.iter().map(|s| TransportAddr::Ip(*s)));
+    }
+    Ok(endpoint_addr)
+}
+
 fn parse_ticket(ticket: &JoinTicket) -> Result<SessionTicket, SessionError> {
     ticket::decode(ticket.as_str()).map_err(|err| {
         // Log the underlying TicketError at debug; the wire-facing

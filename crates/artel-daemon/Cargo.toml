@@ -14,11 +14,12 @@ default = ["iroh"]
 # substrate. Off-mode keeps the daemon a local-only IPC bus with a
 # synthetic peer id, useful for tests and embeds that don't want the
 # network stack.
-iroh = ["dep:iroh", "dep:iroh-gossip", "dep:rand"]
+iroh = ["dep:iroh", "dep:iroh-gossip", "dep:rand", "dep:bytes"]
 
 [dependencies]
 artel-protocol = { workspace = true, features = ["tokio"] }
 async-trait = { workspace = true }
+bytes = { workspace = true, optional = true }
 clap = { workspace = true }
 futures-util = { workspace = true }
 iroh = { workspace = true, optional = true }

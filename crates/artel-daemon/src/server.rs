@@ -184,6 +184,11 @@ impl Daemon {
         // - Otherwise: use the caller-supplied peer id and don't
         //   stand up any iroh runtime. Keeps tests fast and lets
         //   embeds opt out of the network stack entirely.
+        // Keep a clone of the MemoryLookup (if any) so the gossip
+        // bridge can reach into it later when joiners arrive with
+        // out-of-band addrs to seed.
+        #[cfg(feature = "iroh")]
+        let address_lookup_for_bridge = config.address_lookup.as_ref().map(|o| o.0.clone());
         #[cfg(feature = "iroh")]
         let (daemon_peer_id, iroh) = resolve_iroh_runtime(
             config.iroh_key_path.as_deref(),
@@ -207,14 +212,31 @@ impl Daemon {
         #[cfg(not(feature = "iroh"))]
         let daemon_addr = artel_protocol::WireEndpointAddr::id_only(daemon_peer_id);
 
+        // Build the gossip bridge once we have the runtime. Lives
+        // for the daemon's lifetime; sessions register themselves
+        // with it as they're hosted/joined.
+        #[cfg(feature = "iroh")]
+        let bridge = iroh.as_ref().map(|rt| {
+            Arc::new(crate::gossip_bridge::GossipBridge::new(
+                rt.gossip.clone(),
+                address_lookup_for_bridge,
+            ))
+        });
+
         let store: crate::store::DynStore = Arc::new(
             crate::store::FsLogStore::open(&config.sessions_dir)
                 .map_err(StartError::LoadSessions)?,
         );
         let registry = Arc::new(
-            Registry::load(daemon_peer_id, daemon_addr, store)
-                .await
-                .map_err(StartError::LoadSessions)?,
+            Registry::load(
+                daemon_peer_id,
+                daemon_addr,
+                store,
+                #[cfg(feature = "iroh")]
+                bridge,
+            )
+            .await
+            .map_err(StartError::LoadSessions)?,
         );
 
         let shutdown = Arc::new(Shutdown::new());
@@ -694,6 +716,9 @@ fn session_error_to_protocol(err: &SessionError) -> ProtocolError {
         SessionError::AlreadyJoined(s) => ProtocolError::AlreadyJoined(*s),
         SessionError::InvalidTicket => ProtocolError::InvalidTicket,
         SessionError::Storage(io_err) => ProtocolError::Internal(format!("storage: {io_err}")),
+        SessionError::InvalidAddr(msg) => ProtocolError::Internal(format!("invalid addr: {msg}")),
+        SessionError::Internal(msg) => ProtocolError::Internal(msg.clone()),
+        SessionError::NotHost => ProtocolError::NotHost,
     }
 }
 

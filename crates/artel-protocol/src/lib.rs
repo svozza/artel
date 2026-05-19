@@ -25,6 +25,7 @@
 //!   version stamped on every [`SessionMessage`].
 
 pub mod error;
+pub mod gossip;
 pub mod ids;
 pub mod message;
 pub mod rpc;

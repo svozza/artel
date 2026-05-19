@@ -41,6 +41,12 @@ pub enum ProtocolError {
     #[error("daemon is not ready yet")]
     NotReady,
 
+    /// `Send` was issued for a session whose host lives on another
+    /// daemon. Phase 2c-2b ships host→joiner one-way fanout only;
+    /// joiner-issued sends arrive in 2c-2c.
+    #[error("send is only supported on the host side in this build")]
+    NotHost,
+
     /// Catch-all for daemon-side failures the client cannot otherwise
     /// distinguish. The string is for diagnostics only.
     #[error("internal daemon error: {0}")]
@@ -59,6 +65,7 @@ impl ProtocolError {
             Self::InvalidTicket => "invalid_ticket",
             Self::AlreadyJoined(_) => "already_joined",
             Self::NotReady => "not_ready",
+            Self::NotHost => "not_host",
             Self::Internal(_) => "internal",
         }
     }
@@ -100,6 +107,7 @@ mod tests {
             "already_joined"
         );
         assert_eq!(ProtocolError::NotReady.slug(), "not_ready");
+        assert_eq!(ProtocolError::NotHost.slug(), "not_host");
         assert_eq!(ProtocolError::Internal("x".into()).slug(), "internal");
     }
 
@@ -112,6 +120,7 @@ mod tests {
             ProtocolError::InvalidTicket,
             ProtocolError::AlreadyJoined(s),
             ProtocolError::NotReady,
+            ProtocolError::NotHost,
             ProtocolError::Internal("disk full".into()),
         ];
         for c in cases {
@@ -169,6 +178,7 @@ mod tests {
             Just(ProtocolError::InvalidTicket),
             any::<[u8; 16]>().prop_map(|b| ProtocolError::AlreadyJoined(SessionId::from_bytes(b))),
             Just(ProtocolError::NotReady),
+            Just(ProtocolError::NotHost),
             "[\\PC]{0,64}".prop_map(ProtocolError::Internal),
         ]
     }
