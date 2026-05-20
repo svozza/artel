@@ -21,6 +21,7 @@ iroh.workspace = true
 iroh-blobs.workspace = true
 iroh-docs.workspace = true
 iroh-gossip.workspace = true
+rand.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "macros", "rt", "sync", "time"] }
 tokio-util.workspace = true

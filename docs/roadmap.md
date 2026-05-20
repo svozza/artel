@@ -17,9 +17,9 @@ along the way.
 | `artel-protocol` | Wire types + Unix-socket transport. Done. |
 | `artel-daemon` | Persistent in-memory daemon + `artel-daemon` binary. Done. |
 | `artel-client` | Stateless multiplexed client + `artel` CLI binary + `connect_or_spawn`. Done. |
-| `artel-fs` | Phase 3a (MVP) shipped: ticket-handout `Workspace` with watcher + applier. Persistence and identity are follow-ups. |
+| `artel-fs` | Phase 3a (MVP) + 3b-1 (disk-backed persistence) shipped. Author identity, crash recovery, and configurable filter remain. |
 
-279 tests passing. fmt + clippy clean in both feature modes (with and
+289 tests passing. fmt + clippy clean in both feature modes (with and
 without `--all-features`). CI runs ubuntu + macos on stable; workspace
 `rust-version` is 1.95.
 
@@ -357,21 +357,33 @@ Storage was memory-only this slice (`Docs::memory()` + blob
 `MemStore`); on workspace restart, host re-scans the dir and
 re-publishes. Disk-backed Docs/Blobs is a follow-up slice.
 
-### Slice 3b — open follow-ups
+### Slice 3b — hardening
 
-- **Disk-backed Docs/Blobs.** `Docs::persistent(path)` +
-  `iroh-blobs::store::fs::FsStore`. Workspace state survives across
-  restarts. Adds a meaningful disk footprint per workspace; needs a
-  cleanup story for orphaned doc dirs.
-- **Persistent author identity.** Today `Workspace::host` /
-  `join` calls `Authors::author_create` per process; restarting a
-  workspace gives it a new author id (cosmetic since we don't
-  attribute writes anywhere user-visible, but still wrong).
-- **Crash recovery test.** Kill the workspace mid-write, reopen,
-  assert no corruption. Pairs with disk-backed.
-- **Authoritative `WorkspaceConfig`.** Today filter rules (`.git`,
-  `target`, …) are hardcoded. A user-facing config struct lets
-  apps add or remove paths.
+- **3b-1 — Disk-backed storage.** DONE.
+  `iroh.key` (mode 0600) + `doc-id` + `Docs::persistent(...)/docs/`
+  (redb + default-author) + `FsStore` blobs all live under a per-
+  workspace `state_dir` (default `<root>/.artel-fs/`, configurable
+  via `WorkspaceConfig::with_state_dir`). Host reuses the same
+  `NamespaceId` across restarts so existing tickets stay valid; on
+  reopen the host runs a reconcile pass that tombstones doc entries
+  whose backing files vanished offline, then `scan_and_publish_existing`
+  re-asserts the current disk state. Joiners persist their docs +
+  blobs too, so an offline joiner keeps its synced files on disk.
+  `bulk_export` queries `Query::single_latest_per_key().include_empty()`
+  so a returning joiner picks up tombstones the host published while
+  it was offline. See `docs/handoff-phase-3b.md` for the layout
+  rationale and the residual sketches for 3b-2/3/4 below.
+- **3b-2 — Persistent author identity.** Today we lean on
+  `iroh-docs`'s built-in `default-author` file under `state_dir/docs/`,
+  which is good enough until a real consumer wants per-author
+  attribution surfaced in `WorkspaceEvent`. Sketch in handoff doc.
+- **3b-3 — Crash recovery test.** Kill the workspace mid-write,
+  reopen, assert disk + doc agree. Subprocess test harness; depends
+  on 3b-1 (which is done).
+- **3b-4 — Configurable filter.** `WorkspaceConfig::filter:
+  FilterRules` so apps can extend or override the hardcoded skip
+  list (`.git`, `target`, `node_modules`, `.DS_Store`, `*.swp`,
+  `*.tmp`, `.artel-fs`).
 
 None block the next phase; pick them up when a real consumer needs
 them.

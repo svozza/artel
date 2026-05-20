@@ -127,7 +127,10 @@ fn is_hardcoded_skip(rel: &Path) -> bool {
     for component in rel.components() {
         let os = component.as_os_str();
         let Some(s) = os.to_str() else { continue };
-        if matches!(s, ".git" | "target" | "node_modules" | ".DS_Store") {
+        if matches!(
+            s,
+            ".git" | "target" | "node_modules" | ".DS_Store" | ".artel-fs"
+        ) {
             return true;
         }
         // Editor and OS-temp files. Case-sensitive on purpose — these
@@ -212,6 +215,28 @@ mod tests {
         let dir = make_root();
         let filter = WorkspaceFilter::new(dir.path());
         for rel in ["foo.swp", "foo.tmp", "sub/.DS_Store"] {
+            let p = write_file(dir.path(), rel, b"x");
+            assert_eq!(
+                filter.check(&p),
+                FilterDecision::Skip(SkipReason::Hardcoded),
+                "{rel} should be hardcoded-skipped",
+            );
+        }
+    }
+
+    #[test]
+    fn skips_artel_fs_state_dir() {
+        // The workspace's own state dir lives under `<root>/.artel-fs`
+        // by default; without this skip, the watcher would loop on
+        // its own redb / blobs writes.
+        let dir = make_root();
+        let filter = WorkspaceFilter::new(dir.path());
+        for rel in [
+            ".artel-fs/iroh.key",
+            ".artel-fs/doc-id",
+            ".artel-fs/docs/docs.redb",
+            ".artel-fs/blobs/blobs.db",
+        ] {
             let p = write_file(dir.path(), rel, b"x");
             assert_eq!(
                 filter.check(&p),

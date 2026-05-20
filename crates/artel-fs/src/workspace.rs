@@ -15,6 +15,7 @@
 //! in 3a-5. This file gets us as far as "host stands up, ticket lands
 //! on the session."
 
+use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
@@ -25,6 +26,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use iroh_docs::AuthorId;
 use iroh_docs::DocTicket;
+use iroh_docs::NamespaceId;
 use iroh_docs::api::Doc;
 use iroh_docs::api::protocol::{AddrInfoOptions, ShareMode};
 use iroh_docs::engine::LiveEvent;
@@ -49,6 +51,49 @@ pub const TICKET_ACTION: &str = "workspace.ticket";
 /// stuck consumer back-pressures the watcher rather than letting
 /// events queue without bound.
 const EVENT_BUFFER: usize = 64;
+
+/// Default name of the workspace's per-`root` state directory.
+///
+/// Lives inside the workspace so it travels with `root` for free;
+/// added to the hardcoded filter skip list so the watcher never
+/// tries to publish iroh's own redb / blob files into the doc.
+pub const DEFAULT_STATE_SUBDIR: &str = ".artel-fs";
+
+/// File inside `state_dir` that stores the host's persisted
+/// `NamespaceId`. 32 raw bytes — namespaces aren't secret so no
+/// special permissions are required.
+const DOC_ID_FILE: &str = "doc-id";
+
+/// Configurable knobs for [`Workspace::host_with`] /
+/// [`Workspace::join_with`].
+///
+/// The default ([`WorkspaceConfig::default`]) puts state under
+/// `<root>/.artel-fs/`. Override via [`Self::with_state_dir`] when
+/// the workspace lives in a directory the user wouldn't want a
+/// dotfile inside (e.g. a read-only export root).
+#[derive(Clone, Debug, Default)]
+pub struct WorkspaceConfig {
+    /// Where the workspace persists its iroh secret, doc replica,
+    /// and blob store. `None` resolves to `<root>/.artel-fs/`.
+    pub state_dir: Option<PathBuf>,
+}
+
+impl WorkspaceConfig {
+    /// Set an explicit state directory.
+    #[must_use]
+    pub fn with_state_dir(mut self, dir: PathBuf) -> Self {
+        self.state_dir = Some(dir);
+        self
+    }
+
+    /// Resolve the configured `state_dir` against `root`, applying
+    /// the `<root>/.artel-fs/` default if unset.
+    fn resolve(&self, root: &Path) -> PathBuf {
+        self.state_dir
+            .clone()
+            .unwrap_or_else(|| root.join(DEFAULT_STATE_SUBDIR))
+    }
+}
 
 /// Out-of-band signal surfaced to the consumer of a [`Workspace`].
 ///
@@ -137,22 +182,56 @@ impl Workspace {
         session: SessionId,
         root: PathBuf,
     ) -> Result<(Self, mpsc::Receiver<WorkspaceEvent>), WorkspaceError> {
-        let root = canonicalise(&root);
-        let node = WorkspaceNode::spawn().await?;
+        Self::host_with(client, session, root, WorkspaceConfig::default()).await
+    }
 
+    /// [`Self::host`], but with an explicit [`WorkspaceConfig`] so
+    /// callers can override the state directory.
+    ///
+    /// On a fresh `state_dir`: creates a new doc and persists its
+    /// `NamespaceId` to `state_dir/doc-id`. On a populated
+    /// `state_dir`: opens the previously-published doc, **runs a
+    /// reconcile pass** (tombstones doc entries whose backing files
+    /// disappeared while we were down), and then re-publishes the
+    /// remaining on-disk files. The resulting ticket is byte-stable
+    /// across restarts so any joiner with the old ticket can
+    /// resume.
+    pub async fn host_with(
+        client: &Client,
+        session: SessionId,
+        root: PathBuf,
+        config: WorkspaceConfig,
+    ) -> Result<(Self, mpsc::Receiver<WorkspaceEvent>), WorkspaceError> {
+        let root = canonicalise(&root);
+        // Materialise the workspace dir before the state dir so the
+        // (default) `<root>/.artel-fs/` placement doesn't fail.
+        tokio::fs::create_dir_all(&root).await?;
+        let state_dir = config.resolve(&root);
+        ensure_state_dir(&state_dir)?;
+
+        let node = WorkspaceNode::spawn(&state_dir).await?;
+
+        // Persistent docs store; default-author is managed by
+        // iroh-docs at `state_dir/docs/default-author`.
         let author = node
             .docs
-            .author_create()
+            .author_default()
             .await
-            .map_err(|e| WorkspaceError::Doc(format!("author_create: {e}")))?;
-        let doc = node
-            .docs
-            .create()
-            .await
-            .map_err(|e| WorkspaceError::Doc(format!("doc create: {e}")))?;
+            .map_err(|e| WorkspaceError::Doc(format!("author_default: {e}")))?;
+
+        let doc_id_path = state_dir.join(DOC_ID_FILE);
+        let (doc, returning) = open_or_create_doc(&node, &doc_id_path).await?;
 
         let (tx, rx) = mpsc::channel(EVENT_BUFFER);
         let echo_guard = EchoGuard::new();
+
+        // Returning host: prune entries that no longer exist on
+        // disk *before* we re-publish the current scan. Order
+        // matters — tombstoning after re-publishing would erase
+        // legitimate entries laid down by the scan.
+        if returning {
+            reconcile_doc_against_disk(&root, &doc, author, &tx).await?;
+        }
 
         // Pre-populate the doc from disk *before* we share the
         // ticket — joiners that import after this scan see the
@@ -212,15 +291,37 @@ impl Workspace {
         session: SessionId,
         root: PathBuf,
     ) -> Result<(Self, mpsc::Receiver<WorkspaceEvent>), WorkspaceError> {
+        Self::join_with(client, session, root, WorkspaceConfig::default()).await
+    }
+
+    /// [`Self::join`], but with an explicit [`WorkspaceConfig`].
+    ///
+    /// The joiner persists its iroh secret + doc replica + blobs
+    /// store under `state_dir`. On restart, `iroh-docs` resumes from
+    /// the existing replica; if the host's namespace has changed
+    /// since last time, the joiner imports the new ticket alongside
+    /// the old one without losing what it already had on disk.
+    pub async fn join_with(
+        client: &Client,
+        session: SessionId,
+        root: PathBuf,
+        config: WorkspaceConfig,
+    ) -> Result<(Self, mpsc::Receiver<WorkspaceEvent>), WorkspaceError> {
         let root = canonicalise(&root);
         tokio::fs::create_dir_all(&root).await?;
+        let state_dir = config.resolve(&root);
+        ensure_state_dir(&state_dir)?;
 
-        let node = WorkspaceNode::spawn().await?;
+        let node = WorkspaceNode::spawn(&state_dir).await?;
+        // Joiners don't persist a per-workspace `doc-id` — they
+        // import the host's namespace from the ticket each time.
+        // The default author is still useful for stamping our own
+        // writes once live sync starts.
         let author = node
             .docs
-            .author_create()
+            .author_default()
             .await
-            .map_err(|e| WorkspaceError::Doc(format!("author_create: {e}")))?;
+            .map_err(|e| WorkspaceError::Doc(format!("author_default: {e}")))?;
 
         // Subscribe and drain until the ticket arrives. Phase 2
         // follow-up (c) (subscribe replay) means a fresh subscriber
@@ -505,8 +606,12 @@ async fn bulk_export(
     echo_guard: &EchoGuard,
     events: &mpsc::Sender<WorkspaceEvent>,
 ) -> Result<(), WorkspaceError> {
+    // `include_empty()` is load-bearing for the returning-joiner
+    // path: a tombstone the host emitted while we were offline only
+    // shows up here if we ask for empty entries, otherwise sync
+    // updates the replica but disk state silently drifts.
     let stream = doc
-        .get_many(Query::all())
+        .get_many(Query::single_latest_per_key().include_empty())
         .await
         .map_err(|e| WorkspaceError::Doc(format!("get_many: {e}")))?;
     tokio::pin!(stream);
@@ -582,4 +687,132 @@ const PENDING_RELEASE_GRACE: Duration = Duration::from_millis(250);
 /// are expected to pass an existing dir.
 fn canonicalise(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// Create the state dir (and any missing parents) if it doesn't
+/// already exist. Idempotent — re-runs on every workspace startup.
+fn ensure_state_dir(state_dir: &Path) -> Result<(), WorkspaceError> {
+    std::fs::create_dir_all(state_dir)
+        .map_err(|e| WorkspaceError::Iroh(format!("create state_dir {}: {e}", state_dir.display())))
+}
+
+/// Open the host's persisted doc, or create a fresh one and stamp
+/// `doc_id_path` with its `NamespaceId`. Returns the doc plus a
+/// flag: `true` means we opened an existing doc (the caller must
+/// reconcile it against disk), `false` means we created a fresh
+/// one (no reconcile needed).
+async fn open_or_create_doc(
+    node: &WorkspaceNode,
+    doc_id_path: &Path,
+) -> Result<(Doc, bool), WorkspaceError> {
+    match std::fs::read(doc_id_path) {
+        Ok(bytes) => {
+            let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+                WorkspaceError::Doc(format!(
+                    "doc-id at {} is corrupt: expected 32 bytes, got {}",
+                    doc_id_path.display(),
+                    bytes.len(),
+                ))
+            })?;
+            let id = NamespaceId::from(&arr);
+            let doc = node
+                .docs
+                .open(id)
+                .await
+                .map_err(|e| WorkspaceError::Doc(format!("doc open: {e}")))?
+                .ok_or_else(|| {
+                    WorkspaceError::Doc(format!(
+                        "doc-id refers to a namespace not in the store: {id}",
+                    ))
+                })?;
+            Ok((doc, true))
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            let doc = node
+                .docs
+                .create()
+                .await
+                .map_err(|e| WorkspaceError::Doc(format!("doc create: {e}")))?;
+            write_doc_id_atomic(doc_id_path, &doc.id().to_bytes()).map_err(|e| {
+                WorkspaceError::Doc(format!("persist doc-id at {}: {e}", doc_id_path.display()))
+            })?;
+            Ok((doc, false))
+        }
+        Err(err) => Err(WorkspaceError::Doc(format!(
+            "read doc-id at {}: {err}",
+            doc_id_path.display(),
+        ))),
+    }
+}
+
+/// Atomic write: tmp-and-rename. Same shape as the keystore's
+/// write but without the chmod — `doc-id` isn't sensitive.
+fn write_doc_id_atomic(path: &Path, bytes: &[u8; 32]) -> io::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Walk the doc and tombstone any entry whose key maps to a path
+/// that no longer exists on disk under `root`.
+///
+/// **Must** run before `scan_and_publish_existing` so a
+/// stale-on-disk entry is removed before the rescan re-asserts
+/// it; it must also run before the watcher / applier are spawned
+/// and before the ticket is re-broadcast (otherwise a peer
+/// importing the ticket would observe flapping state mid-pass).
+async fn reconcile_doc_against_disk(
+    root: &Path,
+    doc: &Doc,
+    author: AuthorId,
+    events: &mpsc::Sender<WorkspaceEvent>,
+) -> Result<(), WorkspaceError> {
+    // One entry per key — we only need to know the *latest* state of
+    // each path. Already-tombstoned entries are filtered out via the
+    // `include_empty=false` default.
+    let stream = doc
+        .get_many(Query::single_latest_per_key())
+        .await
+        .map_err(|e| WorkspaceError::Doc(format!("reconcile get_many: {e}")))?;
+    tokio::pin!(stream);
+
+    while let Some(res) = stream.next().await {
+        let Ok(entry) = res else { continue };
+        // Defensive: should be unreachable given the default query.
+        if entry.content_len() == 0 {
+            continue;
+        }
+
+        let path = match keys::key_to_path(root, entry.key()) {
+            Ok(p) => p,
+            Err(err) => {
+                let _ = events
+                    .send(WorkspaceEvent::Error(format!(
+                        "reconcile invalid key: {err}"
+                    )))
+                    .await;
+                continue;
+            }
+        };
+        if !path.exists() {
+            // `Doc::del` writes a tombstone for `prefix`. The key
+            // we hand it is exact, so it tombstones just this
+            // entry.
+            if let Err(err) = doc.del(author, entry.key().to_vec()).await {
+                let _ = events
+                    .send(WorkspaceEvent::Error(format!(
+                        "reconcile tombstone {}: {err}",
+                        path.display(),
+                    )))
+                    .await;
+            }
+        }
+    }
+    Ok(())
 }
