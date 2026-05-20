@@ -75,6 +75,15 @@ pub struct WorkspaceConfig {
     /// Where the workspace persists its iroh secret, doc replica,
     /// and blob store. `None` resolves to `<root>/.artel-fs/`.
     pub state_dir: Option<PathBuf>,
+
+    /// How long [`Workspace::join_with`] waits for the host's
+    /// `workspace.ticket` to arrive on the artel session before
+    /// giving up. `None` (the default) means wait forever — useful
+    /// for long-lived joiners that may attach minutes or hours
+    /// after the host first published. Set [`Some(duration)`] when
+    /// you'd rather fail fast on a misconfigured session (e.g.
+    /// wrong ticket, daemons that can't reach each other).
+    pub join_ticket_timeout: Option<Duration>,
 }
 
 impl WorkspaceConfig {
@@ -82,6 +91,14 @@ impl WorkspaceConfig {
     #[must_use]
     pub fn with_state_dir(mut self, dir: PathBuf) -> Self {
         self.state_dir = Some(dir);
+        self
+    }
+
+    /// Set how long the joiner waits for the host's ticket to
+    /// arrive over the artel session. `None` waits forever.
+    #[must_use]
+    pub const fn with_join_ticket_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.join_ticket_timeout = timeout;
         self
     }
 
@@ -341,7 +358,8 @@ impl Workspace {
             .await
             .ok_or_else(|| WorkspaceError::Iroh("client events already taken".into()))?;
 
-        let ticket_bytes = wait_for_ticket(&mut events, session).await?;
+        let ticket_bytes =
+            wait_for_ticket(&mut events, session, config.join_ticket_timeout).await?;
         let ticket_str = std::str::from_utf8(&ticket_bytes)
             .map_err(|e| WorkspaceError::Doc(format!("ticket payload not utf-8: {e}")))?;
         let ticket = DocTicket::from_str(ticket_str)
@@ -581,14 +599,16 @@ where
 }
 
 /// Drain `events` until a `MessageKind::System` event with
-/// [`TICKET_ACTION`] for `session` arrives, returning its payload.
-/// 15 s ceiling so a misconfigured session can't hang the joiner
-/// forever.
+/// [`TICKET_ACTION`] for `session` arrives. `deadline` caps the
+/// wait — `None` means wait indefinitely (the right shape for
+/// long-lived joiners that may arrive minutes or hours after the
+/// host).
 async fn wait_for_ticket(
     events: &mut artel_client::EventStream,
     session: SessionId,
+    deadline: Option<Duration>,
 ) -> Result<Vec<u8>, WorkspaceError> {
-    timeout(Duration::from_secs(15), async {
+    let drain = async {
         loop {
             let ev = events.recv().await.ok_or_else(|| {
                 WorkspaceError::Iroh("event stream closed before ticket arrived".into())
@@ -604,9 +624,13 @@ async fn wait_for_ticket(
                 return Ok::<_, WorkspaceError>(message.payload);
             }
         }
-    })
-    .await
-    .map_err(|_| WorkspaceError::Iroh("timed out waiting for workspace.ticket".into()))?
+    };
+    match deadline {
+        Some(d) => timeout(d, drain)
+            .await
+            .map_err(|_| WorkspaceError::Iroh("timed out waiting for workspace.ticket".into()))?,
+        None => drain.await,
+    }
 }
 
 /// Walk the doc and write every entry to disk under `root`.
@@ -838,4 +862,26 @@ async fn reconcile_doc_against_disk(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_config_with_join_ticket_timeout_sets_field() {
+        let cfg = WorkspaceConfig::default().with_join_ticket_timeout(Some(Duration::from_secs(7)));
+        assert_eq!(cfg.join_ticket_timeout, Some(Duration::from_secs(7)));
+
+        let cfg = WorkspaceConfig::default().with_join_ticket_timeout(None);
+        assert_eq!(cfg.join_ticket_timeout, None);
+    }
+
+    #[test]
+    fn workspace_config_default_has_no_join_ticket_timeout() {
+        // Long-lived joiners are the common case — default to "wait
+        // forever" so a misconfigured single-process test has to opt
+        // into a deadline.
+        assert_eq!(WorkspaceConfig::default().join_ticket_timeout, None);
+    }
 }
