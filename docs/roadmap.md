@@ -395,46 +395,117 @@ re-publishes. Disk-backed Docs/Blobs is a follow-up slice.
 None block the next phase; pick them up when a real consumer needs
 them.
 
-## Phase 4 and beyond
+## Phase 4: production hardening
+
+Two concrete workstreams that close gaps blocking real consumers
+from using `artel-fs` end-to-end. Both have detailed plans below;
+pick up in either order, but the safety design probably wants to
+land first because it changes the public surface of
+`Workspace::host` / `Workspace::join`.
+
+### Workspace host/join safety
+
+Today `Workspace::host` runs `scan_and_publish_existing` on
+whatever dir it's pointed at, and `Workspace::join` runs
+`bulk_export` into whatever dir it's pointed at. Both behaviours
+are unsafe in the wrong dir:
+
+- Hosting on the wrong dir (e.g. `~`) publishes the entire tree
+  into the doc and out to any joiner. Surfaced 2026-05-20 while
+  smoke-testing two-process sync end-to-end; nearly published a
+  whole home dir before someone noticed.
+- Joining into a non-empty dir silently overwrites local files
+  via `bulk_export`'s `tokio::fs::write(&path, ...)`. The joiner
+  has no opportunity to inspect what's about to land.
+- The current asymmetry — joiner's pre-existing files are *not*
+  propagated outward — is itself a bug or a feature depending on
+  which mental model we pick.
+
+Open design questions before any code change:
+1. **Mental model.** "Shared bucket" (any party can drop files
+   in, all parties see all) vs "clone of host's tree" (host owns
+   the canonical tree; joiners get a copy and can edit it but
+   their local pre-existing files are irrelevant on join).
+   Clone-semantics matches `git clone`, removes the
+   joiner-publishes-outward risk entirely, and is probably the
+   right v1 default.
+2. **Default policy on non-empty target dir.** Refuse to host or
+   join if the dir is non-empty, modulo `--allow-existing` /
+   `--init-from-this-dir` opt-in flags? Empty `.artel-fs/` and
+   filtered paths (`.git`, `target`, etc.) shouldn't count as
+   "non-empty".
+3. **Symmetric scan?** If we adopt shared-bucket semantics
+   instead of clone, the joiner needs `scan_and_publish_existing`
+   too, which multiplies the wrong-dir risk onto the joiner side.
+   Only worth doing once #1 and #2 are settled.
+
+Until this is designed, do not silently change scan/bulk_export
+behaviour or add piecemeal guards. Existing testing should use
+fresh empty dirs.
+
+### Multi-session resume across daemon restarts
+
+Surfaced 2026-05-20 while smoke-testing two-process sync: when
+either side's CLI dies and restarts pointing at the same
+workspace dir, the new instance can't reliably reattach to the
+existing session — the joiner's daemon is still tracking an
+old session id, the new host mints a fresh one, and the two
+sides talk past each other. Workaround today is `rm -rf
+.artel-fs/` between runs, which defeats the point of persistence.
+
+The substrate is mostly there:
+
+- Phase 1 auto-spawn lets the daemon outlive any single client
+  invocation. A long-running daemon at the default state path
+  (`artel-protocol::transport::path::default_dir`) is the basis
+  for everything below.
+- 3b-1 disk-backed persistence makes the host's namespace + iroh
+  identity stable across restarts. A re-hosted workspace produces
+  a byte-identical ticket, and existing joiners' tickets keep
+  working without re-issuing.
+- 3b-3 crash recovery proved both halves resume correctly under
+  SIGKILL.
+
+What's missing:
+
+1. **Stable session id across host restarts.** Today
+   `Request::HostSession` mints a fresh `SessionId` per call. A
+   re-hosted workspace gets a new session, which means a joiner's
+   daemon (still tracking the old session id) can't reattach.
+   Two reasonable shapes:
+   - Derive the session id deterministically from the workspace's
+     `NamespaceId`, OR
+   - Add `Request::ResumeHost { session: SessionId, ... }` that
+     reuses an existing entry from the daemon's session log.
+2. **Workspace registry on the daemon side.** Today nothing maps
+   `(local_path, session_id)` → workspace state dir, so a
+   restarted client has no way to enumerate "what workspaces does
+   this daemon know about?" without reading `~/.artel/`
+   filesystem state directly. Add `Request::ListWorkspaces` plus
+   `Request::ForgetWorkspace`; backing store extends `FsLogStore`
+   (or sibling) with a `workspaces.toml` keyed by session id.
+   Single source of truth, survives daemon restarts, usable by
+   any client (CLI, future GUI, whatever the consumer is).
+3. **`Workspace::resume`?** Today `Workspace::host_with` already
+   does the right thing if `.artel-fs/` exists — it opens the
+   existing namespace, runs the reconcile pass, re-broadcasts the
+   ticket. So no new constructor needed; consumers just call
+   `host_with` again. **Verify this end-to-end with a test that
+   asserts the second host's ticket is byte-identical to the
+   first's** — implicit in 3b-1 but never directly asserted.
+
+Concrete first deliverable: `tests/host_restart_ticket_stable.rs`
+that hosts, captures the ticket, drops the workspace, re-hosts
+the same dir, captures the second ticket, asserts byte-equality.
+Pins the resume property under regression without committing to
+a registry shape yet.
+
+After that, the registry + session-id work can land as separate
+slices.
+
+## Future
 
 Listed for completeness, no detailed plan yet:
-
-- **Workspace host/join safety.** Today `Workspace::host` runs
-  `scan_and_publish_existing` on whatever dir it's pointed at, and
-  `Workspace::join` runs `bulk_export` into whatever dir it's
-  pointed at. Both behaviours are unsafe in the wrong dir:
-  - Hosting on the wrong dir (e.g. `~`) publishes the entire tree
-    into the doc and out to any joiner. Surfaced 2026-05-20 while
-    testing the throwaway `wsdemo` CLI; the user nearly published
-    their whole home dir before noticing.
-  - Joining into a non-empty dir silently overwrites local files
-    via `bulk_export`'s `tokio::fs::write(&path, ...)`. The joiner
-    has no opportunity to inspect what's about to land.
-  - The current asymmetry — joiner's pre-existing files are *not*
-    propagated outward — is itself a bug or a feature depending on
-    which mental model we pick.
-
-  Open design questions before any code change:
-  1. **Mental model.** "Shared bucket" (any party can drop files
-     in, all parties see all) vs "clone of host's tree" (host owns
-     the canonical tree; joiners get a copy and can edit it but
-     their local pre-existing files are irrelevant on join).
-     Clone-semantics matches `git clone`, removes the
-     joiner-publishes-outward risk entirely, and is probably the
-     right v1 default.
-  2. **Default policy on non-empty target dir.** Refuse to host or
-     join if the dir is non-empty, modulo `--allow-existing` /
-     `--init-from-this-dir` opt-in flags? Empty `.artel-fs/` and
-     filtered paths (`.git`, `target`, etc.) shouldn't count as
-     "non-empty".
-  3. **Symmetric scan?** If we adopt shared-bucket semantics
-     instead of clone, the joiner needs `scan_and_publish_existing`
-     too, which multiplies the wrong-dir risk onto the joiner side.
-     Only worth doing once #1 and #2 are settled.
-
-  Until this is designed, do not silently change scan/bulk_export
-  behaviour or add piecemeal guards. Existing testing should use
-  fresh empty dirs.
 
 - **Capabilities & auth.** Read-only tickets, signed messages,
   ticket revocation. ADR-001 § "Auth and capability model" — explicitly
