@@ -164,6 +164,18 @@ async fn on_modified(
         Err(_) => return,
     };
 
+    // Skip zero-length files: iroh-docs reserves zero-length entries
+    // for tombstones and rejects an explicit empty `set_bytes` with
+    // "Attempted to insert an empty entry". Once the file gets actual
+    // content the next debounced event picks it up.
+    //
+    // TODO: support genuinely-empty files (e.g. `touch sentinel`) —
+    // probably by storing an inline marker in the entry's metadata
+    // or splitting "presence" from "content" at the doc layer.
+    if bytes.is_empty() {
+        return;
+    }
+
     if guard.should_skip_local(&path, &bytes).await {
         return;
     }
