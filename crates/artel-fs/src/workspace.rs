@@ -715,34 +715,51 @@ async fn open_or_create_doc(
                 ))
             })?;
             let id = NamespaceId::from(&arr);
-            let doc = node
-                .docs
-                .open(id)
-                .await
-                .map_err(|e| WorkspaceError::Doc(format!("doc open: {e}")))?
-                .ok_or_else(|| {
-                    WorkspaceError::Doc(format!(
-                        "doc-id refers to a namespace not in the store: {id}",
-                    ))
-                })?;
-            Ok((doc, true))
+            // `Docs::open` may fail with "Replica not found" if the
+            // redb commit for the namespace hasn't durably landed
+            // yet — `iroh-docs` batches writes with a 500 ms delay,
+            // so a SIGKILL between `Docs::create` returning and the
+            // commit firing leaves us with a `doc-id` pointing at a
+            // namespace that doesn't exist on disk. The handoff's
+            // risk #1: self-heal by treating the stale id as if it
+            // was never written. Joiners with the prior ticket lose
+            // the ability to resume — acceptable since they would
+            // not have synced anything before the crash anyway.
+            if let Ok(Some(doc)) = node.docs.open(id).await {
+                Ok((doc, true))
+            } else {
+                tracing::warn!(
+                    ?id,
+                    "stale doc-id at {}: namespace not in store, recreating",
+                    doc_id_path.display(),
+                );
+                create_and_persist(node, doc_id_path).await
+            }
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            let doc = node
-                .docs
-                .create()
-                .await
-                .map_err(|e| WorkspaceError::Doc(format!("doc create: {e}")))?;
-            write_doc_id_atomic(doc_id_path, &doc.id().to_bytes()).map_err(|e| {
-                WorkspaceError::Doc(format!("persist doc-id at {}: {e}", doc_id_path.display()))
-            })?;
-            Ok((doc, false))
+            create_and_persist(node, doc_id_path).await
         }
         Err(err) => Err(WorkspaceError::Doc(format!(
             "read doc-id at {}: {err}",
             doc_id_path.display(),
         ))),
     }
+}
+
+/// Create a fresh namespace and persist its id.
+async fn create_and_persist(
+    node: &WorkspaceNode,
+    doc_id_path: &Path,
+) -> Result<(Doc, bool), WorkspaceError> {
+    let doc = node
+        .docs
+        .create()
+        .await
+        .map_err(|e| WorkspaceError::Doc(format!("doc create: {e}")))?;
+    write_doc_id_atomic(doc_id_path, &doc.id().to_bytes()).map_err(|e| {
+        WorkspaceError::Doc(format!("persist doc-id at {}: {e}", doc_id_path.display()))
+    })?;
+    Ok((doc, false))
 }
 
 /// Atomic write: tmp-and-rename. Same shape as the keystore's

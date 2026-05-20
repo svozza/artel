@@ -17,9 +17,9 @@ along the way.
 | `artel-protocol` | Wire types + Unix-socket transport. Done. |
 | `artel-daemon` | Persistent in-memory daemon + `artel-daemon` binary. Done. |
 | `artel-client` | Stateless multiplexed client + `artel` CLI binary + `connect_or_spawn`. Done. |
-| `artel-fs` | Phase 3a (MVP) + 3b-1 (disk-backed persistence) shipped. Author identity, crash recovery, and configurable filter remain. |
+| `artel-fs` | Phase 3a (MVP) + 3b-1 (disk-backed persistence) + 3b-3 (crash recovery) shipped. Author identity and configurable filter remain. |
 
-289 tests passing. fmt + clippy clean in both feature modes (with and
+292 tests passing. fmt + clippy clean in both feature modes (with and
 without `--all-features`). CI runs ubuntu + macos on stable; workspace
 `rust-version` is 1.95.
 
@@ -377,9 +377,16 @@ re-publishes. Disk-backed Docs/Blobs is a follow-up slice.
   `iroh-docs`'s built-in `default-author` file under `state_dir/docs/`,
   which is good enough until a real consumer wants per-author
   attribution surfaced in `WorkspaceEvent`. Sketch in handoff doc.
-- **3b-3 — Crash recovery test.** Kill the workspace mid-write,
-  reopen, assert disk + doc agree. Subprocess test harness; depends
-  on 3b-1 (which is done).
+- **3b-3 — Crash recovery.** DONE.
+  `tests/crash_recovery.rs` spawns Alice's host as a child process
+  (`tests/bin/crash_child.rs`), SIGKILLs it at three different
+  points (steady-state, mid scan-and-publish, mid live-write), and
+  verifies the workspace recovers on restart with Bob's mirror
+  intact. Surfaced and fixed `iroh-docs`'s 500 ms commit-batch
+  window: a SIGKILL between `Docs::create` returning and the redb
+  commit firing leaves a `doc-id` pointing at a non-existent
+  namespace; `open_or_create_doc` self-heals by recreating the doc
+  when `Docs::open` doesn't find the persisted namespace.
 - **3b-4 — Configurable filter.** `WorkspaceConfig::filter:
   FilterRules` so apps can extend or override the hardcoded skip
   list (`.git`, `target`, `node_modules`, `.DS_Store`, `*.swp`,

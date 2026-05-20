@@ -33,9 +33,20 @@ walkdir = "2"
 artel-daemon = { path = "../artel-daemon" }
 bytes.workspace = true
 futures-util.workspace = true
+nix = { workspace = true }
 pretty_assertions.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util", "time"] }
+tokio = { workspace = true, features = ["macros", "process", "rt-multi-thread", "test-util", "time"] }
 
 [lints]
 workspace = true
+
+# Helper binary used by `tests/crash_recovery.rs` only. Locating it
+# via `env!("CARGO_BIN_EXE_crash_child")` is the standard pattern;
+# the test fails fast if the binary isn't built.
+[[bin]]
+name = "crash_child"
+path = "tests/bin/crash_child.rs"
+test = false
+doctest = false
+bench = false

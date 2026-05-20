@@ -188,6 +188,7 @@ dependencies = [
  "iroh-blobs",
  "iroh-docs",
  "iroh-gossip",
+ "nix",
  "notify",
  "notify-debouncer-full",
  "pretty_assertions",
