@@ -40,9 +40,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use artel_protocol::gossip::{self, GossipBody, GossipFrame};
+use artel_protocol::gossip::{self, GossipBody};
 use artel_protocol::rpc::SendPayload;
-use artel_protocol::{PeerId, PeerInfo, ProtocolError, SessionId, SessionMessage};
+use artel_protocol::{PeerId, PeerInfo, ProtocolError, Seq, SessionId, SessionMessage};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use iroh::EndpointAddr;
@@ -97,7 +97,6 @@ pub(crate) struct GossipBridge {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // forwarder JoinHandle is only consumed by Drop.
 struct SessionState {
     sender: iroh_gossip::api::GossipSender,
     forwarder: tokio::task::JoinHandle<()>,
@@ -168,9 +167,18 @@ impl GossipBridge {
     /// bootstrap. Spawns a forwarder task that decodes inbound
     /// gossip frames and pushes the resulting [`SessionMessage`]s
     /// into `on_message`.
+    ///
+    /// Once the gossip mesh is up, broadcasts a
+    /// [`GossipBody::JoinAnnouncement`] carrying `joiner` so the
+    /// host can admit the peer to membership and emit
+    /// [`Event::PeerJoined`] proactively — without this, the
+    /// joiner stays invisible until their first `SendRequest`.
+    ///
+    /// [`Event::PeerJoined`]: artel_protocol::Event::PeerJoined
     pub(crate) async fn join_session(
         self: &Arc<Self>,
         session: SessionId,
+        joiner: PeerInfo,
         host_peer: PeerId,
         host_addr: EndpointAddr,
         on_message: impl Fn(SessionMessage) + Send + Sync + 'static,
@@ -187,7 +195,52 @@ impl GossipBridge {
                 on_message: Arc::new(on_message),
             },
         )
-        .await
+        .await?;
+        // Mesh is up (subscribe_inner waits for `joined()` on the
+        // joiner path). Announce ourselves so the host's bridge can
+        // call `Registry::ensure_member` and emit `PeerJoined`.
+        // Best-effort: a failure here just degrades to lazy
+        // admission on first `SendRequest`, the same shape we had
+        // pre-2c-2d.
+        self.publish_join_announcement(session, joiner).await;
+        // Ask the host to backfill any committed messages we
+        // missed before the mesh was up. Since this is a fresh
+        // mirror, we have nothing — `since: ZERO` requests the
+        // full log. Best-effort: a failure here just means the
+        // joiner's mirror starts empty, same shape as pre-replay.
+        self.publish_replay(session, Seq::ZERO).await;
+        Ok(())
+    }
+
+    /// Tear down all per-session topic state for `session`. Called
+    /// from [`Registry::leave`] (host or joiner) so the forwarder
+    /// task exits, the gossip topic is left, and `bridge.sessions`
+    /// doesn't grow unbounded as sessions come and go.
+    ///
+    /// Safe to call for a session the bridge never knew about
+    /// (e.g. a daemon built without iroh) — no-op in that case.
+    /// Per iroh-gossip docs, the topic is left once both the
+    /// `GossipSender` and `GossipReceiver` halves are dropped; we
+    /// own the sender here and abort the forwarder task to drop
+    /// the receiver.
+    pub(crate) async fn forget_session(&self, session: SessionId) {
+        let removed = self.sessions.lock().await.remove(&session);
+        let Some(state) = removed else {
+            debug!(?session, "forget_session: bridge had no entry");
+            return;
+        };
+        // Abort first so the forwarder stops processing inbound
+        // frames immediately — the receiver inside it is dropped
+        // when the task unwinds. Then drop the sender so
+        // iroh-gossip leaves the topic.
+        state.forwarder.abort();
+        drop(state.sender);
+        // pending_sends entries that were keyed to this session
+        // (joiner-side outbound `Send` waiting for ack) will
+        // resolve to SendTimeout on their own deadline. Not worth
+        // hunting them down here — the map is keyed by req_id, not
+        // session_id, so we'd be doing a linear scan for an event
+        // that's already self-cleaning.
     }
 
     /// Joiner-side `Send`: publish a [`GossipBody::SendRequest`] on
@@ -214,15 +267,12 @@ impl GossipBridge {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.pending_sends.lock().await.insert(req_id, reply_tx);
 
-        let frame = GossipFrame {
-            version: gossip::GOSSIP_FRAME_VERSION,
-            body: GossipBody::SendRequest {
-                req_id,
-                peer,
-                payload,
-            },
+        let body = GossipBody::SendRequest {
+            req_id,
+            peer,
+            payload,
         };
-        let bytes = Bytes::from(gossip::encode(&frame));
+        let bytes = Bytes::from(gossip::encode(&body));
         if let Err(err) = sender.broadcast(bytes).await {
             // Drop the pending entry so it doesn't leak; nobody is
             // ever going to resolve it.
@@ -284,8 +334,8 @@ impl GossipBridge {
             while let Some(item) = receiver.next().await {
                 match item {
                     Ok(IrohGossipEvent::Received(msg)) => match gossip::decode(&msg.content) {
-                        Ok(frame) => {
-                            handle_inbound_frame(&bridge, session_for_log, &role, frame.body).await;
+                        Ok(body) => {
+                            handle_inbound_frame(&bridge, session_for_log, &role, body).await;
                         }
                         Err(err) => {
                             warn!(?err, "gossip frame decode failed; dropping");
@@ -326,10 +376,90 @@ impl GossipBridge {
             );
             return;
         };
-        let frame = gossip::message_frame(msg);
-        let bytes = Bytes::from(gossip::encode(&frame));
+        let bytes = Bytes::from(gossip::encode(&GossipBody::Message(msg)));
         if let Err(err) = sender.broadcast(bytes).await {
             warn!(error = %err, "gossip broadcast failed");
+        }
+    }
+
+    /// Broadcast a [`GossipBody::Replay`] asking the host to
+    /// re-emit every committed message with `seq > since`. Called
+    /// from [`Self::join_session`] right after the announcement.
+    /// Best-effort: a failed broadcast just means the joiner's
+    /// mirror starts empty rather than backfilled.
+    async fn publish_replay(&self, session: SessionId, since: Seq) {
+        let sender = self
+            .sessions
+            .lock()
+            .await
+            .get(&session)
+            .map(|s| s.sender.clone());
+        let Some(sender) = sender else {
+            debug!(
+                ?session,
+                "publish_replay: session has no gossip topic; dropping",
+            );
+            return;
+        };
+        let bytes = Bytes::from(gossip::encode(&GossipBody::Replay { since }));
+        if let Err(err) = sender.broadcast(bytes).await {
+            warn!(error = %err, "replay broadcast failed");
+        }
+    }
+
+    /// Broadcast a [`GossipBody::SessionClosed`] on the topic for
+    /// `session`. Called from the host side of [`Registry::leave`]
+    /// just before [`Self::forget_session`] tears the topic down,
+    /// so joiners' forwarders see the close before the gossip
+    /// neighbor goes silent. Best-effort — if the broadcast fails,
+    /// joiners fall back to discovering the close via their next
+    /// `SendRequest` timing out.
+    pub(crate) async fn publish_session_closed(&self, session: SessionId) {
+        let sender = self
+            .sessions
+            .lock()
+            .await
+            .get(&session)
+            .map(|s| s.sender.clone());
+        let Some(sender) = sender else {
+            debug!(
+                ?session,
+                "publish_session_closed: session has no gossip topic; dropping",
+            );
+            return;
+        };
+        let bytes = Bytes::from(gossip::encode(&GossipBody::SessionClosed));
+        if let Err(err) = sender.broadcast(bytes).await {
+            warn!(error = %err, "session_closed broadcast failed");
+        }
+    }
+
+    /// Broadcast a [`GossipBody::JoinAnnouncement`] on the topic
+    /// for `session`. Called from [`Self::join_session`] once the
+    /// mesh is up. Best-effort — a failed broadcast falls back to
+    /// the lazy-admission path (the host learns about us on our
+    /// first `SendRequest`).
+    async fn publish_join_announcement(&self, session: SessionId, peer: PeerInfo) {
+        let sender = self
+            .sessions
+            .lock()
+            .await
+            .get(&session)
+            .map(|s| s.sender.clone());
+        let Some(sender) = sender else {
+            debug!(
+                ?session,
+                "publish_join_announcement: session has no gossip topic; dropping",
+            );
+            return;
+        };
+        let body = GossipBody::JoinAnnouncement {
+            peer,
+            timestamp_ms: now_ms(),
+        };
+        let bytes = Bytes::from(gossip::encode(&body));
+        if let Err(err) = sender.broadcast(bytes).await {
+            warn!(error = %err, "join_announcement broadcast failed");
         }
     }
 
@@ -355,11 +485,7 @@ impl GossipBridge {
             );
             return;
         };
-        let frame = GossipFrame {
-            version: gossip::GOSSIP_FRAME_VERSION,
-            body: GossipBody::SendAck { req_id, result },
-        };
-        let bytes = Bytes::from(gossip::encode(&frame));
+        let bytes = Bytes::from(gossip::encode(&GossipBody::SendAck { req_id, result }));
         if let Err(err) = sender.broadcast(bytes).await {
             warn!(error = %err, "send_ack broadcast failed");
         }
@@ -389,11 +515,63 @@ async fn handle_inbound_frame(
             let result = run_host_send(bridge, session, peer, payload).await;
             bridge.publish_send_ack(session, req_id, result).await;
         }
+        // Host receives a joiner's mesh-up announcement — admit them
+        // to the session's membership eagerly so `PeerJoined` lands
+        // on local IPC subscribers without waiting for a SendRequest.
+        // `ensure_member` is idempotent, so a duplicate announcement
+        // (or one that races with the lazy-admission path inside
+        // run_host_send) is harmless.
+        (
+            SessionRole::Host,
+            GossipBody::JoinAnnouncement {
+                peer,
+                timestamp_ms: _,
+            },
+        ) => {
+            let registry_weak = bridge.registry.lock().await.clone();
+            if let Some(registry) = registry_weak.upgrade()
+                && let Err(err) = registry.ensure_member(session, peer).await
+            {
+                warn!(?err, "join_announcement: ensure_member failed");
+            }
+        }
+        // Joiner receives the host's "I am closing this session"
+        // broadcast — drop the local mirror, emit
+        // `Event::SessionClosed`, and tear down our own bridge
+        // entry. Idempotent on the registry side, so a stray
+        // duplicate frame is harmless.
+        (SessionRole::Joiner { .. }, GossipBody::SessionClosed) => {
+            let registry_weak = bridge.registry.lock().await.clone();
+            if let Some(registry) = registry_weak.upgrade()
+                && let Err(err) = registry.host_closed_session(session).await
+            {
+                warn!(?err, "session_closed: host_closed_session failed");
+            }
+        }
+        // Host receives a joiner's `Replay` request — fetch the
+        // log entries with seq > since and re-broadcast each as
+        // a `Message` frame. Other joiners on the topic see the
+        // replay traffic too and dedup-skip it; that's wasteful
+        // but correct (see `GossipBody::Replay` doc-comment).
+        (SessionRole::Host, GossipBody::Replay { since }) => {
+            run_host_replay(bridge, session, since).await;
+        }
         // Host ignores its own Message+SendAck broadcasts (Registry
-        // already fanned out locally) and joiners ignore each other's
-        // SendRequests (only the host services them).
-        (SessionRole::Host, GossipBody::Message(_) | GossipBody::SendAck { .. })
-        | (SessionRole::Joiner { .. }, GossipBody::SendRequest { .. }) => {}
+        // already fanned out locally) and its own SessionClosed
+        // (we publish before forget_session, so the broadcast
+        // round-trips back here on the same forwarder); joiners
+        // ignore each other's SendRequests + JoinAnnouncements
+        // + Replays (only the host services them at this layer).
+        (
+            SessionRole::Host,
+            GossipBody::Message(_) | GossipBody::SendAck { .. } | GossipBody::SessionClosed,
+        )
+        | (
+            SessionRole::Joiner { .. },
+            GossipBody::SendRequest { .. }
+            | GossipBody::JoinAnnouncement { .. }
+            | GossipBody::Replay { .. },
+        ) => {}
 
         // Joiner receives the host's broadcast — push into the local
         // mirror's events_tx + log.
@@ -425,11 +603,11 @@ async fn run_host_send(
         // Daemon shutting down; nothing useful to say.
         return Err(ProtocolError::Internal("daemon shutting down".into()));
     };
-    // Lazy admission: a joiner's first SendRequest doubles as their
-    // arrival on this host. Without this, `Registry::send` would
-    // bounce the request as `NotMember`. A future slice can replace
-    // this with an explicit `JoinAnnouncement` gossip frame so the
-    // host emits `PeerJoined` proactively.
+    // Idempotent backstop: in the common case the joiner's
+    // `JoinAnnouncement` already drove ensure_member, but if the
+    // announcement broadcast was lost (or this SendRequest beat it
+    // through the mesh) we want to admit the peer here too. No-op
+    // when membership is already in place.
     if let Err(err) = registry.ensure_member(session, peer.clone()).await {
         return Err(session_error_to_wire(&err));
     }
@@ -444,6 +622,33 @@ async fn run_host_send(
     {
         Ok(message) => Ok(message),
         Err(err) => Err(session_error_to_wire(&err)),
+    }
+}
+
+/// Run the host-side reply to an inbound `Replay`. Snapshots the
+/// session's log via `Registry::log_since` and re-broadcasts each
+/// entry as a `Message` frame on the topic. Best-effort: any
+/// failure (registry gone, session unknown, broadcast hiccup) is
+/// logged at warn and the joiner falls back to whatever it
+/// already has.
+async fn run_host_replay(bridge: &Arc<GossipBridge>, session: SessionId, since: Seq) {
+    let registry_weak = bridge.registry.lock().await.clone();
+    let Some(registry) = registry_weak.upgrade() else {
+        return;
+    };
+    let messages = match registry.log_since(session, since).await {
+        Ok(msgs) => msgs,
+        Err(err) => {
+            warn!(?err, "replay: log_since failed");
+            return;
+        }
+    };
+    for msg in messages {
+        // Reuse the host's existing publish_message path so the
+        // wire shape is identical to live broadcasts. The joiner's
+        // mirror dedups by seq, so this is safe even if the
+        // joiner already has some of these entries.
+        bridge.publish_message(session, msg).await;
     }
 }
 

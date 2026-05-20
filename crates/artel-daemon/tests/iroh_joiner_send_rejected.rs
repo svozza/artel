@@ -1,8 +1,14 @@
-//! Phase 2c-2c: a joiner's `Send` is no longer rejected outright —
-//! it now round-trips via `SendRequest`/`SendAck`. This test
-//! exercises the *error* path of that round-trip: when the host has
-//! closed the session, the joiner's send must surface the host's
-//! actual rejection (not a flattened generic error or a timeout).
+//! 2c-2c added the joiner→host send round-trip via
+//! `SendRequest`/`SendAck`. 2c-2e made `LeaveSession` tear down
+//! the host's gossip topic. Follow-up (a) added the
+//! `SessionClosed` broadcast so joiners learn about the close
+//! proactively rather than via timeouts.
+//!
+//! This test exercises the resulting error path: after the host
+//! leaves and broadcasts `SessionClosed`, the joiner's mirror
+//! is gone, so a subsequent `Send` from the joiner's IPC client
+//! surfaces a specific `UnknownSession` (registry's verdict on
+//! the missing mirror) instead of a generic timeout.
 //!
 //! Own integration-test binary so it runs in a distinct process from
 //! the other iroh tests; see `tests/common/mod.rs` for the
@@ -12,8 +18,12 @@
 
 mod common;
 
+use std::time::Duration;
+
 use artel_client::Client;
-use artel_protocol::{MessageKind, PeerId, PeerInfo, Request, Response, SendPayload};
+use artel_protocol::{Event, MessageKind, PeerId, PeerInfo, Request, Response, SendPayload};
+use pretty_assertions::assert_eq;
+use tokio::time::timeout;
 
 #[tokio::test]
 async fn joiner_send_after_host_closes_surfaces_unknown_session() {
@@ -33,7 +43,9 @@ async fn joiner_send_after_host_closes_surfaces_unknown_session() {
         other => panic!("expected HostSession, got {other:?}"),
     };
 
-    // Bob on daemon B joins via the real ticket.
+    // Bob on daemon B joins and subscribes so we can wait for the
+    // SessionClosed event before sending — otherwise we race the
+    // close-broadcast and the test occasionally sees a timeout.
     let bob_client = Client::connect(&daemon_b.socket).await.unwrap();
     let bob = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
     bob_client
@@ -43,18 +55,45 @@ async fn joiner_send_after_host_closes_surfaces_unknown_session() {
         })
         .await
         .unwrap();
+    bob_client
+        .request(Request::Subscribe {
+            session: session_id,
+            since: None,
+        })
+        .await
+        .unwrap();
+    let mut bob_events = bob_client.take_events().await.expect("bob events");
 
-    // Alice closes the session before Bob sends. LeaveSession on the
-    // host removes the session from Alice's daemon; Bob's daemon
-    // doesn't yet know (no leave-broadcast yet — that's a future
-    // slice). The bridge keeps Bob's gossip topic alive so the
-    // SendRequest still gets out.
+    // Alice closes the session. The host-side bridge broadcasts
+    // SessionClosed before tearing down its topic; Bob's
+    // forwarder picks it up, drops his local mirror, and emits
+    // Event::SessionClosed to his IPC subscribers.
     alice_client
         .request(Request::LeaveSession {
             session: session_id,
         })
         .await
         .unwrap();
+
+    // Wait for Bob to observe the close before sending. Filter past
+    // any Message/PeerJoined that may interleave.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "bob never observed SessionClosed for the host's leave",
+        );
+        let event = match timeout(remaining, bob_events.recv()).await {
+            Ok(Some(ev)) => ev,
+            Ok(None) => panic!("bob's events channel closed"),
+            Err(_) => continue,
+        };
+        if let Event::SessionClosed { session } = event {
+            assert_eq!(session, session_id);
+            break;
+        }
+    }
 
     let send_err = bob_client
         .request(Request::Send {
@@ -68,16 +107,15 @@ async fn joiner_send_after_host_closes_surfaces_unknown_session() {
         .await
         .unwrap_err();
 
-    // Alice's daemon answered with UnknownSession (the session is
-    // gone from her registry); the bridge ferried that back as a
-    // SendAck.Err, the joiner-side Registry forwarded it as
-    // HostRejected, and the IPC dispatch flattened to the host's
-    // verdict — we should see UnknownSession on the wire.
+    // Bob's mirror is gone, so the registry rejects the send
+    // outright with UnknownSession — no gossip round-trip, no
+    // timeout. That's the specific-reason behaviour the
+    // SessionClosed frame restored.
     match send_err {
         artel_client::ClientError::Protocol(artel_protocol::ProtocolError::UnknownSession(id)) => {
             assert_eq!(id, session_id);
         }
-        other => panic!("expected UnknownSession on the wire, got {other:?}"),
+        other => panic!("expected UnknownSession, got {other:?}"),
     }
 
     drop(alice_client);

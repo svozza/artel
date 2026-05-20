@@ -31,7 +31,7 @@ pub(crate) mod memory;
 pub(crate) use fs::FsLogStore;
 #[cfg(test)]
 pub(crate) use memory::MemoryStore;
-pub(crate) use record::SessionRecord;
+pub(crate) use record::{SessionKind, SessionRecord};
 
 use std::io;
 use std::sync::Arc;

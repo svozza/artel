@@ -25,7 +25,7 @@ use artel_protocol::{
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, broadcast};
 
-use crate::store::{DynStore, SessionRecord};
+use crate::store::{DynStore, SessionKind, SessionRecord};
 
 /// Capacity of the per-session broadcast channel.
 ///
@@ -117,18 +117,6 @@ pub struct Subscription {
     pub events: broadcast::Receiver<Event>,
 }
 
-/// Whether this daemon owns the authoritative log for the session
-/// or is mirroring another daemon's.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SessionKind {
-    /// Originated via [`Registry::host`] on this daemon. We assign
-    /// seqs and serve the canonical log.
-    Local,
-    /// Materialised via [`Registry::join`] for a ticket whose host
-    /// lives elsewhere. Log entries flow in over gossip.
-    Remote,
-}
-
 /// One active session.
 #[derive(Debug)]
 pub struct Session {
@@ -157,15 +145,16 @@ impl Session {
         }
     }
 
-    /// Hydrate from a persisted [`SessionRecord`]. Kind defaults to
-    /// `Local` for now; Phase 2c-2c will persist the discriminator
-    /// so remote mirrors survive daemon restart.
+    /// Hydrate from a persisted [`SessionRecord`]. The record's
+    /// `kind` is authoritative — a `Remote` mirror rehydrates as
+    /// `Remote` so it doesn't try to assign seqs locally after a
+    /// daemon restart.
     fn from_record(record: SessionRecord) -> Self {
         let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Self {
             id: record.id,
             host: record.host,
-            kind: SessionKind::Local,
+            kind: record.kind,
             members: record.members,
             log: record.log,
             head: record.head,
@@ -181,6 +170,7 @@ impl Session {
             members: self.members.clone(),
             head: self.head,
             log: self.log.clone(),
+            kind: self.kind,
         }
     }
 
@@ -343,8 +333,13 @@ impl Registry {
             // Remote session: not yet known locally. Materialise
             // a mirror and wire up the gossip bridge so the host's
             // messages start flowing in.
-            self.materialise_remote_session(session_id, &parsed.host_peer_id, &parsed.host_addr)
-                .await?
+            self.materialise_remote_session(
+                session_id,
+                &parsed.host_peer_id,
+                &parsed.host_addr,
+                &peer,
+            )
+            .await?
         };
 
         // Hold the session lock across the store write so a concurrent
@@ -387,13 +382,14 @@ impl Registry {
         session_id: SessionId,
         host_peer_id: &PeerId,
         host_addr: &WireEndpointAddr,
+        joiner: &PeerInfo,
     ) -> Result<Arc<Mutex<Session>>, SessionError> {
         // Without the `iroh` feature, there's no way to actually
         // reach the host; refuse cleanly rather than silently
         // creating an unreachable session.
         #[cfg(not(feature = "iroh"))]
         {
-            let _ = (host_peer_id, host_addr);
+            let _ = (host_peer_id, host_addr, joiner);
             tracing::debug!(
                 ?session_id,
                 "remote ticket received but iroh feature is off",
@@ -450,12 +446,22 @@ impl Registry {
                 // mpsc.
                 tokio::spawn(async move {
                     let mut s = mirror.lock().await;
-                    if msg.seq <= s.head {
-                        // Duplicate or out-of-order replay; drop.
+                    // Insert by seq, skipping duplicates. Messages
+                    // can arrive out-of-order when a Replay is
+                    // landing alongside live broadcasts (joiner
+                    // asked for history, host re-emitted older
+                    // seqs). The log is kept sorted so subsequent
+                    // `Subscribe { since }` replays from the
+                    // mirror are coherent.
+                    let pos = s.log.partition_point(|m| m.seq < msg.seq);
+                    if pos < s.log.len() && s.log[pos].seq == msg.seq {
+                        // Duplicate; drop quietly.
                         return;
                     }
-                    s.head = msg.seq;
-                    s.log.push(msg.clone());
+                    s.log.insert(pos, msg.clone());
+                    if msg.seq > s.head {
+                        s.head = msg.seq;
+                    }
                     let _ = s.events_tx.send(Event::Message {
                         session: session_for_log,
                         message: msg,
@@ -466,7 +472,13 @@ impl Registry {
             let host_endpoint_addr =
                 wire_addr_to_iroh(host_peer_id, host_addr).map_err(SessionError::InvalidAddr)?;
             bridge
-                .join_session(session_id, *host_peer_id, host_endpoint_addr, on_message)
+                .join_session(
+                    session_id,
+                    joiner.clone(),
+                    *host_peer_id,
+                    host_endpoint_addr,
+                    on_message,
+                )
                 .await
                 .map_err(|e| SessionError::Internal(e.to_string()))?;
 
@@ -519,6 +531,18 @@ impl Registry {
 
         if session_closed {
             self.sessions.write().await.remove(&session);
+            // Tear down the bridge's per-session topic state so the
+            // forwarder task exits and `bridge.sessions` doesn't grow
+            // unbounded across host-and-close cycles. Best-effort;
+            // the IPC client has already been told the leave
+            // succeeded. Publish `SessionClosed` first so joiners
+            // see the close before the gossip topic goes silent;
+            // forget_session drops the topic immediately after.
+            #[cfg(feature = "iroh")]
+            if let Some(bridge) = &self.bridge {
+                bridge.publish_session_closed(session).await;
+                bridge.forget_session(session).await;
+            }
         }
         Ok(())
     }
@@ -538,11 +562,11 @@ impl Registry {
 
     /// Ensure `peer` is a member of `session`. No-op if they
     /// already are. Used by the gossip bridge on the host side to
-    /// lazily admit a remote joiner the first time their inbound
-    /// `SendRequest` lands — we don't yet have a `JoinAnnouncement`
-    /// frame, so the host's `Registry` learns about the joiner via
-    /// their first send. Persists the membership change and emits
-    /// [`Event::PeerJoined`] when the peer is newly added.
+    /// admit a remote joiner — typically driven by an inbound
+    /// `JoinAnnouncement` frame, with `SendRequest` as an
+    /// idempotent backstop in case the announcement was lost or
+    /// arrives out of order. Persists the membership change and
+    /// emits [`Event::PeerJoined`] when the peer is newly added.
     ///
     /// Returns `Err(UnknownSession)` if `session` doesn't exist on
     /// this daemon. Other failures surface the underlying
@@ -575,6 +599,85 @@ impl Registry {
         let events_tx = s.events_tx.clone();
         drop(s);
         let _ = events_tx.send(Event::PeerJoined { session, peer });
+        Ok(())
+    }
+
+    /// Snapshot every message in `session`'s log with `seq > since`.
+    /// Used by the host's gossip bridge to answer a joiner's
+    /// `Replay` request — we re-broadcast each entry as a
+    /// `Message` frame and the joiner's mirror dedups by seq.
+    ///
+    /// Returns `Err(UnknownSession)` if `session` doesn't exist on
+    /// this daemon. Returns an empty Vec if the joiner is already
+    /// caught up.
+    #[cfg(feature = "iroh")]
+    pub(crate) async fn log_since(
+        &self,
+        session: SessionId,
+        since: Seq,
+    ) -> Result<Vec<SessionMessage>, SessionError> {
+        let session_arc = {
+            let guard = self.sessions.read().await;
+            guard
+                .get(&session)
+                .cloned()
+                .ok_or(SessionError::UnknownSession(session))?
+        };
+        let s = session_arc.lock().await;
+        Ok(s.log.iter().filter(|m| m.seq > since).cloned().collect())
+    }
+
+    /// Drop a remote-mirror session because the host has signalled
+    /// (via [`GossipBody::SessionClosed`]) that they're closing it.
+    /// Deletes the persisted record, removes the in-memory session,
+    /// emits [`Event::SessionClosed`] to local IPC subscribers, and
+    /// tears down the bridge's per-session topic state. Idempotent:
+    /// if the session is already gone (or was never `Remote`)
+    /// returns `Ok(())` so a duplicate close broadcast doesn't
+    /// surface as an error.
+    ///
+    /// Only meaningful for `Remote` sessions — the host's own
+    /// close path is `Registry::leave(session, host_peer)`. We
+    /// guard against the wrong kind defensively so a misrouted
+    /// frame from a hostile peer can't poison a local session.
+    ///
+    /// [`GossipBody::SessionClosed`]: artel_protocol::gossip::GossipBody::SessionClosed
+    #[cfg(feature = "iroh")]
+    pub(crate) async fn host_closed_session(&self, session: SessionId) -> Result<(), SessionError> {
+        let session_arc = {
+            let guard = self.sessions.read().await;
+            guard.get(&session).cloned()
+        };
+        let Some(session_arc) = session_arc else {
+            // Already closed (or never present). Nothing to do.
+            return Ok(());
+        };
+        {
+            let s = session_arc.lock().await;
+            if s.kind != SessionKind::Remote {
+                tracing::warn!(?session, "ignoring SessionClosed for a non-remote session",);
+                return Ok(());
+            }
+        }
+
+        self.store
+            .delete(session)
+            .await
+            .map_err(SessionError::Storage)?;
+
+        // Snapshot the broadcast channel so we can fire the
+        // SessionClosed event after dropping the per-session
+        // arc — same shape as `send` and `ensure_member`.
+        let events_tx = {
+            let s = session_arc.lock().await;
+            s.events_tx.clone()
+        };
+        self.sessions.write().await.remove(&session);
+        let _ = events_tx.send(Event::SessionClosed { session });
+
+        if let Some(bridge) = &self.bridge {
+            bridge.forget_session(session).await;
+        }
         Ok(())
     }
 
@@ -1138,5 +1241,177 @@ mod tests {
         r.host(host).await.unwrap();
         let summaries = r.list().await;
         assert!(summaries[0].is_host);
+    }
+
+    // ---- rehydrate with persisted SessionKind ----
+
+    use crate::store::SessionStore;
+
+    #[tokio::test]
+    async fn load_rehydrates_remote_session_with_remote_kind() {
+        // Pre-populate a store with a Remote-kind record (the shape
+        // a daemon would have on disk after joining a remote
+        // session and being restarted), load a registry on top of
+        // it, and verify that local Send refuses to assign seqs —
+        // i.e. the kind survived the round trip.
+        let daemon_peer = PeerId::from_bytes([7; 32]);
+        let remote_host = peer(1, "alice");
+        let session_id = SessionId::from_bytes([0xaa; 16]);
+        let me = peer(2, "bob");
+
+        let store = Arc::new(crate::store::MemoryStore::new());
+        let record = SessionRecord {
+            id: session_id,
+            host: remote_host.id,
+            members: HashSet::from([remote_host.id, me.id]),
+            head: Seq::ZERO,
+            log: Vec::new(),
+            kind: SessionKind::Remote,
+        };
+        store.create(&record).await.unwrap();
+
+        let r = Registry::load(
+            daemon_peer,
+            WireEndpointAddr::id_only(daemon_peer),
+            store,
+            #[cfg(feature = "iroh")]
+            None,
+        )
+        .await
+        .unwrap();
+
+        let err = r
+            .send(session_id, me, MessageKind::Chat, "x".into(), vec![], 0)
+            .await
+            .unwrap_err();
+        // Without the iroh feature the registry surfaces NotHost
+        // directly. With iroh on but no bridge attached, the
+        // Remote-send branch reports the missing bridge as Internal —
+        // either way confirms the kind was persisted as Remote
+        // (a Local rehydrate would have just appended locally).
+        #[cfg(feature = "iroh")]
+        assert!(
+            matches!(&err, SessionError::Internal(msg) if msg.contains("remote send")),
+            "expected internal-no-bridge, got {err:?}",
+        );
+        #[cfg(not(feature = "iroh"))]
+        assert_eq!(err, SessionError::NotHost);
+    }
+
+    // ---- host_closed_session (joiner-side mirror teardown) ----
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn host_closed_session_drops_remote_mirror_and_emits_event() {
+        // Stand up a Remote-kind mirror by hand (no live bridge —
+        // host_closed_session only consults bridge if Some, so a
+        // None bridge is the right shape for this unit test).
+        let daemon_peer = PeerId::from_bytes([7; 32]);
+        let remote_host = peer(1, "alice");
+        let session_id = SessionId::from_bytes([0xaa; 16]);
+        let me = peer(2, "bob");
+
+        let store = Arc::new(crate::store::MemoryStore::new());
+        let record = SessionRecord {
+            id: session_id,
+            host: remote_host.id,
+            members: HashSet::from([remote_host.id, me.id]),
+            head: Seq::ZERO,
+            log: Vec::new(),
+            kind: SessionKind::Remote,
+        };
+        store.create(&record).await.unwrap();
+
+        let r = Registry::load(
+            daemon_peer,
+            WireEndpointAddr::id_only(daemon_peer),
+            store.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut sub = r.subscribe(session_id, None).await.unwrap();
+
+        r.host_closed_session(session_id).await.unwrap();
+
+        let event = timeout(Duration::from_millis(100), sub.events.recv())
+            .await
+            .expect("event")
+            .unwrap();
+        assert_eq!(
+            event,
+            Event::SessionClosed {
+                session: session_id
+            }
+        );
+        assert!(r.list().await.is_empty(), "mirror should be gone");
+        assert!(
+            store.load_all().await.unwrap().is_empty(),
+            "persisted record should be deleted",
+        );
+
+        // Idempotency: a duplicate close broadcast (or one that
+        // races with a manual leave) shouldn't surface as an error.
+        r.host_closed_session(session_id).await.unwrap();
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn log_since_returns_only_messages_after_cursor() {
+        let r = registry();
+        let host = peer(1, "alice");
+        let (id, _) = r.host(host.clone()).await.unwrap();
+
+        let s1 = r
+            .send(id, host.clone(), MessageKind::Chat, "1".into(), vec![], 0)
+            .await
+            .unwrap();
+        let _s2 = r
+            .send(id, host.clone(), MessageKind::Chat, "2".into(), vec![], 0)
+            .await
+            .unwrap();
+        let _s3 = r
+            .send(id, host, MessageKind::Chat, "3".into(), vec![], 0)
+            .await
+            .unwrap();
+
+        // since = ZERO returns the full log.
+        let all = r.log_since(id, Seq::ZERO).await.unwrap();
+        assert_eq!(all.len(), 3);
+
+        // since = s1 skips the first.
+        let after_s1 = r.log_since(id, s1.seq).await.unwrap();
+        let actions: Vec<&str> = after_s1.iter().map(|m| m.action.as_str()).collect();
+        assert_eq!(actions, vec!["2", "3"]);
+
+        // since past head returns empty.
+        let past = r.log_since(id, Seq::new(99)).await.unwrap();
+        assert!(past.is_empty());
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn log_since_unknown_session_errors() {
+        let r = registry();
+        let bogus = SessionId::new_random();
+        let err = r.log_since(bogus, Seq::ZERO).await.unwrap_err();
+        assert_eq!(err, SessionError::UnknownSession(bogus));
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn host_closed_session_ignores_local_session() {
+        // Defensive: a misrouted SessionClosed for a Local session
+        // shouldn't take it down. The host's own close path is
+        // `Registry::leave(session, host_peer)`, not this one.
+        let r = registry();
+        let host = peer(1, "alice");
+        let (id, _) = r.host(host).await.unwrap();
+
+        r.host_closed_session(id).await.unwrap();
+
+        // Session is still here.
+        assert_eq!(r.list().await.len(), 1);
     }
 }

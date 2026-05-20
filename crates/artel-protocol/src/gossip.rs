@@ -1,20 +1,21 @@
-//! Wire envelope for inter-daemon gossip traffic.
+//! Wire frames for inter-daemon gossip traffic.
 //!
 //! When two daemons share a session via iroh-gossip, every payload
-//! they exchange on the topic is a postcard-encoded
-//! [`GossipFrame`]. Lives in `artel-protocol` so both sides agree
-//! on the bytes without pulling iroh into the protocol crate.
+//! they exchange on the topic is a postcard-encoded [`GossipBody`].
+//! Lives in `artel-protocol` so both sides agree on the bytes
+//! without pulling iroh into the protocol crate.
 //!
 //! ## Frame model
 //!
-//! Phase 2c-2c rounds out send fanout in both directions, all over
-//! the same gossip topic:
+//! All inter-daemon traffic — both directions — rides the same
+//! gossip topic. The protocol stays symmetric so we can drop the
+//! host-as-sequencer model later without ripping out a transport.
 //!
 //! - **Host → all.** Each freshly-sequenced [`SessionMessage`] is
 //!   wrapped in [`GossipBody::Message`] and broadcast. Joiners
 //!   decode and forward to their local IPC subscribers; the
-//!   originating joiner uses it as the ack for its own outbound
-//!   send (see below).
+//!   originating joiner uses it as the data path for its own
+//!   outbound send (see below).
 //! - **Joiner → host.** A joiner-side `Send` IPC call publishes a
 //!   [`GossipBody::SendRequest`] carrying a `req_id`, the
 //!   originating peer info, and the application payload. The host's
@@ -24,42 +25,32 @@
 //!   carrying the assigned [`SessionMessage`] on success or the
 //!   host's [`ProtocolError`] on rejection. The joiner correlates
 //!   the ack to its in-flight oneshot via `req_id`.
+//! - **Joiner → host (membership).** Once the gossip mesh is up, a
+//!   joiner broadcasts a [`GossipBody::JoinAnnouncement`] so the
+//!   host can admit them to membership and emit `PeerJoined`
+//!   eagerly, rather than waiting for their first `SendRequest`.
 //!
-//! Routing everything through gossip (rather than a dedicated
-//! direct-QUIC sidechannel) is deliberate: the protocol stays
-//! symmetric so we can drop the host-as-sequencer model later
-//! without ripping out a transport.
+//! ## No wire versioning yet
 //!
-//! ## Versioning
-//!
-//! Carried as the leading byte ([`GOSSIP_FRAME_VERSION`]). Bumped
-//! when a structural change makes older daemons unable to parse.
-//! v2 added [`GossipBody::SendRequest`] and [`GossipBody::SendAck`].
+//! Pre-1.0, both daemons rebuild together; we have zero on-the-wire
+//! compatibility surface to defend. Adding a wire-version envelope
+//! later is ~30 lines (struct + decode check + error variant) and
+//! by then we'll have a real story for capability negotiation
+//! anyway. Until then, an unrecognised frame surfaces as
+//! [`GossipFrameError::Malformed`] from postcard and is dropped at
+//! the bridge with a warn log.
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::ProtocolError;
+use crate::ids::Seq;
 use crate::message::{PeerInfo, SessionMessage};
 use crate::rpc::SendPayload;
 
-/// Current envelope version. Receivers that see a different version
-/// drop the frame with [`GossipFrameError::UnsupportedVersion`]. v2
-/// added the joiner→host send path.
-pub const GOSSIP_FRAME_VERSION: u8 = 2;
-
-/// One frame on a session's gossip topic.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GossipFrame {
-    /// Envelope version. Only [`GOSSIP_FRAME_VERSION`] is currently
-    /// understood; receivers reject anything else with
-    /// [`GossipFrameError::UnsupportedVersion`].
-    pub version: u8,
-    /// The actual payload.
-    pub body: GossipBody,
-}
-
-/// Frame payloads. Externally tagged (postcard-friendly).
+/// One frame on a session's gossip topic. Externally tagged so
+/// postcard can serialise it (see workspace memo on postcard +
+/// `tag`/`content`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GossipBody {
     /// Authoritative session message published by the host.
@@ -96,45 +87,67 @@ pub enum GossipBody {
         /// than a generic timeout.
         result: Result<SessionMessage, ProtocolError>,
     },
+
+    /// Joiner-published announcement that they have subscribed to
+    /// this session's topic. The host admits the peer to the
+    /// session's membership on receipt (idempotent, so a duplicate
+    /// announcement is harmless). Lets the host emit `PeerJoined`
+    /// proactively rather than lazily on the joiner's first
+    /// `SendRequest`.
+    JoinAnnouncement {
+        /// The joining peer's identity.
+        peer: PeerInfo,
+        /// Joiner-local wall-clock millis at the moment they
+        /// finished subscribing. Carried so the host's
+        /// `PeerJoined` event has a meaningful timestamp; not
+        /// otherwise interpreted.
+        timestamp_ms: u64,
+    },
+
+    /// Host-published broadcast that the session has been closed.
+    /// Sent on the way out of `Registry::leave` (host-closes path)
+    /// so joiners learn the truth proactively instead of
+    /// discovering it via a `SendRequest` that never gets acked.
+    /// On receipt, joiners drop their local mirror and emit
+    /// `Event::SessionClosed` to their IPC subscribers.
+    SessionClosed,
+
+    /// Joiner-published request asking the host to replay every
+    /// committed message with `seq > since`. The host's response
+    /// is plain [`GossipBody::Message`] frames re-broadcast on the
+    /// same topic; the joiner's mirror dedups by seq, so a Message
+    /// that arrives twice (once live, once via replay) is harmless.
+    ///
+    /// Carries no correlation id: replay is fire-and-forget, and
+    /// every `Message` already carries its own seq for ordering.
+    /// Other joiners on the topic see the replay traffic too and
+    /// dedup-skip it — wasteful but not incorrect; can be tightened
+    /// later (e.g. unicast over a dedicated stream) if it matters.
+    Replay {
+        /// Highest seq the joiner has already seen. The host
+        /// re-broadcasts every committed message with `seq > since`.
+        /// Use [`Seq::ZERO`] to ask for the full log.
+        since: Seq,
+    },
 }
 
 /// Errors [`decode`] may return.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum GossipFrameError {
-    /// Bytes did not deserialize as a [`GossipFrame`].
+    /// Bytes did not deserialize as a [`GossipBody`].
     #[error("malformed gossip frame: {0}")]
     Malformed(String),
-
-    /// Frame version does not match what this build understands.
-    #[error("unsupported gossip frame version {0} (this build speaks v{GOSSIP_FRAME_VERSION})")]
-    UnsupportedVersion(u8),
 }
 
-/// Encode `frame` to the bytes broadcast on the gossip topic.
+/// Encode `body` to the bytes broadcast on the gossip topic.
 #[must_use]
-pub fn encode(frame: &GossipFrame) -> Vec<u8> {
-    postcard::to_stdvec(frame).expect("postcard encode of fixed-shape types")
+pub fn encode(body: &GossipBody) -> Vec<u8> {
+    postcard::to_stdvec(body).expect("postcard encode of fixed-shape types")
 }
 
-/// Decode `bytes` into a [`GossipFrame`]. Rejects unknown versions
-/// up front so we never partially-deserialize garbage.
-pub fn decode(bytes: &[u8]) -> Result<GossipFrame, GossipFrameError> {
-    let frame: GossipFrame =
-        postcard::from_bytes(bytes).map_err(|e| GossipFrameError::Malformed(e.to_string()))?;
-    if frame.version != GOSSIP_FRAME_VERSION {
-        return Err(GossipFrameError::UnsupportedVersion(frame.version));
-    }
-    Ok(frame)
-}
-
-/// Convenience: build a [`GossipFrame`] wrapping a session message
-/// at the current envelope version.
-#[must_use]
-pub const fn message_frame(msg: SessionMessage) -> GossipFrame {
-    GossipFrame {
-        version: GOSSIP_FRAME_VERSION,
-        body: GossipBody::Message(msg),
-    }
+/// Decode `bytes` into a [`GossipBody`].
+pub fn decode(bytes: &[u8]) -> Result<GossipBody, GossipFrameError> {
+    postcard::from_bytes(bytes).map_err(|e| GossipFrameError::Malformed(e.to_string()))
 }
 
 #[cfg(test)]
@@ -166,89 +179,78 @@ mod tests {
 
     #[test]
     fn message_frame_round_trips() {
-        let frame = message_frame(sample_msg());
-        let bytes = encode(&frame);
+        let body = GossipBody::Message(sample_msg());
+        let bytes = encode(&body);
         let decoded = decode(&bytes).unwrap();
-        assert_eq!(decoded, frame);
+        assert_eq!(decoded, body);
     }
 
     #[test]
     fn send_request_frame_round_trips() {
-        let frame = GossipFrame {
-            version: GOSSIP_FRAME_VERSION,
-            body: GossipBody::SendRequest {
-                req_id: Uuid::from_u128(0x4242_4242_4242_4242_4242_4242_4242_4242),
-                peer: PeerInfo::new(PeerId::from_bytes([3; 32]), "bob"),
-                payload: sample_payload(),
-            },
+        let body = GossipBody::SendRequest {
+            req_id: Uuid::from_u128(0x4242_4242_4242_4242_4242_4242_4242_4242),
+            peer: PeerInfo::new(PeerId::from_bytes([3; 32]), "bob"),
+            payload: sample_payload(),
         };
-        let bytes = encode(&frame);
+        let bytes = encode(&body);
         let decoded = decode(&bytes).unwrap();
-        assert_eq!(decoded, frame);
+        assert_eq!(decoded, body);
     }
 
     #[test]
     fn send_ack_ok_frame_round_trips() {
-        let frame = GossipFrame {
-            version: GOSSIP_FRAME_VERSION,
-            body: GossipBody::SendAck {
-                req_id: Uuid::from_u128(0x1),
-                result: Ok(sample_msg()),
-            },
+        let body = GossipBody::SendAck {
+            req_id: Uuid::from_u128(0x1),
+            result: Ok(sample_msg()),
         };
-        let bytes = encode(&frame);
+        let bytes = encode(&body);
         let decoded = decode(&bytes).unwrap();
-        assert_eq!(decoded, frame);
+        assert_eq!(decoded, body);
     }
 
     #[test]
     fn send_ack_err_frame_round_trips() {
-        let frame = GossipFrame {
-            version: GOSSIP_FRAME_VERSION,
-            body: GossipBody::SendAck {
-                req_id: Uuid::from_u128(0x2),
-                result: Err(ProtocolError::Internal("session closed".into())),
-            },
+        let body = GossipBody::SendAck {
+            req_id: Uuid::from_u128(0x2),
+            result: Err(ProtocolError::Internal("session closed".into())),
         };
-        let bytes = encode(&frame);
+        let bytes = encode(&body);
         let decoded = decode(&bytes).unwrap();
-        assert_eq!(decoded, frame);
+        assert_eq!(decoded, body);
     }
 
     #[test]
-    fn unknown_version_byte_errors_clearly() {
-        // Hand-craft a frame with version 99, encode, and verify
-        // decode rejects without touching the body.
-        let bogus = GossipFrame {
-            version: 99,
-            body: GossipBody::Message(sample_msg()),
-        };
-        let bytes = postcard::to_stdvec(&bogus).unwrap();
-        assert_eq!(
-            decode(&bytes),
-            Err(GossipFrameError::UnsupportedVersion(99))
-        );
+    fn session_closed_frame_round_trips() {
+        let body = GossipBody::SessionClosed;
+        let bytes = encode(&body);
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded, body);
     }
 
     #[test]
-    fn v1_frame_is_rejected_by_v2_decoder() {
-        // A peer running an older build still emits version=1 on
-        // the wire. We must surface that as UnsupportedVersion
-        // rather than misparsing — the body shape changed
-        // (variants added) so postcard's discriminator is no
-        // longer trustworthy across versions.
-        let stale = GossipFrame {
-            version: 1,
-            body: GossipBody::Message(sample_msg()),
+    fn replay_frame_round_trips() {
+        let body = GossipBody::Replay {
+            since: Seq::new(42),
         };
-        let bytes = postcard::to_stdvec(&stale).unwrap();
-        assert_eq!(decode(&bytes), Err(GossipFrameError::UnsupportedVersion(1)));
+        let bytes = encode(&body);
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn join_announcement_frame_round_trips() {
+        let body = GossipBody::JoinAnnouncement {
+            peer: PeerInfo::new(PeerId::from_bytes([4; 32]), "carol"),
+            timestamp_ms: 1_700_000_000_000,
+        };
+        let bytes = encode(&body);
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded, body);
     }
 
     #[test]
     fn truncated_bytes_error_as_malformed() {
-        let frame = message_frame(sample_msg());
-        let bytes = encode(&frame);
+        let bytes = encode(&GossipBody::Message(sample_msg()));
         let truncated = &bytes[..bytes.len() / 2];
         match decode(truncated) {
             Err(GossipFrameError::Malformed(_)) => {}

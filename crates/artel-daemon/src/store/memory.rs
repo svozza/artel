@@ -20,6 +20,8 @@ use std::sync::Mutex;
 use artel_protocol::{PeerId, PeerInfo, SessionId, SessionMessage};
 use async_trait::async_trait;
 
+#[cfg(test)]
+use super::SessionKind;
 use super::{SessionRecord, SessionStore};
 
 /// In-memory store. Cheap to construct; tests use one per scenario.
@@ -104,6 +106,7 @@ mod tests {
             members: HashSet::from([PeerId::from_bytes([1; 32])]),
             head: Seq::ZERO,
             log: Vec::new(),
+            kind: SessionKind::Local,
         }
     }
 
@@ -174,5 +177,16 @@ mod tests {
     async fn delete_unknown_is_noop() {
         let store = MemoryStore::new();
         store.delete(SessionId::from_bytes([9; 16])).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_kind_round_trips_through_create_load() {
+        let store = MemoryStore::new();
+        let mut r = record();
+        r.kind = SessionKind::Remote;
+        store.create(&r).await.unwrap();
+        let loaded = store.load_all().await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].kind, SessionKind::Remote);
     }
 }

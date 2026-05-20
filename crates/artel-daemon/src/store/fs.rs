@@ -29,7 +29,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use super::{SessionRecord, SessionStore};
+use super::{SessionKind, SessionRecord, SessionStore};
 
 /// Maximum size of one log frame's payload, in bytes. Same cap as the
 /// IPC transport — a frame too big to send over IPC isn't worth
@@ -199,6 +199,12 @@ struct Meta {
     host: PeerId,
     members: HashSet<PeerId>,
     head: Seq,
+    /// Whether the daemon hosts this session or mirrors it. Added
+    /// in 2c-2e; old meta files without this field deserialise to
+    /// `SessionKind::Local`, which is correct retroactively (pre-
+    /// 2c-2e there was no way for a remote mirror to reach disk).
+    #[serde(default)]
+    kind: SessionKind,
 }
 
 impl Meta {
@@ -210,6 +216,7 @@ impl Meta {
             host: r.host,
             members: r.members.clone(),
             head: r.head,
+            kind: r.kind,
         }
     }
 }
@@ -240,6 +247,7 @@ fn load_one(dir: &Path) -> io::Result<SessionRecord> {
         members: meta.members,
         head: meta.head,
         log,
+        kind: meta.kind,
     })
 }
 
@@ -425,6 +433,7 @@ mod tests {
             members: HashSet::from([PeerId::from_bytes([id_byte; 32])]),
             head: Seq::ZERO,
             log: Vec::new(),
+            kind: SessionKind::Local,
         }
     }
 
@@ -614,6 +623,53 @@ mod tests {
         let store = FsLogStore::open(dir.path()).unwrap();
         let loaded = store.load_all().await.unwrap();
         assert!(loaded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_kind_round_trips() {
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        let mut r = record(1);
+        r.kind = SessionKind::Remote;
+        store.create(&r).await.unwrap();
+
+        let loaded = FsLogStore::open(dir.path())
+            .unwrap()
+            .load_all()
+            .await
+            .unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].kind, SessionKind::Remote);
+    }
+
+    #[tokio::test]
+    async fn legacy_meta_without_kind_field_defaults_to_local() {
+        // Pre-2c-2e meta.json files don't have a `kind` field. Old
+        // records were always host-local in practice, so #[serde(default)]
+        // → SessionKind::Local is correct retroactively.
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        let r = record(1);
+        store.create(&r).await.unwrap();
+
+        // Strip the `kind` field by re-writing meta.json with the
+        // legacy shape (just the four fields that existed pre-2c-2e).
+        let meta_path = dir.path().join(r.id.to_string()).join(META_FILE);
+        let legacy = serde_json::json!({
+            "version": Meta::CURRENT_VERSION,
+            "host": r.host,
+            "members": r.members,
+            "head": r.head,
+        });
+        std::fs::write(&meta_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+        let loaded = FsLogStore::open(dir.path())
+            .unwrap()
+            .load_all()
+            .await
+            .unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].kind, SessionKind::Local);
     }
 
     #[tokio::test]

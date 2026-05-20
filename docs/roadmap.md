@@ -19,12 +19,15 @@ along the way.
 | `artel-client` | Stateless multiplexed client + `artel` CLI binary + `connect_or_spawn`. Done. |
 | `artel-fs` | Stub. |
 
-197 tests passing. fmt + clippy clean in both feature modes (with and
+247 tests passing. fmt + clippy clean in both feature modes (with and
 without `--all-features`). CI runs ubuntu + macos on stable; workspace
 `rust-version` is 1.95.
 
-The substrate works end-to-end on a single machine with synthetic peer
-ids — not yet a real P2P system. The remaining work makes it one.
+The substrate is now a real P2P system at the daemon layer: two
+daemons cross-seed addresses over iroh-gossip and host/joiner
+messaging round-trips through ack-correlated gossip frames, with
+sessions persisting across restarts. `artel-fs` is the next slice
+that builds the user-visible filesystem-sync layer on top.
 
 ## Phase 1: client auto-spawn — DONE
 
@@ -356,6 +359,14 @@ Listed for completeness, no detailed plan yet:
 - **N-1 protocol-version compatibility.** Today version mismatch is
   fatal. Some scheme that lets a daemon serve clients one version
   behind would smooth upgrades.
+- **Wire versioning for gossip frames.** Pre-1.0 we deliberately
+  removed the `GossipFrame { version, body }` envelope: both
+  daemons rebuild together and an unrecognised body just surfaces
+  as `GossipFrameError::Malformed`. Before the first real release
+  we'll want a proper capability-negotiation story (or, at minimum,
+  re-introduce a leading version byte) so daemons across versions
+  can refuse cleanly instead of swallowing garbage. Cheap to add —
+  ~30 lines plus tests — and the right time is the v1 cutover.
 - **Observability.** Structured metrics endpoint, `collab-daemon list`
   → `artel sessions inspect <id>` deeper view.
 - **Symmetric P2P.** ADR-001 § "Future evolution" — drop the
