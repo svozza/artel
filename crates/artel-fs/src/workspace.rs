@@ -390,24 +390,47 @@ impl Workspace {
         &self.doc
     }
 
-    /// Spawn the watcher + applier background tasks.
+    /// Spawn the watcher + applier background tasks, **awaiting**
+    /// the watcher's OS-level attach before returning.
     ///
     /// - The watcher debounces filesystem events under [`Self::root`]
     ///   and publishes them into the doc.
     /// - The applier subscribes to [`Doc::subscribe`] and applies
     ///   `InsertRemote` / `ContentReady` events to disk.
     ///
+    /// When this future resolves, the OS-level filesystem watch is
+    /// guaranteed to be attached — any subsequent write under
+    /// [`Self::root`] will reach the watcher. This ordering matters
+    /// because callers (most often a peer-driven test or production
+    /// flow) typically write to [`Self::root`] right after `run()`
+    /// completes; without the attach guarantee, those writes can
+    /// race ahead of the watcher and be silently dropped on macOS
+    /// `FSEvents`.
+    ///
+    /// If the watcher fails to initialise or attach, the readiness
+    /// channel is dropped and `run` still returns the `JoinHandle`
+    /// — the underlying error is surfaced via the [`WorkspaceEvent`]
+    /// stream. The applier continues either way.
+    ///
     /// Both tasks honour the workspace's shutdown token. The
     /// returned `JoinHandle` resolves once both have exited.
     #[must_use]
-    pub fn run(self: std::sync::Arc<Self>) -> tokio::task::JoinHandle<()> {
+    pub async fn run(self: std::sync::Arc<Self>) -> tokio::task::JoinHandle<()> {
         let watcher_ws = std::sync::Arc::clone(&self);
         let applier_ws = std::sync::Arc::clone(&self);
-        tokio::spawn(async move {
-            let watcher = tokio::spawn(crate::watcher::run(watcher_ws));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let join = tokio::spawn(async move {
+            let watcher = tokio::spawn(crate::watcher::run(watcher_ws, ready_tx));
             let applier = tokio::spawn(crate::applier::run(applier_ws));
             let _ = tokio::join!(watcher, applier);
-        })
+        });
+        // Wait for the watcher to attach. A `RecvError` here means
+        // the watcher dropped the sender on its early-return error
+        // path (init failed / watch failed); the WorkspaceEvent::Error
+        // already surfaces the cause, and we still hand back the
+        // JoinHandle so callers can shut down cleanly.
+        let _ = ready_rx.await;
+        join
     }
 
     /// Trigger graceful shutdown. The node is taken out of its slot

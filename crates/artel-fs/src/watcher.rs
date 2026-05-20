@@ -16,6 +16,8 @@ use bytes::Bytes;
 use notify::EventKind;
 use notify_debouncer_full::DebounceEventResult;
 
+use tokio::sync::oneshot;
+
 use crate::filter::{FilterDecision, SkipReason, WorkspaceFilter};
 use crate::workspace::{Workspace, WorkspaceEvent};
 use crate::{EchoGuard, keys};
@@ -34,7 +36,22 @@ enum LocalChange {
 /// as [`WorkspaceEvent::Error`] / [`WorkspaceEvent::SkippedTooLarge`]
 /// rather than returning them; the watcher is a background task and
 /// transient failures shouldn't take it down.
-pub(crate) async fn run(workspace: Arc<Workspace>) {
+///
+/// `ready` is signalled exactly once, after the underlying notify
+/// debouncer has successfully attached its OS-level watch (`FSEvents`
+/// on macOS, inotify on Linux). Callers can `await` the matching
+/// receiver to know that subsequent filesystem writes under
+/// [`Workspace::root`] will reach this watcher — without this gate,
+/// a write that lands between [`Workspace::run`] returning and the
+/// debouncer attaching is silently missed.
+///
+/// On the early-return error paths (debouncer init failure, initial
+/// watch failure), `ready` is dropped without being sent, so the
+/// receiver resolves with [`oneshot::error::RecvError`]. Callers
+/// should treat that as "watcher will never come up" and either bail
+/// or proceed best-effort — the [`WorkspaceEvent::Error`] is also
+/// emitted so the consumer's event stream sees what went wrong.
+pub(crate) async fn run(workspace: Arc<Workspace>, ready: oneshot::Sender<()>) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<LocalChange>();
 
     let mut debouncer = match notify_debouncer_full::new_debouncer(
@@ -76,6 +93,11 @@ pub(crate) async fn run(workspace: Arc<Workspace>) {
             .await;
         return;
     }
+    // Watch is attached. Signal readiness so callers blocked in
+    // `Workspace::run().await` can proceed. `send` only fails if the
+    // receiver was dropped, which means the caller stopped waiting
+    // — fine to ignore.
+    let _ = ready.send(());
 
     let filter = WorkspaceFilter::new(&workspace.root);
     // Same shared echo-guard handles the applier uses; we re-borrow

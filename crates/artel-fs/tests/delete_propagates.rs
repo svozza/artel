@@ -44,7 +44,7 @@ async fn alice_delete_propagates_to_bob() {
         .await
         .expect("Workspace::host");
     let alice_ws = Arc::new(alice_ws);
-    let alice_handle = Arc::clone(&alice_ws).run();
+    let alice_handle = Arc::clone(&alice_ws).run().await;
 
     // Bob joins. After bulk_export his dir should already contain
     // `doomed.txt` (sanity-checked before we delete).
@@ -64,7 +64,7 @@ async fn alice_delete_propagates_to_bob() {
         .await
         .expect("Workspace::join");
     let bob_ws = Arc::new(bob_ws);
-    let bob_handle = Arc::clone(&bob_ws).run();
+    let bob_handle = Arc::clone(&bob_ws).run().await;
 
     let bob_path = bob_ws.root.join("doomed.txt");
     let bob_bytes = tokio::fs::read(&bob_path)
@@ -72,9 +72,8 @@ async fn alice_delete_propagates_to_bob() {
         .expect("bulk export should have populated doomed.txt");
     assert_eq!(bob_bytes, b"to be deleted");
 
-    // Settling delay so the watcher attaches inotify before we
-    // start mutating Alice's dir.
-    sleep(Duration::from_millis(150)).await;
+    // No settling delay needed — `Workspace::run().await` already
+    // resolved once the OS-level filesystem watch was attached.
 
     // Delete on Alice. The watcher emits a `Removed` event after
     // the 300ms debounce, which becomes a `Doc::del` (zero-length

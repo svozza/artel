@@ -203,7 +203,7 @@ async fn join_as_bob(
         .await
         .expect("Workspace::join_with");
     let ws = Arc::new(ws);
-    let handle = Arc::clone(&ws).run();
+    let handle = Arc::clone(&ws).run().await;
     (bob, ws, events, handle)
 }
 

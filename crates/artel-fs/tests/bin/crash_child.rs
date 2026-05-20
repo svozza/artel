@@ -160,7 +160,7 @@ async fn run(args: Args) -> Result<(), String> {
         .await
         .map_err(|e| format!("Workspace::host_with: {e}"))?;
     let ws = Arc::new(ws);
-    let _handle = Arc::clone(&ws).run();
+    let _handle = Arc::clone(&ws).run().await;
     emit("WORKSPACE_UP");
 
     // Drain workspace events to keep the channel from filling up.

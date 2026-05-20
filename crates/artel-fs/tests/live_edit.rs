@@ -40,7 +40,7 @@ async fn live_edit_propagates_host_to_joiner() {
         .await
         .expect("Workspace::host");
     let alice_ws = Arc::new(alice_ws);
-    let alice_handle = Arc::clone(&alice_ws).run();
+    let alice_handle = Arc::clone(&alice_ws).run().await;
 
     // Bob joins.
     let bob = Client::connect(&daemon_b.socket).await.unwrap();
@@ -59,12 +59,7 @@ async fn live_edit_propagates_host_to_joiner() {
         .await
         .expect("Workspace::join");
     let bob_ws = Arc::new(bob_ws);
-    let bob_handle = Arc::clone(&bob_ws).run();
-
-    // Give the watcher a moment to settle on Alice's dir before
-    // we drop a fresh file in. notify-debouncer-full's tick rate
-    // defaults to 1/4 of the timeout (300ms ÷ 4 = 75ms).
-    sleep(Duration::from_millis(150)).await;
+    let bob_handle = Arc::clone(&bob_ws).run().await;
 
     let alice_path = alice_dir.path().join("live.txt");
     let bob_path = bob_dir.path().join("live.txt");

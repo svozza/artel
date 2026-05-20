@@ -89,7 +89,7 @@ async fn workspace_state_survives_graceful_restart() {
                 .await
                 .expect("Workspace::host_with");
         let alice_ws = Arc::new(alice_ws);
-        let alice_handle = Arc::clone(&alice_ws).run();
+        let alice_handle = Arc::clone(&alice_ws).run().await;
 
         let phase1_ticket = capture_ticket(&mut alice_events, session).await;
 
@@ -110,7 +110,7 @@ async fn workspace_state_survives_graceful_restart() {
                 .await
                 .expect("Workspace::join_with");
         let bob_ws = Arc::new(bob_ws);
-        let bob_handle = Arc::clone(&bob_ws).run();
+        let bob_handle = Arc::clone(&bob_ws).run().await;
 
         // Sanity: a.txt makes it to bob.
         wait_for_file(&bob_root.path().join("a.txt"), b"alpha").await;
@@ -183,7 +183,7 @@ async fn workspace_state_survives_graceful_restart() {
             .await
             .expect("Workspace::host_with phase 2");
     let alice_ws = Arc::new(alice_ws);
-    let alice_handle = Arc::clone(&alice_ws).run();
+    let alice_handle = Arc::clone(&alice_ws).run().await;
 
     let phase2_ticket = capture_ticket(&mut alice_events, session).await;
 
@@ -220,13 +220,14 @@ async fn workspace_state_survives_graceful_restart() {
             .await
             .expect("Workspace::join_with phase 2");
     let bob_ws = Arc::new(bob_ws);
-    let bob_handle = Arc::clone(&bob_ws).run();
+    let bob_handle = Arc::clone(&bob_ws).run().await;
 
     // Reconcile-driven delete propagates to bob.
     wait_for_missing(&bob_root.path().join("a.txt")).await;
 
-    // Live sync resumed both ways.
-    sleep(Duration::from_millis(150)).await;
+    // Live sync resumed both ways. No settling sleep needed —
+    // `Workspace::run().await` only resolves once the watcher is
+    // attached.
     tokio::fs::write(alice_root.path().join("b.txt"), b"beta")
         .await
         .unwrap();

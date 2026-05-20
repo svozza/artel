@@ -64,7 +64,7 @@ async fn round_trip_once(run: usize) {
         .await
         .expect("Workspace::host");
     let alice_ws = Arc::new(alice_ws);
-    let alice_handle = Arc::clone(&alice_ws).run();
+    let alice_handle = Arc::clone(&alice_ws).run().await;
 
     // Bob on daemon B joins, then mounts a workspace.
     let bob = Client::connect(&daemon_b.socket).await.unwrap();
@@ -83,12 +83,10 @@ async fn round_trip_once(run: usize) {
         .await
         .expect("Workspace::join");
     let bob_ws = Arc::new(bob_ws);
-    let bob_handle = Arc::clone(&bob_ws).run();
+    let bob_handle = Arc::clone(&bob_ws).run().await;
 
-    // Settling delay so the watchers register inotify subscriptions
-    // *before* we start writing — without it the first write can
-    // land before the watcher attaches to the inode and we miss it.
-    sleep(Duration::from_millis(150)).await;
+    // No settling delay needed — `Workspace::run().await` only
+    // resolves once the OS-level filesystem watch is attached.
 
     // 1. Alice writes a.txt → Bob sees it.
     let alice_a = alice_dir.path().join("a.txt");
