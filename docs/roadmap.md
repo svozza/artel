@@ -399,6 +399,43 @@ them.
 
 Listed for completeness, no detailed plan yet:
 
+- **Workspace host/join safety.** Today `Workspace::host` runs
+  `scan_and_publish_existing` on whatever dir it's pointed at, and
+  `Workspace::join` runs `bulk_export` into whatever dir it's
+  pointed at. Both behaviours are unsafe in the wrong dir:
+  - Hosting on the wrong dir (e.g. `~`) publishes the entire tree
+    into the doc and out to any joiner. Surfaced 2026-05-20 while
+    testing the throwaway `wsdemo` CLI; the user nearly published
+    their whole home dir before noticing.
+  - Joining into a non-empty dir silently overwrites local files
+    via `bulk_export`'s `tokio::fs::write(&path, ...)`. The joiner
+    has no opportunity to inspect what's about to land.
+  - The current asymmetry — joiner's pre-existing files are *not*
+    propagated outward — is itself a bug or a feature depending on
+    which mental model we pick.
+
+  Open design questions before any code change:
+  1. **Mental model.** "Shared bucket" (any party can drop files
+     in, all parties see all) vs "clone of host's tree" (host owns
+     the canonical tree; joiners get a copy and can edit it but
+     their local pre-existing files are irrelevant on join).
+     Clone-semantics matches `git clone`, removes the
+     joiner-publishes-outward risk entirely, and is probably the
+     right v1 default.
+  2. **Default policy on non-empty target dir.** Refuse to host or
+     join if the dir is non-empty, modulo `--allow-existing` /
+     `--init-from-this-dir` opt-in flags? Empty `.artel-fs/` and
+     filtered paths (`.git`, `target`, etc.) shouldn't count as
+     "non-empty".
+  3. **Symmetric scan?** If we adopt shared-bucket semantics
+     instead of clone, the joiner needs `scan_and_publish_existing`
+     too, which multiplies the wrong-dir risk onto the joiner side.
+     Only worth doing once #1 and #2 are settled.
+
+  Until this is designed, do not silently change scan/bulk_export
+  behaviour or add piecemeal guards. Existing testing should use
+  fresh empty dirs.
+
 - **Capabilities & auth.** Read-only tickets, signed messages,
   ticket revocation. ADR-001 § "Auth and capability model" — explicitly
   deferred.
