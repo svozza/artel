@@ -291,14 +291,24 @@ async fn drop_resolves_pending_requests_to_connection_closed() {
         .expect("daemon panic")
         .expect("daemon io");
 
-    // Give the reader task a moment to observe EOF.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let err = client.request(Request::ListSessions).await.unwrap_err();
-    assert!(
-        matches!(err, ClientError::ConnectionClosed),
-        "expected ConnectionClosed, got {err:?}"
-    );
+    // Poll until the client's reader task observes EOF and turns
+    // every subsequent request into ConnectionClosed. No fixed
+    // settling delay — bounded retry instead.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match client.request(Request::ListSessions).await {
+            Err(ClientError::ConnectionClosed) => break,
+            Err(other) => panic!("unexpected error: {other:?}"),
+            Ok(_) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "ListSessions kept succeeding after daemon shutdown — \
+                     reader task never observed EOF",
+                );
+                tokio::task::yield_now().await;
+            }
+        }
+    }
 }
 
 #[tokio::test]

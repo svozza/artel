@@ -5,7 +5,7 @@
 //! the timing of two independent races:
 //!
 //! 1. The watcher's debouncer hadn't yet attached its OS-level
-//!    filesystem watch (FSEvents on macOS, inotify on Linux), so a
+//!    filesystem watch (`FSEvents` on macOS, inotify on Linux), so a
 //!    write that landed under [`Workspace::root`] right after
 //!    `run()` could silently miss the watcher.
 //! 2. The applier's `doc.subscribe()` hadn't yet returned, so a
@@ -17,11 +17,11 @@
 //! resolves once each is observably ready. These two tests pin
 //! that contract:
 //!
-//! - [`watcher_attached_when_run_resolves`]: write a file
+//! - `watcher_attached_when_run_resolves`: write a file
 //!   immediately on return and assert the doc picks it up via the
 //!   watcher → `set_bytes` path. No settling sleep; without the
 //!   gate this race-flakes.
-//! - [`applier_subscribed_when_run_resolves`]: assert
+//! - `applier_subscribed_when_run_resolves`: assert
 //!   `doc.status().subscribers` has grown by 1 on return. iroh-docs
 //!   exposes the live actor's subscriber count, so we don't need to
 //!   wait for an event to confirm the subscription is live.
@@ -32,7 +32,7 @@
 //! task to be polled and subscribe. So the test is **non-strict**
 //! against regressions — a regressed `run()` may still pass it on
 //! a fast scheduler. It pins the post-condition (the contract) but
-//! relies on the watcher test and the round_trip integration test
+//! relies on the watcher test and the `round_trip` integration test
 //! to catch real timing regressions. Without a peer it's hard to do
 //! better; the applier only handles `InsertRemote` events.
 
@@ -178,7 +178,7 @@ async fn applier_subscribed_when_run_resolves() {
     // be registered. No polling, no sleep — this is the contract.
     let post = ws.doc().status().await.expect("status").subscribers;
     assert!(
-        post >= pre + 1,
+        post > pre,
         "expected applier to add a subscriber by the time \
          run().await resolves: pre={pre}, post={post} \
          — if equal, run().await returned before the applier subscribed",

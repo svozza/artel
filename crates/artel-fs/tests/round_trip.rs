@@ -115,13 +115,27 @@ async fn round_trip_once(run: usize) {
     .await;
 
     // 3. Alice writes target/junk — hardcoded skip; Bob must NOT
-    //    see it after a generous settling period.
+    //    see it. Use a sentinel file (`sentinel.txt`) written
+    //    *after* `target/junk` to drive timing end-to-end: once
+    //    Bob has the sentinel, Alice's watcher pipeline has
+    //    finished its debounce, published, and propagated. If
+    //    `target/junk` were going to leak, it would have arrived by
+    //    then too. This avoids picking a fixed settling delay.
     let alice_target = alice_dir.path().join("target");
     tokio::fs::create_dir_all(&alice_target).await.unwrap();
     tokio::fs::write(alice_target.join("junk"), b"build artifact")
         .await
         .unwrap();
-    sleep(Duration::from_millis(700)).await; // > debounce + a bit
+    tokio::fs::write(alice_dir.path().join("sentinel.txt"), b"after-junk")
+        .await
+        .unwrap();
+    wait_for_file(
+        &bob_dir.path().join("sentinel.txt"),
+        b"after-junk",
+        "bob sees sentinel after target/junk",
+        run,
+    )
+    .await;
     let bob_target_path = bob_dir.path().join("target/junk");
     let leaked = tokio::fs::try_exists(&bob_target_path)
         .await
@@ -130,6 +144,25 @@ async fn round_trip_once(run: usize) {
         !leaked,
         "[run {run}] target/junk leaked to bob: {}",
         bob_target_path.display(),
+    );
+    // Defense in depth: Alice's filter should have blocked the
+    // publish in the first place, not just relied on Bob's applier
+    // filter to catch it. Check Alice's doc directly.
+    let junk_key = path_to_key(
+        alice_ws.root.as_path(),
+        &alice_ws.root.join("target/junk"),
+    )
+    .expect("path_to_key for target/junk");
+    let stream = alice_ws
+        .doc()
+        .get_many(Query::key_exact(junk_key))
+        .await
+        .expect("get_many on alice's doc");
+    tokio::pin!(stream);
+    let alice_published_junk = stream.next().await.is_some();
+    assert!(
+        !alice_published_junk,
+        "[run {run}] alice's filter regression: target/junk made it into the doc",
     );
 
     // 4. Echo-guard sanity: count Doc entries for `a.txt` on Bob's
