@@ -12,8 +12,6 @@
 //! 4. Size cap (1 MiB). Larger files are surfaced to consumers as
 //!    [`FilterDecision::Skip(SkipReason::TooLarge)`] so they can decide
 //!    whether to log/notify.
-//!
-//! Ported near-verbatim from harness's `session/workspace/filter.rs`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -21,7 +19,8 @@ use std::path::{Path, PathBuf};
 use ignore::gitignore::Gitignore;
 
 /// Files larger than this are skipped. Keeps the doc small enough that
-/// memory-store + naïve full-replay stay tractable for the MVP.
+/// the memory-store path stays tractable; revisit when the doc grows
+/// big enough that streaming becomes a real concern.
 pub const MAX_FILE_SIZE: u64 = 1 << 20;
 
 /// Pre-parsed view of the workspace root + its `.gitignore` (if any).

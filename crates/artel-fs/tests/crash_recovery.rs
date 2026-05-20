@@ -1,4 +1,4 @@
-//! Slice 3b-3: process-level crash recovery.
+//! Process-level crash recovery.
 //!
 //! `iroh-docs` (redb) and `iroh-blobs` (append-only blobs + redb
 //! metadata) are designed to survive `SIGKILL`, but our code

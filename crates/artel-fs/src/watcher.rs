@@ -5,14 +5,7 @@
 //! into the doc — guarded by [`crate::EchoGuard`] so peer-driven
 //! writes (which the applier just laid down on disk) don't get
 //! re-published in a loop.
-//!
-//! Ported near-verbatim from harness `session/workspace/watcher.rs`;
-//! the only structural change is API drift in
-//! `notify-debouncer-full` 0.6 (`Debouncer::watch` instead of
-//! `Debouncer::watcher().watch`).
 
-// Crate-private module; pair `unreachable_pub` with crate-pub funs.
-// See `feedback_clippy_lint_conflict` in memory.
 #![allow(clippy::redundant_pub_crate)]
 
 use std::path::PathBuf;
@@ -167,9 +160,10 @@ async fn on_modified(
         }
     };
 
+    let bytes = Bytes::from(bytes);
     match workspace
         .doc
-        .set_bytes(workspace.author, key, Bytes::from(bytes.clone()))
+        .set_bytes(workspace.author, key, bytes.clone())
         .await
     {
         Ok(_) => {

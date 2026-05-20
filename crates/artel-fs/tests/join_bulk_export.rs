@@ -1,5 +1,5 @@
-//! Slice 3a-4: a joiner imports the host's `DocTicket` from the
-//! artel session and bulk-exports the doc to disk.
+//! A joiner imports the host's `DocTicket` from the artel session
+//! and bulk-exports the doc to disk.
 //!
 //! Two daemons (cross-seeded address books for the artel session
 //! traffic). Alice on daemon A hosts and stands a workspace up with

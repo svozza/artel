@@ -1,8 +1,7 @@
-//! Slice 3a-3: `Workspace::host` stands the workspace up and lands
-//! a `workspace.ticket` system message on the artel session.
+//! `Workspace::host` stands the workspace up and lands a
+//! `workspace.ticket` system message on the artel session.
 //!
-//! No watcher / applier yet — that's 3a-5. This test verifies only
-//! that:
+//! Doesn't run the watcher / applier — verifies only that:
 //! 1. `Workspace::host` returns successfully against an existing
 //!    artel session.
 //! 2. A second client subscribed to the same session observes a

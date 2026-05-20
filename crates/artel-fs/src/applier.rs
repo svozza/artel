@@ -9,30 +9,20 @@
 //!   `InsertRemote` arrived before bytes were locally available).
 //!
 //! Tombstones (zero-length entries) become `remove_file`.
-//!
-//! Ported near-verbatim from harness `session/workspace/applier.rs`.
 
-// Crate-private module; pair `unreachable_pub` with crate-pub funs.
-// See `feedback_clippy_lint_conflict` in memory.
 #![allow(clippy::redundant_pub_crate)]
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use futures_util::StreamExt;
 use iroh_docs::Entry;
 use iroh_docs::engine::LiveEvent;
 use iroh_docs::store::Query;
 
+use crate::echo_guard::PENDING_RELEASE_GRACE;
 use crate::filter::{FilterDecision, SkipReason, WorkspaceFilter};
 use crate::workspace::{Workspace, WorkspaceEvent};
 use crate::{EchoGuard, keys};
-
-/// How long the echo guard's pending entry survives after we apply
-/// a peer write. The watcher's debouncer is 300 ms; 250 ms is the
-/// largest grace that still leaves the entry cleared by the time
-/// debounced events arrive.
-const PENDING_RELEASE_GRACE: Duration = Duration::from_millis(250);
 
 pub(crate) async fn run(workspace: Arc<Workspace>) {
     let mut events = match workspace.doc.subscribe().await {
@@ -50,6 +40,7 @@ pub(crate) async fn run(workspace: Arc<Workspace>) {
         workspace.echo_guard.pending_handle(),
         workspace.echo_guard.last_published_handle(),
     );
+    let filter = WorkspaceFilter::new(&workspace.root);
 
     loop {
         tokio::select! {
@@ -57,10 +48,10 @@ pub(crate) async fn run(workspace: Arc<Workspace>) {
             ev = events.next() => {
                 match ev {
                     Some(Ok(LiveEvent::InsertRemote { entry, .. })) => {
-                        handle_entry(&workspace, &guard, entry).await;
+                        handle_entry(&workspace, &guard, &filter, entry).await;
                     }
                     Some(Ok(LiveEvent::ContentReady { hash })) => {
-                        handle_content_ready(&workspace, &guard, hash).await;
+                        handle_content_ready(&workspace, &guard, &filter, hash).await;
                     }
                     Some(Ok(_)) => {}
                     Some(Err(err)) => {
@@ -76,7 +67,12 @@ pub(crate) async fn run(workspace: Arc<Workspace>) {
     }
 }
 
-async fn handle_entry(workspace: &Arc<Workspace>, guard: &EchoGuard, entry: Entry) {
+async fn handle_entry(
+    workspace: &Arc<Workspace>,
+    guard: &EchoGuard,
+    filter: &WorkspaceFilter,
+    entry: Entry,
+) {
     let path = match keys::key_to_path(&workspace.root, entry.key()) {
         Ok(p) => p,
         Err(err) => {
@@ -97,7 +93,6 @@ async fn handle_entry(workspace: &Arc<Workspace>, guard: &EchoGuard, entry: Entr
         return;
     }
 
-    let filter = WorkspaceFilter::new(&workspace.root);
     match filter.check(&path) {
         FilterDecision::Skip(SkipReason::TooLarge { size }) => {
             let _ = workspace
@@ -151,6 +146,7 @@ async fn handle_entry(workspace: &Arc<Workspace>, guard: &EchoGuard, entry: Entr
 async fn handle_content_ready(
     workspace: &Arc<Workspace>,
     guard: &EchoGuard,
+    filter: &WorkspaceFilter,
     hash: iroh_blobs::Hash,
 ) {
     let stream = match workspace.doc.get_many(Query::all()).await {
@@ -168,7 +164,7 @@ async fn handle_content_ready(
     while let Some(res) = stream.next().await {
         let Ok(entry) = res else { continue };
         if entry.content_hash() == hash {
-            handle_entry(workspace, guard, entry).await;
+            handle_entry(workspace, guard, filter, entry).await;
         }
     }
 }

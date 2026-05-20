@@ -13,16 +13,12 @@
 //! Constructors are private; the only way to build one is through
 //! [`crate::Workspace::host`] / `join`. Dropping the node aborts the
 //! router and shuts the endpoint down with it.
-//!
-//! Storage is **disk-backed** (3b-1): the iroh secret, doc replica
-//! (redb), and blob store all live under a per-workspace
-//! `state_dir`. See `docs/handoff-phase-3b.md` for the layout.
 
 // Crate-private module: pair `unreachable_pub` with the
 // crate-visibility lint so they stop fighting (see memory).
 #![allow(clippy::redundant_pub_crate)]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use iroh::Endpoint;
 use iroh::protocol::Router;
@@ -37,23 +33,12 @@ use crate::keystore::load_or_create_secret;
 /// Per-`Workspace` iroh runtime. Held for the workspace's lifetime;
 /// drop teardown is best-effort via [`Self::shutdown`].
 #[derive(Debug)]
-// `endpoint` and `state_dir` are unused today but kept on the
-// runtime so future callers (e.g. teardown helpers, diagnostics)
-// don't have to thread them in.
-#[allow(dead_code)]
 pub(crate) struct WorkspaceNode {
-    /// Endpoint owning the workspace's ed25519 identity. Distinct
-    /// from the artel daemon's endpoint.
-    pub endpoint: Endpoint,
     /// Doc + author handles. `Clone` is cheap.
     pub docs: Docs,
     /// Blob protocol handler over the same store; `BlobsProtocol`
     /// derefs to the `Store` so callers can `.blobs().get_bytes(...)`.
     pub blobs: BlobsProtocol,
-    /// Per-workspace state directory. Owned so any future shutdown
-    /// path that wants to touch on-disk state (compaction,
-    /// diagnostics) doesn't need it threaded in.
-    pub state_dir: PathBuf,
     /// Holding the router keeps the accept loop alive. Calling
     /// [`Router::shutdown`] on it during teardown closes the
     /// endpoint for us.
@@ -72,8 +57,6 @@ impl WorkspaceNode {
     ///
     /// Reuses any state already present, creates whatever's missing.
     pub(crate) async fn spawn(state_dir: &Path) -> Result<Self, WorkspaceError> {
-        let state_dir = state_dir.to_path_buf();
-
         let secret = load_or_create_secret(&state_dir.join("iroh.key"))
             .map_err(|e| WorkspaceError::Iroh(format!("workspace key: {e}")))?;
 
@@ -122,10 +105,8 @@ impl WorkspaceNode {
         endpoint.online().await;
 
         Ok(Self {
-            endpoint,
             docs,
             blobs,
-            state_dir,
             router,
         })
     }

@@ -21,9 +21,6 @@
 //!    that path; if they match it's an echo of *something we caused*
 //!    and we skip. Hashes are blake3 — fast and collision-immune in
 //!    practice.
-//!
-//! Ported verbatim from harness `session/workspace/echo_guard.rs`,
-//! shape and all. The only deviation is import paths.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -32,6 +29,14 @@ use std::time::Duration;
 
 use blake3::Hash;
 use tokio::sync::Mutex;
+
+/// How long the echo guard's pending entry survives after we apply
+/// a peer write.
+///
+/// The watcher's debouncer is 300 ms; 250 ms is the largest grace
+/// that still leaves the entry cleared by the time debounced events
+/// arrive.
+pub const PENDING_RELEASE_GRACE: Duration = Duration::from_millis(250);
 
 /// Tracks pending peer writes and last-published bytes per path.
 ///

@@ -4,10 +4,6 @@
 //! under a fixed prefix. The translation is stable, NFC-normalised, and
 //! refuses anything that would let a peer escape the workspace root
 //! (parent traversal, absolute paths, drive letters).
-//!
-//! Verbatim port from the harness reference impl
-//! (`session/workspace/keys.rs`); see
-//! `docs/handoff-phase-3-mvp.md` § "Reference implementation".
 
 use std::path::{Component, MAIN_SEPARATOR, Path, PathBuf};
 

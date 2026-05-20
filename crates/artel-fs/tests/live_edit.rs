@@ -1,11 +1,11 @@
-//! Slice 3a-5: a live edit on the host's filesystem propagates to
-//! the joiner via the watcher → doc → applier pipeline.
+//! A live edit on the host's filesystem propagates to the joiner
+//! via the watcher → doc → applier pipeline.
 //!
-//! Builds on top of 3a-4: two daemons, Alice hosts the artel
-//! session and a workspace, Bob joins. Both call `Workspace::run`
-//! so their watchers + appliers are live. Alice writes
-//! `live.txt` *after* `Workspace::host` returned; Bob's filesystem
-//! should reflect it within a couple of seconds.
+//! Two daemons, Alice hosts the artel session and a workspace,
+//! Bob joins. Both call `Workspace::run` so their watchers +
+//! appliers are live. Alice writes `live.txt` *after*
+//! `Workspace::host` returned; Bob's filesystem should reflect it
+//! within a couple of seconds.
 
 mod common;
 

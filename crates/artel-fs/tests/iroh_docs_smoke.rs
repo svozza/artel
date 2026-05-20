@@ -1,8 +1,7 @@
-//! Slice 3a-1: iroh-docs / iroh-blobs version-compat smoke test.
+//! iroh-docs / iroh-blobs version-compat smoke test.
 //!
-//! Goal: prove the version matrix in `[workspace.dependencies]` actually
-//! compiles + works together (iroh 0.98, iroh-docs 0.98, iroh-blobs
-//! 0.100, iroh-gossip 0.98), and that a `DocTicket` carries enough
+//! Proves the version matrix in `[workspace.dependencies]` actually
+//! compiles + works together, and that a `DocTicket` carries enough
 //! `EndpointAddr` info on its own for the joiner to dial the host
 //! without any out-of-band address-book seeding.
 //!
@@ -11,11 +10,9 @@
 //!   writes one entry, shares the ticket.
 //! - joiner: spawns Endpoint + Gossip + Docs/Blobs (NO address-lookup
 //!   override, NO manual `add_endpoint_info`), imports the ticket,
-//!   reads the entry back.
-//!
-//! If discovery doesn't work from the ticket alone, the bet recorded
-//! in `docs/handoff-phase-3-mvp.md` § "Architectural shape" is wrong
-//! and we revisit before building Workspace on top.
+//!   reads the entry back. If discovery from the ticket alone fails,
+//!   `get_bytes` hangs and the timeout converts that into a clear
+//!   failure.
 
 use std::time::Duration;
 
@@ -82,10 +79,10 @@ impl Node {
     }
 }
 
-/// 3a-1: import a doc from a ticket and read its contents back.
+/// Import a doc from a ticket and read its contents back.
 ///
-/// **Crucially** the joiner is *not* given the host's `EndpointAddr` out
-/// of band. If discovery fails this test hangs at `get_bytes`; the
+/// The joiner is *not* given the host's `EndpointAddr` out of
+/// band. If discovery fails this test hangs at `get_bytes`; the
 /// 30-second timeout converts that into a clear failure.
 #[tokio::test(flavor = "multi_thread")]
 async fn doc_ticket_round_trips_without_manual_address_seeding() {

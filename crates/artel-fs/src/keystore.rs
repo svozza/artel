@@ -9,15 +9,11 @@
 //!
 //! Author identity is a separate concern: `iroh-docs`'s
 //! `Docs::persistent` already manages a per-store default author
-//! file under `<state_dir>/docs/default-author`, so we don't
-//! manage that ourselves yet (3b-2 may revisit).
+//! file under `<state_dir>/docs/default-author`.
 //!
 //! [`load_or_create_secret`] is the entry point. It reads `path`
 //! if it exists, otherwise generates a fresh key from `OsRng` and
 //! writes it out atomically with mode `0600`.
-//!
-//! Ported from `crates/artel-daemon/src/iroh_key.rs` so that
-//! `artel-fs` doesn't depend on `artel-daemon`.
 
 #![allow(clippy::redundant_pub_crate)]
 
@@ -95,25 +91,27 @@ fn parse_key(path: &Path, bytes: &[u8]) -> Result<SecretKey, KeyError> {
 fn generate_and_persist(path: &Path) -> Result<SecretKey, KeyError> {
     let mut bytes = [0u8; 32];
     OsRng.try_fill_bytes(&mut bytes).map_err(KeyError::Rng)?;
-    write_atomic(path, &bytes).map_err(|source| KeyError::Io {
+    write_atomic(path, &bytes, Some(KEY_MODE)).map_err(|source| KeyError::Io {
         path: path.to_path_buf(),
         source,
     })?;
     Ok(SecretKey::from_bytes(&bytes))
 }
 
-/// Write `bytes` to `path` atomically: write to `path.tmp`, fsync,
-/// chmod 0600, rename. A partially-written tmp file never
-/// replaces the real one.
-fn write_atomic(path: &Path, bytes: &[u8; 32]) -> io::Result<()> {
+/// Write `bytes` to `path` atomically: tmp-create + `write_all` +
+/// fsync + (optional chmod) + rename. A partially-written tmp file
+/// never replaces the real one.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8], mode: Option<u32>) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
     {
         let mut f = fs::File::create(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
-        let mut perms = f.metadata()?.permissions();
-        perms.set_mode(KEY_MODE);
-        fs::set_permissions(&tmp, perms)?;
+        if let Some(mode) = mode {
+            let mut perms = f.metadata()?.permissions();
+            perms.set_mode(mode);
+            fs::set_permissions(&tmp, perms)?;
+        }
     }
     fs::rename(&tmp, path)?;
     Ok(())
@@ -121,7 +119,7 @@ fn write_atomic(path: &Path, bytes: &[u8; 32]) -> io::Result<()> {
 
 /// Same shape as `transport::server::ensure_dir` — chmod 0700 on
 /// create, leave existing dirs alone.
-fn ensure_dir(dir: &Path) -> io::Result<()> {
+pub(crate) fn ensure_dir(dir: &Path) -> io::Result<()> {
     match fs::metadata(dir) {
         Ok(meta) if meta.is_dir() => Ok(()),
         Ok(_) => Err(io::Error::new(

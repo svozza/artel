@@ -1,4 +1,4 @@
-//! Slice 3a-6: full round-trip test.
+//! Full round-trip test.
 //!
 //! Two daemons + two `Workspace`s on the same artel session
 //! exercise the full watcher → doc → applier loop in both
@@ -11,8 +11,8 @@
 //! - Echo guard sanity: count Doc entries for the key Bob just
 //!   applied — there should be exactly 1, not 2.
 //!
-//! This is the "round-trip" test the roadmap calls for. Runs 3
-//! times in a row to flush out gossip-on-gossip-on-fs flakiness.
+//! Runs 3 times in a row to flush out gossip-on-gossip-on-fs
+//! flakiness.
 
 mod common;
 

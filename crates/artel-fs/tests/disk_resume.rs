@@ -1,11 +1,10 @@
-//! Slice 3b-1-f: workspace state survives a process-graceful
-//! restart on both host and joiner.
+//! Workspace state survives a process-graceful restart on both
+//! host and joiner.
 //!
-//! The flow this test exercises is the one a real consumer relies
-//! on: Alice hosts a workspace, Bob joins, both shut down cleanly,
-//! both come back later (against fresh artel daemons even) and
-//! pick up where they left off — without losing files, without
-//! the workspace ticket invalidating, and without breaking delete
+//! Alice hosts a workspace, Bob joins, both shut down cleanly,
+//! both come back later (against fresh artel daemons) and pick up
+//! where they left off — without losing files, without the
+//! workspace ticket invalidating, and without breaking delete
 //! propagation.
 //!
 //! Load-bearing pieces:

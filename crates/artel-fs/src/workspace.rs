@@ -7,13 +7,12 @@
 //!   broadcasts the resulting [`DocTicket`] over the artel session
 //!   as a [`MessageKind::System`] message with action
 //!   [`TICKET_ACTION`].
-//! - [`Workspace::join`] (added in 3a-4) listens for the system
-//!   message, imports the ticket, and bulk-exports the doc to its
-//!   own copy of the directory.
+//! - [`Workspace::join`] listens for the system message, imports the
+//!   ticket, and bulk-exports the doc to its own copy of the
+//!   directory.
 //!
-//! The watcher / applier that turn this into live two-way sync land
-//! in 3a-5. This file gets us as far as "host stands up, ticket lands
-//! on the session."
+//! Live two-way sync is wired up by [`Workspace::run`], which spawns
+//! the watcher + applier background tasks.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -36,7 +35,7 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 
-use crate::echo_guard::EchoGuard;
+use crate::echo_guard::{EchoGuard, PENDING_RELEASE_GRACE};
 use crate::error::WorkspaceError;
 use crate::filter::{FilterDecision, SkipReason, WorkspaceFilter};
 use crate::keys;
@@ -175,8 +174,8 @@ impl Workspace {
     ///    action [`TICKET_ACTION`].
     ///
     /// Returns the [`Workspace`] handle plus the receiver side of
-    /// the [`WorkspaceEvent`] stream. The watcher / applier are not
-    /// running yet — that's slice 3a-5.
+    /// the [`WorkspaceEvent`] stream. Call [`Self::run`] to start
+    /// the watcher + applier.
     pub async fn host(
         client: &Client,
         session: SessionId,
@@ -236,11 +235,10 @@ impl Workspace {
         // Pre-populate the doc from disk *before* we share the
         // ticket — joiners that import after this scan see the
         // current snapshot via initial sync.
-        scan_and_publish_existing(&root, &doc, author, &node.blobs, &echo_guard, &tx).await?;
+        scan_and_publish_existing(&root, &doc, author, &echo_guard, &tx).await?;
 
         // Share with full addressing info so the ticket is enough
-        // for joiners to dial without out-of-band addr seeding (the
-        // bet 3a-1 verified).
+        // for joiners to dial without out-of-band addr seeding.
         let ticket = doc
             .share(ShareMode::Write, AddrInfoOptions::default())
             .await
@@ -271,17 +269,15 @@ impl Workspace {
     /// workspace internally:
     ///
     /// 1. Spawns its own iroh node.
-    /// 2. Issues `Subscribe { since: None }` so the joiner backfills
-    ///    the existing session log via Phase 2 follow-up (c)'s
-    ///    replay path. The replay surfaces the host's
-    ///    `workspace.ticket` system message even if the joiner
-    ///    arrived after it was originally broadcast.
+    /// 2. Issues `Subscribe { since: None }` so the daemon's replay
+    ///    path surfaces the host's `workspace.ticket` system
+    ///    message even if the joiner arrived after it was
+    ///    originally broadcast.
     /// 3. Drains events until the ticket arrives (15 s ceiling).
     /// 4. Imports the ticket into the joiner's local doc, runs
     ///    `bulk_export` to seed `root` with whatever's already in
-    ///    the doc, and returns.
-    ///
-    /// Watcher / applier are *not* started yet — that's slice 3a-5.
+    ///    the doc, and returns. Call [`Self::run`] to start the
+    ///    watcher + applier.
     ///
     /// **Side effect:** consumes the client's [`Client::take_events`]
     /// channel. Callers that need to observe other session events
@@ -323,10 +319,9 @@ impl Workspace {
             .await
             .map_err(|e| WorkspaceError::Doc(format!("author_default: {e}")))?;
 
-        // Subscribe and drain until the ticket arrives. Phase 2
-        // follow-up (c) (subscribe replay) means a fresh subscriber
-        // sees historical messages on subscribe, so a joiner that
-        // hosts after the ticket was published still picks it up.
+        // Subscribe and drain until the ticket arrives. Subscribe
+        // replays historical messages, so a joiner that arrives
+        // after the ticket was published still picks it up.
         match client
             .request(Request::Subscribe {
                 session,
@@ -433,7 +428,6 @@ async fn scan_and_publish_existing(
     root: &Path,
     doc: &Doc,
     author: AuthorId,
-    _blobs: &iroh_blobs::BlobsProtocol,
     echo_guard: &EchoGuard,
     events: &mpsc::Sender<WorkspaceEvent>,
 ) -> Result<(), WorkspaceError> {
@@ -481,7 +475,8 @@ async fn scan_and_publish_existing(
                 continue;
             }
         };
-        if let Err(err) = doc.set_bytes(author, key, Bytes::from(bytes.clone())).await {
+        let bytes = Bytes::from(bytes);
+        if let Err(err) = doc.set_bytes(author, key, bytes.clone()).await {
             let _ = events
                 .send(WorkspaceEvent::Error(format!(
                     "scan publish {} failed: {err}",
@@ -593,12 +588,12 @@ async fn wait_for_ticket(
 /// - too-large or filtered-out keys → skipped (with a
 ///   `SkippedTooLarge` event for size),
 /// - invalid keys → logged and skipped,
-/// - bytes not yet locally available → skipped (the applier in
-///   3a-5 retries on `ContentReady`).
+/// - bytes not yet locally available → skipped (the applier
+///   retries on `ContentReady`).
 ///
-/// Pending-set entries are inserted via the echo guard so the (yet
-/// to be wired) watcher won't republish what we just wrote. They
-/// are released after [`PENDING_RELEASE_GRACE`].
+/// Pending-set entries are inserted via the echo guard so the
+/// watcher won't republish what we just wrote. They are released
+/// after [`PENDING_RELEASE_GRACE`].
 async fn bulk_export(
     root: &Path,
     doc: &Doc,
@@ -651,7 +646,7 @@ async fn bulk_export(
         }
 
         // Bytes not yet available locally → skip; the applier
-        // (3a-5) retries on the next ContentReady. Bulk export is
+        // retries on the next ContentReady. Bulk export is
         // best-effort.
         let Ok(bytes) = blobs.blobs().get_bytes(entry.content_hash()).await else {
             continue;
@@ -676,12 +671,6 @@ async fn bulk_export(
     Ok(())
 }
 
-/// Grace period before a path is removed from the echo guard's
-/// pending set. The watcher's debouncer is 300 ms; 250 ms covers
-/// the common case of "watcher fires while we're still writing"
-/// without holding the path indefinitely.
-const PENDING_RELEASE_GRACE: Duration = Duration::from_millis(250);
-
 /// Best-effort canonicalisation. Falls back to the input path if
 /// `canonicalize` fails (e.g., the dir doesn't exist yet) — callers
 /// are expected to pass an existing dir.
@@ -692,7 +681,10 @@ fn canonicalise(p: &Path) -> PathBuf {
 /// Create the state dir (and any missing parents) if it doesn't
 /// already exist. Idempotent — re-runs on every workspace startup.
 fn ensure_state_dir(state_dir: &Path) -> Result<(), WorkspaceError> {
-    std::fs::create_dir_all(state_dir)
+    // chmod 0700 on first create — the dir holds the workspace's
+    // iroh secret key, so default-deny on traversal matches the
+    // keystore's own threat model.
+    crate::keystore::ensure_dir(state_dir)
         .map_err(|e| WorkspaceError::Iroh(format!("create state_dir {}: {e}", state_dir.display())))
 }
 
@@ -715,16 +707,15 @@ async fn open_or_create_doc(
                 ))
             })?;
             let id = NamespaceId::from(&arr);
-            // `Docs::open` may fail with "Replica not found" if the
-            // redb commit for the namespace hasn't durably landed
-            // yet — `iroh-docs` batches writes with a 500 ms delay,
-            // so a SIGKILL between `Docs::create` returning and the
-            // commit firing leaves us with a `doc-id` pointing at a
-            // namespace that doesn't exist on disk. The handoff's
-            // risk #1: self-heal by treating the stale id as if it
-            // was never written. Joiners with the prior ticket lose
-            // the ability to resume — acceptable since they would
-            // not have synced anything before the crash anyway.
+            // `Docs::open` returns "Replica not found" if the redb
+            // commit for the namespace hasn't durably landed yet —
+            // `iroh-docs` batches writes with a 500 ms delay, so a
+            // crash between `Docs::create` returning and the commit
+            // firing can leave a `doc-id` pointing at a namespace
+            // that doesn't exist on disk. Self-heal by recreating;
+            // joiners with the prior ticket lose the ability to
+            // resume, which is acceptable since they wouldn't have
+            // synced anything pre-crash anyway.
             if let Ok(Some(doc)) = node.docs.open(id).await {
                 Ok((doc, true))
             } else {
@@ -756,24 +747,11 @@ async fn create_and_persist(
         .create()
         .await
         .map_err(|e| WorkspaceError::Doc(format!("doc create: {e}")))?;
-    write_doc_id_atomic(doc_id_path, &doc.id().to_bytes()).map_err(|e| {
+    // No chmod — namespace ids aren't secret.
+    crate::keystore::write_atomic(doc_id_path, &doc.id().to_bytes(), None).map_err(|e| {
         WorkspaceError::Doc(format!("persist doc-id at {}: {e}", doc_id_path.display()))
     })?;
     Ok((doc, false))
-}
-
-/// Atomic write: tmp-and-rename. Same shape as the keystore's
-/// write but without the chmod — `doc-id` isn't sensitive.
-fn write_doc_id_atomic(path: &Path, bytes: &[u8; 32]) -> io::Result<()> {
-    use std::io::Write;
-    let tmp = path.with_extension("tmp");
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    Ok(())
 }
 
 /// Walk the doc and tombstone any entry whose key maps to a path
@@ -817,7 +795,7 @@ async fn reconcile_doc_against_disk(
                 continue;
             }
         };
-        if !path.exists() {
+        if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
             // `Doc::del` writes a tombstone for `prefix`. The key
             // we hand it is exact, so it tombstones just this
             // entry.
