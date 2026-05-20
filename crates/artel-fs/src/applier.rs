@@ -18,13 +18,32 @@ use futures_util::StreamExt;
 use iroh_docs::Entry;
 use iroh_docs::engine::LiveEvent;
 use iroh_docs::store::Query;
+use tokio::sync::oneshot;
 
 use crate::echo_guard::PENDING_RELEASE_GRACE;
 use crate::filter::{FilterDecision, SkipReason, WorkspaceFilter};
 use crate::workspace::{Workspace, WorkspaceEvent};
 use crate::{EchoGuard, keys};
 
-pub(crate) async fn run(workspace: Arc<Workspace>) {
+/// Subscribe to the doc's live event stream and apply incoming
+/// remote writes / tombstones / content-ready notifications to disk.
+///
+/// `ready` is signalled once `doc.subscribe()` has returned a live
+/// event stream — i.e. iroh-docs's subscriber list now includes us
+/// and any subsequent `InsertRemote` / `ContentReady` will reach
+/// this loop. Callers can `await` the matching receiver to know the
+/// applier won't drop events fired against `Workspace`'s doc going
+/// forward. Without this gate, an event that arrives between
+/// [`Workspace::run`] returning and `subscribe()` completing is
+/// silently lost — iroh-docs subscribers are push-to-vec, no replay.
+///
+/// On the early-return error path (`subscribe()` failed), `ready`
+/// is dropped without being sent, so the receiver resolves with
+/// [`oneshot::error::RecvError`]. The cause is also surfaced via
+/// the [`WorkspaceEvent`] stream.
+///
+/// [`Workspace::run`]: crate::workspace::Workspace::run
+pub(crate) async fn run(workspace: Arc<Workspace>, ready: oneshot::Sender<()>) {
     let mut events = match workspace.doc.subscribe().await {
         Ok(s) => s,
         Err(err) => {
@@ -35,6 +54,10 @@ pub(crate) async fn run(workspace: Arc<Workspace>) {
             return;
         }
     };
+    // Subscription is live. Signal readiness so callers blocked in
+    // `Workspace::run().await` can proceed. `send` only fails if
+    // the receiver was dropped — fine to ignore.
+    let _ = ready.send(());
 
     let guard = EchoGuard::shared(
         workspace.echo_guard.pending_handle(),

@@ -391,26 +391,29 @@ impl Workspace {
     }
 
     /// Spawn the watcher + applier background tasks, **awaiting**
-    /// the watcher's OS-level attach before returning.
+    /// both halves' readiness before returning.
     ///
     /// - The watcher debounces filesystem events under [`Self::root`]
     ///   and publishes them into the doc.
     /// - The applier subscribes to [`Doc::subscribe`] and applies
     ///   `InsertRemote` / `ContentReady` events to disk.
     ///
-    /// When this future resolves, the OS-level filesystem watch is
-    /// guaranteed to be attached — any subsequent write under
-    /// [`Self::root`] will reach the watcher. This ordering matters
-    /// because callers (most often a peer-driven test or production
-    /// flow) typically write to [`Self::root`] right after `run()`
-    /// completes; without the attach guarantee, those writes can
-    /// race ahead of the watcher and be silently dropped on macOS
-    /// `FSEvents`.
+    /// When this future resolves, both halves are wired up:
+    /// - the OS-level filesystem watch is attached, so any
+    ///   subsequent write under [`Self::root`] reaches the watcher
+    ///   (without this, writes can race ahead of the watcher and be
+    ///   silently dropped on macOS `FSEvents`);
+    /// - the applier's `doc.subscribe()` has returned, so any
+    ///   `InsertRemote` / `ContentReady` fired against this
+    ///   workspace's doc reaches the applier (iroh-docs subscribers
+    ///   are push-to-vec — events fired before `subscribe()`
+    ///   completes are not replayed).
     ///
-    /// If the watcher fails to initialise or attach, the readiness
-    /// channel is dropped and `run` still returns the `JoinHandle`
-    /// — the underlying error is surfaced via the [`WorkspaceEvent`]
-    /// stream. The applier continues either way.
+    /// If either half fails to start (watcher init / attach, or
+    /// applier subscribe), the corresponding readiness signal is
+    /// dropped and `run` still returns the `JoinHandle` — the
+    /// underlying error is surfaced via the [`WorkspaceEvent`]
+    /// stream. The other half continues.
     ///
     /// Both tasks honour the workspace's shutdown token. The
     /// returned `JoinHandle` resolves once both have exited.
@@ -418,18 +421,20 @@ impl Workspace {
     pub async fn run(self: std::sync::Arc<Self>) -> tokio::task::JoinHandle<()> {
         let watcher_ws = std::sync::Arc::clone(&self);
         let applier_ws = std::sync::Arc::clone(&self);
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let (watcher_ready_tx, watcher_ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let (applier_ready_tx, applier_ready_rx) = tokio::sync::oneshot::channel::<()>();
         let join = tokio::spawn(async move {
-            let watcher = tokio::spawn(crate::watcher::run(watcher_ws, ready_tx));
-            let applier = tokio::spawn(crate::applier::run(applier_ws));
+            let watcher = tokio::spawn(crate::watcher::run(watcher_ws, watcher_ready_tx));
+            let applier = tokio::spawn(crate::applier::run(applier_ws, applier_ready_tx));
             let _ = tokio::join!(watcher, applier);
         });
-        // Wait for the watcher to attach. A `RecvError` here means
-        // the watcher dropped the sender on its early-return error
-        // path (init failed / watch failed); the WorkspaceEvent::Error
-        // already surfaces the cause, and we still hand back the
-        // JoinHandle so callers can shut down cleanly.
-        let _ = ready_rx.await;
+        // Wait for both halves to come up. A `RecvError` on either
+        // channel means that half hit its early-return error path
+        // (watcher init / attach failure, or applier subscribe
+        // failure); the WorkspaceEvent::Error already surfaces the
+        // cause, and we still hand back the JoinHandle so callers
+        // can shut down cleanly.
+        let (_, _) = tokio::join!(watcher_ready_rx, applier_ready_rx);
         join
     }
 

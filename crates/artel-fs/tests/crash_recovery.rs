@@ -304,8 +304,10 @@ async fn steady_state_sigkill_preserves_state() {
     assert_eq!(seed_after, b"steady-seed");
 
     // Live sync resumes: write via Alice's filesystem, observe on
-    // Bob's.
-    sleep(Duration::from_millis(200)).await;
+    // Bob's. No settling sleep needed — `Workspace::run().await`
+    // resolves only once both Bob's watcher is attached and his
+    // applier has subscribed to the doc, so a write here will reach
+    // his applier.
     tokio::fs::write(alice_root.path().join("post-restart.txt"), b"live-again")
         .await
         .unwrap();
