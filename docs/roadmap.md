@@ -17,17 +17,18 @@ along the way.
 | `artel-protocol` | Wire types + Unix-socket transport. Done. |
 | `artel-daemon` | Persistent in-memory daemon + `artel-daemon` binary. Done. |
 | `artel-client` | Stateless multiplexed client + `artel` CLI binary + `connect_or_spawn`. Done. |
-| `artel-fs` | Stub. |
+| `artel-fs` | Phase 3a (MVP) shipped: ticket-handout `Workspace` with watcher + applier. Persistence and identity are follow-ups. |
 
-247 tests passing. fmt + clippy clean in both feature modes (with and
+279 tests passing. fmt + clippy clean in both feature modes (with and
 without `--all-features`). CI runs ubuntu + macos on stable; workspace
 `rust-version` is 1.95.
 
-The substrate is now a real P2P system at the daemon layer: two
-daemons cross-seed addresses over iroh-gossip and host/joiner
-messaging round-trips through ack-correlated gossip frames, with
-sessions persisting across restarts. `artel-fs` is the next slice
-that builds the user-visible filesystem-sync layer on top.
+The substrate is now a real P2P system: two daemons cross-seed addresses
+over iroh-gossip, host/joiner messaging round-trips through ack-correlated
+gossip frames, sessions persist across restarts, and `artel-fs::Workspace`
+mirrors a directory between peers via its own ticket-handout iroh node
+(per ADR-001 § "Doc handles across IPC"). What's left is hardening
+(persistence for fs, capabilities, observability).
 
 ## Phase 1: client auto-spawn — DONE
 
@@ -313,41 +314,67 @@ Today's placeholders:
 
 ## Phase 3: artel-fs (medium-large)
 
-ADR-001 § "Doc handles across IPC" is the design discussion. Decision
-deferred there: ticket-handout (clients spin up their own iroh node
-just for docs and drive the doc directly) vs daemon proxies the doc
-API. ADR-001 picked **ticket-handout** for v1.
+ADR-001 § "Doc handles across IPC" picked the **ticket-handout** shape
+for v1: each `Workspace` spawns its own iroh `Endpoint` + `Gossip` +
+`Docs` + `Blobs`, distinct from the daemon's. The daemon stays
+ignorant of doc semantics; tickets ride the artel session as a
+`MessageKind::System` message with action `workspace.ticket`.
 
-### Scope
+### Slice 3a — MVP — DONE
 
-1. New crate methods/types in `artel-fs`:
-   - `Workspace::open(client: &Client, session: SessionId, root: PathBuf)`
-     attaches a filesystem-backed workspace to an existing session.
-   - `Workspace::watch()` returns a `Stream<Item = WorkspaceEvent>`.
-2. The workspace maintains an `iroh-docs` Doc per session. The daemon
-   hands the workspace a Doc ticket via a new RPC (`HostWorkspace`
-   returns a ticket; `JoinWorkspace` accepts one).
-3. The workspace process spins up its **own** iroh node (small one,
-   docs only). It imports the ticket, drives the doc directly. Two
-   iroh nodes per app (daemon's main one + workspace's docs one).
-4. File-watching: `notify` crate. Filesystem events → doc writes,
-   doc events → filesystem writes, with echo guards so we don't loop.
-5. Gitignore filtering by default; configurable.
+Sub-slices, in order:
 
-### Tests
+- **3a-1** — iroh-docs / iroh-blobs version-compat smoke test. Confirmed
+  iroh 0.98 + iroh-docs 0.98 + iroh-blobs 0.100 mate; verified the
+  `DocTicket` carries enough `EndpointAddr` info on its own (no
+  out-of-band `add_endpoint_info` needed).
+- **3a-2** — Pure-logic modules: `keys` (path↔key, NFC, traversal
+  guards), `filter` (hardcoded skips + symlink + `.gitignore` + 1 MiB
+  cap), `echo_guard` (pending-set + last-published-hash). 26 unit
+  tests.
+- **3a-3** — `Workspace::host`. Spawns its own iroh node, creates the
+  Doc, runs `scan_and_publish_existing`, broadcasts the `DocTicket`
+  as a system message. Integration test: a second client subscribed
+  to the session observes the ticket.
+- **3a-4** — `Workspace::join`. Subscribes to the session, drains
+  events until the ticket arrives (15 s ceiling), `import_and_subscribe`
+  → wait for `SyncFinished` + `PendingContentReady` → `bulk_export`
+  to disk under echo guard. Two-daemon test: Bob's empty dir mirrors
+  Alice's two files after `join` returns.
+- **3a-5** — Watcher + applier. `notify-debouncer-full` 300 ms
+  debounce → `Doc::set_bytes` / `Doc::del`. Applier listens on
+  `Doc::subscribe()`, handles `InsertRemote` and `ContentReady` with
+  250 ms echo-guard release grace. `Workspace::run` spawns both as
+  tokio tasks. Live-edit test: Alice writes → Bob's filesystem
+  reflects within ~1 s.
+- **3a-6** — End-to-end round-trip test (`tests/round_trip.rs`).
+  Bidirectional file edits, gitignore exclusion, and echo-guard
+  sanity (1 doc entry per applied key, not 2). Runs the full
+  scenario 3 consecutive times to flush out gossip-on-gossip-on-fs
+  flakiness.
 
-- Round-trip: write a file in client A, observe in client B.
-- Echo guard: a doc-driven write doesn't trigger another doc write.
-- Gitignore: `target/`, `.git/`, etc. are skipped.
-- Persistence: closing and reopening a workspace recovers prior state.
-- Crash recovery: kill the workspace mid-write, reopen, no corruption.
+Storage was memory-only this slice (`Docs::memory()` + blob
+`MemStore`); on workspace restart, host re-scans the dir and
+re-publishes. Disk-backed Docs/Blobs is a follow-up slice.
 
-### Definition of done
+### Slice 3b — open follow-ups
 
-- Two `artel-fs::Workspace` handles attached to the same session see
-  each other's file edits.
-- Gitignore-aware default. Configurable via `WorkspaceConfig`.
-- Documented as the canonical example of "build a CRDT-app on artel."
+- **Disk-backed Docs/Blobs.** `Docs::persistent(path)` +
+  `iroh-blobs::store::fs::FsStore`. Workspace state survives across
+  restarts. Adds a meaningful disk footprint per workspace; needs a
+  cleanup story for orphaned doc dirs.
+- **Persistent author identity.** Today `Workspace::host` /
+  `join` calls `Authors::author_create` per process; restarting a
+  workspace gives it a new author id (cosmetic since we don't
+  attribute writes anywhere user-visible, but still wrong).
+- **Crash recovery test.** Kill the workspace mid-write, reopen,
+  assert no corruption. Pairs with disk-backed.
+- **Authoritative `WorkspaceConfig`.** Today filter rules (`.git`,
+  `target`, …) are hardcoded. A user-facing config struct lets
+  apps add or remove paths.
+
+None block the next phase; pick them up when a real consumer needs
+them.
 
 ## Phase 4 and beyond
 
