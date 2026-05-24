@@ -503,6 +503,47 @@ a registry shape yet.
 After that, the registry + session-id work can land as separate
 slices.
 
+#### Stale-daemon detection and cleanup
+
+Adjacent concern, surfaced 2026-05-23 while finishing the
+Workspace host/join safety slice: when a daemon is left running
+(orphaned by a test that SIGKILLed its parent, a CLI that
+crashed without tearing the daemon down, etc.) it keeps holding
+its iroh `EndpointId`, n0 discovery registration, bound UDP
+port, and redb mmap. Subsequent test runs that spawn fresh
+daemons against fresh tempdirs got non-deterministic timeouts
+on `crash_recovery` / `live_edit` until the orphans were
+`pkill`'d. Mechanism not investigated; suspected culprits are
+stale n0 entries pointing at dead peers, FD pressure, or
+iroh-docs commit-batch timing being squeezed by syscall
+contention.
+
+This is a daemon-reuse-shaped problem: the long-running daemon
+the rest of this section assumes is well-behaved is itself a
+liability if we don't have a clean answer for "is the daemon
+at the default socket path actually ours, or a corpse?"
+
+Two angles, both worth treating together:
+
+1. **Production**: a daemon that's been up for days through
+   many connect/disconnect cycles should not silently degrade.
+   Build a stress harness (spawn N fresh daemons in sequence
+   against the same default state dir, measure connection-setup
+   latency on the Nth) and verify it doesn't trend upward.
+   If it does, fix the underlying cleanup — most likely candidates
+   are n0 discovery entries we never re-publish on key reuse,
+   and unreaped iroh-gossip topic memberships.
+2. **Test harness**: `common::spawn_pair` /
+   `spawn_daemon_with_lookup` should defensively pkill any
+   prior `artel-daemon` whose state dir matches the test's
+   tempdir prefix before starting. Cheap, doesn't address the
+   production-side fragility but stops it masquerading as
+   flaky tests in the meantime.
+
+Lower priority than the resume work above, but a real concern
+to track — it's the quiet failure mode of "daemon lives a long
+time" that the rest of this phase is committing to.
+
 ## Future
 
 Listed for completeness, no detailed plan yet:
