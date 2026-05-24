@@ -29,7 +29,7 @@ mod watcher;
 pub mod workspace;
 
 pub use echo_guard::EchoGuard;
-pub use error::WorkspaceError;
+pub use error::{PolicyViolation, WorkspaceError};
 pub use filter::{FilterDecision, MAX_FILE_SIZE, SkipReason, WorkspaceFilter};
 pub use keys::{KEY_PREFIX, key_to_path, path_to_key};
-pub use workspace::{TICKET_ACTION, Workspace, WorkspaceConfig, WorkspaceEvent};
+pub use workspace::{AttachPolicy, TICKET_ACTION, Workspace, WorkspaceConfig, WorkspaceEvent};

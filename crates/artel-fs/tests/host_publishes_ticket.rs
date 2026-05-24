@@ -17,7 +17,7 @@ use std::time::Duration;
 use artel_client::Client;
 use artel_daemon::shutdown::Shutdown;
 use artel_daemon::{Daemon, DaemonConfig};
-use artel_fs::{TICKET_ACTION, Workspace};
+use artel_fs::{AttachPolicy, TICKET_ACTION, Workspace};
 use artel_protocol::{Event, MessageKind, PeerId, PeerInfo, Request, Response};
 use iroh_docs::DocTicket;
 use tempfile::TempDir;
@@ -120,9 +120,14 @@ async fn host_lands_ticket_on_session() {
         .await
         .unwrap();
 
-    let (workspace, _ws_events) = Workspace::host(&alice, session, ws_dir.path().to_path_buf())
-        .await
-        .expect("Workspace::host");
+    let (workspace, _ws_events) = Workspace::host(
+        &alice,
+        session,
+        ws_dir.path().to_path_buf(),
+        AttachPolicy::AllowExisting,
+    )
+    .await
+    .expect("Workspace::host");
 
     // Pull events until we see the ticket system message.
     let payload = timeout(Duration::from_secs(15), async {

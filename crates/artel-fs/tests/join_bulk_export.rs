@@ -16,7 +16,7 @@ mod common;
 use std::time::Duration;
 
 use artel_client::Client;
-use artel_fs::Workspace;
+use artel_fs::{AttachPolicy, Workspace};
 use artel_protocol::{PeerId, PeerInfo, Request, Response};
 use pretty_assertions::assert_eq;
 use tokio::time::timeout;
@@ -50,10 +50,14 @@ async fn joiner_bulk_imports_host_files() {
 
     // Stand Alice's workspace up. This publishes the existing files
     // into the doc and broadcasts the ticket on the session.
-    let (alice_ws, _alice_ws_events) =
-        Workspace::host(&alice, session, alice_dir.path().to_path_buf())
-            .await
-            .expect("Workspace::host");
+    let (alice_ws, _alice_ws_events) = Workspace::host(
+        &alice,
+        session,
+        alice_dir.path().to_path_buf(),
+        AttachPolicy::AllowExisting,
+    )
+    .await
+    .expect("Workspace::host");
 
     // Bob on daemon B joins the artel session. We need a separate
     // client because Workspace::join consumes the events stream.
@@ -73,7 +77,12 @@ async fn joiner_bulk_imports_host_files() {
 
     let (bob_ws, _bob_ws_events) = timeout(
         Duration::from_secs(45),
-        Workspace::join(&bob, session, bob_dir.path().to_path_buf()),
+        Workspace::join(
+            &bob,
+            session,
+            bob_dir.path().to_path_buf(),
+            AttachPolicy::RequireEmpty,
+        ),
     )
     .await
     .expect("Workspace::join exceeded 45s")

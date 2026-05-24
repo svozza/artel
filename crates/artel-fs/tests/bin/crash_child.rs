@@ -41,7 +41,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use artel_client::Client;
-use artel_fs::{Workspace, WorkspaceConfig};
+use artel_fs::{AttachPolicy, Workspace, WorkspaceConfig};
 use artel_protocol::{PeerId, PeerInfo, Request, Response};
 
 #[derive(Debug)]
@@ -156,9 +156,15 @@ async fn run(args: Args) -> Result<(), String> {
     emit(&format!("TICKET {}", ticket.as_str()));
 
     let cfg = WorkspaceConfig::default().with_state_dir(args.state_dir.clone());
-    let (ws, mut events) = Workspace::host_with(&client, session, args.root.clone(), cfg)
-        .await
-        .map_err(|e| format!("Workspace::host_with: {e}"))?;
+    let (ws, mut events) = Workspace::host_with(
+        &client,
+        session,
+        args.root.clone(),
+        AttachPolicy::AllowExisting,
+        cfg,
+    )
+    .await
+    .map_err(|e| format!("Workspace::host_with: {e}"))?;
     let ws = Arc::new(ws);
     let _handle = Arc::clone(&ws).run().await;
     emit("WORKSPACE_UP");

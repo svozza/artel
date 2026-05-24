@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use artel_client::Client;
-use artel_fs::Workspace;
+use artel_fs::{AttachPolicy, Workspace};
 use artel_protocol::{PeerId, PeerInfo, Request, Response};
 use tokio::time::sleep;
 
@@ -36,9 +36,14 @@ async fn live_edit_propagates_host_to_joiner() {
     };
 
     let alice_dir = tempfile::tempdir().unwrap();
-    let (alice_ws, _) = Workspace::host(&alice, session, alice_dir.path().to_path_buf())
-        .await
-        .expect("Workspace::host");
+    let (alice_ws, _) = Workspace::host(
+        &alice,
+        session,
+        alice_dir.path().to_path_buf(),
+        AttachPolicy::RequireEmpty,
+    )
+    .await
+    .expect("Workspace::host");
     let alice_ws = Arc::new(alice_ws);
     let alice_handle = Arc::clone(&alice_ws).run().await;
 
@@ -55,9 +60,14 @@ async fn live_edit_propagates_host_to_joiner() {
     assert!(matches!(resp, Response::JoinSession { .. }), "{resp:?}");
 
     let bob_dir = tempfile::tempdir().unwrap();
-    let (bob_ws, _) = Workspace::join(&bob, session, bob_dir.path().to_path_buf())
-        .await
-        .expect("Workspace::join");
+    let (bob_ws, _) = Workspace::join(
+        &bob,
+        session,
+        bob_dir.path().to_path_buf(),
+        AttachPolicy::RequireEmpty,
+    )
+    .await
+    .expect("Workspace::join");
     let bob_ws = Arc::new(bob_ws);
     let bob_handle = Arc::clone(&bob_ws).run().await;
 

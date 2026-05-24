@@ -88,7 +88,7 @@ impl WorkspaceFilter {
         let rel = abs_path.strip_prefix(&self.root).unwrap_or(abs_path);
 
         // 1. Hardcoded matches (highest priority).
-        if is_hardcoded_skip(rel) {
+        if Self::is_hardcoded_skip(rel) {
             return FilterDecision::Skip(SkipReason::Hardcoded);
         }
 
@@ -120,28 +120,38 @@ impl WorkspaceFilter {
 
         FilterDecision::Include
     }
-}
 
-fn is_hardcoded_skip(rel: &Path) -> bool {
-    for component in rel.components() {
-        let os = component.as_os_str();
-        let Some(s) = os.to_str() else { continue };
-        if matches!(
-            s,
-            ".git" | "target" | "node_modules" | ".DS_Store" | ".artel-fs"
-        ) {
-            return true;
+    /// Single source of truth for the hardcoded-skip predicate.
+    ///
+    /// Used by [`Self::check`] (the watcher / applier filter) and by
+    /// [`crate::workspace::AttachPolicy::RequireEmpty`]'s emptiness
+    /// check, so the two never drift on what counts as "filesystem
+    /// noise we should ignore" (`.git/`, `target/`, `*.swp`, etc.).
+    ///
+    /// Accepts any path: relative, absolute, top-level entry, deep
+    /// nested. Walks every component looking for a match.
+    #[must_use]
+    pub fn is_hardcoded_skip(rel: &Path) -> bool {
+        for component in rel.components() {
+            let os = component.as_os_str();
+            let Some(s) = os.to_str() else { continue };
+            if matches!(
+                s,
+                ".git" | "target" | "node_modules" | ".DS_Store" | ".artel-fs"
+            ) {
+                return true;
+            }
+            // Editor and OS-temp files. Case-sensitive on purpose —
+            // these match the lowercase forms vim/vi/etc. produce on
+            // Unix; we don't want to over-skip files a user actually
+            // named e.g. `Foo.SWP`.
+            #[allow(clippy::case_sensitive_file_extension_comparisons)]
+            if s.ends_with(".swp") || s.ends_with(".tmp") {
+                return true;
+            }
         }
-        // Editor and OS-temp files. Case-sensitive on purpose — these
-        // match the lowercase forms vim/vi/etc. produce on Unix; we
-        // don't want to over-skip files a user actually named e.g.
-        // `Foo.SWP`.
-        #[allow(clippy::case_sensitive_file_extension_comparisons)]
-        if s.ends_with(".swp") || s.ends_with(".tmp") {
-            return true;
-        }
+        false
     }
-    false
 }
 
 #[cfg(test)]

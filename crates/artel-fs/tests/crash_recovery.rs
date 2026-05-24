@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use artel_client::Client;
-use artel_fs::{Workspace, WorkspaceConfig, WorkspaceEvent};
+use artel_fs::{AttachPolicy, Workspace, WorkspaceConfig, WorkspaceEvent};
 use artel_protocol::{JoinTicket, PeerId, PeerInfo, Request, Response};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
@@ -199,9 +199,15 @@ async fn join_as_bob(
         other => panic!("JoinSession: got {other:?}"),
     };
     let cfg = WorkspaceConfig::default().with_state_dir(bob_wstate.to_path_buf());
-    let (ws, events) = Workspace::join_with(&bob, session, bob_root.to_path_buf(), cfg)
-        .await
-        .expect("Workspace::join_with");
+    let (ws, events) = Workspace::join_with(
+        &bob,
+        session,
+        bob_root.to_path_buf(),
+        AttachPolicy::AllowExisting,
+        cfg,
+    )
+    .await
+    .expect("Workspace::join_with");
     let ws = Arc::new(ws);
     let handle = Arc::clone(&ws).run().await;
     (bob, ws, events, handle)

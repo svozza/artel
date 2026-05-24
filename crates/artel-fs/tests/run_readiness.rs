@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 use artel_client::Client;
 use artel_daemon::shutdown::Shutdown;
 use artel_daemon::{Daemon, DaemonConfig};
-use artel_fs::{Workspace, path_to_key};
+use artel_fs::{AttachPolicy, Workspace, path_to_key};
 use artel_protocol::{PeerId, PeerInfo, Request, Response, SessionId};
 use futures_util::StreamExt;
 use iroh_docs::store::Query;
@@ -97,11 +97,7 @@ impl DaemonHarness {
 
 async fn host_session(client: &Client) -> SessionId {
     let peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
-    match client
-        .request(Request::HostSession { peer })
-        .await
-        .unwrap()
-    {
+    match client.request(Request::HostSession { peer }).await.unwrap() {
         Response::HostSession { session, .. } => session,
         other => panic!("HostSession: got {other:?}"),
     }
@@ -114,9 +110,14 @@ async fn watcher_attached_when_run_resolves() {
     let session = host_session(&client).await;
 
     let ws_dir = tempfile::tempdir().unwrap();
-    let (ws, _ws_events) = Workspace::host(&client, session, ws_dir.path().to_path_buf())
-        .await
-        .expect("Workspace::host");
+    let (ws, _ws_events) = Workspace::host(
+        &client,
+        session,
+        ws_dir.path().to_path_buf(),
+        AttachPolicy::RequireEmpty,
+    )
+    .await
+    .expect("Workspace::host");
     let ws = Arc::new(ws);
     let handle = Arc::clone(&ws).run().await;
 
@@ -161,9 +162,14 @@ async fn applier_subscribed_when_run_resolves() {
     let session = host_session(&client).await;
 
     let ws_dir = tempfile::tempdir().unwrap();
-    let (ws, _ws_events) = Workspace::host(&client, session, ws_dir.path().to_path_buf())
-        .await
-        .expect("Workspace::host");
+    let (ws, _ws_events) = Workspace::host(
+        &client,
+        session,
+        ws_dir.path().to_path_buf(),
+        AttachPolicy::RequireEmpty,
+    )
+    .await
+    .expect("Workspace::host");
     let ws = Arc::new(ws);
 
     // Snapshot the subscriber count before run — `Workspace::host`

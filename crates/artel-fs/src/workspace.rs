@@ -14,6 +14,7 @@
 //! Live two-way sync is wired up by [`Workspace::run`], which spawns
 //! the watcher + applier background tasks.
 
+use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -36,10 +37,16 @@ use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 
 use crate::echo_guard::{EchoGuard, PENDING_RELEASE_GRACE};
-use crate::error::WorkspaceError;
+use crate::error::{PolicyViolation, WorkspaceError};
 use crate::filter::{FilterDecision, SkipReason, WorkspaceFilter};
 use crate::keys;
 use crate::node::WorkspaceNode;
+
+/// Maximum number of offending entries surfaced in a
+/// [`PolicyViolation::DirNotEmpty`] error before truncation. Five is
+/// enough to be diagnostic without flooding terminals on a
+/// disastrously-wrong dir (e.g. `~`).
+const POLICY_OFFENDING_LIMIT: usize = 5;
 
 /// Action stamped on the `MessageKind::System` ticket-handout
 /// message. Joiners filter on this to find the ticket inside the
@@ -62,6 +69,51 @@ pub const DEFAULT_STATE_SUBDIR: &str = ".artel-fs";
 /// `NamespaceId`. 32 raw bytes — namespaces aren't secret so no
 /// special permissions are required.
 const DOC_ID_FILE: &str = "doc-id";
+
+/// How a [`Workspace::host`] / [`Workspace::join`] call may attach
+/// to its workspace root.
+///
+/// There is **deliberately no [`Default`]**. The brainstorm fixing
+/// the home-dir-publish hazard (2026-05-20) decided every caller
+/// must specify the policy explicitly so wrong-dir risk is visible
+/// at every call site. If always specifying turns out to be
+/// annoying we add a default later — easier to relax than to
+/// tighten.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachPolicy {
+    /// Refuse to attach if the workspace root is non-empty.
+    ///
+    /// "Empty" is computed at the **top level only**. The state
+    /// directory (default `<root>/.artel-fs/`, or whatever
+    /// [`WorkspaceConfig::with_state_dir`] resolves to when it lives
+    /// under `root`) does not count toward non-emptiness, nor do
+    /// hardcoded-skip paths like `.git/`, `target/`, `node_modules/`,
+    /// `.DS_Store`, `*.swp`, `*.tmp`. Top-level symlinks **do**
+    /// count: we never follow them, and a symlinked tree shouldn't
+    /// trick us into thinking the dir is empty.
+    ///
+    /// This is the safe default for fresh hosts and joiners.
+    RequireEmpty,
+    /// Attach regardless of the root's existing contents.
+    ///
+    /// On host, the existing files are scanned and published into
+    /// the doc. On join, [`bulk_export`](Workspace::join_with) may
+    /// overwrite local files whose paths collide with synced doc
+    /// entries. Use when you know the dir is yours and you accept
+    /// that local edits may be clobbered.
+    AllowExisting,
+    /// Originate-only: adopt the existing dir's contents into a
+    /// fresh workspace.
+    ///
+    /// Today this behaves identically to [`Self::AllowExisting`] on
+    /// host: the scan runs and publishes whatever's there. The
+    /// distinct variant exists so a future slice (snapshot/init
+    /// step distinct from the live scan) can diverge without a
+    /// breaking change. **Rejected on join** — a joiner has no
+    /// canonical tree to seed from; use [`Self::AllowExisting`]
+    /// there instead.
+    InitFromExisting,
+}
 
 /// Configurable knobs for [`Workspace::host_with`] /
 /// [`Workspace::join_with`].
@@ -197,8 +249,9 @@ impl Workspace {
         client: &Client,
         session: SessionId,
         root: PathBuf,
+        policy: AttachPolicy,
     ) -> Result<(Self, mpsc::Receiver<WorkspaceEvent>), WorkspaceError> {
-        Self::host_with(client, session, root, WorkspaceConfig::default()).await
+        Self::host_with(client, session, root, policy, WorkspaceConfig::default()).await
     }
 
     /// [`Self::host`], but with an explicit [`WorkspaceConfig`] so
@@ -216,6 +269,7 @@ impl Workspace {
         client: &Client,
         session: SessionId,
         root: PathBuf,
+        policy: AttachPolicy,
         config: WorkspaceConfig,
     ) -> Result<(Self, mpsc::Receiver<WorkspaceEvent>), WorkspaceError> {
         let root = canonicalise(&root);
@@ -223,6 +277,12 @@ impl Workspace {
         // (default) `<root>/.artel-fs/` placement doesn't fail.
         tokio::fs::create_dir_all(&root).await?;
         let state_dir = config.resolve(&root);
+
+        // Enforce the policy *before* any state-dir or iroh-node
+        // creation so a `Policy` error guarantees no on-disk
+        // artefacts were left behind.
+        enforce_attach_policy(&root, &state_dir, policy, AttachSide::Host)?;
+
         ensure_state_dir(&state_dir)?;
 
         let node = WorkspaceNode::spawn(&state_dir).await?;
@@ -303,8 +363,9 @@ impl Workspace {
         client: &Client,
         session: SessionId,
         root: PathBuf,
+        policy: AttachPolicy,
     ) -> Result<(Self, mpsc::Receiver<WorkspaceEvent>), WorkspaceError> {
-        Self::join_with(client, session, root, WorkspaceConfig::default()).await
+        Self::join_with(client, session, root, policy, WorkspaceConfig::default()).await
     }
 
     /// [`Self::join`], but with an explicit [`WorkspaceConfig`].
@@ -318,11 +379,18 @@ impl Workspace {
         client: &Client,
         session: SessionId,
         root: PathBuf,
+        policy: AttachPolicy,
         config: WorkspaceConfig,
     ) -> Result<(Self, mpsc::Receiver<WorkspaceEvent>), WorkspaceError> {
         let root = canonicalise(&root);
         tokio::fs::create_dir_all(&root).await?;
         let state_dir = config.resolve(&root);
+
+        // Enforce the policy before any state-dir / iroh-node /
+        // subscribe work so a `Policy` error leaves zero on-disk
+        // and zero IPC state.
+        enforce_attach_policy(&root, &state_dir, policy, AttachSide::Join)?;
+
         ensure_state_dir(&state_dir)?;
 
         let node = WorkspaceNode::spawn(&state_dir).await?;
@@ -730,6 +798,103 @@ fn canonicalise(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
+/// Which side of an attach is being checked. Drives the
+/// `InitFromExisting`-on-join rejection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttachSide {
+    Host,
+    Join,
+}
+
+/// Enforce `policy` against the given workspace `root`.
+///
+/// `state_dir` is the resolved state directory path (after
+/// [`WorkspaceConfig::resolve`]). When it lives under `root` (the
+/// common case), its top-level component is excluded from the
+/// emptiness check so a returning host/joiner with persisted state
+/// can still pass `RequireEmpty`.
+///
+/// Hardcoded-skip paths (`.git`, `target`, etc.) are also excluded —
+/// see [`WorkspaceFilter::is_hardcoded_skip`].
+fn enforce_attach_policy(
+    root: &Path,
+    state_dir: &Path,
+    policy: AttachPolicy,
+    side: AttachSide,
+) -> Result<(), WorkspaceError> {
+    if matches!(policy, AttachPolicy::InitFromExisting) && side == AttachSide::Join {
+        return Err(WorkspaceError::Policy(
+            PolicyViolation::InitFromExistingNotMeaningfulOnJoin,
+        ));
+    }
+
+    if !matches!(policy, AttachPolicy::RequireEmpty) {
+        return Ok(());
+    }
+
+    // Resolve the state dir's top-level component name relative to
+    // `root`, when the state dir lives under `root`. Used to exempt
+    // `<root>/.artel-fs` (or whatever override placed the state dir
+    // inside the workspace) from the emptiness check.
+    let exempt_state_component: Option<OsString> = state_dir
+        .strip_prefix(root)
+        .ok()
+        .and_then(|rel| rel.components().next())
+        .map(|c| c.as_os_str().to_owned());
+
+    let read_dir = match std::fs::read_dir(root) {
+        Ok(rd) => rd,
+        // The policy check runs before `create_dir_all` (we want
+        // canonicalisation to happen before either, and that
+        // requires the path to already exist on disk). A
+        // not-yet-created `root` is, by definition, empty — no user
+        // data to clobber.
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(WorkspaceError::Io(err)),
+    };
+
+    let mut offending = Vec::with_capacity(POLICY_OFFENDING_LIMIT);
+    let mut more = false;
+    for entry in read_dir {
+        let entry = entry.map_err(WorkspaceError::Io)?;
+        let name = entry.file_name();
+
+        // Exempt the workspace's own state dir.
+        if let Some(exempt) = exempt_state_component.as_ref()
+            && &name == exempt
+        {
+            continue;
+        }
+
+        // Exempt hardcoded-skip names by treating each top-level
+        // entry as a single-component relative path. `.git/`,
+        // `target/`, `node_modules/`, `.DS_Store`, `*.swp`, `*.tmp`.
+        if WorkspaceFilter::is_hardcoded_skip(Path::new(&name)) {
+            continue;
+        }
+
+        if offending.len() < POLICY_OFFENDING_LIMIT {
+            offending.push(entry.path());
+        } else {
+            more = true;
+            break;
+        }
+    }
+
+    if offending.is_empty() {
+        return Ok(());
+    }
+
+    let _ = more; // Reserved: a future variant could distinguish
+    // truncated-vs-complete; today the error message already names
+    // "first N entries" and that's good enough.
+
+    Err(WorkspaceError::Policy(PolicyViolation::DirNotEmpty {
+        root: root.to_path_buf(),
+        offending_entries: offending,
+    }))
+}
+
 /// Create the state dir (and any missing parents) if it doesn't
 /// already exist. Idempotent — re-runs on every workspace startup.
 fn ensure_state_dir(state_dir: &Path) -> Result<(), WorkspaceError> {
@@ -866,6 +1031,10 @@ async fn reconcile_doc_against_disk(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
+    use tempfile::TempDir;
+
     use super::*;
 
     #[test]
@@ -883,5 +1052,185 @@ mod tests {
         // forever" so a misconfigured single-process test has to opt
         // into a deadline.
         assert_eq!(WorkspaceConfig::default().join_ticket_timeout, None);
+    }
+
+    /// Helper: build (`root`, `state_dir`) for a default-layout
+    /// workspace inside a fresh tempdir. State dir is the standard
+    /// `<root>/.artel-fs/` placement — its parent (`root`) doesn't
+    /// have it pre-created so we can exercise both the
+    /// already-exists and not-yet-exists branches.
+    fn default_layout() -> (TempDir, PathBuf, PathBuf) {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let state_dir = root.join(DEFAULT_STATE_SUBDIR);
+        (dir, root, state_dir)
+    }
+
+    #[test]
+    fn enforce_attach_policy_require_empty_accepts_truly_empty_dir() {
+        let (_t, root, state_dir) = default_layout();
+        let res = enforce_attach_policy(
+            &root,
+            &state_dir,
+            AttachPolicy::RequireEmpty,
+            AttachSide::Host,
+        );
+        assert!(res.is_ok(), "{res:?}");
+    }
+
+    #[test]
+    fn enforce_attach_policy_require_empty_accepts_dir_with_only_artel_fs() {
+        let (_t, root, state_dir) = default_layout();
+        // Materialise the state dir before the check — this is the
+        // returning-host / returning-joiner case.
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(state_dir.join("iroh.key"), b"x").unwrap();
+        fs::write(state_dir.join("doc-id"), b"x").unwrap();
+        let res = enforce_attach_policy(
+            &root,
+            &state_dir,
+            AttachPolicy::RequireEmpty,
+            AttachSide::Host,
+        );
+        assert!(res.is_ok(), "{res:?}");
+    }
+
+    #[test]
+    fn enforce_attach_policy_require_empty_accepts_dir_with_only_filtered_paths() {
+        let (_t, root, state_dir) = default_layout();
+        // All hardcoded-skip names should be exempted from the
+        // emptiness check.
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("target")).unwrap();
+        fs::create_dir_all(root.join("node_modules")).unwrap();
+        fs::write(root.join(".DS_Store"), b"x").unwrap();
+        fs::write(root.join("foo.swp"), b"x").unwrap();
+        fs::write(root.join("scratch.tmp"), b"x").unwrap();
+        let res = enforce_attach_policy(
+            &root,
+            &state_dir,
+            AttachPolicy::RequireEmpty,
+            AttachSide::Host,
+        );
+        assert!(res.is_ok(), "{res:?}");
+    }
+
+    #[test]
+    fn enforce_attach_policy_require_empty_accepts_dir_with_overridden_state_dir() {
+        // State dir lives *inside* `root` but under a non-default
+        // name. Its top-level component should still be exempted.
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        let state_dir = root.join("custom-state");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(state_dir.join("iroh.key"), b"x").unwrap();
+        let res = enforce_attach_policy(
+            &root,
+            &state_dir,
+            AttachPolicy::RequireEmpty,
+            AttachSide::Host,
+        );
+        assert!(res.is_ok(), "{res:?}");
+    }
+
+    #[test]
+    fn enforce_attach_policy_require_empty_rejects_dir_with_user_file() {
+        let (_t, root, state_dir) = default_layout();
+        fs::write(root.join("a.txt"), b"hello").unwrap();
+        let err = enforce_attach_policy(
+            &root,
+            &state_dir,
+            AttachPolicy::RequireEmpty,
+            AttachSide::Host,
+        )
+        .expect_err("should reject non-empty dir");
+        match err {
+            WorkspaceError::Policy(PolicyViolation::DirNotEmpty {
+                offending_entries, ..
+            }) => {
+                assert_eq!(offending_entries.len(), 1);
+                assert!(offending_entries[0].ends_with("a.txt"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enforce_attach_policy_require_empty_rejects_dir_with_subdirectory() {
+        let (_t, root, state_dir) = default_layout();
+        fs::create_dir_all(root.join("src")).unwrap();
+        let err = enforce_attach_policy(
+            &root,
+            &state_dir,
+            AttachPolicy::RequireEmpty,
+            AttachSide::Join,
+        )
+        .expect_err("should reject");
+        assert!(matches!(
+            err,
+            WorkspaceError::Policy(PolicyViolation::DirNotEmpty { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enforce_attach_policy_require_empty_rejects_top_level_symlink() {
+        // Symlinks at the top level count as non-empty: the filter
+        // never follows them, so a symlinked tree shouldn't trick
+        // emptiness into a pass.
+        let (_t, root, state_dir) = default_layout();
+        let target = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(target.path(), root.join("link")).unwrap();
+        let err = enforce_attach_policy(
+            &root,
+            &state_dir,
+            AttachPolicy::RequireEmpty,
+            AttachSide::Host,
+        )
+        .expect_err("symlink at top level should reject");
+        assert!(matches!(
+            err,
+            WorkspaceError::Policy(PolicyViolation::DirNotEmpty { .. })
+        ));
+    }
+
+    #[test]
+    fn enforce_attach_policy_allow_existing_passes_anything() {
+        let (_t, root, state_dir) = default_layout();
+        fs::write(root.join("a.txt"), b"x").unwrap();
+        fs::create_dir_all(root.join("nested/dir")).unwrap();
+        for side in [AttachSide::Host, AttachSide::Join] {
+            let res = enforce_attach_policy(&root, &state_dir, AttachPolicy::AllowExisting, side);
+            assert!(res.is_ok(), "AllowExisting {side:?} should pass: {res:?}");
+        }
+    }
+
+    #[test]
+    fn enforce_attach_policy_init_from_existing_passes_on_host() {
+        let (_t, root, state_dir) = default_layout();
+        fs::write(root.join("a.txt"), b"x").unwrap();
+        let res = enforce_attach_policy(
+            &root,
+            &state_dir,
+            AttachPolicy::InitFromExisting,
+            AttachSide::Host,
+        );
+        assert!(res.is_ok(), "{res:?}");
+    }
+
+    #[test]
+    fn enforce_attach_policy_init_from_existing_rejected_on_join() {
+        let (_t, root, state_dir) = default_layout();
+        let err = enforce_attach_policy(
+            &root,
+            &state_dir,
+            AttachPolicy::InitFromExisting,
+            AttachSide::Join,
+        )
+        .expect_err("InitFromExisting must reject on join");
+        assert!(matches!(
+            err,
+            WorkspaceError::Policy(PolicyViolation::InitFromExistingNotMeaningfulOnJoin)
+        ));
     }
 }

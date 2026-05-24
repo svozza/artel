@@ -17,7 +17,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use artel_client::Client;
-use artel_fs::{Workspace, WorkspaceConfig, WorkspaceError};
+use artel_fs::{AttachPolicy, Workspace, WorkspaceConfig, WorkspaceError};
 use artel_protocol::{PeerId, PeerInfo, Request, Response};
 use futures_util::future::FutureExt;
 use tempfile::TempDir;
@@ -93,9 +93,15 @@ async fn join_with_short_timeout_errors_when_no_ticket_published() {
 
     let cfg = workspace_config(&bob_state, Some(Duration::from_millis(500)));
     let started = Instant::now();
-    let err = Workspace::join_with(&bob, session, bob_dir.path().to_path_buf(), cfg)
-        .await
-        .expect_err("must time out — no host ever published a ticket");
+    let err = Workspace::join_with(
+        &bob,
+        session,
+        bob_dir.path().to_path_buf(),
+        AttachPolicy::RequireEmpty,
+        cfg,
+    )
+    .await
+    .expect_err("must time out — no host ever published a ticket");
     let elapsed = started.elapsed();
 
     match err {
@@ -130,7 +136,13 @@ async fn join_with_no_timeout_stays_pending_when_no_ticket_published() {
 
     let cfg = workspace_config(&bob_state, None);
     let bob_dir_path = bob_dir.path().to_path_buf();
-    let mut join_fut = Box::pin(Workspace::join_with(&bob, session, bob_dir_path, cfg));
+    let mut join_fut = Box::pin(Workspace::join_with(
+        &bob,
+        session,
+        bob_dir_path,
+        AttachPolicy::RequireEmpty,
+        cfg,
+    ));
 
     // Real wall-clock wait — `tokio::time::pause` would also pause
     // the daemon's internal timers and risk false positives. 3s is

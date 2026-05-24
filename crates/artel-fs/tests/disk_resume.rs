@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use artel_client::Client;
-use artel_fs::{TICKET_ACTION, Workspace, WorkspaceConfig};
+use artel_fs::{AttachPolicy, TICKET_ACTION, Workspace, WorkspaceConfig};
 use artel_protocol::{Event, MessageKind, PeerId, PeerInfo, Request, Response, SessionId};
 use iroh_docs::DocTicket;
 use tokio::time::{sleep, timeout};
@@ -84,10 +84,15 @@ async fn workspace_state_survives_graceful_restart() {
 
         let alice_cfg =
             WorkspaceConfig::default().with_state_dir(alice_wstate.path().to_path_buf());
-        let (alice_ws, _alice_ws_events) =
-            Workspace::host_with(&alice, session, alice_root.path().to_path_buf(), alice_cfg)
-                .await
-                .expect("Workspace::host_with");
+        let (alice_ws, _alice_ws_events) = Workspace::host_with(
+            &alice,
+            session,
+            alice_root.path().to_path_buf(),
+            AttachPolicy::AllowExisting,
+            alice_cfg,
+        )
+        .await
+        .expect("Workspace::host_with");
         let alice_ws = Arc::new(alice_ws);
         let alice_handle = Arc::clone(&alice_ws).run().await;
 
@@ -105,10 +110,15 @@ async fn workspace_state_survives_graceful_restart() {
         assert!(matches!(resp, Response::JoinSession { .. }), "{resp:?}");
 
         let bob_cfg = WorkspaceConfig::default().with_state_dir(bob_wstate.path().to_path_buf());
-        let (bob_ws, _bob_ws_events) =
-            Workspace::join_with(&bob, session, bob_root.path().to_path_buf(), bob_cfg)
-                .await
-                .expect("Workspace::join_with");
+        let (bob_ws, _bob_ws_events) = Workspace::join_with(
+            &bob,
+            session,
+            bob_root.path().to_path_buf(),
+            AttachPolicy::RequireEmpty,
+            bob_cfg,
+        )
+        .await
+        .expect("Workspace::join_with");
         let bob_ws = Arc::new(bob_ws);
         let bob_handle = Arc::clone(&bob_ws).run().await;
 
@@ -178,10 +188,15 @@ async fn workspace_state_survives_graceful_restart() {
     let mut alice_events = alice.take_events().await.expect("alice events");
 
     let alice_cfg = WorkspaceConfig::default().with_state_dir(alice_wstate.path().to_path_buf());
-    let (alice_ws, _alice_ws_events) =
-        Workspace::host_with(&alice, session, alice_root.path().to_path_buf(), alice_cfg)
-            .await
-            .expect("Workspace::host_with phase 2");
+    let (alice_ws, _alice_ws_events) = Workspace::host_with(
+        &alice,
+        session,
+        alice_root.path().to_path_buf(),
+        AttachPolicy::AllowExisting,
+        alice_cfg,
+    )
+    .await
+    .expect("Workspace::host_with phase 2");
     let alice_ws = Arc::new(alice_ws);
     let alice_handle = Arc::clone(&alice_ws).run().await;
 
@@ -215,10 +230,15 @@ async fn workspace_state_survives_graceful_restart() {
     assert!(matches!(resp, Response::JoinSession { .. }), "{resp:?}");
 
     let bob_cfg = WorkspaceConfig::default().with_state_dir(bob_wstate.path().to_path_buf());
-    let (bob_ws, _bob_ws_events) =
-        Workspace::join_with(&bob, session, bob_root.path().to_path_buf(), bob_cfg)
-            .await
-            .expect("Workspace::join_with phase 2");
+    let (bob_ws, _bob_ws_events) = Workspace::join_with(
+        &bob,
+        session,
+        bob_root.path().to_path_buf(),
+        AttachPolicy::AllowExisting,
+        bob_cfg,
+    )
+    .await
+    .expect("Workspace::join_with phase 2");
     let bob_ws = Arc::new(bob_ws);
     let bob_handle = Arc::clone(&bob_ws).run().await;
 

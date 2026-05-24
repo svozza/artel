@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use artel_client::Client;
-use artel_fs::{Workspace, key_to_path, path_to_key};
+use artel_fs::{AttachPolicy, Workspace, key_to_path, path_to_key};
 use artel_protocol::{PeerId, PeerInfo, Request, Response};
 use futures_util::StreamExt;
 use iroh_docs::store::Query;
@@ -60,9 +60,14 @@ async fn round_trip_once(run: usize) {
     };
 
     let alice_dir = tempfile::tempdir().unwrap();
-    let (alice_ws, _) = Workspace::host(&alice, session, alice_dir.path().to_path_buf())
-        .await
-        .expect("Workspace::host");
+    let (alice_ws, _) = Workspace::host(
+        &alice,
+        session,
+        alice_dir.path().to_path_buf(),
+        AttachPolicy::RequireEmpty,
+    )
+    .await
+    .expect("Workspace::host");
     let alice_ws = Arc::new(alice_ws);
     let alice_handle = Arc::clone(&alice_ws).run().await;
 
@@ -79,9 +84,14 @@ async fn round_trip_once(run: usize) {
     assert!(matches!(resp, Response::JoinSession { .. }), "{resp:?}");
 
     let bob_dir = tempfile::tempdir().unwrap();
-    let (bob_ws, _) = Workspace::join(&bob, session, bob_dir.path().to_path_buf())
-        .await
-        .expect("Workspace::join");
+    let (bob_ws, _) = Workspace::join(
+        &bob,
+        session,
+        bob_dir.path().to_path_buf(),
+        AttachPolicy::RequireEmpty,
+    )
+    .await
+    .expect("Workspace::join");
     let bob_ws = Arc::new(bob_ws);
     let bob_handle = Arc::clone(&bob_ws).run().await;
 
@@ -148,11 +158,8 @@ async fn round_trip_once(run: usize) {
     // Defense in depth: Alice's filter should have blocked the
     // publish in the first place, not just relied on Bob's applier
     // filter to catch it. Check Alice's doc directly.
-    let junk_key = path_to_key(
-        alice_ws.root.as_path(),
-        &alice_ws.root.join("target/junk"),
-    )
-    .expect("path_to_key for target/junk");
+    let junk_key = path_to_key(alice_ws.root.as_path(), &alice_ws.root.join("target/junk"))
+        .expect("path_to_key for target/junk");
     let stream = alice_ws
         .doc()
         .get_many(Query::key_exact(junk_key))

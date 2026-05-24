@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use artel_client::Client;
-use artel_fs::{Workspace, WorkspaceEvent, path_to_key};
+use artel_fs::{AttachPolicy, Workspace, WorkspaceEvent, path_to_key};
 use artel_protocol::{PeerId, PeerInfo, Request, Response};
 use futures_util::StreamExt;
 use iroh_docs::store::Query;
@@ -38,7 +38,7 @@ const POLL: Duration = Duration::from_millis(50);
 
 /// Minimal harness: one daemon, one client, one host workspace.
 /// The joiner side is irrelevant for this property — empty-file
-/// rejection is purely about the host's watcher → set_bytes path.
+/// rejection is purely about the host's watcher → `set_bytes` path.
 async fn spawn_host_workspace() -> (
     common::RunningDaemon,
     Client,
@@ -54,18 +54,19 @@ async fn spawn_host_workspace() -> (
     .await;
     let client = Client::connect(&daemon.socket).await.unwrap();
     let peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "host");
-    let session = match client
-        .request(Request::HostSession { peer })
-        .await
-        .unwrap()
-    {
+    let session = match client.request(Request::HostSession { peer }).await.unwrap() {
         Response::HostSession { session, .. } => session,
         other => panic!("HostSession: got {other:?}"),
     };
     let dir = tempfile::tempdir().unwrap();
-    let (ws, events) = Workspace::host(&client, session, dir.path().to_path_buf())
-        .await
-        .expect("Workspace::host");
+    let (ws, events) = Workspace::host(
+        &client,
+        session,
+        dir.path().to_path_buf(),
+        AttachPolicy::RequireEmpty,
+    )
+    .await
+    .expect("Workspace::host");
     let ws = Arc::new(ws);
     let handle = Arc::clone(&ws).run().await;
     (daemon, client, ws, handle, events, dir)
@@ -100,11 +101,7 @@ async fn doc_has_entry(ws: &Workspace, path: &std::path::Path) -> bool {
     stream.next().await.is_some()
 }
 
-async fn wait_for_entry(
-    ws: &Workspace,
-    path: &std::path::Path,
-    budget: Duration,
-) -> bool {
+async fn wait_for_entry(ws: &Workspace, path: &std::path::Path, budget: Duration) -> bool {
     let deadline = Instant::now() + budget;
     while Instant::now() < deadline {
         if doc_has_entry(ws, path).await {
