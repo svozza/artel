@@ -505,44 +505,53 @@ slices.
 
 #### Stale-daemon detection and cleanup
 
-Adjacent concern, surfaced 2026-05-23 while finishing the
-Workspace host/join safety slice: when a daemon is left running
-(orphaned by a test that SIGKILLed its parent, a CLI that
-crashed without tearing the daemon down, etc.) it keeps holding
-its iroh `EndpointId`, n0 discovery registration, bound UDP
-port, and redb mmap. Subsequent test runs that spawn fresh
-daemons against fresh tempdirs got non-deterministic timeouts
-on `crash_recovery` / `live_edit` until the orphans were
-`pkill`'d. Mechanism not investigated; suspected culprits are
-stale n0 entries pointing at dead peers, FD pressure, or
-iroh-docs commit-batch timing being squeezed by syscall
-contention.
+Surfaced 2026-05-23 while finishing the Workspace host/join
+safety slice: rapid back-to-back `cargo test` runs against
+`round_trip` / `live_edit` / `crash_recovery` failed ~30% with
+"never saw expected bytes" panics that a 30-second cool-down
+fully eliminated.
 
-This is a daemon-reuse-shaped problem: the long-running daemon
-the rest of this section assumes is well-behaved is itself a
-liability if we don't have a clean answer for "is the daemon
-at the default socket path actually ours, or a corpse?"
+Investigated 2026-05-25 (see prior `docs/handoff-stale-daemon.md`,
+deleted on resolution). Evidence: Matrix A (rapid back-to-back)
+2/8 pass, Matrix D (rapid + `pkill` between runs) 3/6 pass —
+identical failure rates ruled out *local* process state, leaving
+n0 DNS publish/resolve as the accumulator. The per-workspace
+iroh nodes used `iroh::endpoint::presets::N0`, so each test run
+made four pkarr publish + DNS-lookup calls against
+`dns.iroh.link`, hitting external rate limits the test harness
+had no business paying.
 
-Two angles, both worth treating together:
+**Fixed in test harness only**: `WorkspaceConfig` gained
+`address_lookup_override: Option<MemoryLookup>`. When set, the
+workspace endpoint switches to `presets::Minimal` plus the
+caller-supplied lookup, fully bypassing the n0 path
+(`endpoint.online()` is also skipped because Minimal has no
+relay to rendezvous with). `tests/common/mod.rs::spawn_pair`
+now hands the same shared `MemoryLookup` to both daemons and
+both workspaces, so all four nodes resolve each other in
+process. Production callers leave the field `None` and continue
+to use n0 discovery unchanged. After the fix, 10/10 pass on the
+rapid-iteration matrix with no sleeps. The `crash_recovery`
+tests deliberately stay on the n0 path — the child binary runs
+in a separate process and can't share an in-memory lookup
+across the boundary; they're slower but functionally correct.
 
-1. **Production**: a daemon that's been up for days through
-   many connect/disconnect cycles should not silently degrade.
-   Build a stress harness (spawn N fresh daemons in sequence
-   against the same default state dir, measure connection-setup
-   latency on the Nth) and verify it doesn't trend upward.
-   If it does, fix the underlying cleanup — most likely candidates
-   are n0 discovery entries we never re-publish on key reuse,
-   and unreaped iroh-gossip topic memberships.
-2. **Test harness**: `common::spawn_pair` /
-   `spawn_daemon_with_lookup` should defensively pkill any
-   prior `artel-daemon` whose state dir matches the test's
-   tempdir prefix before starting. Cheap, doesn't address the
-   production-side fragility but stops it masquerading as
-   flaky tests in the meantime.
+`iroh_docs_smoke.rs` continues to exercise the production
+discovery path so the `DocTicket`-carries-enough-addressing
+contract stays under regression coverage somewhere.
 
-Lower priority than the resume work above, but a real concern
-to track — it's the quiet failure mode of "daemon lives a long
-time" that the rest of this phase is committing to.
+What's still on the table:
+
+- **Production daemon stress**: a daemon that's been up for
+  days through many connect/disconnect cycles should not
+  silently degrade. Build a stress harness (spawn N fresh
+  daemons in sequence against the same default state dir,
+  measure connection-setup latency on the Nth) and verify it
+  doesn't trend upward. The test-harness fix dodged the
+  symptom in CI but the production-side fragility — n0
+  registrations stale-pointing at dead peers, unreaped
+  iroh-gossip topic memberships — is unproven and unmeasured.
+  Lower priority than the resume work above.
 
 ## Future
 
