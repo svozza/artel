@@ -114,9 +114,17 @@ New integration tests under `crates/artel-fs/tests/`:
 
 **Goal:** `PathRules` rides in the workspace.ticket payload, is bound at originate-time, decoded at join-time, stored on the `Workspace` struct. **No enforcement yet** — that's sub-slice 3. This slice only proves end-to-end that rules round-trip through the wire.
 
-Two things named "ticket" in this codebase:
-- `artel-protocol::ticket::SessionTicket` (artel-session ticket, currently v2).
-- `iroh_docs::DocTicket` (the per-workspace doc ticket, broadcast as a `workspace.ticket` system message).
+### Changes since 2026-05-22
+
+- Sub-slice 1 (`AttachPolicy` + wrong-dir guards) landed in `1207fca`. `WorkspaceConfig` does NOT carry policy; policy is positional. Sub-slice 2 must not regress that.
+- `WorkspaceConfig` gained `address_lookup_override: Option<MemoryLookup>` in `ac06c69`. Pattern is now: every config knob is `Option<T>` with a `with_*` builder. The original draft's `pub rules: PathRules` (non-Option) breaks that pattern; switching to `Option<PathRules>` below.
+- `globset` is confirmed NOT directly usable as a transitive of `ignore` (Rust crate-visibility rules). Adding a direct `globset = "0.4"` line to `crates/artel-fs/Cargo.toml`.
+- The test fixture `tests/common/mod.rs::spawn_pair` now returns a `Pair` struct (post `ac06c69`). New integration tests below use the `Pair` destructure pattern. Confirmed `Pair` does **not** need workspace-rules handles — rules ride existing `MemoryLookup`-routed session traffic.
+
+### Two things named "ticket" in this codebase
+
+- `artel-protocol::ticket::SessionTicket` (artel-session ticket, currently v2). **Untouched by this slice.**
+- `iroh_docs::DocTicket` (the per-workspace doc ticket, broadcast as a `workspace.ticket` system message). **This slice introduces an envelope around it.**
 
 The brainstorm phrasing ("Bumps `TICKET_VERSION` 2→3") refers to the workspace.ticket payload, not the artel-session ticket. Concretely, the workspace.ticket payload is today `ticket.to_string().into_bytes()`. We extend the wire shape to a postcard-encoded envelope:
 
@@ -134,17 +142,19 @@ The artel-session-level `TICKET_VERSION` (`artel-protocol::ticket`) is **not** t
 
 ### Files touched
 
-- `crates/artel-fs/src/rules.rs` — **new module.** Defines `PathRules`, `PathRule`, `Mode`, plus `PathRules::mode_for(rel_path: &Path) -> Mode` (first-match-wins; falls through to `default`). All glob matching uses the `globset` crate (already a transitive dep via `ignore`; verify in `Cargo.toml`). Globs are workspace-relative, forward-slash only (matches the doc-key shape; we're Unix-only).
+- `crates/artel-fs/Cargo.toml` — **add** `globset = "0.4"` to `[dependencies]`. Not transitively usable via `ignore`.
+- `crates/artel-fs/src/rules.rs` — **new module.** Defines `PathRules`, `PathRule`, `Mode`, plus `PathRules::mode_for(rel_path: &Path) -> Mode` (first-match-wins; falls through to `default`). All glob matching uses `globset`. Globs are workspace-relative, forward-slash only (matches the doc-key shape; we're Unix-only). NFC normalisation on both glob and input path at construction (mirrors `keys::path_to_key`).
 - `crates/artel-fs/src/ticket.rs` — **new module.** Defines `WorkspaceTicketEnvelope { version, doc_ticket, rules }`, plus `encode(env) -> Vec<u8>` / `decode(bytes) -> Result<Envelope, TicketEnvelopeError>`. Postcard encoding. v1 only; future versions extend via the version byte.
 - `crates/artel-fs/src/workspace.rs`:
-  - `WorkspaceConfig` gains `pub rules: PathRules` (originator side; defaults to `PathRules { default: Mode::ReadWrite, rules: vec![] }` — see "v2-ticket compat" below).
-  - `Workspace` struct gains `pub(crate) rules: Arc<PathRules>` (Arc so the watcher and applier can borrow without cloning the vec).
-  - `host_with` serializes `WorkspaceConfig::rules` into the envelope and broadcasts that as the workspace.ticket payload.
-  - `join_with` parses the envelope, extracts `doc_ticket` and `rules`, stores `rules` on the resulting `Workspace`.
-  - `publish_ticket` signature changes to take `(client, session, doc_ticket, rules)` and encode the envelope internally.
-  - `wait_for_ticket` returns the parsed envelope (not raw bytes).
-- `crates/artel-fs/src/error.rs` — add `WorkspaceError::TicketEnvelope(TicketEnvelopeError)`.
-- `crates/artel-fs/src/lib.rs` — `pub mod rules; pub mod ticket;` and re-exports for `PathRules`, `PathRule`, `Mode`.
+  - `WorkspaceConfig` gains `pub rules: Option<PathRules>` (matches existing `Option<...>` pattern for `state_dir`, `join_ticket_timeout`, `address_lookup_override`). `None` resolves to `PathRules::read_write()` on both originator and joiner side. Builder: `pub fn with_rules(self, rules: PathRules) -> Self`.
+  - `Workspace` struct gains `pub(crate) rules: Arc<PathRules>` (Arc so the watcher and applier can borrow without cloning the vec — load-bearing for sub-slice 3 ergonomics).
+  - `host_with` resolves `config.rules.unwrap_or_else(PathRules::read_write)`, validates, serialises into the envelope, and broadcasts that as the workspace.ticket payload.
+  - `join_with` parses the envelope, extracts `doc_ticket` and `rules`, stores `Arc::new(rules)` on the resulting `Workspace`. The `config.rules` field is **ignored** on join — the host's rules win. Document this loudly on the field doc-comment.
+  - `publish_ticket` signature changes from `(client, session, ticket: &DocTicket)` to `(client, session, ticket: &DocTicket, rules: &PathRules)`. Encodes the envelope internally.
+  - `wait_for_ticket` return type changes from `Result<Vec<u8>, WorkspaceError>` to `Result<WorkspaceTicketEnvelope, WorkspaceError>` (decodes inside). The UTF-8 / `DocTicket::from_str` parsing currently in `join_with` moves into the envelope decode path.
+  - Add `pub fn rules(&self) -> &PathRules` accessor.
+- `crates/artel-fs/src/error.rs` — add `WorkspaceError::TicketEnvelope(TicketEnvelopeError)` and `WorkspaceError::PathRules(PathRulesError)`. Both via `#[from]`.
+- `crates/artel-fs/src/lib.rs` — `pub mod rules; pub mod ticket;` and re-exports for `PathRules`, `PathRule`, `Mode`, `PathRulesError`, `TicketEnvelopeError`.
 
 ### Public API additions
 
@@ -170,21 +180,35 @@ impl PathRules {
         // Reject empty globs, globs with absolute prefixes, globs containing ".."
     }
 }
+
+// artel-fs::workspace (new builder method)
+impl WorkspaceConfig {
+    #[must_use]
+    pub fn with_rules(mut self, rules: PathRules) -> Self {
+        self.rules = Some(rules);
+        self
+    }
+}
+
+// artel-fs::workspace (new accessor on Workspace)
+impl Workspace {
+    pub fn rules(&self) -> &PathRules { &self.rules }
+}
 ```
 
 ### Postcard encoding for `PathRules`
 
-Externally-tagged `Mode` (default for `serde::Serialize` on a unit-variant enum) — already postcard-compatible. `PathRule` and `PathRules` are plain structs. No `#[serde(tag, content)]` anywhere — honoured.
+`Mode` is a unit-variant enum (externally tagged by default in serde — postcard encodes as a single discriminant byte). `PathRule` and `PathRules` are plain structs. `WorkspaceTicketEnvelope` is a plain struct. No `#[serde(tag, content)]` anywhere. Cross-referenced against `MessageKind` in `artel-protocol::message` which uses the same shape and round-trips through postcard in existing tests — confirms the externally-tagged-by-default story.
 
 Encoded size: each rule is ~`len(glob) + 1 byte mode + ~2 bytes length prefix` ≈ 20-50 bytes. 100 rules ≈ 2-5 KiB postcard. The workspace.ticket message is iroh-gossip-bound; current gossip frames can be MiBs. No practical ceiling for the workspace.ticket payload (it's a session message, not a base32-encoded URL-safe string). Document this in the module-doc.
 
-### v2-ticket compatibility decision (brainstorm open question)
+### v2-ticket compatibility decision (now answered)
 
-Brainstorm: "leaning hard-reject — pre-1.0, no external tickets in the wild." **Recommendation: hard-reject.**
+**Hard-reject** old `DocTicket`-string-only payloads. Sub-slice 1 already adopted "no defaults, every caller is explicit" for attach policy; soft-fallback at the wire layer would re-introduce the same ambiguity a layer down.
 
-In practice this means the workspace.ticket payload is *now* always a `WorkspaceTicketEnvelope`. Joiners that try to decode the payload as a raw `DocTicket::from_str` (the old shape) will fail. Joiners running new code against an old host (which broadcast a raw `DocTicket` string) get a clean `TicketEnvelopeError::Malformed` and bail.
+In practice this means the workspace.ticket payload is *now* always a `WorkspaceTicketEnvelope`. Joiners that try to decode the payload as a raw `DocTicket::from_str` (the old shape) will fail. New joiners against an old host get a clean `TicketEnvelopeError::Malformed` and bail.
 
-This is a hard cutover. Justification:
+Justification:
 1. No external consumers pre-1.0; no tickets in the wild.
 2. Silent fallback (old shape → "default-permissive rules") is the exact hazard pattern this slice closes — a `~`-published-by-accident host whose ticket was issued under the old code shouldn't be silently honoured by a new joiner.
 3. The cost is "rebuild both sides together"; identical to the gossip-frame versioning story in the roadmap's "Future" section.
@@ -213,23 +237,32 @@ Unit tests in `crates/artel-fs/src/ticket.rs`:
 - `envelope_decode_rejects_wrong_version_byte`
 - `envelope_decode_rejects_raw_doc_ticket_string` (hard-reject pre-existing v2 shape)
 
-Integration tests:
-- `crates/artel-fs/tests/ticket_envelope_round_trip.rs` — Alice hosts with `PathRules { default: ReadOnly, rules: vec![PathRule { glob: "shared/**", mode: ReadWrite }] }`. Bob joins, asserts `bob_ws.rules()` (new pub accessor) deep-equals what Alice handed in. Verify rules ride the wire intact.
-- `crates/artel-fs/tests/ticket_envelope_rejects_old_shape.rs` — manually broadcast a raw `DocTicket::to_string().into_bytes()` payload on the workspace.ticket action; assert the joiner's `wait_for_ticket` returns a `TicketEnvelope` error and does not bulk-export.
+Unit tests in `crates/artel-fs/src/workspace.rs`:
+- `workspace_config_default_has_no_rules`
+- `workspace_config_with_rules_sets_field`
 
-Update existing tests that capture the workspace.ticket payload (`disk_resume.rs`, `host_publishes_ticket.rs`):
-- `capture_ticket` helper now decodes the envelope, returns `(DocTicket, PathRules)`.
-- `disk_resume.rs`'s `phase1_ticket.capability.id() == phase2_ticket.capability.id()` assertion stays — uses the inner `DocTicket`.
+Integration tests:
+- `crates/artel-fs/tests/ticket_envelope_round_trip.rs` — Alice hosts via `WorkspaceConfig::default().with_rules(PathRules { default: ReadOnly, rules: vec![PathRule { glob: "shared/**".into(), mode: ReadWrite }] })`. Bob joins; assert `bob_ws.rules()` deep-equals what Alice handed in. Verify rules ride the wire intact. Uses the `Pair`-based fixture.
+- `crates/artel-fs/tests/ticket_envelope_rejects_old_shape.rs` — manually broadcast a raw `DocTicket::to_string().into_bytes()` payload on the workspace.ticket action; assert the joiner's `wait_for_ticket` returns a `WorkspaceError::TicketEnvelope(TicketEnvelopeError::Malformed(_))` and does not bulk-export.
+
+Update existing tests that capture the workspace.ticket payload:
+- `crates/artel-fs/tests/disk_resume.rs` — its `capture_ticket` helper currently calls `DocTicket::from_str` on the raw payload. Update to decode via `WorkspaceTicketEnvelope::decode` and return `(DocTicket, PathRules)` (or just `DocTicket` if the test only needs the inner). The `phase1_ticket.capability.id() == phase2_ticket.capability.id()` assertion stays — uses the inner `DocTicket`, which is what the helper still returns. Both `Workspace::host_with` calls in this test use `WorkspaceConfig::default()` today; they continue to do so (the implicit `None` rules round-trip cleanly to `PathRules::read_write()` on the joiner).
+- `crates/artel-fs/tests/host_publishes_ticket.rs` — its inline drain calls `DocTicket::from_str` on the payload to assert the ticket is well-formed. Update the inline parse to decode the envelope first, then `DocTicket::from_str` on the inner string. The test's intent is "host publishes a parseable ticket"; the new intent is "host publishes a parseable envelope wrapping a parseable ticket."
+- `crates/artel-fs/tests/join_ticket_timeout.rs` — checks the error string `"timed out waiting for workspace.ticket"`. That error originates inside `wait_for_ticket`'s `timeout` branch and is unaffected by the envelope change (timeout fires *before* any decode). No update needed; verify the test still passes.
+
+All other tests (`attach_policy_*`, `delete_propagates`, `live_edit`, `round_trip`, etc.) use `Workspace::host` / `Workspace::host_with` with `WorkspaceConfig::default()` and don't capture the ticket payload directly. They're unaffected by the wire change (the envelope is encoded/decoded transparently inside `host_with` / `join_with`).
 
 ### Definition of done
 
-1. `WorkspaceTicketEnvelope` v1 lives in `artel-fs::ticket`; postcard encoded, version-byte-prefixed.
-2. `PathRules` round-trips through host → workspace.ticket → joiner; joiner stores them on `Workspace`.
-3. **No enforcement yet.** The watcher and applier still treat all paths as `ReadWrite`. (Sub-slice 3.)
+1. `WorkspaceTicketEnvelope` v1 lives in `artel-fs::ticket`; postcard-encoded, version-byte-prefixed.
+2. `PathRules` round-trips through host → workspace.ticket → joiner; joiner stores them on `Workspace::rules`.
+3. `WorkspaceConfig::rules` is `Option<PathRules>`; default is `None`; `with_rules` builder added.
 4. `Workspace::rules() -> &PathRules` exists for tests and consumers to inspect.
-5. All sub-slice-1 tests still pass after this slice's wire changes.
-6. New unit + integration tests above exist and pass.
-7. fmt + clippy clean both feature modes.
+5. `globset` added as a direct dep in `crates/artel-fs/Cargo.toml`.
+6. **No enforcement yet.** The watcher and applier still treat all paths as `ReadWrite`. (Sub-slice 3.)
+7. **All sub-slice-1 (`AttachPolicy`) tests still pass after this slice's wire change.** Specifically: `attach_policy_host.rs`, `attach_policy_join.rs`, `attach_policy_state_dir_only.rs`, plus the unit tests in `workspace.rs::tests` (the `enforce_attach_policy_*` battery).
+8. New unit + integration tests above exist and pass.
+9. fmt + clippy clean both feature modes.
 
 ---
 
