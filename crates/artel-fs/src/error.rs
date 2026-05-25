@@ -5,6 +5,9 @@ use std::path::PathBuf;
 
 use artel_client::ClientError;
 
+use crate::rules::PathRulesError;
+use crate::ticket::TicketEnvelopeError;
+
 /// Workspace-side error type.
 ///
 /// Callers see these out of [`crate::Workspace`]'s constructors and
@@ -35,6 +38,16 @@ pub enum WorkspaceError {
     /// non-empty dirs and the `InitFromExisting`-on-join error.
     #[error("attach policy: {0}")]
     Policy(#[from] PolicyViolation),
+
+    /// `workspace.ticket` envelope encode/decode failed. Joiners see
+    /// this against a host that publishes the legacy raw
+    /// `DocTicket`-string payload — hard-rejected by design.
+    #[error("ticket envelope: {0}")]
+    TicketEnvelope(#[from] TicketEnvelopeError),
+
+    /// [`crate::PathRules`] failed validation at originate-time.
+    #[error("path rules: {0}")]
+    PathRules(#[from] PathRulesError),
 
     /// IPC roundtrip via the artel client failed.
     #[error(transparent)]

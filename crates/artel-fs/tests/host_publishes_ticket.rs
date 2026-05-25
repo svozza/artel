@@ -17,7 +17,7 @@ use std::time::Duration;
 use artel_client::Client;
 use artel_daemon::shutdown::Shutdown;
 use artel_daemon::{Daemon, DaemonConfig};
-use artel_fs::{AttachPolicy, TICKET_ACTION, Workspace};
+use artel_fs::{AttachPolicy, TICKET_ACTION, Workspace, ticket as fs_ticket};
 use artel_protocol::{Event, MessageKind, PeerId, PeerInfo, Request, Response};
 use iroh_docs::DocTicket;
 use tempfile::TempDir;
@@ -147,8 +147,11 @@ async fn host_lands_ticket_on_session() {
     .expect("workspace.ticket message never arrived");
 
     assert!(!payload.is_empty(), "ticket payload should be non-empty");
-    let ticket_str = std::str::from_utf8(&payload).expect("ticket bytes are utf-8");
-    let _: DocTicket = DocTicket::from_str(ticket_str).expect("valid DocTicket");
+    // The payload is a postcard-encoded `WorkspaceTicketEnvelope`.
+    // Decode it first, then assert its `doc_ticket` parses as a
+    // real `DocTicket`.
+    let envelope = fs_ticket::decode(&payload).expect("envelope decode");
+    let _: DocTicket = DocTicket::from_str(&envelope.doc_ticket).expect("valid DocTicket");
 
     workspace.shutdown().await;
     drop(events);

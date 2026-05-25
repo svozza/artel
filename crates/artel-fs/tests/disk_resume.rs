@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use artel_client::Client;
-use artel_fs::{AttachPolicy, TICKET_ACTION, Workspace, WorkspaceConfig};
+use artel_fs::{AttachPolicy, TICKET_ACTION, Workspace, WorkspaceConfig, ticket as fs_ticket};
 use artel_protocol::{Event, MessageKind, PeerId, PeerInfo, Request, Response, SessionId};
 use iroh_docs::DocTicket;
 use tokio::time::{sleep, timeout};
@@ -292,8 +292,10 @@ async fn workspace_state_survives_graceful_restart() {
     daemon_b.stop().await;
 }
 
-/// Drain `events` until the workspace ticket lands; parse and
-/// return it.
+/// Drain `events` until the workspace ticket lands; decode the
+/// envelope and return the embedded `DocTicket`. The rules half of
+/// the envelope is dropped — this test only cares about
+/// `NamespaceId` / `NodeId` stability.
 async fn capture_ticket(events: &mut artel_client::EventStream, session: SessionId) -> DocTicket {
     let payload = timeout(TICKET_BUDGET, async {
         loop {
@@ -313,8 +315,8 @@ async fn capture_ticket(events: &mut artel_client::EventStream, session: Session
     .await
     .expect("workspace.ticket never arrived");
 
-    let s = std::str::from_utf8(&payload).expect("ticket utf-8");
-    DocTicket::from_str(s).expect("ticket parse")
+    let envelope = fs_ticket::decode(&payload).expect("envelope decode");
+    DocTicket::from_str(&envelope.doc_ticket).expect("ticket parse")
 }
 
 async fn wait_for_file(path: &Path, expected: &[u8]) {

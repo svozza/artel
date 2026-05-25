@@ -41,6 +41,8 @@ use crate::error::{PolicyViolation, WorkspaceError};
 use crate::filter::{FilterDecision, SkipReason, WorkspaceFilter};
 use crate::keys;
 use crate::node::WorkspaceNode;
+use crate::rules::PathRules;
+use crate::ticket::{self, WorkspaceTicketEnvelope};
 
 /// Maximum number of offending entries surfaced in a
 /// [`PolicyViolation::DirNotEmpty`] error before truncation. Five is
@@ -153,6 +155,21 @@ pub struct WorkspaceConfig {
     /// both with one cross-seeded lookup. See `tests/common/mod.rs`
     /// (`spawn_pair`) for the canonical use.
     pub address_lookup_override: Option<iroh::address_lookup::memory::MemoryLookup>,
+
+    /// Per-path read/write rules for this workspace.
+    ///
+    /// Bound at originate-time (host side), travel with the
+    /// `workspace.ticket` envelope, decoded and stored on the joiner
+    /// side. **Ignored on join**: a joiner's `rules` field is
+    /// dropped on the floor — the host's rules win. `None` resolves
+    /// to [`PathRules::read_write`] (default-permissive).
+    ///
+    /// Note: in v1 only the **originator** decides the rules. There
+    /// is no negotiation, no peer-side override. Once issued, the
+    /// rules are fixed for the lifetime of the doc; restart the host
+    /// with the same `WorkspaceConfig::rules` to keep them stable
+    /// across resumes (see plan §"persistence-first constraint").
+    pub rules: Option<PathRules>,
 }
 
 impl WorkspaceConfig {
@@ -180,6 +197,16 @@ impl WorkspaceConfig {
         lookup: iroh::address_lookup::memory::MemoryLookup,
     ) -> Self {
         self.address_lookup_override = Some(lookup);
+        self
+    }
+
+    /// Bind a [`PathRules`] set to the workspace at originate-time.
+    ///
+    /// Honoured on host (rides the `workspace.ticket` envelope to
+    /// joiners). **Ignored on join** — see [`Self::rules`].
+    #[must_use]
+    pub fn with_rules(mut self, rules: PathRules) -> Self {
+        self.rules = Some(rules);
         self
     }
 
@@ -257,6 +284,15 @@ pub struct Workspace {
     /// [`Self::shutdown`] can take it and consume it without
     /// requiring `&mut self`.
     pub(crate) node: tokio::sync::Mutex<Option<WorkspaceNode>>,
+    /// Path rules bound at originate-time.
+    ///
+    /// On the host: the configured (or default-permissive)
+    /// [`PathRules`]. On the joiner: the rules decoded from the
+    /// `workspace.ticket` envelope — the host's rules, not whatever
+    /// the joiner configured. Surfaced via [`Self::rules`] for
+    /// inspection; enforcement (watcher / applier consultation)
+    /// lands in a follow-up slice.
+    pub(crate) rules: PathRules,
 }
 
 impl Workspace {
@@ -312,6 +348,12 @@ impl Workspace {
         // artefacts were left behind.
         enforce_attach_policy(&root, &state_dir, policy, AttachSide::Host)?;
 
+        // Resolve and validate rules *before* iroh-node spawn too —
+        // a malformed rule set is a configuration error, not a
+        // runtime one.
+        let rules = config.rules.unwrap_or_else(PathRules::read_write);
+        rules.validate()?;
+
         ensure_state_dir(&state_dir)?;
 
         let node = WorkspaceNode::spawn(&state_dir, config.address_lookup_override.clone()).await?;
@@ -350,7 +392,7 @@ impl Workspace {
             .await
             .map_err(|e| WorkspaceError::Doc(format!("share doc: {e}")))?;
 
-        publish_ticket(client, session, &ticket).await?;
+        publish_ticket(client, session, &ticket, &rules).await?;
 
         let blobs = node.blobs.clone();
         Ok((
@@ -363,6 +405,7 @@ impl Workspace {
                 events: tx,
                 shutdown_token: CancellationToken::new(),
                 node: tokio::sync::Mutex::new(Some(node)),
+                rules,
             },
             rx,
         ))
@@ -455,11 +498,12 @@ impl Workspace {
             .await
             .ok_or_else(|| WorkspaceError::Iroh("client events already taken".into()))?;
 
-        let ticket_bytes =
-            wait_for_ticket(&mut events, session, config.join_ticket_timeout).await?;
-        let ticket_str = std::str::from_utf8(&ticket_bytes)
-            .map_err(|e| WorkspaceError::Doc(format!("ticket payload not utf-8: {e}")))?;
-        let ticket = DocTicket::from_str(ticket_str)
+        let envelope = wait_for_ticket(&mut events, session, config.join_ticket_timeout).await?;
+        // The host's rules are authoritative — `config.rules` on the
+        // joiner side is dropped on the floor here. Documented on
+        // `WorkspaceConfig::rules`.
+        let rules = envelope.rules;
+        let ticket = DocTicket::from_str(&envelope.doc_ticket)
             .map_err(|e| WorkspaceError::Doc(format!("ticket parse: {e}")))?;
 
         let (doc, live) = node
@@ -490,6 +534,7 @@ impl Workspace {
                 events: tx,
                 shutdown_token: CancellationToken::new(),
                 node: tokio::sync::Mutex::new(Some(node)),
+                rules,
             },
             rx,
         ))
@@ -503,6 +548,19 @@ impl Workspace {
     #[must_use]
     pub const fn doc(&self) -> &Doc {
         &self.doc
+    }
+
+    /// Borrow the workspace's [`PathRules`].
+    ///
+    /// On the host: the configured (or default-permissive) rules.
+    /// On the joiner: the rules decoded from the host's
+    /// `workspace.ticket` envelope (the host's, not whatever the
+    /// joiner configured). Surfaced for tests and future consumers;
+    /// enforcement (watcher / applier consultation) lands in a
+    /// follow-up slice.
+    #[must_use]
+    pub const fn rules(&self) -> &PathRules {
+        &self.rules
     }
 
     /// Spawn the watcher + applier background tasks, **awaiting**
@@ -567,6 +625,7 @@ impl Workspace {
 /// Walk `root` and publish every non-skipped file to `doc`. Errors
 /// on a single file surface as [`WorkspaceEvent::Error`]; we do not
 /// abort the scan.
+///
 async fn scan_and_publish_existing(
     root: &Path,
     doc: &Doc,
@@ -633,24 +692,29 @@ async fn scan_and_publish_existing(
     Ok(())
 }
 
-/// Broadcast `ticket` over `session` as a `MessageKind::System`
-/// message with [`TICKET_ACTION`].
+/// Broadcast `ticket` + `rules` over `session` as a
+/// `MessageKind::System` message with [`TICKET_ACTION`].
 ///
-/// Wire shape: `payload = ticket.to_string().into_bytes()`. `DocTicket`
-/// has a stable base32 string representation (its `Display` impl) so
-/// joiners just call [`DocTicket::from_str`] on the bytes.
+/// Wire shape: postcard-encoded [`WorkspaceTicketEnvelope`]. The
+/// legacy pre-envelope shape (raw `DocTicket::to_string().into_bytes()`)
+/// is hard-rejected by the joiner with
+/// [`TicketEnvelopeError::Malformed`] — see [`crate::ticket`] module
+/// docs for the wire-compat decision.
 pub(crate) async fn publish_ticket(
     client: &Client,
     session: SessionId,
     ticket: &DocTicket,
+    rules: &PathRules,
 ) -> Result<(), WorkspaceError> {
+    let envelope = WorkspaceTicketEnvelope::new(ticket.to_string(), rules.clone());
+    let payload = ticket::encode(&envelope)?;
     let resp = client
         .request(Request::Send {
             session,
             payload: SendPayload {
                 kind: MessageKind::System,
                 action: TICKET_ACTION.to_string(),
-                payload: ticket.to_string().into_bytes(),
+                payload,
             },
         })
         .await?;
@@ -696,15 +760,15 @@ where
 }
 
 /// Drain `events` until a `MessageKind::System` event with
-/// [`TICKET_ACTION`] for `session` arrives. `deadline` caps the
-/// wait — `None` means wait indefinitely (the right shape for
-/// long-lived joiners that may arrive minutes or hours after the
-/// host).
+/// [`TICKET_ACTION`] for `session` arrives, then decode the payload
+/// as a [`WorkspaceTicketEnvelope`]. `deadline` caps the wait —
+/// `None` means wait indefinitely (the right shape for long-lived
+/// joiners that may arrive minutes or hours after the host).
 async fn wait_for_ticket(
     events: &mut artel_client::EventStream,
     session: SessionId,
     deadline: Option<Duration>,
-) -> Result<Vec<u8>, WorkspaceError> {
+) -> Result<WorkspaceTicketEnvelope, WorkspaceError> {
     let drain = async {
         loop {
             let ev = events.recv().await.ok_or_else(|| {
@@ -718,7 +782,8 @@ async fn wait_for_ticket(
                 && message.kind == MessageKind::System
                 && message.action == TICKET_ACTION
             {
-                return Ok::<_, WorkspaceError>(message.payload);
+                let envelope = ticket::decode(&message.payload)?;
+                return Ok::<_, WorkspaceError>(envelope);
             }
         }
     };
@@ -1081,6 +1146,29 @@ mod tests {
         // forever" so a misconfigured single-process test has to opt
         // into a deadline.
         assert_eq!(WorkspaceConfig::default().join_ticket_timeout, None);
+    }
+
+    #[test]
+    fn workspace_config_default_has_no_rules() {
+        // The plan calls for default `None`, resolving to
+        // `PathRules::read_write()` inside `host_with`. Test the
+        // configuration default explicitly so a future patch can't
+        // change the default rules without also flipping this test.
+        assert!(WorkspaceConfig::default().rules.is_none());
+    }
+
+    #[test]
+    fn workspace_config_with_rules_sets_field() {
+        use crate::rules::{Mode, PathRule, PathRules};
+        let rules = PathRules {
+            default: Mode::ReadOnly,
+            rules: vec![PathRule {
+                glob: "shared/**".into(),
+                mode: Mode::ReadWrite,
+            }],
+        };
+        let cfg = WorkspaceConfig::default().with_rules(rules.clone());
+        assert_eq!(cfg.rules, Some(rules));
     }
 
     /// Helper: build (`root`, `state_dir`) for a default-layout

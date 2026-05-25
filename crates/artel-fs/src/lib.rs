@@ -25,6 +25,8 @@ pub mod filter;
 pub mod keys;
 mod keystore;
 mod node;
+pub mod rules;
+pub mod ticket;
 mod watcher;
 pub mod workspace;
 
@@ -32,4 +34,6 @@ pub use echo_guard::EchoGuard;
 pub use error::{PolicyViolation, WorkspaceError};
 pub use filter::{FilterDecision, MAX_FILE_SIZE, SkipReason, WorkspaceFilter};
 pub use keys::{KEY_PREFIX, key_to_path, path_to_key};
+pub use rules::{Mode, PathRule, PathRules, PathRulesError};
+pub use ticket::{TicketEnvelopeError, WorkspaceTicketEnvelope};
 pub use workspace::{AttachPolicy, TICKET_ACTION, Workspace, WorkspaceConfig, WorkspaceEvent};

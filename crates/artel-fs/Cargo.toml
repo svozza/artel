@@ -14,6 +14,7 @@ artel-protocol.workspace = true
 blake3 = "1"
 bytes.workspace = true
 futures-util.workspace = true
+globset = "0.4"
 ignore = "0.4"
 notify = "8"
 notify-debouncer-full = "0.6"
@@ -21,7 +22,9 @@ iroh.workspace = true
 iroh-blobs.workspace = true
 iroh-docs.workspace = true
 iroh-gossip.workspace = true
+postcard.workspace = true
 rand.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "macros", "rt", "sync", "time"] }
 tokio-util.workspace = true
