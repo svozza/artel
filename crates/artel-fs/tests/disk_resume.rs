@@ -57,7 +57,12 @@ async fn workspace_state_survives_graceful_restart() {
         .unwrap();
 
     let phase1_ticket = {
-        let (daemon_a, daemon_b) = common::spawn_pair().await;
+        let common::Pair {
+            daemon_a,
+            daemon_b,
+            workspace_lookup_a,
+            workspace_lookup_b,
+        } = common::spawn_pair().await;
 
         let alice = Client::connect(&daemon_a.socket).await.unwrap();
         let (session, artel_ticket) = match alice
@@ -82,8 +87,9 @@ async fn workspace_state_survives_graceful_restart() {
             .unwrap();
         let mut alice_events = alice.take_events().await.expect("alice events");
 
-        let alice_cfg =
-            WorkspaceConfig::default().with_state_dir(alice_wstate.path().to_path_buf());
+        let alice_cfg = WorkspaceConfig::default()
+            .with_state_dir(alice_wstate.path().to_path_buf())
+            .with_address_lookup_override(workspace_lookup_a);
         let (alice_ws, _alice_ws_events) = Workspace::host_with(
             &alice,
             session,
@@ -109,7 +115,9 @@ async fn workspace_state_survives_graceful_restart() {
             .unwrap();
         assert!(matches!(resp, Response::JoinSession { .. }), "{resp:?}");
 
-        let bob_cfg = WorkspaceConfig::default().with_state_dir(bob_wstate.path().to_path_buf());
+        let bob_cfg = WorkspaceConfig::default()
+            .with_state_dir(bob_wstate.path().to_path_buf())
+            .with_address_lookup_override(workspace_lookup_b);
         let (bob_ws, _bob_ws_events) = Workspace::join_with(
             &bob,
             session,
@@ -166,7 +174,12 @@ async fn workspace_state_survives_graceful_restart() {
     // -----------------------------------------------------------
     // Phase 2: fresh daemons, same workspace state dirs.
     // -----------------------------------------------------------
-    let (daemon_a, daemon_b) = common::spawn_pair().await;
+    let common::Pair {
+        daemon_a,
+        daemon_b,
+        workspace_lookup_a,
+        workspace_lookup_b,
+    } = common::spawn_pair().await;
 
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
     let (session, artel_ticket) = match alice
@@ -187,7 +200,9 @@ async fn workspace_state_survives_graceful_restart() {
         .unwrap();
     let mut alice_events = alice.take_events().await.expect("alice events");
 
-    let alice_cfg = WorkspaceConfig::default().with_state_dir(alice_wstate.path().to_path_buf());
+    let alice_cfg = WorkspaceConfig::default()
+        .with_state_dir(alice_wstate.path().to_path_buf())
+        .with_address_lookup_override(workspace_lookup_a);
     let (alice_ws, _alice_ws_events) = Workspace::host_with(
         &alice,
         session,
@@ -229,7 +244,9 @@ async fn workspace_state_survives_graceful_restart() {
         .unwrap();
     assert!(matches!(resp, Response::JoinSession { .. }), "{resp:?}");
 
-    let bob_cfg = WorkspaceConfig::default().with_state_dir(bob_wstate.path().to_path_buf());
+    let bob_cfg = WorkspaceConfig::default()
+        .with_state_dir(bob_wstate.path().to_path_buf())
+        .with_address_lookup_override(workspace_lookup_b);
     let (bob_ws, _bob_ws_events) = Workspace::join_with(
         &bob,
         session,

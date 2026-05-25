@@ -235,7 +235,19 @@ async fn wait_for_file(path: &Path, expected: &[u8]) {
 /// state and live sync should resume.
 #[tokio::test(flavor = "multi_thread")]
 async fn steady_state_sigkill_preserves_state() {
-    let (daemon_a, daemon_b) = common::spawn_pair().await;
+    // Crash-recovery tests deliberately don't override the workspace
+    // address-lookup: the child binary runs in a separate process
+    // and an in-memory MemoryLookup can't be shared across the
+    // process boundary. These tests therefore exercise the n0
+    // discovery path. They're slower and flakier than the in-process
+    // tests because of it; that's the price of testing a real
+    // SIGKILL → restart cycle. See `docs/handoff-stale-daemon.md`.
+    let common::Pair {
+        daemon_a,
+        daemon_b,
+        workspace_lookup_a: _,
+        workspace_lookup_b: _,
+    } = common::spawn_pair().await;
 
     let alice_root = tempfile::tempdir().unwrap();
     let alice_wstate = tempfile::tempdir().unwrap();
@@ -338,7 +350,12 @@ async fn steady_state_sigkill_preserves_state() {
 async fn mid_scan_sigkill_recovers_via_reconcile() {
     const N: usize = 16;
 
-    let (daemon_a, daemon_b) = common::spawn_pair().await;
+    let common::Pair {
+        daemon_a,
+        daemon_b,
+        workspace_lookup_a: _,
+        workspace_lookup_b: _,
+    } = common::spawn_pair().await;
 
     let alice_root = tempfile::tempdir().unwrap();
     let alice_wstate = tempfile::tempdir().unwrap();
@@ -416,7 +433,12 @@ async fn mid_scan_sigkill_recovers_via_reconcile() {
 /// the prior process didn't get to publish.
 #[tokio::test(flavor = "multi_thread")]
 async fn mid_write_sigkill_resyncs_on_restart() {
-    let (daemon_a, daemon_b) = common::spawn_pair().await;
+    let common::Pair {
+        daemon_a,
+        daemon_b,
+        workspace_lookup_a: _,
+        workspace_lookup_b: _,
+    } = common::spawn_pair().await;
 
     let alice_root = tempfile::tempdir().unwrap();
     let alice_wstate = tempfile::tempdir().unwrap();

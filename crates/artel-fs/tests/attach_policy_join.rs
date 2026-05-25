@@ -18,13 +18,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use artel_client::Client;
-use artel_fs::{AttachPolicy, PolicyViolation, Workspace, WorkspaceError};
+use artel_fs::{AttachPolicy, PolicyViolation, Workspace, WorkspaceConfig, WorkspaceError};
 use artel_protocol::{PeerId, PeerInfo, Request, Response};
 use tempfile::TempDir;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn join_require_empty_rejects_non_empty_dir_without_creating_state() {
-    let (daemon_a, daemon_b) = common::spawn_pair().await;
+    let common::Pair {
+        daemon_a,
+        daemon_b,
+        workspace_lookup_a,
+        workspace_lookup_b: _,
+    } = common::spawn_pair().await;
 
     // Stand the host up so there's a real session + ticket to join
     // against. The joiner's policy rejection should fire *before* we
@@ -41,11 +46,12 @@ async fn join_require_empty_rejects_non_empty_dir_without_creating_state() {
     };
 
     let alice_dir = TempDir::new().unwrap();
-    let (alice_ws, _) = Workspace::host(
+    let (alice_ws, _) = Workspace::host_with(
         &alice,
         session,
         alice_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
+        WorkspaceConfig::default().with_address_lookup_override(workspace_lookup_a),
     )
     .await
     .expect("Workspace::host");

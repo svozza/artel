@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use artel_client::Client;
-use artel_fs::{AttachPolicy, Workspace, key_to_path, path_to_key};
+use artel_fs::{AttachPolicy, Workspace, WorkspaceConfig, key_to_path, path_to_key};
 use artel_protocol::{PeerId, PeerInfo, Request, Response};
 use futures_util::StreamExt;
 use iroh_docs::store::Query;
@@ -45,7 +45,13 @@ async fn round_trip_3_in_a_row() {
 // length hurts.
 #[allow(clippy::too_many_lines)]
 async fn round_trip_once(run: usize) {
-    let (daemon_a, daemon_b) = common::spawn_pair().await;
+    let pair = common::spawn_pair().await;
+    let common::Pair {
+        daemon_a,
+        daemon_b,
+        workspace_lookup_a,
+        workspace_lookup_b,
+    } = pair;
 
     // Alice on daemon A hosts the artel session + workspace.
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
@@ -60,11 +66,12 @@ async fn round_trip_once(run: usize) {
     };
 
     let alice_dir = tempfile::tempdir().unwrap();
-    let (alice_ws, _) = Workspace::host(
+    let (alice_ws, _) = Workspace::host_with(
         &alice,
         session,
         alice_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
+        WorkspaceConfig::default().with_address_lookup_override(workspace_lookup_a),
     )
     .await
     .expect("Workspace::host");
@@ -84,11 +91,12 @@ async fn round_trip_once(run: usize) {
     assert!(matches!(resp, Response::JoinSession { .. }), "{resp:?}");
 
     let bob_dir = tempfile::tempdir().unwrap();
-    let (bob_ws, _) = Workspace::join(
+    let (bob_ws, _) = Workspace::join_with(
         &bob,
         session,
         bob_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
+        WorkspaceConfig::default().with_address_lookup_override(workspace_lookup_b),
     )
     .await
     .expect("Workspace::join");

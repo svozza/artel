@@ -21,6 +21,7 @@
 use std::path::Path;
 
 use iroh::Endpoint;
+use iroh::address_lookup::memory::MemoryLookup;
 use iroh::protocol::Router;
 use iroh_blobs::BlobsProtocol;
 use iroh_blobs::store::fs::FsStore;
@@ -56,15 +57,45 @@ impl WorkspaceNode {
     /// - `state_dir/blobs/` — `iroh-blobs` `FsStore`.
     ///
     /// Reuses any state already present, creates whatever's missing.
-    pub(crate) async fn spawn(state_dir: &Path) -> Result<Self, WorkspaceError> {
+    ///
+    /// `address_lookup_override` swaps the production discovery path
+    /// (`presets::N0` — pkarr publish + DNS resolve via the n0
+    /// infrastructure) for a caller-supplied [`MemoryLookup`] on top
+    /// of `presets::Minimal`. Real deployments leave it `None`;
+    /// integration tests that run multiple workspace nodes in rapid
+    /// succession use it to take n0's externally-rate-limited DNS off
+    /// the critical path. With `Some(_)`, the relay-fallback path
+    /// is also disabled (Minimal has no relay), so the
+    /// `endpoint.online()` rendezvous is skipped — there's nothing to
+    /// rendezvous with.
+    pub(crate) async fn spawn(
+        state_dir: &Path,
+        address_lookup_override: Option<MemoryLookup>,
+    ) -> Result<Self, WorkspaceError> {
         let secret = load_or_create_secret(&state_dir.join("iroh.key"))
             .map_err(|e| WorkspaceError::Iroh(format!("workspace key: {e}")))?;
 
-        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
-            .secret_key(secret)
-            .bind()
-            .await
-            .map_err(|e| WorkspaceError::Iroh(format!("bind endpoint: {e}")))?;
+        let endpoint = match address_lookup_override.clone() {
+            Some(lookup) => Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .secret_key(secret)
+                .address_lookup(lookup)
+                .bind()
+                .await
+                .map_err(|e| WorkspaceError::Iroh(format!("bind endpoint: {e}")))?,
+            None => Endpoint::builder(iroh::endpoint::presets::N0)
+                .secret_key(secret)
+                .bind()
+                .await
+                .map_err(|e| WorkspaceError::Iroh(format!("bind endpoint: {e}")))?,
+        };
+
+        // When tests inject a MemoryLookup, also seed our own addr
+        // into it so peers cross-seeded with the same lookup can
+        // resolve us. The daemon does the same dance in its
+        // gossip_bridge — keep the test fixture symmetric.
+        if let Some(lookup) = address_lookup_override.as_ref() {
+            lookup.add_endpoint_info(endpoint.addr());
+        }
 
         let gossip = Gossip::builder().spawn(endpoint.clone());
 
@@ -101,8 +132,15 @@ impl WorkspaceNode {
             .spawn();
 
         // Block until the endpoint is ready to accept; without this a
-        // joiner that follows immediately can race us.
-        endpoint.online().await;
+        // joiner that follows immediately can race us. `online()`
+        // resolves on home-relay readiness, which only exists under
+        // the N0 preset — Minimal+MemoryLookup has no relay and
+        // would hang here forever. Skipping is safe because the
+        // direct UDP path is bound by the time `bind().await`
+        // returned.
+        if address_lookup_override.is_none() {
+            endpoint.online().await;
+        }
 
         Ok(Self {
             docs,

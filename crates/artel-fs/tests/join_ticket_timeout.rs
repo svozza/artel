@@ -30,10 +30,16 @@ struct JoinerSetup {
     session: artel_protocol::SessionId,
     bob_dir: TempDir,
     bob_state: TempDir,
+    bob_workspace_lookup: iroh::address_lookup::memory::MemoryLookup,
 }
 
 async fn host_session_without_workspace() -> JoinerSetup {
-    let (daemon_a, daemon_b) = common::spawn_pair().await;
+    let common::Pair {
+        daemon_a,
+        daemon_b,
+        workspace_lookup_a: _,
+        workspace_lookup_b,
+    } = common::spawn_pair().await;
 
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
     let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
@@ -70,13 +76,19 @@ async fn host_session_without_workspace() -> JoinerSetup {
         session,
         bob_dir,
         bob_state,
+        bob_workspace_lookup: workspace_lookup_b,
     }
 }
 
-fn workspace_config(state: &TempDir, timeout: Option<Duration>) -> WorkspaceConfig {
+fn workspace_config(
+    state: &TempDir,
+    timeout: Option<Duration>,
+    lookup: iroh::address_lookup::memory::MemoryLookup,
+) -> WorkspaceConfig {
     WorkspaceConfig::default()
         .with_state_dir(state.path().to_path_buf())
         .with_join_ticket_timeout(timeout)
+        .with_address_lookup_override(lookup)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -89,9 +101,14 @@ async fn join_with_short_timeout_errors_when_no_ticket_published() {
         session,
         bob_dir,
         bob_state,
+        bob_workspace_lookup,
     } = setup;
 
-    let cfg = workspace_config(&bob_state, Some(Duration::from_millis(500)));
+    let cfg = workspace_config(
+        &bob_state,
+        Some(Duration::from_millis(500)),
+        bob_workspace_lookup,
+    );
     let started = Instant::now();
     let err = Workspace::join_with(
         &bob,
@@ -132,9 +149,10 @@ async fn join_with_no_timeout_stays_pending_when_no_ticket_published() {
         session,
         bob_dir,
         bob_state,
+        bob_workspace_lookup,
     } = setup;
 
-    let cfg = workspace_config(&bob_state, None);
+    let cfg = workspace_config(&bob_state, None, bob_workspace_lookup);
     let bob_dir_path = bob_dir.path().to_path_buf();
     let mut join_fut = Box::pin(Workspace::join_with(
         &bob,

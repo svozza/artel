@@ -16,14 +16,19 @@ mod common;
 use std::time::Duration;
 
 use artel_client::Client;
-use artel_fs::{AttachPolicy, Workspace};
+use artel_fs::{AttachPolicy, Workspace, WorkspaceConfig};
 use artel_protocol::{PeerId, PeerInfo, Request, Response};
 use pretty_assertions::assert_eq;
 use tokio::time::timeout;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn joiner_bulk_imports_host_files() {
-    let (daemon_a, daemon_b) = common::spawn_pair().await;
+    let common::Pair {
+        daemon_a,
+        daemon_b,
+        workspace_lookup_a,
+        workspace_lookup_b,
+    } = common::spawn_pair().await;
 
     // Alice on daemon A hosts the artel session.
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
@@ -50,11 +55,12 @@ async fn joiner_bulk_imports_host_files() {
 
     // Stand Alice's workspace up. This publishes the existing files
     // into the doc and broadcasts the ticket on the session.
-    let (alice_ws, _alice_ws_events) = Workspace::host(
+    let (alice_ws, _alice_ws_events) = Workspace::host_with(
         &alice,
         session,
         alice_dir.path().to_path_buf(),
         AttachPolicy::AllowExisting,
+        WorkspaceConfig::default().with_address_lookup_override(workspace_lookup_a),
     )
     .await
     .expect("Workspace::host");
@@ -77,11 +83,12 @@ async fn joiner_bulk_imports_host_files() {
 
     let (bob_ws, _bob_ws_events) = timeout(
         Duration::from_secs(45),
-        Workspace::join(
+        Workspace::join_with(
             &bob,
             session,
             bob_dir.path().to_path_buf(),
             AttachPolicy::RequireEmpty,
+            WorkspaceConfig::default().with_address_lookup_override(workspace_lookup_b),
         ),
     )
     .await

@@ -136,6 +136,23 @@ pub struct WorkspaceConfig {
     /// you'd rather fail fast on a misconfigured session (e.g.
     /// wrong ticket, daemons that can't reach each other).
     pub join_ticket_timeout: Option<Duration>,
+
+    /// Override the workspace's iroh-side discovery layer. Real
+    /// deployments leave this `None` — the workspace endpoint runs
+    /// `iroh::endpoint::presets::N0` and discovers peers via n0's
+    /// pkarr publish + DNS resolve. Integration tests that spin up
+    /// many workspace nodes in rapid succession set
+    /// [`Some(MemoryLookup)`] to swap discovery for an in-process
+    /// lookup table; this also disables the relay path (`Minimal`
+    /// preset has no relay) so n0's externally-rate-limited
+    /// services are entirely off the critical path.
+    ///
+    /// Mirrors the daemon's
+    /// [`artel_daemon::AddressLookupOverride`] knob — daemons and
+    /// workspaces share the same shape so test fixtures can seed
+    /// both with one cross-seeded lookup. See `tests/common/mod.rs`
+    /// (`spawn_pair`) for the canonical use.
+    pub address_lookup_override: Option<iroh::address_lookup::memory::MemoryLookup>,
 }
 
 impl WorkspaceConfig {
@@ -151,6 +168,18 @@ impl WorkspaceConfig {
     #[must_use]
     pub const fn with_join_ticket_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.join_ticket_timeout = timeout;
+        self
+    }
+
+    /// Set an in-process address lookup to substitute for n0's
+    /// pkarr/DNS discovery. See [`Self::address_lookup_override`]
+    /// for when this is appropriate (essentially: tests only).
+    #[must_use]
+    pub fn with_address_lookup_override(
+        mut self,
+        lookup: iroh::address_lookup::memory::MemoryLookup,
+    ) -> Self {
+        self.address_lookup_override = Some(lookup);
         self
     }
 
@@ -285,7 +314,7 @@ impl Workspace {
 
         ensure_state_dir(&state_dir)?;
 
-        let node = WorkspaceNode::spawn(&state_dir).await?;
+        let node = WorkspaceNode::spawn(&state_dir, config.address_lookup_override.clone()).await?;
 
         // Persistent docs store; default-author is managed by
         // iroh-docs at `state_dir/docs/default-author`.
@@ -393,7 +422,7 @@ impl Workspace {
 
         ensure_state_dir(&state_dir)?;
 
-        let node = WorkspaceNode::spawn(&state_dir).await?;
+        let node = WorkspaceNode::spawn(&state_dir, config.address_lookup_override.clone()).await?;
         // Joiners don't persist a per-workspace `doc-id` — they
         // import the host's namespace from the ticket each time.
         // The default author is still useful for stamping our own

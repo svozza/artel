@@ -13,13 +13,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use artel_client::Client;
-use artel_fs::{AttachPolicy, Workspace};
+use artel_fs::{AttachPolicy, Workspace, WorkspaceConfig};
 use artel_protocol::{PeerId, PeerInfo, Request, Response};
 use tokio::time::sleep;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn live_edit_propagates_host_to_joiner() {
-    let (daemon_a, daemon_b) = common::spawn_pair().await;
+    let common::Pair {
+        daemon_a,
+        daemon_b,
+        workspace_lookup_a,
+        workspace_lookup_b,
+    } = common::spawn_pair().await;
 
     // Alice hosts.
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
@@ -36,11 +41,12 @@ async fn live_edit_propagates_host_to_joiner() {
     };
 
     let alice_dir = tempfile::tempdir().unwrap();
-    let (alice_ws, _) = Workspace::host(
+    let (alice_ws, _) = Workspace::host_with(
         &alice,
         session,
         alice_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
+        WorkspaceConfig::default().with_address_lookup_override(workspace_lookup_a),
     )
     .await
     .expect("Workspace::host");
@@ -60,11 +66,12 @@ async fn live_edit_propagates_host_to_joiner() {
     assert!(matches!(resp, Response::JoinSession { .. }), "{resp:?}");
 
     let bob_dir = tempfile::tempdir().unwrap();
-    let (bob_ws, _) = Workspace::join(
+    let (bob_ws, _) = Workspace::join_with(
         &bob,
         session,
         bob_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
+        WorkspaceConfig::default().with_address_lookup_override(workspace_lookup_b),
     )
     .await
     .expect("Workspace::join");

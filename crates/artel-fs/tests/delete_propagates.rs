@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use artel_client::Client;
-use artel_fs::{AttachPolicy, Workspace};
+use artel_fs::{AttachPolicy, Workspace, WorkspaceConfig};
 use artel_protocol::{PeerId, PeerInfo, Request, Response};
 use tokio::time::sleep;
 
@@ -20,7 +20,12 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[tokio::test(flavor = "multi_thread")]
 async fn alice_delete_propagates_to_bob() {
-    let (daemon_a, daemon_b) = common::spawn_pair().await;
+    let common::Pair {
+        daemon_a,
+        daemon_b,
+        workspace_lookup_a,
+        workspace_lookup_b,
+    } = common::spawn_pair().await;
 
     // Alice hosts; her workspace starts with one seed file so the
     // file is present on Bob's side after `Workspace::join`.
@@ -40,11 +45,12 @@ async fn alice_delete_propagates_to_bob() {
         .await
         .unwrap();
 
-    let (alice_ws, _) = Workspace::host(
+    let (alice_ws, _) = Workspace::host_with(
         &alice,
         session,
         alice_dir.path().to_path_buf(),
         AttachPolicy::AllowExisting,
+        WorkspaceConfig::default().with_address_lookup_override(workspace_lookup_a),
     )
     .await
     .expect("Workspace::host");
@@ -65,11 +71,12 @@ async fn alice_delete_propagates_to_bob() {
     assert!(matches!(resp, Response::JoinSession { .. }), "{resp:?}");
 
     let bob_dir = tempfile::tempdir().unwrap();
-    let (bob_ws, _) = Workspace::join(
+    let (bob_ws, _) = Workspace::join_with(
         &bob,
         session,
         bob_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
+        WorkspaceConfig::default().with_address_lookup_override(workspace_lookup_b),
     )
     .await
     .expect("Workspace::join");
