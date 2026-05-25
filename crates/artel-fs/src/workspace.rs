@@ -41,7 +41,7 @@ use crate::error::{PolicyViolation, WorkspaceError};
 use crate::filter::{FilterDecision, SkipReason, WorkspaceFilter};
 use crate::keys;
 use crate::node::WorkspaceNode;
-use crate::rules::PathRules;
+use crate::rules::{CompiledPathRules, Mode, PathRules};
 use crate::ticket::{self, WorkspaceTicketEnvelope};
 
 /// Maximum number of offending entries surfaced in a
@@ -219,6 +219,21 @@ impl WorkspaceConfig {
     }
 }
 
+/// Which side of the sync a [`WorkspaceEvent::SkippedReadOnly`] fired
+/// on.
+///
+/// `Outgoing` covers a local change the watcher / scan refused to
+/// publish. `Incoming` covers a peer-driven event the applier /
+/// bulk-export refused to apply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    /// A peer's change was refused at the applier or bulk-export
+    /// boundary.
+    Incoming,
+    /// A local change was refused at the watcher or scan boundary.
+    Outgoing,
+}
+
 /// Out-of-band signal surfaced to the consumer of a [`Workspace`].
 ///
 /// Live-loop errors land here rather than as `Result` returns from
@@ -246,6 +261,20 @@ pub enum WorkspaceEvent {
         /// Actual size in bytes.
         size: u64,
     },
+    /// A path-event was skipped because the workspace's
+    /// [`PathRules`] classified it [`crate::Mode::ReadOnly`].
+    ///
+    /// One event per skipped path-event — no coalescing. Mirrors
+    /// [`Self::SkippedTooLarge`]'s shape; consumers that find this
+    /// noisy (e.g. for a `target/**: ReadOnly` rule with chatty
+    /// editor saves) should dedupe themselves.
+    SkippedReadOnly {
+        /// Absolute path under the workspace root that was skipped.
+        path: PathBuf,
+        /// Whether the skip happened on the publish side (`Outgoing`)
+        /// or the apply side (`Incoming`).
+        direction: Direction,
+    },
     /// Non-fatal error in the live loop. Logged for the consumer;
     /// the workspace keeps running.
     Error(String),
@@ -263,9 +292,13 @@ pub struct Workspace {
     /// Absolute path of the directory being mirrored.
     pub root: PathBuf,
     /// Doc handle. The watcher writes to it; the applier reads from
-    /// `doc.subscribe()`.
+    /// `doc.subscribe()`. Borrowed via [`Self::doc`].
     pub(crate) doc: Doc,
-    /// Author id used to stamp our writes.
+    /// Author id used to stamp our writes. Borrowed via
+    /// [`Self::author`]. Exposed so integration tests can inject
+    /// `InsertRemote`-shaped events that bypass the watcher's rule
+    /// check — required by the applier-side defence-in-depth test for
+    /// [`crate::Mode::ReadOnly`].
     pub(crate) author: AuthorId,
     /// Blobs API for fetching content the doc references. Cloned
     /// out of the iroh node so the applier can `get_bytes` without
@@ -284,15 +317,20 @@ pub struct Workspace {
     /// [`Self::shutdown`] can take it and consume it without
     /// requiring `&mut self`.
     pub(crate) node: tokio::sync::Mutex<Option<WorkspaceNode>>,
-    /// Path rules bound at originate-time.
+    /// Path rules bound at originate-time. Two forms:
+    /// `rules` is the wire-shape (kept for [`Self::rules`]
+    /// inspection); `compiled_rules` is the precompiled
+    /// [`globset::GlobSet`]-backed form consulted on every event
+    /// (watcher, applier, scan, bulk-export).
     ///
-    /// On the host: the configured (or default-permissive)
-    /// [`PathRules`]. On the joiner: the rules decoded from the
-    /// `workspace.ticket` envelope — the host's rules, not whatever
-    /// the joiner configured. Surfaced via [`Self::rules`] for
-    /// inspection; enforcement (watcher / applier consultation)
-    /// lands in a follow-up slice.
+    /// On the host: the configured (or default-permissive) rules.
+    /// On the joiner: the rules decoded from the `workspace.ticket`
+    /// envelope — the host's rules, not whatever the joiner
+    /// configured.
     pub(crate) rules: PathRules,
+    /// Precompiled rules; built once from `rules` at construction
+    /// and read per event. See [`Self::rules`].
+    pub(crate) compiled_rules: CompiledPathRules,
 }
 
 impl Workspace {
@@ -348,11 +386,11 @@ impl Workspace {
         // artefacts were left behind.
         enforce_attach_policy(&root, &state_dir, policy, AttachSide::Host)?;
 
-        // Resolve and validate rules *before* iroh-node spawn too —
-        // a malformed rule set is a configuration error, not a
-        // runtime one.
+        // Resolve and compile rules *before* iroh-node spawn too —
+        // `compile` validates as a side-effect, so a malformed rule
+        // set is rejected as a configuration error, not a runtime one.
         let rules = config.rules.unwrap_or_else(PathRules::read_write);
-        rules.validate()?;
+        let compiled_rules = rules.compile()?;
 
         ensure_state_dir(&state_dir)?;
 
@@ -383,7 +421,7 @@ impl Workspace {
         // Pre-populate the doc from disk *before* we share the
         // ticket — joiners that import after this scan see the
         // current snapshot via initial sync.
-        scan_and_publish_existing(&root, &doc, author, &echo_guard, &tx).await?;
+        scan_and_publish_existing(&root, &doc, author, &compiled_rules, &echo_guard, &tx).await?;
 
         // Share with full addressing info so the ticket is enough
         // for joiners to dial without out-of-band addr seeding.
@@ -406,6 +444,7 @@ impl Workspace {
                 shutdown_token: CancellationToken::new(),
                 node: tokio::sync::Mutex::new(Some(node)),
                 rules,
+                compiled_rules,
             },
             rx,
         ))
@@ -501,8 +540,10 @@ impl Workspace {
         let envelope = wait_for_ticket(&mut events, session, config.join_ticket_timeout).await?;
         // The host's rules are authoritative — `config.rules` on the
         // joiner side is dropped on the floor here. Documented on
-        // `WorkspaceConfig::rules`.
+        // `WorkspaceConfig::rules`. Compile here too so the joiner's
+        // hot path matches against a precompiled `GlobSet`.
         let rules = envelope.rules;
+        let compiled_rules = rules.compile()?;
         let ticket = DocTicket::from_str(&envelope.doc_ticket)
             .map_err(|e| WorkspaceError::Doc(format!("ticket parse: {e}")))?;
 
@@ -521,7 +562,7 @@ impl Workspace {
         let (tx, rx) = mpsc::channel(EVENT_BUFFER);
         let echo_guard = EchoGuard::new();
 
-        bulk_export(&root, &doc, &node.blobs, &echo_guard, &tx).await?;
+        bulk_export(&root, &doc, &node.blobs, &compiled_rules, &echo_guard, &tx).await?;
 
         let blobs = node.blobs.clone();
         Ok((
@@ -535,6 +576,7 @@ impl Workspace {
                 shutdown_token: CancellationToken::new(),
                 node: tokio::sync::Mutex::new(Some(node)),
                 rules,
+                compiled_rules,
             },
             rx,
         ))
@@ -550,17 +592,32 @@ impl Workspace {
         &self.doc
     }
 
-    /// Borrow the workspace's [`PathRules`].
+    /// Borrow the workspace's [`PathRules`] in wire form.
     ///
     /// On the host: the configured (or default-permissive) rules.
     /// On the joiner: the rules decoded from the host's
     /// `workspace.ticket` envelope (the host's, not whatever the
-    /// joiner configured). Surfaced for tests and future consumers;
-    /// enforcement (watcher / applier consultation) lands in a
-    /// follow-up slice.
+    /// joiner configured). Surfaced for tests and consumers that
+    /// want to inspect the configured rules; the hot path
+    /// (watcher / applier / scan / bulk-export) uses
+    /// [`Self::compiled_rules`] internally for matcher-once
+    /// performance.
     #[must_use]
     pub const fn rules(&self) -> &PathRules {
         &self.rules
+    }
+
+    /// The [`AuthorId`] this workspace stamps on its outgoing writes.
+    ///
+    /// Exposed so integration tests can call
+    /// `workspace.doc().set_bytes(workspace.author(), ...)` to inject
+    /// peer-driven events that bypass the watcher — required by the
+    /// applier-side defence-in-depth test for [`crate::Mode::ReadOnly`].
+    /// Production code should not need this; the watcher publishes
+    /// outbound writes directly.
+    #[must_use]
+    pub const fn author(&self) -> AuthorId {
+        self.author
     }
 
     /// Spawn the watcher + applier background tasks, **awaiting**
@@ -626,10 +683,16 @@ impl Workspace {
 /// on a single file surface as [`WorkspaceEvent::Error`]; we do not
 /// abort the scan.
 ///
+/// `rules` consultation: any file whose workspace-relative path
+/// resolves to [`Mode::ReadOnly`] is skipped with a
+/// [`WorkspaceEvent::SkippedReadOnly`] (`Outgoing`). A
+/// `default: ReadOnly` workspace publishes nothing here — by design;
+/// see plan §"Bulk-export `ReadOnly`: yes, honour it".
 async fn scan_and_publish_existing(
     root: &Path,
     doc: &Doc,
     author: AuthorId,
+    rules: &CompiledPathRules,
     echo_guard: &EchoGuard,
     events: &mpsc::Sender<WorkspaceEvent>,
 ) -> Result<(), WorkspaceError> {
@@ -651,6 +714,17 @@ async fn scan_and_publish_existing(
             }
             FilterDecision::Skip(_) => continue,
             FilterDecision::Include => {}
+        }
+
+        let rel = path.strip_prefix(root).unwrap_or(path);
+        if rules.mode_for(rel) == Mode::ReadOnly {
+            let _ = events
+                .send(WorkspaceEvent::SkippedReadOnly {
+                    path: path.to_path_buf(),
+                    direction: Direction::Outgoing,
+                })
+                .await;
+            continue;
         }
 
         let bytes = match tokio::fs::read(path).await {
@@ -805,6 +879,12 @@ async fn wait_for_ticket(
 /// - bytes not yet locally available → skipped (the applier
 ///   retries on `ContentReady`).
 ///
+/// `rules` consultation: any entry whose workspace-relative path
+/// resolves to [`Mode::ReadOnly`] is skipped with
+/// [`WorkspaceEvent::SkippedReadOnly`] (`Incoming`), tombstones
+/// included. A `default: ReadOnly` workspace bulk-exports nothing on
+/// join — by design; see plan §"Bulk-export `ReadOnly`: yes, honour it".
+///
 /// Pending-set entries are inserted via the echo guard so the
 /// watcher won't republish what we just wrote. They are released
 /// after [`PENDING_RELEASE_GRACE`].
@@ -812,6 +892,7 @@ async fn bulk_export(
     root: &Path,
     doc: &Doc,
     blobs: &iroh_blobs::BlobsProtocol,
+    rules: &CompiledPathRules,
     echo_guard: &EchoGuard,
     events: &mpsc::Sender<WorkspaceEvent>,
 ) -> Result<(), WorkspaceError> {
@@ -838,6 +919,22 @@ async fn bulk_export(
                 continue;
             }
         };
+
+        // Rule check sits ABOVE the tombstone branch and the filter
+        // check, mirroring `applier::handle_entry`. A `ReadOnly`
+        // path's incoming tombstone must not trigger `remove_file`,
+        // and a `ReadOnly` path's incoming write must not be applied
+        // even if the filter would have let it through.
+        let rel = path.strip_prefix(root).unwrap_or(&path);
+        if rules.mode_for(rel) == Mode::ReadOnly {
+            let _ = events
+                .send(WorkspaceEvent::SkippedReadOnly {
+                    path,
+                    direction: Direction::Incoming,
+                })
+                .await;
+            continue;
+        }
 
         if entry.content_len() == 0 {
             let _ = tokio::fs::remove_file(&path).await;

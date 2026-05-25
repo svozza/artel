@@ -26,16 +26,71 @@
 
 #![allow(dead_code, unreachable_pub, clippy::redundant_pub_crate)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use artel_daemon::shutdown::Shutdown;
 use artel_daemon::{AddressLookupOverride, Daemon, DaemonConfig};
 use artel_protocol::PeerId;
+use futures_util::StreamExt;
 use iroh::address_lookup::memory::MemoryLookup;
+use iroh_docs::api::Doc;
+use iroh_docs::store::Query;
 use tempfile::TempDir;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
+
+/// Default poll interval used by [`wait_for_file`] / [`wait_for_missing`].
+pub const POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Default deadline budget. 15s covers notify debounce (300ms) +
+/// doc `set_bytes` + sync + applier + `tokio::fs::write` under load.
+pub const FILE_BUDGET: Duration = Duration::from_secs(15);
+
+/// Poll `path` until it contains `expected` exactly, or panic with
+/// the path on timeout.
+pub async fn wait_for_file(path: &Path, expected: &[u8]) {
+    let deadline = Instant::now() + FILE_BUDGET;
+    loop {
+        if let Ok(bytes) = tokio::fs::read(path).await
+            && bytes == expected
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "never saw expected bytes at {}",
+            path.display(),
+        );
+        sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Poll until `path` no longer exists, or panic on timeout.
+pub async fn wait_for_missing(path: &Path) {
+    let deadline = Instant::now() + FILE_BUDGET;
+    loop {
+        if !path.exists() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} never disappeared",
+            path.display(),
+        );
+        sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Whether `doc` has any (non-tombstone) entry for `key`. Used by
+/// rule tests to confirm a `ReadOnly` write never landed in the doc.
+pub async fn doc_has_key(doc: &Doc, key: &[u8]) -> bool {
+    let stream = doc
+        .get_many(Query::key_exact(key))
+        .await
+        .expect("get_many");
+    tokio::pin!(stream);
+    stream.next().await.is_some()
+}
 
 pub const FALLBACK_PEER: PeerId = PeerId::from_bytes([0xee; 32]);
 

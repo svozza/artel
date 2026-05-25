@@ -268,25 +268,34 @@ All other tests (`attach_policy_*`, `delete_propagates`, `live_edit`, `round_tri
 
 ## Sub-slice 3 — Watcher and applier rule consultation
 
-**Goal:** Wire `Workspace::rules` into the watcher and applier so `ReadOnly`-classed paths don't publish outward (watcher) and don't get written to disk inbound (applier).
+**Goal:** Wire `Workspace::rules` into the watcher, applier, and the two bulk paths (`scan_and_publish_existing`, `bulk_export`) so `ReadOnly`-classed paths don't publish outward and don't get written to disk inbound.
+
+### Changes since 2026-05-22
+
+- Sub-slice 2 (`PathRules` plumbing + workspace.ticket envelope) landed. `Workspace::rules() -> &PathRules` exists and round-trips host→joiner; this slice consumes it. No new wire shape; pure behaviour change.
+- Reading the actual `applier.rs` (post sub-slice 1/2) shows the **tombstone branch lives BEFORE the filter check** (`handle_entry` line 110-117 then line 119). The original sketch said "after filter.check == Include, consult rules" but for tombstones (zero-length entries) that ordering is wrong: a `ReadOnly` path's incoming tombstone would still trigger `remove_file` because the early-return at line 116 fires before any rule check. Fix: rule consultation must slot in **before** the tombstone branch in `handle_entry`. Same logic applies on the watcher side — `on_removed` doesn't consult the filter today and goes straight to `doc.del`, so a rule check has to be added there too rather than hoping `on_modified`'s check covers it.
+- macOS FSEvents post-unlink quirk (`watcher.rs::on_modified` line 152-161): a deleted file shows up as a `Modify(Metadata)` event, gets a `NotFound` from `tokio::fs::read`, and falls through to `on_removed`. With the rule check in `on_modified`, a `ReadOnly` deleted file is dropped before reaching this fallthrough, so `on_removed`'s own rule check is belt-and-braces — but still required, since Linux sends a real `Remove` that bypasses `on_modified` entirely.
+- `WorkspaceEvent::SkippedReadOnly` shape: `Direction { Incoming, Outgoing }` is fine, but tests will want to assert "skipped because ReadOnly" vs "skipped because filtered" cleanly. The new variant carries `direction` only — consumers that want to know *why* skipped use the variant itself.
+- **Event volume**: emit one `SkippedReadOnly` per skipped path-event, mirroring how `SkippedTooLarge` already behaves. No coalescing, no state. Consumers that find this noisy (e.g. for a `target/**: ReadOnly` rule with chatty editor saves) dedupe themselves. Rationale: simpler, no per-watcher state, no "what counts as a state change" definition to invent.
+- **Applier test bypass**: the `read_only_incoming_blocks_apply.rs` test needs to inject `InsertRemote` events into Bob's doc that bypass Alice's watcher rule check (since a role-blind rule blocks both sides at the watcher layer). Approach: use the existing `pub const fn Workspace::doc()` accessor and call `doc.set_bytes(author, key, bytes)` directly from the test harness. `Workspace::author` is currently `pub(crate)`; bump to `pub` in this slice — same rationale as the `rules()` accessor in sub-slice 2 (tests need doc-layer inspection/injection). No test-only API surface; production code path is what's being tested.
 
 ### Files touched
 
 - `crates/artel-fs/src/watcher.rs`:
-  - `on_modified`: after `filter.check(...) == Include`, consult `workspace.rules.mode_for(rel_path)`. If `ReadOnly`, drop the local change *and* surface a `WorkspaceEvent::SkippedReadOnly { path, direction: Outgoing }`. Do not publish.
-  - `on_removed`: same — `ReadOnly` paths don't get tombstones written by this peer.
-  - `rel_path` here is `path.strip_prefix(&workspace.root)`. Compute it once with `strip_prefix`.
+  - `on_modified`: after `filter.check(...) == Include`, compute `rel = path.strip_prefix(&workspace.root)` and consult `workspace.rules().mode_for(rel)`. If `ReadOnly`, surface `WorkspaceEvent::SkippedReadOnly { path, direction: Outgoing }` and return without publishing. Place the rule check **before** the file read so a `ReadOnly` path doesn't even hit the disk.
+  - `on_removed`: compute `rel` and consult rules. If `ReadOnly`, surface the event and return without `doc.del`. (Linux `Remove` events arrive here directly; macOS arrives via `on_modified`'s fallthrough — both paths need the gate.)
+  - The `rel` computation: a path that doesn't strip cleanly (shouldn't happen since `notify` only reports paths under the watched root, but defensively) falls through to publish/delete as today — don't fail closed on a pathological case that masks unrelated bugs.
 - `crates/artel-fs/src/applier.rs`:
-  - `handle_entry`: after `filter.check(...) == Include`, consult `workspace.rules.mode_for(rel_path)`. If `ReadOnly`, **do not write** to disk. Surface `WorkspaceEvent::SkippedReadOnly { path, direction: Incoming }`.
-  - Same for tombstones (zero-length entries): `ReadOnly` means we don't `remove_file` either.
-  - Same handling in `handle_content_ready` — the underlying `handle_entry` call covers it.
+  - `handle_entry`: hoist the `key_to_path` call (already at line 99) above the tombstone branch so we have `path` to consult against. **Insert the rule check immediately after `key_to_path` succeeds, before both the tombstone branch (line 110) and the filter check (line 119).** If `ReadOnly`, surface `SkippedReadOnly { path, direction: Incoming }` and return. This single insertion covers tombstone-incoming, content-incoming, and (transitively) the `handle_content_ready` retry path that funnels through `handle_entry`.
+  - `handle_content_ready`: no direct change — the rule check inside `handle_entry` covers it. Add a code-comment noting the dependence so a future refactor doesn't accidentally bypass.
 - `crates/artel-fs/src/workspace.rs`:
-  - `scan_and_publish_existing`: same rule consultation. Originator-side: a host with a rule like `default: ReadOnly, "shared/**": ReadWrite` should not publish the read-only zones either. Surfaces `SkippedReadOnly { Outgoing }`.
-  - `bulk_export`: same. **Recommendation: yes, honour `ReadOnly` during bulk-export.** `ReadOnly` in role-blind v1 means "the originator declared this path-class is not subject to peer-driven mutation." Initial bulk-export *is* peer-driven mutation of the joiner's disk. Honouring it during bulk-export means a `ReadOnly` rule has no surprise carve-out for the join boundary.
+  - `scan_and_publish_existing`: after `filter.check(...) == Include`, compute `rel` (we already strip in `keys::path_to_key`; reuse via a `let rel = path.strip_prefix(root).ok()`) and consult `workspace.rules` (passed in as `&PathRules`). If `ReadOnly`, surface `SkippedReadOnly { Outgoing }` and skip. Note: `scan_and_publish_existing` runs *before* `Workspace` is constructed (no `&self` in scope), so its signature gains a `rules: &PathRules` parameter — same pattern as `echo_guard: &EchoGuard`.
+  - `bulk_export`: same. Signature gains `rules: &PathRules`. Honours `ReadOnly` for both content writes (line 808 `tokio::fs::write`) and tombstones (line 778 `tokio::fs::remove_file`). Surfaces `SkippedReadOnly { Incoming }`.
+  - Add `WorkspaceEvent::SkippedReadOnly { path: PathBuf, direction: Direction }` variant + `pub enum Direction { Incoming, Outgoing }` re-exported from `lib.rs`.
 
-  Edge case: this means a `default: ReadOnly` workspace bulk-exports nothing on join. That's the consistent behaviour. Consumers can opt into per-class `ReadWrite` rules; the default-deny case is correct for "I want to publish state outward without anyone modifying it."
+### Bulk-export ReadOnly: yes, honour it
 
-- `crates/artel-fs/src/workspace.rs`: add `WorkspaceEvent::SkippedReadOnly { path: PathBuf, direction: Direction }` variant, with `pub enum Direction { Incoming, Outgoing }`.
+`ReadOnly` in role-blind v1 means "this path-class is not subject to peer-driven mutation." Bulk-export *is* peer-driven mutation of the joiner's disk. A `default: ReadOnly` workspace correctly bulk-exports nothing on join; consumers wanting per-class writes opt in with `ReadWrite` rules. The carve-out "but bulk-export should bypass rules" would create a "rule-laundering" hazard where the join boundary is the one moment a `ReadOnly` rule doesn't apply — exactly the kind of inconsistency this whole plan exists to close.
 
 ### Public API additions
 
@@ -299,29 +308,37 @@ pub enum WorkspaceEvent {
 }
 ```
 
-`Workspace::rules() -> &PathRules` (added in sub-slice 2) becomes load-bearing for tests.
+Re-exports in `lib.rs`: add `Direction` to the `workspace::*` re-export line. `WorkspaceEvent` already re-exported.
 
 ### Test additions
 
 Integration tests under `crates/artel-fs/tests/`:
-- `read_only_outgoing_blocks_publish.rs` — Alice hosts with `default: ReadWrite, "secret/**": ReadOnly`. Alice writes `secret/key.txt` locally. Bob joins. Assert: Bob never sees `secret/key.txt` (use a sentinel-after-write to drive timing, mirror of `round_trip.rs`'s target/junk pattern). Also assert: Alice's doc has *no* entry for `secret/key.txt` (defense in depth).
-- `read_only_incoming_blocks_apply.rs` — Alice hosts with `default: ReadOnly`. Alice has a pre-existing `a.txt` and the rules block its initial publish on Alice's side. Bob joins; bulk-export honours rules (joiner-side `mode_for` says `ReadOnly` for `a.txt`); Bob's disk stays empty. Assert `WorkspaceEvent::SkippedReadOnly { Incoming }` fires.
-- `read_only_post_join_live_blocks.rs` — Alice and Bob both up with `default: ReadWrite, "locked/**": ReadOnly`. Alice writes `locked/x.txt` after both are running. Verify Alice's watcher drops it, Bob never gets it, and neither side publishes a doc entry.
-- `mixed_rules_first_match_wins.rs` — `rules: [{ glob: "docs/**", mode: ReadWrite }, { glob: "docs/secret/**", mode: ReadOnly }]`. The second rule is unreachable (first-match-wins on `docs/secret/foo.txt` → `ReadWrite`). Assert the second rule is honoured *only* if it precedes the first.
-- `default_read_write_unchanged_behaviour.rs` — `default: ReadWrite, rules: vec![]`. Run a subset of the existing `round_trip.rs` checks. Confirms zero behavioural drift for the default case.
+
+- `read_only_outgoing_blocks_publish.rs` — Alice hosts with `default: ReadWrite, "secret/**": ReadOnly`. Alice writes `secret/key.txt` and a sentinel `marker.txt` locally (both *after* `Workspace::run` has resolved). Wait for `marker.txt` on Bob's side, then assert Bob's `secret/key.txt` does NOT exist. Also assert Alice's `doc.get_many` returns no entry under key `path/secret/key.txt`. Defence in depth: doc inspection rules out the case where the watcher published it but the applier dropped it, which would still leak via a third joiner.
+- `read_only_outgoing_blocks_scan.rs` — Alice hosts with the same rules but `secret/key.txt` is *pre-existing* (so it goes through `scan_and_publish_existing`, not the watcher). Same assertion: doc has no entry, Bob's disk doesn't get it. This is the test the original plan rolled into "outgoing blocks publish" but the two code paths (scan vs watcher) deserve separate coverage.
+- `read_only_incoming_blocks_apply.rs` — Verifies the applier as a defence-in-depth layer: even if a (misbehaving or pre-rules) peer publishes a `ReadOnly` path into the doc, the applier drops it. Mechanism: Alice hosts with `default: ReadWrite, "secret/**": ReadOnly`, then **bypasses her own watcher** by calling `alice_ws.doc().set_bytes(alice_ws.author, b"path/secret/foo.txt", bytes)` directly from the test (using the existing `pub const fn doc(&self)` accessor; `Workspace::author` is `pub(crate)` today and gets promoted to `pub` in this slice — same justification as `rules()`: tests need to inspect/inject at the doc layer). Bob joins with the host's rules. Assert: Bob's disk does NOT contain `secret/foo.txt`, AND Bob's `WorkspaceEvent` stream emits `SkippedReadOnly { Incoming }` for it. Also drive a tombstone via `alice_ws.doc().del(...)` to verify the tombstone branch of the applier rule check.
+- `read_only_post_join_live_blocks.rs` — Alice and Bob both up with `default: ReadWrite, "locked/**": ReadOnly`. Alice writes `locked/x.txt` after both are running. Assert: Alice's watcher emits `SkippedReadOnly { Outgoing }`, neither doc entry nor Bob's file exists.
+- `read_only_post_join_live_delete_blocks.rs` — same setup as above. Alice has `unlocked/y.txt` (synced), then writes and deletes `locked/y.txt`. The delete must not publish a tombstone (the rule check in `on_removed`). Assert: doc has no entry for `path/locked/y.txt`.
+- `mixed_rules_first_match_wins.rs` — `rules: [{ glob: "docs/**", mode: ReadWrite }, { glob: "docs/secret/**", mode: ReadOnly }]`. Alice writes `docs/secret/foo.txt`; first-match-wins says `ReadWrite`, so the file *does* propagate. Assert it lands on Bob. Then re-host with rules reversed; same write doesn't propagate. (This is mostly a behavioural assertion that the unit-test ordering carries through the live wire path.)
+- `default_read_write_unchanged_behaviour.rs` — `default: ReadWrite, rules: vec![]`. Re-run a small subset of `round_trip.rs`'s assertions. Confirms zero behavioural drift for the default-permissive case (the case 100% of existing tests fall into).
 
 Update existing tests:
-- `round_trip.rs` etc. now construct workspaces with `PathRules::read_write()`. Most tests get a one-line addition.
+- No mandatory changes. Existing tests construct `WorkspaceConfig::default()`, which has `rules = None`, which resolves to `PathRules::read_write()` — the default-permissive case is the existing behaviour. The `default_read_write_unchanged_behaviour.rs` test makes this guarantee explicit.
+
+### Edge case: race between rule check and rule update
+
+There is no rule update mechanism in v1 — `PathRules` are bound at originate-time (sub-slice 2 §"persistence-first constraint"). So `Arc<PathRules>` is effectively immutable for the lifetime of the workspace; the watcher and applier just borrow `workspace.rules()` per event and the borrow can't observe a torn state.
 
 ### Definition of done
 
-1. `ReadOnly` paths are never published outward by `scan_and_publish_existing` or the watcher (verified via doc inspection, not just disk state).
-2. `ReadOnly` paths are never written inward by `bulk_export` or the applier.
-3. First-match-wins ordering verified.
-4. `WorkspaceEvent::SkippedReadOnly` fires in both directions.
-5. All existing tests still pass.
-6. New integration tests above exist and pass.
-7. fmt + clippy clean both feature modes.
+1. `ReadOnly` paths are never published outward by `scan_and_publish_existing`, the watcher (`on_modified` / `on_removed`), or any other path that calls `doc.set_bytes` / `doc.del` (verified via `doc.get_many` inspection in tests, not just disk state).
+2. `ReadOnly` paths are never written inward by `bulk_export` or the applier (`handle_entry` / `handle_content_ready`).
+3. The `handle_entry` rule check sits **before** the tombstone branch — verified by the `read_only_post_join_live_delete_blocks.rs` test landing without flake.
+4. First-match-wins ordering is verified at the wire level (not just unit-tested in `rules.rs`).
+5. `WorkspaceEvent::SkippedReadOnly` fires in both directions; existing event consumers see no spurious extra events on the default-permissive path.
+6. `WorkspaceConfig::default()` (rules = None → `PathRules::read_write()`) yields exactly the pre-slice behaviour. All existing tests pass without modification.
+7. New integration tests above exist and pass.
+8. fmt + clippy clean.
 
 ---
 

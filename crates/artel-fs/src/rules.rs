@@ -4,9 +4,8 @@
 //! Rules live on [`crate::WorkspaceConfig::rules`], ride the
 //! `workspace.ticket` envelope to joiners
 //! ([`crate::ticket::WorkspaceTicketEnvelope`]), and are stored on
-//! [`crate::Workspace::rules`]. Enforcement (watcher / applier
-//! consultation) lands in a follow-up slice; this module is the
-//! data type and the wire-side validation only.
+//! [`crate::Workspace::rules`] for consultation by the watcher and
+//! applier per event.
 //!
 //! Globs match against the **workspace-relative**, forward-slash,
 //! NFC-normalised path shape — the same shape [`crate::keys::path_to_key`]
@@ -16,7 +15,7 @@
 
 use std::path::Path;
 
-use globset::Glob;
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
@@ -96,13 +95,18 @@ impl PathRules {
     /// match nothing — they fall through to `default` rather than
     /// silently inheriting a permissive rule. Defensive: callers
     /// should pass already-stripped relative paths.
+    ///
+    /// This is the slow path: every call re-parses every glob. Hot
+    /// paths (watcher, applier, scan, bulk-export) should
+    /// [`Self::compile`] once and call
+    /// [`CompiledPathRules::mode_for`] per event.
     #[must_use]
     pub fn mode_for(&self, rel: &Path) -> Mode {
         let Some(hay) = path_to_match_string(rel) else {
             return self.default;
         };
         for rule in &self.rules {
-            if glob_matches(&rule.glob, &hay) {
+            if glob_matches_one(&rule.glob, &hay) {
                 return rule.mode;
             }
         }
@@ -120,6 +124,85 @@ impl PathRules {
             validate_glob(&rule.glob)?;
         }
         Ok(())
+    }
+
+    /// Build the runtime form: glob patterns are precompiled into a
+    /// single [`GlobSet`] so per-event matching is one matcher call,
+    /// not N regex compilations.
+    ///
+    /// Validates as a side-effect; the returned [`CompiledPathRules`]
+    /// is guaranteed to have well-formed globs.
+    pub fn compile(&self) -> Result<CompiledPathRules, PathRulesError> {
+        let mut builder = GlobSetBuilder::new();
+        let mut modes = Vec::with_capacity(self.rules.len());
+        for rule in &self.rules {
+            validate_glob(&rule.glob)?;
+            let normalised: String = rule.glob.nfc().collect();
+            let glob = Glob::new(&normalised).map_err(|e| PathRulesError::InvalidGlob {
+                glob: rule.glob.clone(),
+                reason: e.to_string(),
+            })?;
+            builder.add(glob);
+            modes.push(rule.mode);
+        }
+        let set = builder.build().map_err(|e| PathRulesError::InvalidGlob {
+            glob: String::new(),
+            reason: e.to_string(),
+        })?;
+        Ok(CompiledPathRules {
+            default: self.default,
+            set,
+            modes,
+        })
+    }
+}
+
+/// Runtime form of [`PathRules`]: globs precompiled into a single
+/// [`GlobSet`]. Built once via [`PathRules::compile`]; consulted per
+/// event by the watcher, applier, scan, and bulk-export.
+///
+/// Preserves first-match-wins semantics. `GlobSet::matches` returns
+/// every matching glob's index in input order; the lowest index is
+/// the first matching rule.
+#[derive(Debug, Clone)]
+pub struct CompiledPathRules {
+    default: Mode,
+    set: GlobSet,
+    modes: Vec<Mode>,
+}
+
+impl CompiledPathRules {
+    /// Default-permissive runtime rules.
+    #[must_use]
+    pub fn read_write() -> Self {
+        PathRules::read_write()
+            .compile()
+            .expect("read_write has no rules to validate")
+    }
+
+    /// Mode this rule set applies to a path matched by no rule.
+    #[must_use]
+    pub const fn default_mode(&self) -> Mode {
+        self.default
+    }
+
+    /// Resolve the [`Mode`] for `rel` (workspace-relative path).
+    /// First-match-wins on the originally-supplied rule order.
+    #[must_use]
+    pub fn mode_for(&self, rel: &Path) -> Mode {
+        let Some(hay) = path_to_match_string(rel) else {
+            return self.default;
+        };
+        // `matches_candidate` doesn't re-walk the path on every glob —
+        // it builds a `Candidate` once and reuses it across the set.
+        let candidate = globset::Candidate::new(&hay);
+        let matches = self.set.matches_candidate(&candidate);
+        // First-match-wins: `matches` is sorted ascending by glob
+        // index, so the first hit is the earliest rule.
+        match matches.first() {
+            Some(&idx) => self.modes[idx],
+            None => self.default,
+        }
     }
 }
 
@@ -164,10 +247,11 @@ fn path_to_match_string(rel: &Path) -> Option<String> {
     Some(parts.join("/"))
 }
 
-fn glob_matches(glob_str: &str, hay: &str) -> bool {
+/// Slow-path single-glob match used by [`PathRules::mode_for`].
+/// `hay` is already NFC (produced by [`path_to_match_string`]).
+fn glob_matches_one(glob_str: &str, hay: &str) -> bool {
     let normalised_glob: String = glob_str.nfc().collect();
-    let normalised_hay: String = hay.nfc().collect();
-    Glob::new(&normalised_glob).is_ok_and(|g| g.compile_matcher().is_match(&normalised_hay))
+    Glob::new(&normalised_glob).is_ok_and(|g| g.compile_matcher().is_match(hay))
 }
 
 /// Why a [`PathRules`] failed validation.
@@ -245,10 +329,7 @@ mod tests {
                 },
             ],
         };
-        assert_eq!(
-            r.mode_for(Path::new("docs/secret/foo.txt")),
-            Mode::ReadOnly
-        );
+        assert_eq!(r.mode_for(Path::new("docs/secret/foo.txt")), Mode::ReadOnly);
     }
 
     #[test]
@@ -344,10 +425,7 @@ mod tests {
                 mode: Mode::ReadOnly,
             }],
         };
-        assert!(matches!(
-            r.validate(),
-            Err(PathRulesError::AbsoluteGlob(_))
-        ));
+        assert!(matches!(r.validate(), Err(PathRulesError::AbsoluteGlob(_))));
     }
 
     #[test]
@@ -385,6 +463,73 @@ mod tests {
             ],
         };
         assert!(r.validate().is_ok());
+    }
+
+    #[test]
+    fn compiled_mode_for_matches_uncompiled_first_match_wins() {
+        let r = PathRules {
+            default: Mode::ReadWrite,
+            rules: vec![
+                PathRule {
+                    glob: "docs/**".into(),
+                    mode: Mode::ReadWrite,
+                },
+                PathRule {
+                    glob: "docs/secret/**".into(),
+                    mode: Mode::ReadOnly,
+                },
+            ],
+        };
+        let c = r.compile().expect("compile");
+        // First-match-wins: broad rule precedes narrow, so the
+        // narrow ReadOnly is unreachable.
+        assert_eq!(
+            c.mode_for(Path::new("docs/secret/foo.txt")),
+            Mode::ReadWrite,
+        );
+        assert_eq!(c.mode_for(Path::new("README.md")), Mode::ReadWrite);
+    }
+
+    #[test]
+    fn compiled_falls_through_to_default() {
+        let r = PathRules {
+            default: Mode::ReadOnly,
+            rules: vec![PathRule {
+                glob: "docs/**".into(),
+                mode: Mode::ReadWrite,
+            }],
+        };
+        let c = r.compile().expect("compile");
+        assert_eq!(c.mode_for(Path::new("src/main.rs")), Mode::ReadOnly);
+        assert_eq!(c.mode_for(Path::new("docs/x.md")), Mode::ReadWrite);
+    }
+
+    #[test]
+    fn compiled_unicode_nfc_normalisation_consistent() {
+        let r = PathRules {
+            default: Mode::ReadWrite,
+            rules: vec![PathRule {
+                glob: "caf\u{00e9}/**".into(),
+                mode: Mode::ReadOnly,
+            }],
+        };
+        let c = r.compile().expect("compile");
+        let composed = PathBuf::from("caf\u{00e9}").join("x.txt");
+        let decomposed = PathBuf::from("cafe\u{0301}").join("x.txt");
+        assert_eq!(c.mode_for(&composed), Mode::ReadOnly);
+        assert_eq!(c.mode_for(&decomposed), Mode::ReadOnly);
+    }
+
+    #[test]
+    fn compile_rejects_invalid_rules() {
+        let r = PathRules {
+            default: Mode::ReadWrite,
+            rules: vec![PathRule {
+                glob: "/etc/**".into(),
+                mode: Mode::ReadOnly,
+            }],
+        };
+        assert!(matches!(r.compile(), Err(PathRulesError::AbsoluteGlob(_))));
     }
 
     #[test]

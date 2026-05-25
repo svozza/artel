@@ -19,7 +19,8 @@ use notify_debouncer_full::DebounceEventResult;
 use tokio::sync::oneshot;
 
 use crate::filter::{FilterDecision, SkipReason, WorkspaceFilter};
-use crate::workspace::{Workspace, WorkspaceEvent};
+use crate::rules::Mode;
+use crate::workspace::{Direction, Workspace, WorkspaceEvent};
 use crate::{EchoGuard, keys};
 
 /// Local change observed by the debounced watcher. Two flavours
@@ -147,6 +148,25 @@ async fn on_modified(
         FilterDecision::Include => {}
     }
 
+    // Rule check sits before the file read so a `ReadOnly` path
+    // doesn't even hit the disk. `strip_prefix` shouldn't fail since
+    // the watcher only reports paths under `workspace.root`, but
+    // we fall through (rather than fail closed) if it does — a
+    // pathological non-stripping path is more likely an unrelated
+    // bug than a rule-evasion attempt, and failing closed would
+    // mask it.
+    let rel = path.strip_prefix(&workspace.root).unwrap_or(&path);
+    if workspace.compiled_rules.mode_for(rel) == Mode::ReadOnly {
+        let _ = workspace
+            .events
+            .send(WorkspaceEvent::SkippedReadOnly {
+                path,
+                direction: Direction::Outgoing,
+            })
+            .await;
+        return;
+    }
+
     let bytes = match tokio::fs::read(&path).await {
         Ok(b) => b,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -216,6 +236,22 @@ async fn on_modified(
 }
 
 async fn on_removed(workspace: &Arc<Workspace>, path: PathBuf) {
+    // Belt-and-braces with `on_modified`: on macOS, FSEvents reports
+    // post-unlink as `Modify(Metadata)` and `on_modified` already
+    // gates on `ReadOnly` before its own fallthrough into here. On
+    // Linux, `Remove` events arrive here directly and bypass that
+    // gate, so the rule check has to live here too.
+    let rel = path.strip_prefix(&workspace.root).unwrap_or(&path);
+    if workspace.compiled_rules.mode_for(rel) == Mode::ReadOnly {
+        let _ = workspace
+            .events
+            .send(WorkspaceEvent::SkippedReadOnly {
+                path,
+                direction: Direction::Outgoing,
+            })
+            .await;
+        return;
+    }
     let Ok(key) = keys::path_to_key(&workspace.root, &path) else {
         return;
     };

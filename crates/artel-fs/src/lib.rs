@@ -34,6 +34,8 @@ pub use echo_guard::EchoGuard;
 pub use error::{PolicyViolation, WorkspaceError};
 pub use filter::{FilterDecision, MAX_FILE_SIZE, SkipReason, WorkspaceFilter};
 pub use keys::{KEY_PREFIX, key_to_path, path_to_key};
-pub use rules::{Mode, PathRule, PathRules, PathRulesError};
+pub use rules::{CompiledPathRules, Mode, PathRule, PathRules, PathRulesError};
 pub use ticket::{TicketEnvelopeError, WorkspaceTicketEnvelope};
-pub use workspace::{AttachPolicy, TICKET_ACTION, Workspace, WorkspaceConfig, WorkspaceEvent};
+pub use workspace::{
+    AttachPolicy, Direction, TICKET_ACTION, Workspace, WorkspaceConfig, WorkspaceEvent,
+};

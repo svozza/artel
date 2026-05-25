@@ -22,7 +22,8 @@ use tokio::sync::oneshot;
 
 use crate::echo_guard::PENDING_RELEASE_GRACE;
 use crate::filter::{FilterDecision, SkipReason, WorkspaceFilter};
-use crate::workspace::{Workspace, WorkspaceEvent};
+use crate::rules::Mode;
+use crate::workspace::{Direction, Workspace, WorkspaceEvent};
 use crate::{EchoGuard, keys};
 
 /// Subscribe to the doc's live event stream and apply incoming
@@ -107,6 +108,24 @@ async fn handle_entry(
         }
     };
 
+    // Rule check sits ABOVE the tombstone branch and the filter
+    // check on purpose: a `ReadOnly` path's incoming tombstone must
+    // not trigger `remove_file`, and a `ReadOnly` path's incoming
+    // write must not be applied even if the filter would have let it
+    // through. `handle_content_ready` retries entries through this
+    // function, so this single gate covers both cold and ready paths.
+    let rel = path.strip_prefix(&workspace.root).unwrap_or(&path);
+    if workspace.compiled_rules.mode_for(rel) == Mode::ReadOnly {
+        let _ = workspace
+            .events
+            .send(WorkspaceEvent::SkippedReadOnly {
+                path,
+                direction: Direction::Incoming,
+            })
+            .await;
+        return;
+    }
+
     if entry.content_len() == 0 {
         let _ = tokio::fs::remove_file(&path).await;
         let _ = workspace
@@ -172,6 +191,11 @@ async fn handle_content_ready(
     filter: &WorkspaceFilter,
     hash: iroh_blobs::Hash,
 ) {
+    // No direct rule check here — every entry funnels through
+    // `handle_entry` below, which gates on `ReadOnly` before any
+    // filter or write work. Keep that ordering invariant if this
+    // function ever grows a fast-path: `Mode::ReadOnly` must be
+    // honoured *before* the disk write.
     let stream = match workspace.doc.get_many(Query::all()).await {
         Ok(s) => s,
         Err(err) => {
