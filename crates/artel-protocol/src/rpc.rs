@@ -111,11 +111,28 @@ pub enum Request {
         client_version: ProtocolVersion,
     },
 
-    /// Create and host a new session. Returns a fresh [`SessionId`] and a
-    /// shareable [`JoinTicket`].
+    /// Create or resume a hosted session. Returns the session's
+    /// [`SessionId`] and a shareable [`JoinTicket`].
+    ///
+    /// `session` controls how the id is chosen:
+    /// - `None` (the default): mint a fresh random id. This is
+    ///   today's behaviour and the right choice for first-time
+    ///   hosts that have nothing to resume.
+    /// - `Some(id)`: resume the session at that id when a matching
+    ///   local-host record exists; otherwise create a new session
+    ///   with the supplied id. Used by callers (e.g. `artel-fs`)
+    ///   that derive a stable id from local state so a re-host of
+    ///   the same workspace lands on the same session id across
+    ///   daemon restarts.
+    ///
+    /// A `Some(id)` request whose existing record has a different
+    /// host or is a remote-mirror session is rejected with
+    /// [`ProtocolError::SessionConflict`].
     HostSession {
         /// Display info for this peer (the host).
         peer: PeerInfo,
+        /// Caller-supplied session id, or `None` to mint a fresh one.
+        session: Option<SessionId>,
     },
 
     /// Join an existing session via its ticket.
@@ -383,9 +400,26 @@ mod tests {
     fn host_session_request_round_trip() {
         let req = Request::HostSession {
             peer: sample_peer(),
+            session: None,
         };
         let bytes = postcard::to_allocvec(&req).unwrap();
         let back: Request = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn host_session_request_round_trip_with_session_id() {
+        let req = Request::HostSession {
+            peer: sample_peer(),
+            session: Some(SessionId::from_bytes([7; 16])),
+        };
+        let bytes = postcard::to_allocvec(&req).unwrap();
+        let back: Request = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(req, back);
+
+        // JSON round-trip too — externally-tagged enum, snake_case fields.
+        let json = serde_json::to_string(&req).unwrap();
+        let back: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(req, back);
     }
 
@@ -601,7 +635,12 @@ mod tests {
             any::<u32>().prop_map(|v| Request::Hello {
                 client_version: ProtocolVersion::new(v),
             }),
-            arb_peer().prop_map(|peer| Request::HostSession { peer }),
+            (arb_peer(), proptest::option::of(any::<[u8; 16]>())).prop_map(|(peer, s)| {
+                Request::HostSession {
+                    peer,
+                    session: s.map(SessionId::from_bytes),
+                }
+            }),
             (arb_peer(), "[\\PC]{0,128}").prop_map(|(peer, ticket)| Request::JoinSession {
                 peer,
                 ticket: JoinTicket::from(ticket),

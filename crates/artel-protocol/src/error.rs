@@ -47,6 +47,13 @@ pub enum ProtocolError {
     #[error("send is only supported on the host side in this build")]
     NotHost,
 
+    /// `HostSession { session: Some(id) }` was issued for an `id`
+    /// that exists locally but with a different host or as a
+    /// remote-mirror session. The caller is asking to resume a
+    /// session they don't own.
+    #[error("session id {0} already exists with a different host or kind")]
+    SessionConflict(SessionId),
+
     /// Catch-all for daemon-side failures the client cannot otherwise
     /// distinguish. The string is for diagnostics only.
     #[error("internal daemon error: {0}")]
@@ -66,6 +73,7 @@ impl ProtocolError {
             Self::AlreadyJoined(_) => "already_joined",
             Self::NotReady => "not_ready",
             Self::NotHost => "not_host",
+            Self::SessionConflict(_) => "session_conflict",
             Self::Internal(_) => "internal",
         }
     }
@@ -108,6 +116,10 @@ mod tests {
         );
         assert_eq!(ProtocolError::NotReady.slug(), "not_ready");
         assert_eq!(ProtocolError::NotHost.slug(), "not_host");
+        assert_eq!(
+            ProtocolError::SessionConflict(sample_session()).slug(),
+            "session_conflict"
+        );
         assert_eq!(ProtocolError::Internal("x".into()).slug(), "internal");
     }
 
@@ -121,6 +133,7 @@ mod tests {
             ProtocolError::AlreadyJoined(s),
             ProtocolError::NotReady,
             ProtocolError::NotHost,
+            ProtocolError::SessionConflict(s),
             ProtocolError::Internal("disk full".into()),
         ];
         for c in cases {
@@ -179,6 +192,8 @@ mod tests {
             any::<[u8; 16]>().prop_map(|b| ProtocolError::AlreadyJoined(SessionId::from_bytes(b))),
             Just(ProtocolError::NotReady),
             Just(ProtocolError::NotHost),
+            any::<[u8; 16]>()
+                .prop_map(|b| ProtocolError::SessionConflict(SessionId::from_bytes(b))),
             "[\\PC]{0,64}".prop_map(ProtocolError::Internal),
         ]
     }
