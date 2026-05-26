@@ -36,6 +36,7 @@ async fn joiner_bulk_imports_host_files() {
     let (session, ticket) = match alice
         .request(Request::HostSession {
             peer: alice_peer.clone(),
+            session: None,
         })
         .await
         .unwrap()

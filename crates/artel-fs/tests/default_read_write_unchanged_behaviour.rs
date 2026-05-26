@@ -33,6 +33,7 @@ async fn default_rules_give_unchanged_round_trip() {
     let (session, ticket) = match alice
         .request(Request::HostSession {
             peer: alice_peer.clone(),
+            session: None,
         })
         .await
         .unwrap()

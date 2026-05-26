@@ -54,7 +54,14 @@ async fn spawn_host_workspace() -> (
     .await;
     let client = Client::connect(&daemon.socket).await.unwrap();
     let peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "host");
-    let session = match client.request(Request::HostSession { peer }).await.unwrap() {
+    let session = match client
+        .request(Request::HostSession {
+            peer,
+            session: None,
+        })
+        .await
+        .unwrap()
+    {
         Response::HostSession { session, .. } => session,
         other => panic!("HostSession: got {other:?}"),
     };

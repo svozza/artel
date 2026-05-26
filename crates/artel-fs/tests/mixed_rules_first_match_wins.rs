@@ -80,6 +80,7 @@ async fn run_with_rules(rules: PathRules) -> bool {
     let (session, ticket) = match alice
         .request(Request::HostSession {
             peer: alice_peer.clone(),
+            session: None,
         })
         .await
         .unwrap()

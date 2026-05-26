@@ -97,7 +97,14 @@ impl DaemonHarness {
 
 async fn host_session(client: &Client) -> SessionId {
     let peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
-    match client.request(Request::HostSession { peer }).await.unwrap() {
+    match client
+        .request(Request::HostSession {
+            peer,
+            session: None,
+        })
+        .await
+        .unwrap()
+    {
         Response::HostSession { session, .. } => session,
         other => panic!("HostSession: got {other:?}"),
     }

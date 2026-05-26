@@ -68,6 +68,7 @@ async fn workspace_state_survives_graceful_restart() {
         let (session, artel_ticket) = match alice
             .request(Request::HostSession {
                 peer: alice_peer.clone(),
+                session: None,
             })
             .await
             .unwrap()
@@ -183,7 +184,10 @@ async fn workspace_state_survives_graceful_restart() {
 
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
     let (session, artel_ticket) = match alice
-        .request(Request::HostSession { peer: alice_peer })
+        .request(Request::HostSession {
+            peer: alice_peer,
+            session: None,
+        })
         .await
         .unwrap()
     {

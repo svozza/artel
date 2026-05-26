@@ -32,7 +32,10 @@ async fn alice_delete_propagates_to_bob() {
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
     let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     let (session, ticket) = match alice
-        .request(Request::HostSession { peer: alice_peer })
+        .request(Request::HostSession {
+            peer: alice_peer,
+            session: None,
+        })
         .await
         .unwrap()
     {

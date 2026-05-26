@@ -35,6 +35,7 @@ async fn joiner_send_after_host_closes_surfaces_unknown_session() {
     let host_resp = alice_client
         .request(Request::HostSession {
             peer: alice.clone(),
+            session: None,
         })
         .await
         .unwrap();

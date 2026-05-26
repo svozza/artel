@@ -30,6 +30,7 @@ async fn rules_round_trip_via_envelope() {
     let (session, artel_ticket) = match alice
         .request(Request::HostSession {
             peer: alice_peer.clone(),
+            session: None,
         })
         .await
         .unwrap()

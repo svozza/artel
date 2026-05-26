@@ -29,6 +29,7 @@ async fn host_close_propagates_session_closed_to_joiner() {
     let host_resp = alice_client
         .request(Request::HostSession {
             peer: alice.clone(),
+            session: None,
         })
         .await
         .unwrap();

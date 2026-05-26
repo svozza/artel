@@ -26,6 +26,7 @@ async fn joiner_send_round_trips_through_host() {
     let host_resp = alice_client
         .request(Request::HostSession {
             peer: alice.clone(),
+            session: None,
         })
         .await
         .unwrap();

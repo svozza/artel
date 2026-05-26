@@ -76,6 +76,15 @@ pub enum SessionError {
     #[error("send is only supported on the host side in this build")]
     NotHost,
 
+    /// `Registry::host(peer, Some(id))` was issued for an `id`
+    /// that exists locally but with a different host or as a
+    /// remote-mirror session. The caller is asking to resume a
+    /// session they don't own. Maps to
+    /// [`artel_protocol::ProtocolError::SessionConflict`] over
+    /// the wire.
+    #[error("session id {0} already exists with a different host or kind")]
+    SessionConflict(SessionId),
+
     /// A joiner-side `Send` that we forwarded to the host over
     /// gossip came back with a wire-form rejection. The wrapped
     /// [`artel_protocol::ProtocolError`] is what the host
@@ -93,7 +102,8 @@ impl PartialEq for SessionError {
         match (self, other) {
             (Self::UnknownSession(a), Self::UnknownSession(b))
             | (Self::NotMember(a), Self::NotMember(b))
-            | (Self::AlreadyJoined(a), Self::AlreadyJoined(b)) => a == b,
+            | (Self::AlreadyJoined(a), Self::AlreadyJoined(b))
+            | (Self::SessionConflict(a), Self::SessionConflict(b)) => a == b,
             (Self::Storage(a), Self::Storage(b)) => a.kind() == b.kind(),
             (Self::InvalidAddr(a), Self::InvalidAddr(b))
             | (Self::Internal(a), Self::Internal(b)) => a == b,
@@ -257,14 +267,82 @@ impl Registry {
         self.daemon_peer_id
     }
 
-    /// Host a new session. Returns the new session's id and a join
-    /// ticket the host distributes out-of-band.
+    /// Host or resume a session. Returns the session's id and a
+    /// fresh join ticket stamped with this daemon's current
+    /// [`WireEndpointAddr`].
     ///
-    /// On store-write failure, the session is **not** added to the
-    /// in-memory map and the error propagates. This keeps "registry
-    /// thinks it has session X but disk doesn't" from happening.
-    pub async fn host(&self, host_peer: PeerInfo) -> Result<(SessionId, JoinTicket), SessionError> {
-        let session_id = SessionId::new_random();
+    /// `requested_id` controls the session id and the resume path:
+    ///
+    /// - `None` (today's behaviour): mint a fresh random
+    ///   [`SessionId`] and create a new session record.
+    /// - `Some(id)` and **no existing local entry**: create a new
+    ///   session record at `id`. Lets a caller (e.g. `artel-fs`)
+    ///   pin the id to local state so a re-host always lands on
+    ///   the same id.
+    /// - `Some(id)` and **existing local entry whose host is
+    ///   `host_peer.id` and whose kind is `Local`**: resume
+    ///   verbatim. Members, log, head, and broadcast channel are
+    ///   preserved. The returned ticket is re-stamped from the
+    ///   *current* `daemon_addr`, which may differ from the addr
+    ///   in the persisted record after a daemon restart.
+    /// - `Some(id)` and **existing entry that doesn't match**
+    ///   (different host, or `kind == Remote`): rejected with
+    ///   [`SessionError::SessionConflict`]. The in-memory state
+    ///   is not modified.
+    ///
+    /// On store-write failure for the create paths the session is
+    /// **not** added to the in-memory map and the error propagates.
+    /// This keeps "registry thinks it has session X but disk
+    /// doesn't" from happening. The resume path doesn't write to
+    /// the store at all — the record is already there.
+    pub async fn host(
+        &self,
+        host_peer: PeerInfo,
+        requested_id: Option<SessionId>,
+    ) -> Result<(SessionId, JoinTicket), SessionError> {
+        // Resume path: caller supplied an id and we already have a
+        // matching local-host record. Reuse the in-memory session
+        // verbatim and re-stamp the ticket with the current addr.
+        if let Some(id) = requested_id {
+            let existing = {
+                let guard = self.sessions.read().await;
+                guard.get(&id).cloned()
+            };
+            if let Some(arc) = existing {
+                let s = arc.lock().await;
+                if s.host != host_peer.id || s.kind != SessionKind::Local {
+                    return Err(SessionError::SessionConflict(id));
+                }
+                drop(s);
+                let ticket = JoinTicket::from(ticket::encode(&SessionTicket {
+                    session_id: id,
+                    host_peer_id: self.daemon_peer_id,
+                    host_addr: self.daemon_addr.clone(),
+                }));
+
+                // Re-open the gossip topic. The bridge tracks per-
+                // session state by id; if the daemon was restarted
+                // since the original `host` call, the topic is gone
+                // and we need to re-subscribe. If it's still around
+                // (same-process resume), the existing entry is left
+                // in place and we just ignore the re-host. Best-
+                // effort: a bridge failure is non-fatal — the local
+                // session still works; we just won't reach the
+                // network until something else triggers a reattach.
+                #[cfg(feature = "iroh")]
+                if let Some(bridge) = &self.bridge
+                    && let Err(err) = bridge.host_session(id).await
+                {
+                    tracing::warn!(?err, ?id, "gossip host_session failed on resume");
+                }
+
+                return Ok((id, ticket));
+            }
+        }
+
+        // Create path. Either no `requested_id` (mint random) or
+        // `Some(id)` whose entry doesn't exist locally yet.
+        let session_id = requested_id.unwrap_or_else(SessionId::new_random);
         let ticket = JoinTicket::from(ticket::encode(&SessionTicket {
             session_id,
             host_peer_id: self.daemon_peer_id,
@@ -896,7 +974,7 @@ mod tests {
     async fn host_creates_session_and_returns_artel_ticket() {
         let daemon_peer = PeerId::from_bytes([0xff; 32]);
         let r = registry_with_peer(daemon_peer);
-        let (id, ticket) = r.host(peer(1, "alice")).await.unwrap();
+        let (id, ticket) = r.host(peer(1, "alice"), None).await.unwrap();
         assert!(ticket.as_str().starts_with("artel:"));
         // The ticket round-trips and embeds this daemon's identity.
         let decoded = ticket::decode(ticket.as_str()).unwrap();
@@ -914,13 +992,159 @@ mod tests {
         assert_eq!(summaries[0].last_seq, None);
     }
 
+    #[tokio::test]
+    async fn host_with_some_id_creates_session_at_that_id() {
+        // First-time host with a caller-supplied id and no
+        // pre-existing record. The id propagates verbatim and is
+        // persisted at that id.
+        let r = registry();
+        let alice = peer(1, "alice");
+        let chosen = SessionId::from_bytes([0xab; 16]);
+        let (id, _ticket) = r.host(alice.clone(), Some(chosen)).await.unwrap();
+        assert_eq!(id, chosen);
+        let summaries = r.list().await;
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, chosen);
+    }
+
+    #[tokio::test]
+    async fn host_with_some_id_resumes_existing_local_session() {
+        // Pre-seed a Local-host record (mimicking what daemon
+        // restart would rehydrate from disk), then resume via
+        // host(peer, Some(id)). Members, log, and head should be
+        // preserved verbatim; the ticket should re-stamp from the
+        // current daemon_addr.
+        let daemon_peer = PeerId::from_bytes([0xff; 32]);
+        let alice = peer(1, "alice");
+        let bob = peer(2, "bob");
+        let session_id = SessionId::from_bytes([0xcd; 16]);
+
+        let store = Arc::new(crate::store::MemoryStore::new());
+        let log = vec![SessionMessage::new(
+            Seq::new(1),
+            42,
+            alice.clone(),
+            MessageKind::Chat,
+            String::from("hello"),
+            b"world".to_vec(),
+        )];
+        let record = SessionRecord {
+            id: session_id,
+            host: alice.id,
+            members: HashSet::from([alice.id, bob.id]),
+            head: Seq::new(1),
+            log: log.clone(),
+            kind: SessionKind::Local,
+        };
+        store.create(&record).await.unwrap();
+        let r = Registry::load(
+            daemon_peer,
+            WireEndpointAddr::id_only(daemon_peer),
+            store,
+            #[cfg(feature = "iroh")]
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (id, ticket) = r.host(alice.clone(), Some(session_id)).await.unwrap();
+        assert_eq!(id, session_id);
+
+        // Ticket re-stamped with this daemon's current addr.
+        let decoded = ticket::decode(ticket.as_str()).unwrap();
+        assert_eq!(decoded.session_id, session_id);
+        assert_eq!(decoded.host_peer_id, daemon_peer);
+
+        // Resumed session keeps members, log, head verbatim. Replay
+        // the log via Subscribe to confirm.
+        let sub = r.subscribe(session_id, None).await.unwrap();
+        assert_eq!(sub.replay, log);
+
+        let summaries = r.list().await;
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].peer_count, 2);
+        assert_eq!(summaries[0].last_seq, Some(Seq::new(1)));
+    }
+
+    #[tokio::test]
+    async fn host_with_some_id_rejects_when_host_differs() {
+        // Existing local-host record at `id` belongs to alice; bob
+        // tries to resume it. Must reject with SessionConflict and
+        // leave the in-memory state alone.
+        let daemon_peer = PeerId::from_bytes([0xff; 32]);
+        let alice = peer(1, "alice");
+        let bob = peer(2, "bob");
+        let session_id = SessionId::from_bytes([0xcd; 16]);
+
+        let store = Arc::new(crate::store::MemoryStore::new());
+        let record = SessionRecord {
+            id: session_id,
+            host: alice.id,
+            members: HashSet::from([alice.id]),
+            head: Seq::ZERO,
+            log: Vec::new(),
+            kind: SessionKind::Local,
+        };
+        store.create(&record).await.unwrap();
+        let r = Registry::load(
+            daemon_peer,
+            WireEndpointAddr::id_only(daemon_peer),
+            store,
+            #[cfg(feature = "iroh")]
+            None,
+        )
+        .await
+        .unwrap();
+
+        let err = r.host(bob, Some(session_id)).await.unwrap_err();
+        assert_eq!(err, SessionError::SessionConflict(session_id));
+
+        // Existing session is still present and still alice's.
+        let summaries = r.list().await;
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].peer_count, 1);
+    }
+
+    #[tokio::test]
+    async fn host_with_some_id_rejects_when_kind_is_remote() {
+        // Existing record at `id` is a Remote mirror — somebody
+        // tries to "host" it locally. Must reject regardless of
+        // whether the supplied peer matches the recorded host.
+        let daemon_peer = PeerId::from_bytes([0xff; 32]);
+        let remote_host = peer(1, "alice");
+        let session_id = SessionId::from_bytes([0xcd; 16]);
+
+        let store = Arc::new(crate::store::MemoryStore::new());
+        let record = SessionRecord {
+            id: session_id,
+            host: remote_host.id,
+            members: HashSet::from([remote_host.id]),
+            head: Seq::ZERO,
+            log: Vec::new(),
+            kind: SessionKind::Remote,
+        };
+        store.create(&record).await.unwrap();
+        let r = Registry::load(
+            daemon_peer,
+            WireEndpointAddr::id_only(daemon_peer),
+            store,
+            #[cfg(feature = "iroh")]
+            None,
+        )
+        .await
+        .unwrap();
+
+        let err = r.host(remote_host, Some(session_id)).await.unwrap_err();
+        assert_eq!(err, SessionError::SessionConflict(session_id));
+    }
+
     // ---- join ----
 
     #[tokio::test]
     async fn join_artel_ticket_succeeds_and_emits_peer_joined() {
         let r = registry();
         let host = peer(1, "alice");
-        let (id, ticket) = r.host(host).await.unwrap();
+        let (id, ticket) = r.host(host, None).await.unwrap();
 
         // Subscribe before second peer joins so we observe the event.
         let mut sub = r.subscribe(id, None).await.unwrap();
@@ -987,7 +1211,7 @@ mod tests {
     #[tokio::test]
     async fn join_twice_errors() {
         let r = registry();
-        let (_id, ticket) = r.host(peer(1, "alice")).await.unwrap();
+        let (_id, ticket) = r.host(peer(1, "alice"), None).await.unwrap();
         r.join(&ticket, peer(2, "bob")).await.unwrap();
         let err = r.join(&ticket, peer(2, "bob")).await.unwrap_err();
         assert!(matches!(err, SessionError::AlreadyJoined(_)), "{err:?}");
@@ -999,7 +1223,7 @@ mod tests {
     async fn send_assigns_strictly_monotonic_seq() {
         let r = registry();
         let host = peer(1, "alice");
-        let (id, _) = r.host(host.clone()).await.unwrap();
+        let (id, _) = r.host(host.clone(), None).await.unwrap();
 
         let s1 = r
             .send(id, host.clone(), MessageKind::Chat, "a".into(), vec![], 1)
@@ -1024,7 +1248,7 @@ mod tests {
     async fn send_by_non_member_errors() {
         let r = registry();
         let host = peer(1, "alice");
-        let (id, _) = r.host(host).await.unwrap();
+        let (id, _) = r.host(host, None).await.unwrap();
         let err = r
             .send(
                 id,
@@ -1061,7 +1285,7 @@ mod tests {
     async fn send_emits_message_event() {
         let r = registry();
         let host = peer(1, "alice");
-        let (id, _) = r.host(host.clone()).await.unwrap();
+        let (id, _) = r.host(host.clone(), None).await.unwrap();
 
         let mut sub = r.subscribe(id, None).await.unwrap();
         let sent = r
@@ -1098,7 +1322,7 @@ mod tests {
     async fn subscribe_replays_messages_after_since() {
         let r = registry();
         let host = peer(1, "alice");
-        let (id, _) = r.host(host.clone()).await.unwrap();
+        let (id, _) = r.host(host.clone(), None).await.unwrap();
 
         let s1 = r
             .send(id, host.clone(), MessageKind::Chat, "1".into(), vec![], 0)
@@ -1124,7 +1348,7 @@ mod tests {
     async fn subscribe_with_no_since_replays_full_log() {
         let r = registry();
         let host = peer(1, "alice");
-        let (id, _) = r.host(host.clone()).await.unwrap();
+        let (id, _) = r.host(host.clone(), None).await.unwrap();
         for n in 0..5 {
             r.send(
                 id,
@@ -1156,7 +1380,7 @@ mod tests {
         let r = registry();
         let host = peer(1, "alice");
         let bob = peer(2, "bob");
-        let (id, ticket) = r.host(host).await.unwrap();
+        let (id, ticket) = r.host(host, None).await.unwrap();
         r.join(&ticket, bob.clone()).await.unwrap();
 
         let mut sub = r.subscribe(id, None).await.unwrap();
@@ -1180,7 +1404,7 @@ mod tests {
     async fn host_leave_emits_session_closed_and_removes_session() {
         let r = registry();
         let host = peer(1, "alice");
-        let (id, _) = r.host(host.clone()).await.unwrap();
+        let (id, _) = r.host(host.clone(), None).await.unwrap();
         let mut sub = r.subscribe(id, None).await.unwrap();
         r.leave(id, host.id).await.unwrap();
 
@@ -1196,7 +1420,7 @@ mod tests {
     #[tokio::test]
     async fn leave_non_member_errors() {
         let r = registry();
-        let (id, _) = r.host(peer(1, "alice")).await.unwrap();
+        let (id, _) = r.host(peer(1, "alice"), None).await.unwrap();
         let err = r.leave(id, peer(9, "intruder").id).await.unwrap_err();
         assert_eq!(err, SessionError::NotMember(id));
     }
@@ -1216,7 +1440,7 @@ mod tests {
         let r = registry();
         let host = peer(1, "alice");
         let bob = peer(2, "bob");
-        let (id, ticket) = r.host(host.clone()).await.unwrap();
+        let (id, ticket) = r.host(host.clone(), None).await.unwrap();
         r.join(&ticket, bob).await.unwrap();
         r.send(id, host, MessageKind::Chat, "x".into(), vec![], 0)
             .await
@@ -1238,7 +1462,7 @@ mod tests {
         let daemon_peer = PeerId::from_bytes([7; 32]);
         let r = registry_with_peer(daemon_peer);
         let host = PeerInfo::new(daemon_peer, "self");
-        r.host(host).await.unwrap();
+        r.host(host, None).await.unwrap();
         let summaries = r.list().await;
         assert!(summaries[0].is_host);
     }
@@ -1361,7 +1585,7 @@ mod tests {
     async fn log_since_returns_only_messages_after_cursor() {
         let r = registry();
         let host = peer(1, "alice");
-        let (id, _) = r.host(host.clone()).await.unwrap();
+        let (id, _) = r.host(host.clone(), None).await.unwrap();
 
         let s1 = r
             .send(id, host.clone(), MessageKind::Chat, "1".into(), vec![], 0)
@@ -1407,7 +1631,7 @@ mod tests {
         // `Registry::leave(session, host_peer)`, not this one.
         let r = registry();
         let host = peer(1, "alice");
-        let (id, _) = r.host(host).await.unwrap();
+        let (id, _) = r.host(host, None).await.unwrap();
 
         r.host_closed_session(id).await.unwrap();
 

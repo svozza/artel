@@ -29,6 +29,7 @@ async fn joiner_announces_membership_without_sending() {
     let host_resp = alice_client
         .request(Request::HostSession {
             peer: alice.clone(),
+            session: None,
         })
         .await
         .unwrap();

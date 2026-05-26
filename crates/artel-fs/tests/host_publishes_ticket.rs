@@ -77,6 +77,7 @@ async fn host_lands_ticket_on_session() {
     let session = match alice
         .request(Request::HostSession {
             peer: alice_peer.clone(),
+            session: None,
         })
         .await
         .unwrap()
@@ -95,6 +96,7 @@ async fn host_lands_ticket_on_session() {
     let _ = bob
         .request(Request::HostSession {
             peer: PeerInfo::new(PeerId::from_bytes([2; 32]), "bob"),
+            session: None,
         })
         .await
         .unwrap();

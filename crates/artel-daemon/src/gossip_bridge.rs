@@ -314,6 +314,13 @@ impl GossipBridge {
         bootstrap: Vec<iroh::EndpointId>,
         role: SessionRole,
     ) -> Result<(), BridgeError> {
+        // Idempotency: a same-process resume re-calls `host_session`
+        // for an id we're already subscribed to. The existing
+        // `SessionState` (sender + forwarder) is fine; tearing it
+        // down and re-subscribing would briefly drop the topic.
+        if self.sessions.lock().await.contains_key(&session) {
+            return Ok(());
+        }
         let topic_id = topic_for(session);
         let wait_for_neighbor = !bootstrap.is_empty();
         let topic = self
@@ -675,6 +682,7 @@ fn session_error_to_wire(err: &SessionError) -> ProtocolError {
         SessionError::InvalidAddr(msg) => ProtocolError::Internal(format!("invalid addr: {msg}")),
         SessionError::Internal(msg) => ProtocolError::Internal(msg.clone()),
         SessionError::NotHost => ProtocolError::NotHost,
+        SessionError::SessionConflict(s) => ProtocolError::SessionConflict(*s),
         // Should never occur on the host side — only joiners
         // receive HostRejected from `send_remote`. Surface
         // defensively so a future bug doesn't silently swallow it.

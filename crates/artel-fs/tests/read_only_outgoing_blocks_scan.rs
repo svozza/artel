@@ -29,6 +29,7 @@ async fn scan_blocks_outgoing_read_only_preexisting_file() {
     let (session, ticket) = match alice
         .request(Request::HostSession {
             peer: alice_peer.clone(),
+            session: None,
         })
         .await
         .unwrap()

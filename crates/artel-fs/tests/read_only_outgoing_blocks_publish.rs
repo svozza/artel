@@ -35,6 +35,7 @@ async fn watcher_blocks_outgoing_read_only_write() {
     let (session, ticket) = match alice
         .request(Request::HostSession {
             peer: alice_peer.clone(),
+            session: None,
         })
         .await
         .unwrap()

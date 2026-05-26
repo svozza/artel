@@ -114,7 +114,10 @@ async fn host_then_list_sees_the_session() {
     let client = Client::connect(&h.socket).await.unwrap();
 
     let resp = client
-        .request(Request::HostSession { peer: alice() })
+        .request(Request::HostSession {
+            peer: alice(),
+            session: None,
+        })
         .await
         .unwrap();
     let session_id = match resp {
@@ -144,7 +147,10 @@ async fn concurrent_requests_correlate_independently() {
 
     // Prime: host a session so the daemon has something to look at.
     let resp = client
-        .request(Request::HostSession { peer: alice() })
+        .request(Request::HostSession {
+            peer: alice(),
+            session: None,
+        })
         .await
         .unwrap();
     let session_id = match resp {
@@ -205,7 +211,10 @@ async fn events_stream_delivers_message_events() {
 
     // Alice hosts and subscribes.
     let resp = alice_client
-        .request(Request::HostSession { peer: alice() })
+        .request(Request::HostSession {
+            peer: alice(),
+            session: None,
+        })
         .await
         .unwrap();
     let (session_id, ticket) = match resp {

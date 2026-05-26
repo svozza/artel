@@ -82,6 +82,7 @@ async fn session_and_log_survive_daemon_restart() {
     let session_id = match alice_client
         .request(Request::HostSession {
             peer: alice_peer.clone(),
+            session: None,
         })
         .await
         .unwrap()
@@ -179,7 +180,10 @@ async fn host_leave_removes_session_dir() {
     let alice = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
 
     let session_id = match client
-        .request(Request::HostSession { peer: alice })
+        .request(Request::HostSession {
+            peer: alice,
+            session: None,
+        })
         .await
         .unwrap()
     {

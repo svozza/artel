@@ -40,6 +40,7 @@ async fn applier_drops_incoming_read_only_insert() {
     let (session, ticket) = match alice
         .request(Request::HostSession {
             peer: alice_peer.clone(),
+            session: None,
         })
         .await
         .unwrap()

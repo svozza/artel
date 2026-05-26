@@ -29,6 +29,7 @@ async fn on_removed_does_not_tombstone_read_only_path() {
     let (session, ticket) = match alice
         .request(Request::HostSession {
             peer: alice_peer.clone(),
+            session: None,
         })
         .await
         .unwrap()

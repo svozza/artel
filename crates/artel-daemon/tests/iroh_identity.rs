@@ -119,6 +119,7 @@ async fn host_ticket_carries_a_real_endpoint_addr() {
     let resp = client
         .request(Request::HostSession {
             peer: PeerInfo::new(PeerId::from_bytes([1; 32]), "alice"),
+            session: None,
         })
         .await
         .unwrap();

@@ -37,7 +37,10 @@ async fn join_require_empty_rejects_non_empty_dir_without_creating_state() {
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
     let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     let (session, artel_ticket) = match alice
-        .request(Request::HostSession { peer: alice_peer })
+        .request(Request::HostSession {
+            peer: alice_peer,
+            session: None,
+        })
         .await
         .unwrap()
     {
@@ -133,7 +136,14 @@ async fn join_init_from_existing_is_rejected() {
     // check fires before any IPC, so the value is immaterial. Mint
     // one via HostSession on the same client.
     let peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "joiner");
-    let session = match client.request(Request::HostSession { peer }).await.unwrap() {
+    let session = match client
+        .request(Request::HostSession {
+            peer,
+            session: None,
+        })
+        .await
+        .unwrap()
+    {
         Response::HostSession { session, .. } => session,
         other => panic!("HostSession: got {other:?}"),
     };

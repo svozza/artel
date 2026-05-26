@@ -17,15 +17,15 @@
 //!
 //! Modes:
 //!
-//! - `steady`     — host the workspace, publish whatever's already
-//!                  in `--root`, emit `READY`, then idle.
-//! - `mid_scan`   — same, but the parent SIGKILLs us between
-//!                  `WORKSPACE_UP` and `READY` (i.e. mid scan-and-
-//!                  publish). Child behaves identically; the
-//!                  parent's choice of when to kill differentiates.
-//! - `mid_write`  — after `READY`, write a new file every 50 ms,
-//!                  emitting `WROTE <name>` per file. Parent
-//!                  SIGKILLs after the first WROTE arrives.
+//! - `steady` — host the workspace, publish whatever's already in
+//!   `--root`, emit `READY`, then idle.
+//! - `mid_scan` — same, but the parent SIGKILLs us between
+//!   `WORKSPACE_UP` and `READY` (i.e. mid scan-and-publish). Child
+//!   behaves identically; the parent's choice of when to kill
+//!   differentiates.
+//! - `mid_write` — after `READY`, write a new file every 50 ms,
+//!   emitting `WROTE <name>` per file. Parent SIGKILLs after the
+//!   first WROTE arrives.
 //!
 //! Args:
 //!
@@ -145,7 +145,10 @@ async fn run(args: Args) -> Result<(), String> {
         .map_err(|e| format!("connect daemon: {e}"))?;
 
     let (session, ticket) = match client
-        .request(Request::HostSession { peer })
+        .request(Request::HostSession {
+            peer,
+            session: None,
+        })
         .await
         .map_err(|e| format!("HostSession: {e}"))?
     {

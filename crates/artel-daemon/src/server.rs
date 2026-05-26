@@ -505,15 +505,17 @@ async fn dispatch(
         Request::Hello { .. } => Response::Error {
             error: ProtocolError::Internal("Hello sent twice on one connection".into()),
         },
-        Request::HostSession { peer } => match registry.host(peer.clone()).await {
-            Ok((session, ticket)) => {
-                memberships.insert(session, peer);
-                Response::HostSession { session, ticket }
+        Request::HostSession { peer, session } => {
+            match registry.host(peer.clone(), session).await {
+                Ok((session, ticket)) => {
+                    memberships.insert(session, peer);
+                    Response::HostSession { session, ticket }
+                }
+                Err(err) => Response::Error {
+                    error: session_error_to_protocol(&err),
+                },
             }
-            Err(err) => Response::Error {
-                error: session_error_to_protocol(&err),
-            },
-        },
+        }
         Request::JoinSession { peer, ticket } => match registry.join(&ticket, peer.clone()).await {
             Ok((session, head)) => {
                 memberships.insert(session, peer);
@@ -731,6 +733,7 @@ fn session_error_to_protocol(err: &SessionError) -> ProtocolError {
         SessionError::InvalidAddr(msg) => ProtocolError::Internal(format!("invalid addr: {msg}")),
         SessionError::Internal(msg) => ProtocolError::Internal(msg.clone()),
         SessionError::NotHost => ProtocolError::NotHost,
+        SessionError::SessionConflict(s) => ProtocolError::SessionConflict(*s),
         // Forward the host's verdict verbatim so the IPC client
         // sees the actual reason (e.g., UnknownSession after a
         // session close) instead of a generic Internal.
@@ -933,6 +936,7 @@ mod tests {
                 id: RequestId::new(2),
                 request: Request::HostSession {
                     peer: PeerInfo::new(PeerId::from_bytes([1; 32]), "alice"),
+                    session: None,
                 },
             })
             .await

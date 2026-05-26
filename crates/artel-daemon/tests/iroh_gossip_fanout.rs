@@ -25,6 +25,7 @@ async fn host_sends_message_joiner_observes_via_gossip() {
     let host_resp = alice_client
         .request(Request::HostSession {
             peer: alice.clone(),
+            session: None,
         })
         .await
         .unwrap();

@@ -30,6 +30,7 @@ async fn joiner_replays_messages_sent_before_join() {
     let host_resp = alice_client
         .request(Request::HostSession {
             peer: alice.clone(),
+            session: None,
         })
         .await
         .unwrap();

@@ -11,7 +11,9 @@ use std::time::Duration;
 use artel_client::Client;
 use artel_daemon::shutdown::Shutdown;
 use artel_daemon::{Daemon, DaemonConfig};
-use artel_protocol::{Event, MessageKind, PeerId, PeerInfo, Request, Response, SendPayload};
+use artel_protocol::{
+    Event, JoinTicket, MessageKind, PeerId, PeerInfo, Request, Response, SendPayload, SessionId,
+};
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -65,26 +67,26 @@ async fn next_event(events: &mut artel_client::EventStream) -> Event {
         .expect("event channel closed")
 }
 
-#[tokio::test]
-async fn two_clients_chat_end_to_end() {
-    let h = DaemonHarness::spawn().await;
-
-    let alice_client = Client::connect(&h.socket).await.unwrap();
-    let bob_client = Client::connect(&h.socket).await.unwrap();
-
-    // Alice hosts.
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
-    let resp = alice_client
-        .request(Request::HostSession { peer: alice_peer })
+/// Host a session as `peer` and subscribe to its full log,
+/// returning the session id, the join ticket, and a live event
+/// stream. Used as the test preamble for any scenario where the
+/// host wants to observe joiners and messages.
+async fn host_and_watch(
+    client: &Client,
+    peer: PeerInfo,
+) -> (SessionId, JoinTicket, artel_client::EventStream) {
+    let resp = client
+        .request(Request::HostSession {
+            peer,
+            session: None,
+        })
         .await
         .unwrap();
     let (session, ticket) = match resp {
         Response::HostSession { session, ticket } => (session, ticket),
         other => panic!("expected HostSession, got {other:?}"),
     };
-
-    // Alice subscribes so she observes peer-joined and the message.
-    let resp = alice_client
+    let resp = client
         .request(Request::Subscribe {
             session,
             since: None,
@@ -92,7 +94,21 @@ async fn two_clients_chat_end_to_end() {
         .await
         .unwrap();
     assert!(matches!(resp, Response::Subscribed { .. }), "{resp:?}");
-    let mut alice_events = alice_client.take_events().await.expect("events");
+    let events = client.take_events().await.expect("events");
+    (session, ticket, events)
+}
+
+#[tokio::test]
+async fn two_clients_chat_end_to_end() {
+    let h = DaemonHarness::spawn().await;
+
+    let alice_client = Client::connect(&h.socket).await.unwrap();
+    let bob_client = Client::connect(&h.socket).await.unwrap();
+
+    // Alice hosts and subscribes so she observes peer-joined and
+    // the message.
+    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
+    let (session, ticket, mut alice_events) = host_and_watch(&alice_client, alice_peer).await;
 
     // Bob joins.
     let bob_peer = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
@@ -193,7 +209,10 @@ async fn subscribe_replays_history() {
     let alice_client = Client::connect(&h.socket).await.unwrap();
     let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     let resp = alice_client
-        .request(Request::HostSession { peer: alice_peer })
+        .request(Request::HostSession {
+            peer: alice_peer,
+            session: None,
+        })
         .await
         .unwrap();
     let (session, ticket) = match resp {

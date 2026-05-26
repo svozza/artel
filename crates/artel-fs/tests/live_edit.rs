@@ -32,6 +32,7 @@ async fn live_edit_propagates_host_to_joiner() {
     let (session, ticket) = match alice
         .request(Request::HostSession {
             peer: alice_peer.clone(),
+            session: None,
         })
         .await
         .unwrap()

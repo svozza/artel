@@ -72,7 +72,14 @@ impl DaemonHarness {
 
 async fn fresh_session(client: &Client) -> artel_protocol::SessionId {
     let peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "host");
-    match client.request(Request::HostSession { peer }).await.unwrap() {
+    match client
+        .request(Request::HostSession {
+            peer,
+            session: None,
+        })
+        .await
+        .unwrap()
+    {
         Response::HostSession { session, .. } => session,
         other => panic!("HostSession: got {other:?}"),
     }

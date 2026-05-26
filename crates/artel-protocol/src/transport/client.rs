@@ -123,6 +123,7 @@ mod tests {
                     id: RequestId::new(2),
                     request: Request::HostSession {
                         peer: PeerInfo::new(PeerId::from_bytes([1; 32]), "alice"),
+                        session: None,
                     },
                 },
                 WireMessage::Request {

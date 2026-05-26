@@ -114,7 +114,10 @@ async fn host_once_and_capture_ticket(harness: &DaemonHarness, root: PathBuf) ->
     let alice = Client::connect(&harness.socket).await.unwrap();
     let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     let session = match alice
-        .request(Request::HostSession { peer: alice_peer })
+        .request(Request::HostSession {
+            peer: alice_peer,
+            session: None,
+        })
         .await
         .unwrap()
     {

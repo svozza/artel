@@ -64,7 +64,14 @@ async fn require_empty_accepts_dir_with_only_artel_fs_state() {
     let harness = DaemonHarness::spawn().await;
     let client = Client::connect(&harness.socket).await.unwrap();
     let peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "host");
-    let session = match client.request(Request::HostSession { peer }).await.unwrap() {
+    let session = match client
+        .request(Request::HostSession {
+            peer,
+            session: None,
+        })
+        .await
+        .unwrap()
+    {
         Response::HostSession { session, .. } => session,
         other => panic!("HostSession: got {other:?}"),
     };

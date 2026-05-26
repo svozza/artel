@@ -40,6 +40,7 @@ async fn joiner_rejects_old_shape_doc_ticket_payload() {
     let (session, artel_ticket) = match alice
         .request(Request::HostSession {
             peer: alice_peer.clone(),
+            session: None,
         })
         .await
         .unwrap()

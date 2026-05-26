@@ -30,6 +30,7 @@ async fn post_join_live_write_to_read_only_zone_is_blocked() {
     let (session, ticket) = match alice
         .request(Request::HostSession {
             peer: alice_peer.clone(),
+            session: None,
         })
         .await
         .unwrap()
