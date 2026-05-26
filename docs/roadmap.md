@@ -490,15 +490,23 @@ What's missing:
    does the right thing if `.artel-fs/` exists — it opens the
    existing namespace, runs the reconcile pass, re-broadcasts the
    ticket. So no new constructor needed; consumers just call
-   `host_with` again. **Verify this end-to-end with a test that
-   asserts the second host's ticket is byte-identical to the
-   first's** — implicit in 3b-1 but never directly asserted.
+   `host_with` again. The structural-identity property (same
+   `NamespaceId`, same host `NodeId(s)`) is what existing joiners'
+   tickets actually depend on; byte-identity of the whole ticket
+   is too strong because address-discovery info inside a ticket
+   can drift legitimately (e.g. relay URL list ordering — see
+   `disk_resume.rs` line 222).
 
-Concrete first deliverable: `tests/host_restart_ticket_stable.rs`
-that hosts, captures the ticket, drops the workspace, re-hosts
-the same dir, captures the second ticket, asserts byte-equality.
-Pins the resume property under regression without committing to
-a registry shape yet.
+Concrete first deliverable — DONE.
+`tests/host_restart_ticket_stable.rs` (commit pending; see
+`docs/brainstorms/2026-05-26-host-restart-ticket-stable-brainstorm.md`)
+hosts, captures the published ticket envelope, shuts down,
+re-hosts the same dir, captures phase 2, and asserts the
+NamespaceId + host NodeId(s) are stable across the boundary.
+Single iroh-disabled daemon, no joiner, ~3.5s — sharper
+regression surface than `disk_resume.rs`'s ~15s end-to-end
+scenario which already covers the same property bundled with
+the rest of the join/restart flow.
 
 After that, the registry + session-id work can land as separate
 slices.

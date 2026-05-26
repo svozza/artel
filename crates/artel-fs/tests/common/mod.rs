@@ -84,10 +84,7 @@ pub async fn wait_for_missing(path: &Path) {
 /// Whether `doc` has any (non-tombstone) entry for `key`. Used by
 /// rule tests to confirm a `ReadOnly` write never landed in the doc.
 pub async fn doc_has_key(doc: &Doc, key: &[u8]) -> bool {
-    let stream = doc
-        .get_many(Query::key_exact(key))
-        .await
-        .expect("get_many");
+    let stream = doc.get_many(Query::key_exact(key)).await.expect("get_many");
     tokio::pin!(stream);
     stream.next().await.is_some()
 }
