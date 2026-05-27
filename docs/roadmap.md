@@ -468,15 +468,20 @@ The substrate is mostly there:
 
 What's missing:
 
-1. **Stable session id across host restarts.** Today
-   `Request::HostSession` mints a fresh `SessionId` per call. A
-   re-hosted workspace gets a new session, which means a joiner's
-   daemon (still tracking the old session id) can't reattach.
-   Two reasonable shapes:
-   - Derive the session id deterministically from the workspace's
-     `NamespaceId`, OR
-   - Add `Request::ResumeHost { session: SessionId, ... }` that
-     reuses an existing entry from the daemon's session log.
+1. **~~Stable session id across host restarts.~~** DONE.
+   `Request::HostSession` now carries an optional caller-supplied
+   `Option<SessionId>` (`PROTOCOL_VERSION` bumped 1 → 2);
+   `artel-fs::Workspace::host_with` derives the id deterministically
+   from the local `NamespaceId` via `session_id_for` and registers
+   with the daemon at that id. First host mints; every restart
+   resumes the existing local-host record verbatim (members, log,
+   head preserved). Re-stamps the ticket with the daemon's current
+   `daemon_addr` so a joiner with the old ticket keeps working
+   across the host's daemon restart. See
+   `docs/brainstorms/2026-05-26-stable-session-id-brainstorm.md` and
+   `docs/plans/2026-05-26-stable-session-id-plan.md`. Sub-slices 1a
+   (protocol), 1b (daemon), 1c (artel-fs) all landed; 1d is this
+   roadmap update.
 2. **Workspace registry on the daemon side.** Today nothing maps
    `(local_path, session_id)` → workspace state dir, so a
    restarted client has no way to enumerate "what workspaces does

@@ -3,7 +3,7 @@
 **Status**: Accepted
 **Date**: 2026-05-15
 **Accepted**: 2026-05-17
-**Updated**: 2026-05-17 (state dir renamed `~/.collab/` → `~/.artel/`; Windows support deferred to v2)
+**Updated**: 2026-05-17 (state dir renamed `~/.collab/` → `~/.artel/`; Windows support deferred to v2); 2026-05-27 (stable session id across host restarts — see "Updates" below)
 
 > Originally drafted as ADR-012 in the [`leandrodamascena/harness`](https://github.com/leandrodamascena/harness) repository ([PR #8](https://github.com/leandrodamascena/harness/pull/8)). Adopted as ADR-001 here as the founding design document for `artel`.
 
@@ -250,3 +250,9 @@ The v1 daemon does not implement any of this, but the architecture is compatible
 These directions all require a designed-for-symmetry session model, not just a daemon. Committing to them in ADR-012 would balloon the scope and prematurely freeze decisions (ordering model, discovery model, capability schema) that need their own analysis. The v1 daemon design deliberately keeps the host-as-sequencer model from ADR-011 because it works and because changing it is a separate decision.
 
 What ADR-012 *does* commit to is not foreclosing these directions: per-user daemons, persisted message logs, and opaque payloads all carry forward unchanged into a symmetric P2P world.
+
+## Updates
+
+### 2026-05-27: Stable session id across host restarts (PROTOCOL_VERSION 2)
+
+`Request::HostSession` now carries an optional caller-supplied `Option<SessionId>`. `None` preserves today's mint-a-fresh-id behaviour; `Some(id)` resumes the existing local-host record (members, log, head) when a matching entry exists, or creates one at the supplied id otherwise. A `Some(id)` against an existing record with a different host or `kind: Remote` is rejected with the new `ProtocolError::SessionConflict(SessionId)` variant. `PROTOCOL_VERSION` ticks 1 → 2; the v1↔v2 boundary still surfaces as the existing `VersionMismatch` error so old clients see "restart required" cleanly. `artel-fs::Workspace::host_with` is the first consumer: it derives the id deterministically from the local `iroh-docs` `NamespaceId`, so a re-host of the same workspace dir under a fresh daemon recovers the same session id (and gossip topic), keeping existing joiners alive across the host's daemon restart. The verb count in § "Daemon scope: medium" is unchanged. See `docs/brainstorms/2026-05-26-stable-session-id-brainstorm.md` and `docs/plans/2026-05-26-stable-session-id-plan.md`.

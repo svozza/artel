@@ -28,9 +28,10 @@ const DOMAIN_TAG: &[u8; 32] = b"artel-fs/session-id/v1\0\0\0\0\0\0\0\0\0\0";
 /// - **Stable**: the same `NamespaceId` always maps to the same
 ///   `SessionId`. Re-hosting the same workspace dir under a fresh
 ///   daemon recovers the original id.
-/// - **Domain-separated**: the v1 derivation uses [`DOMAIN_TAG`] as a
-///   blake3 key so the output can never collide with another use of
-///   the namespace bytes.
+/// - **Domain-separated**: the v1 derivation uses a fixed
+///   `"artel-fs/session-id/v1"` domain tag as the blake3 key so the
+///   output can never collide with another use of the namespace
+///   bytes.
 /// - **UUID v8**: the variant + version bits per RFC 9562 §5.8 are
 ///   stamped so the resulting id is a valid UUID v8 in addition to
 ///   being a 16-byte session id.
