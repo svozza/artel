@@ -585,6 +585,13 @@ async fn dispatch(
                 }
             }
         }
+        Request::RegisterAttachment { .. }
+        | Request::ListAttachments { .. }
+        | Request::ForgetAttachment { .. } => Response::Error {
+            error: ProtocolError::Internal(
+                "attachment RPCs require daemon support — see slice 2b".into(),
+            ),
+        },
     }
 }
 

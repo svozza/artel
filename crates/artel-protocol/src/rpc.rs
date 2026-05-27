@@ -170,6 +170,53 @@ pub enum Request {
         /// Session to leave.
         session: SessionId,
     },
+
+    /// Register an opaque attachment against a session.
+    ///
+    /// `kind` is a consumer-chosen tag (e.g. `"artel-fs/workspace/v1"`)
+    /// the daemon uses only for indexing — it never parses `payload`.
+    /// Within a `(session, kind)` pair, registering overwrites any
+    /// existing entry; this is the idempotent re-register flow
+    /// consumers use on restart.
+    ///
+    /// Returns [`ProtocolError::UnknownSession`] if the session is not
+    /// known to the daemon. Attachments cascade-delete with their
+    /// session.
+    RegisterAttachment {
+        /// Session this attachment is bound to.
+        session: SessionId,
+        /// Consumer-namespaced tag, e.g. `"artel-fs/workspace/v1"`.
+        /// Treated as opaque by the daemon.
+        kind: String,
+        /// Consumer-defined bytes. Daemon never inspects.
+        #[serde(with = "send_payload_bytes")]
+        payload: Vec<u8>,
+    },
+
+    /// List attachments the daemon knows about.
+    ///
+    /// `kind` is an exact-match filter. `None` returns every
+    /// attachment for every known session. `Some(k)` returns only
+    /// attachments tagged with `k`. Order is not specified; callers
+    /// that care should sort client-side.
+    ListAttachments {
+        /// Optional exact-match `kind` filter. `None` = all kinds.
+        kind: Option<String>,
+    },
+
+    /// Remove an attachment without removing its session.
+    ///
+    /// Used by consumers that want their entry gone but the underlying
+    /// session still alive. Idempotent: forgetting an attachment that
+    /// does not exist is `Ok(())`. Forgetting an attachment whose
+    /// session doesn't exist is also `Ok(())` (the cascade already
+    /// cleared it).
+    ForgetAttachment {
+        /// Session the attachment is bound to.
+        session: SessionId,
+        /// Tag of the attachment to remove.
+        kind: String,
+    },
 }
 
 /// Fields of a [`Request::Send`] that the client supplies.
@@ -267,11 +314,40 @@ pub enum Response {
         session: SessionId,
     },
 
+    /// Reply to [`Request::RegisterAttachment`] (success).
+    AttachmentRegistered,
+
+    /// Reply to [`Request::ListAttachments`].
+    Attachments {
+        /// Matching attachments. Order unspecified.
+        entries: Vec<Attachment>,
+    },
+
+    /// Reply to [`Request::ForgetAttachment`] (success).
+    AttachmentForgotten,
+
     /// Any request may produce this in place of its expected variant.
     Error {
         /// Wire-representable error.
         error: ProtocolError,
     },
+}
+
+/// One entry in [`Response::Attachments`].
+///
+/// Pure data, no daemon-side semantics attached. The daemon never parses
+/// `payload`; consumers tag entries with `kind` and ship a postcard- (or
+/// other-) encoded blob inside `payload`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attachment {
+    /// Session this attachment is bound to.
+    pub session: SessionId,
+    /// Consumer-namespaced tag.
+    pub kind: String,
+    /// Consumer-defined opaque bytes. Postcard-encoded as a byte slice
+    /// (matches [`SendPayload::payload`]) rather than a `Vec<u8>` seq.
+    #[serde(with = "send_payload_bytes")]
+    pub payload: Vec<u8>,
 }
 
 /// Asynchronous event the daemon pushes to a subscribed client.
@@ -457,6 +533,56 @@ mod tests {
     }
 
     #[test]
+    fn register_attachment_request_round_trip() {
+        let req = Request::RegisterAttachment {
+            session: SessionId::from_bytes([8; 16]),
+            kind: "artel-fs/workspace/v1".into(),
+            payload: b"opaque-bytes".to_vec(),
+        };
+        let bytes = postcard::to_allocvec(&req).unwrap();
+        let back: Request = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(req, back);
+
+        let json = serde_json::to_string(&req).unwrap();
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn list_attachments_request_round_trip_with_kind() {
+        let req = Request::ListAttachments {
+            kind: Some("artel-fs/workspace/v1".into()),
+        };
+        let bytes = postcard::to_allocvec(&req).unwrap();
+        let back: Request = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn list_attachments_request_round_trip_without_kind() {
+        let req = Request::ListAttachments { kind: None };
+        let bytes = postcard::to_allocvec(&req).unwrap();
+        let back: Request = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(req, back);
+
+        // Pin the JSON shape so a future drift to a non-`None` default
+        // is caught.
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, "{\"list_attachments\":{\"kind\":null}}");
+    }
+
+    #[test]
+    fn forget_attachment_request_round_trip() {
+        let req = Request::ForgetAttachment {
+            session: SessionId::from_bytes([9; 16]),
+            kind: "artel-fs/workspace/v1".into(),
+        };
+        let bytes = postcard::to_allocvec(&req).unwrap();
+        let back: Request = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
     fn send_request_round_trip() {
         let req = Request::Send {
             session: SessionId::from_bytes([2; 16]),
@@ -513,6 +639,92 @@ mod tests {
             let back: Response = postcard::from_bytes(&bytes).unwrap();
             assert_eq!(resp, back);
         }
+    }
+
+    #[test]
+    fn attachment_registered_response_round_trip() {
+        let resp = Response::AttachmentRegistered;
+        let bytes = postcard::to_allocvec(&resp).unwrap();
+        let back: Response = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(resp, back);
+        // Unit-shaped: JSON renders as a bare snake_case string.
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(json, "\"attachment_registered\"");
+    }
+
+    #[test]
+    fn attachment_forgotten_response_round_trip() {
+        let resp = Response::AttachmentForgotten;
+        let bytes = postcard::to_allocvec(&resp).unwrap();
+        let back: Response = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(resp, back);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(json, "\"attachment_forgotten\"");
+    }
+
+    #[test]
+    fn attachments_response_round_trip_empty() {
+        let resp = Response::Attachments {
+            entries: Vec::new(),
+        };
+        let bytes = postcard::to_allocvec(&resp).unwrap();
+        let back: Response = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(resp, back);
+    }
+
+    #[test]
+    fn attachments_response_round_trip_multi_kind() {
+        let resp = Response::Attachments {
+            entries: vec![
+                Attachment {
+                    session: SessionId::from_bytes([1; 16]),
+                    kind: "artel-fs/workspace/v1".into(),
+                    payload: b"first".to_vec(),
+                },
+                Attachment {
+                    session: SessionId::from_bytes([2; 16]),
+                    kind: "other.consumer/thing/v2".into(),
+                    // boundary: empty payload
+                    payload: Vec::new(),
+                },
+                Attachment {
+                    session: SessionId::from_bytes([3; 16]),
+                    kind: "artel-fs/workspace/v1".into(),
+                    // size sanity, not pinning a max
+                    payload: vec![0xCD; 64 * 1024],
+                },
+            ],
+        };
+        let bytes = postcard::to_allocvec(&resp).unwrap();
+        let back: Response = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(resp, back);
+    }
+
+    #[test]
+    fn attachment_payload_round_trip_postcard_uses_bytes_encoding() {
+        // If `payload` were serialized as a generic `Vec<u8>` sequence,
+        // postcard would emit one byte per element plus tag overhead;
+        // with `serde_bytes` it's a length-prefixed byte slice. Pin the
+        // tighter encoding so a future drop of the `serde(with = ...)`
+        // attribute is caught.
+        let attachment = Attachment {
+            session: SessionId::from_bytes([0; 16]),
+            kind: "k".into(),
+            payload: vec![0xAB; 4],
+        };
+        let bytes = postcard::to_allocvec(&attachment).unwrap();
+        // 16-byte session + 1-byte kind length + 1-byte 'k' +
+        // 1-byte payload length + 4 payload bytes = 23.
+        // Allow a small slack (e.g. variable-length encodings) but
+        // catch the >= 4×payload regression a Vec<u8> would cause.
+        assert!(
+            bytes.len() <= 32,
+            "encoded attachment longer than expected ({} bytes): {:?}",
+            bytes.len(),
+            bytes,
+        );
+        let back: Attachment = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(attachment, back);
     }
 
     #[test]
@@ -658,6 +870,23 @@ mod tests {
             }),
             any::<[u8; 16]>().prop_map(|s| Request::LeaveSession {
                 session: SessionId::from_bytes(s),
+            }),
+            (
+                any::<[u8; 16]>(),
+                "[\\PC]{0,32}",
+                proptest::collection::vec(any::<u8>(), 0..256),
+            )
+                .prop_map(|(s, kind, payload)| Request::RegisterAttachment {
+                    session: SessionId::from_bytes(s),
+                    kind,
+                    payload,
+                }),
+            proptest::option::of("[\\PC]{0,32}").prop_map(|kind| Request::ListAttachments { kind }),
+            (any::<[u8; 16]>(), "[\\PC]{0,32}").prop_map(|(s, kind)| {
+                Request::ForgetAttachment {
+                    session: SessionId::from_bytes(s),
+                    kind,
+                }
             }),
         ]
     }

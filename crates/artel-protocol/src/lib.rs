@@ -38,7 +38,8 @@ pub use error::ProtocolError;
 pub use ids::{PeerId, Seq, SessionId};
 pub use message::{MESSAGE_FORMAT, MessageFormat, MessageKind, PeerInfo, SessionMessage};
 pub use rpc::{
-    Event, JoinTicket, Request, RequestId, Response, SendPayload, SessionSummary, WireMessage,
+    Attachment, Event, JoinTicket, Request, RequestId, Response, SendPayload, SessionSummary,
+    WireMessage,
 };
 pub use ticket::{SessionTicket, TICKET_PREFIX, TICKET_VERSION, TicketError, WireEndpointAddr};
 pub use version::{PROTOCOL_VERSION, ProtocolVersion, VersionMismatch};
