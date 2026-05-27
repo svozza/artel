@@ -33,18 +33,6 @@ async fn joiner_bulk_imports_host_files() {
     // Alice on daemon A hosts the artel session.
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
     let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
-    let (session, ticket) = match alice
-        .request(Request::HostSession {
-            peer: alice_peer.clone(),
-            session: None,
-        })
-        .await
-        .unwrap()
-    {
-        Response::HostSession { session, ticket } => (session, ticket),
-        other => panic!("HostSession: got {other:?}"),
-    };
-
     // Alice's workspace dir has two seed files.
     let alice_dir = tempfile::tempdir().unwrap();
     tokio::fs::write(alice_dir.path().join("a.txt"), b"alpha")
@@ -58,13 +46,18 @@ async fn joiner_bulk_imports_host_files() {
     // into the doc and broadcasts the ticket on the session.
     let (alice_ws, _alice_ws_events) = Workspace::host_with(
         &alice,
-        session,
+        alice_peer,
         alice_dir.path().to_path_buf(),
         AttachPolicy::AllowExisting,
         WorkspaceConfig::default().with_address_lookup_override(workspace_lookup_a),
     )
     .await
     .expect("Workspace::host");
+    let session = alice_ws.session_id();
+    let ticket = alice_ws
+        .join_ticket()
+        .expect("host has join_ticket")
+        .clone();
 
     // Bob on daemon B joins the artel session. We need a separate
     // client because Workspace::join consumes the events stream.

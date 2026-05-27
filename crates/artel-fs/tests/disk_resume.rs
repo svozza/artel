@@ -65,20 +65,31 @@ async fn workspace_state_survives_graceful_restart() {
         } = common::spawn_pair().await;
 
         let alice = Client::connect(&daemon_a.socket).await.unwrap();
-        let (session, artel_ticket) = match alice
-            .request(Request::HostSession {
-                peer: alice_peer.clone(),
-                session: None,
-            })
-            .await
-            .unwrap()
-        {
-            Response::HostSession { session, ticket } => (session, ticket),
-            other => panic!("HostSession: got {other:?}"),
-        };
 
-        // Subscribe before standing the workspace up so we don't
-        // miss the broadcast.
+        // The workspace itself owns the `HostSession` round-trip —
+        // it derives the session id from the local NamespaceId and
+        // returns the daemon-issued artel ticket.
+        let alice_cfg = WorkspaceConfig::default()
+            .with_state_dir(alice_wstate.path().to_path_buf())
+            .with_address_lookup_override(workspace_lookup_a);
+        let (alice_ws, _alice_ws_events) = Workspace::host_with(
+            &alice,
+            alice_peer.clone(),
+            alice_root.path().to_path_buf(),
+            AttachPolicy::AllowExisting,
+            alice_cfg,
+        )
+        .await
+        .expect("Workspace::host_with");
+        let session = alice_ws.session_id();
+        let artel_ticket = alice_ws
+            .join_ticket()
+            .expect("host has join_ticket")
+            .clone();
+
+        // Subscribe *after* host returns. The daemon's replay path
+        // surfaces the `workspace.ticket` system message published
+        // during host even for late subscribers.
         let _ = alice
             .request(Request::Subscribe {
                 session,
@@ -88,24 +99,12 @@ async fn workspace_state_survives_graceful_restart() {
             .unwrap();
         let mut alice_events = alice.take_events().await.expect("alice events");
 
-        let alice_cfg = WorkspaceConfig::default()
-            .with_state_dir(alice_wstate.path().to_path_buf())
-            .with_address_lookup_override(workspace_lookup_a);
-        let (alice_ws, _alice_ws_events) = Workspace::host_with(
-            &alice,
-            session,
-            alice_root.path().to_path_buf(),
-            AttachPolicy::AllowExisting,
-            alice_cfg,
-        )
-        .await
-        .expect("Workspace::host_with");
         let alice_ws = Arc::new(alice_ws);
         let alice_handle = Arc::clone(&alice_ws).run().await;
 
         let phase1_ticket = capture_ticket(&mut alice_events, session).await;
 
-        // Bob joins.
+        // Bob joins via the daemon-issued artel ticket.
         let bob = Client::connect(&daemon_b.socket).await.unwrap();
         let resp = bob
             .request(Request::JoinSession {
@@ -114,7 +113,11 @@ async fn workspace_state_survives_graceful_restart() {
             })
             .await
             .unwrap();
-        assert!(matches!(resp, Response::JoinSession { .. }), "{resp:?}");
+        let bob_session = match resp {
+            Response::JoinSession { session, .. } => session,
+            other => panic!("JoinSession: got {other:?}"),
+        };
+        assert_eq!(bob_session, session, "joiner must land on same session id");
 
         let bob_cfg = WorkspaceConfig::default()
             .with_state_dir(bob_wstate.path().to_path_buf())
@@ -183,17 +186,24 @@ async fn workspace_state_survives_graceful_restart() {
     } = common::spawn_pair().await;
 
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
-    let (session, artel_ticket) = match alice
-        .request(Request::HostSession {
-            peer: alice_peer,
-            session: None,
-        })
-        .await
-        .unwrap()
-    {
-        Response::HostSession { session, ticket } => (session, ticket),
-        other => panic!("HostSession (phase 2): got {other:?}"),
-    };
+
+    let alice_cfg = WorkspaceConfig::default()
+        .with_state_dir(alice_wstate.path().to_path_buf())
+        .with_address_lookup_override(workspace_lookup_a);
+    let (alice_ws, _alice_ws_events) = Workspace::host_with(
+        &alice,
+        alice_peer,
+        alice_root.path().to_path_buf(),
+        AttachPolicy::AllowExisting,
+        alice_cfg,
+    )
+    .await
+    .expect("Workspace::host_with phase 2");
+    let session = alice_ws.session_id();
+    let artel_ticket = alice_ws
+        .join_ticket()
+        .expect("host has join_ticket")
+        .clone();
 
     let _ = alice
         .request(Request::Subscribe {
@@ -204,18 +214,6 @@ async fn workspace_state_survives_graceful_restart() {
         .unwrap();
     let mut alice_events = alice.take_events().await.expect("alice events");
 
-    let alice_cfg = WorkspaceConfig::default()
-        .with_state_dir(alice_wstate.path().to_path_buf())
-        .with_address_lookup_override(workspace_lookup_a);
-    let (alice_ws, _alice_ws_events) = Workspace::host_with(
-        &alice,
-        session,
-        alice_root.path().to_path_buf(),
-        AttachPolicy::AllowExisting,
-        alice_cfg,
-    )
-    .await
-    .expect("Workspace::host_with phase 2");
     let alice_ws = Arc::new(alice_ws);
     let alice_handle = Arc::clone(&alice_ws).run().await;
 

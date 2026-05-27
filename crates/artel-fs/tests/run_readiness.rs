@@ -44,7 +44,7 @@ use artel_client::Client;
 use artel_daemon::shutdown::Shutdown;
 use artel_daemon::{Daemon, DaemonConfig};
 use artel_fs::{AttachPolicy, Workspace, path_to_key};
-use artel_protocol::{PeerId, PeerInfo, Request, Response, SessionId};
+use artel_protocol::{PeerId, PeerInfo};
 use futures_util::StreamExt;
 use iroh_docs::store::Query;
 use tempfile::TempDir;
@@ -95,31 +95,19 @@ impl DaemonHarness {
     }
 }
 
-async fn host_session(client: &Client) -> SessionId {
-    let peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
-    match client
-        .request(Request::HostSession {
-            peer,
-            session: None,
-        })
-        .await
-        .unwrap()
-    {
-        Response::HostSession { session, .. } => session,
-        other => panic!("HostSession: got {other:?}"),
-    }
+fn host_peer() -> PeerInfo {
+    PeerInfo::new(PeerId::from_bytes([1; 32]), "alice")
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn watcher_attached_when_run_resolves() {
     let harness = DaemonHarness::spawn().await;
     let client = Client::connect(&harness.socket).await.unwrap();
-    let session = host_session(&client).await;
 
     let ws_dir = tempfile::tempdir().unwrap();
     let (ws, _ws_events) = Workspace::host(
         &client,
-        session,
+        host_peer(),
         ws_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
     )
@@ -166,12 +154,11 @@ async fn watcher_attached_when_run_resolves() {
 async fn applier_subscribed_when_run_resolves() {
     let harness = DaemonHarness::spawn().await;
     let client = Client::connect(&harness.socket).await.unwrap();
-    let session = host_session(&client).await;
 
     let ws_dir = tempfile::tempdir().unwrap();
     let (ws, _ws_events) = Workspace::host(
         &client,
-        session,
+        host_peer(),
         ws_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
     )

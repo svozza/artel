@@ -25,7 +25,7 @@ use artel_client::Client;
 use artel_daemon::shutdown::Shutdown;
 use artel_daemon::{Daemon, DaemonConfig};
 use artel_fs::{AttachPolicy, TICKET_ACTION, Workspace, WorkspaceConfig, ticket as fs_ticket};
-use artel_protocol::{Event, MessageKind, PeerId, PeerInfo, Request, Response, SessionId};
+use artel_protocol::{Event, MessageKind, PeerId, PeerInfo, Request, SessionId};
 use iroh_docs::DocTicket;
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -113,20 +113,21 @@ async fn re_hosting_same_dir_yields_structurally_identical_ticket() {
 async fn host_once_and_capture_ticket(harness: &DaemonHarness, root: PathBuf) -> DocTicket {
     let alice = Client::connect(&harness.socket).await.unwrap();
     let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
-    let session = match alice
-        .request(Request::HostSession {
-            peer: alice_peer,
-            session: None,
-        })
-        .await
-        .unwrap()
-    {
-        Response::HostSession { session, .. } => session,
-        other => panic!("HostSession: got {other:?}"),
-    };
 
-    // Subscribe before standing the workspace up so we don't miss
-    // the broadcast.
+    let (workspace, _ws_events) = Workspace::host_with(
+        &alice,
+        alice_peer,
+        root,
+        AttachPolicy::AllowExisting,
+        WorkspaceConfig::default(),
+    )
+    .await
+    .expect("Workspace::host_with");
+    let session = workspace.session_id();
+
+    // Subscribe *after* host returns. The daemon's replay path
+    // surfaces the workspace.ticket system message published during
+    // host even for late subscribers.
     let _ = alice
         .request(Request::Subscribe {
             session,
@@ -135,16 +136,6 @@ async fn host_once_and_capture_ticket(harness: &DaemonHarness, root: PathBuf) ->
         .await
         .unwrap();
     let mut events = alice.take_events().await.expect("events");
-
-    let (workspace, _ws_events) = Workspace::host_with(
-        &alice,
-        session,
-        root,
-        AttachPolicy::AllowExisting,
-        WorkspaceConfig::default(),
-    )
-    .await
-    .expect("Workspace::host_with");
 
     let ticket = drain_until_ticket(&mut events, session).await;
 

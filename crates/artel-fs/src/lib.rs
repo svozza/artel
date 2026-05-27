@@ -26,6 +26,7 @@ pub mod keys;
 mod keystore;
 mod node;
 pub mod rules;
+pub mod session_id;
 pub mod ticket;
 mod watcher;
 pub mod workspace;
@@ -35,6 +36,7 @@ pub use error::{PolicyViolation, WorkspaceError};
 pub use filter::{FilterDecision, MAX_FILE_SIZE, SkipReason, WorkspaceFilter};
 pub use keys::{KEY_PREFIX, key_to_path, path_to_key};
 pub use rules::{CompiledPathRules, Mode, PathRule, PathRules, PathRulesError};
+pub use session_id::session_id_for;
 pub use ticket::{TicketEnvelopeError, WorkspaceTicketEnvelope};
 pub use workspace::{
     AttachPolicy, Direction, TICKET_ACTION, Workspace, WorkspaceConfig, WorkspaceEvent,

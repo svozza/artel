@@ -20,8 +20,11 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
-use artel_client::Client;
-use artel_protocol::{Event, MessageKind, Request, Response, SendPayload, SessionId};
+use artel_client::{Client, ClientError};
+use artel_protocol::{
+    Event, JoinTicket, MessageKind, PeerInfo, ProtocolError, Request, Response, SendPayload,
+    SessionId,
+};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use iroh_docs::AuthorId;
@@ -331,46 +334,74 @@ pub struct Workspace {
     /// Precompiled rules; built once from `rules` at construction
     /// and read per event. See [`Self::rules`].
     pub(crate) compiled_rules: CompiledPathRules,
+    /// Session id this workspace is attached to.
+    ///
+    /// On the host: derived from the workspace's persisted
+    /// [`NamespaceId`] via [`crate::session_id_for`] so a re-host of
+    /// the same dir under a fresh daemon recovers the same id.
+    /// On the joiner: whatever id the daemon's [`Request::JoinSession`]
+    /// reply returned. Borrow via [`Self::session_id`].
+    pub(crate) session_id: SessionId,
+    /// Artel-session [`JoinTicket`] that the daemon issued when this
+    /// workspace registered as host. `None` on joiners — joiners
+    /// already had a ticket to get here, the workspace doesn't need
+    /// to round-trip it. Read via [`Self::join_ticket`].
+    pub(crate) join_ticket: Option<JoinTicket>,
 }
 
 impl Workspace {
-    /// Stand the workspace up as the host on `session`.
+    /// Stand the workspace up as the host.
     ///
     /// Steps:
     /// 1. Spawn a fresh iroh node (Endpoint + Gossip + Docs/Blobs +
     ///    Router) — see [`WorkspaceNode`].
-    /// 2. Create a writeable `iroh-docs` document and an author id.
-    /// 3. Walk `root`, publish every non-skipped file into the doc.
-    /// 4. Share the doc as a `DocTicket` and broadcast it over the
+    /// 2. Open (or create) the workspace's `iroh-docs` document and
+    ///    derive a stable [`SessionId`] from its `NamespaceId` via
+    ///    [`crate::session_id_for`].
+    /// 3. Register with the daemon by issuing
+    ///    `Request::HostSession { peer, session: Some(derived_id) }`.
+    ///    First-time hosts mint the session at the derived id;
+    ///    subsequent restarts resume the existing record verbatim
+    ///    (members, log, head preserved).
+    /// 4. Walk `root`, publish every non-skipped file into the doc.
+    /// 5. Share the doc as a `DocTicket` and broadcast it over the
     ///    artel session as a [`MessageKind::System`] message with
     ///    action [`TICKET_ACTION`].
     ///
     /// Returns the [`Workspace`] handle plus the receiver side of
     /// the [`WorkspaceEvent`] stream. Call [`Self::run`] to start
-    /// the watcher + applier.
+    /// the watcher + applier. Read the workspace's session id via
+    /// [`Self::session_id`].
     pub async fn host(
         client: &Client,
-        session: SessionId,
+        peer: PeerInfo,
         root: PathBuf,
         policy: AttachPolicy,
     ) -> Result<(Self, mpsc::Receiver<WorkspaceEvent>), WorkspaceError> {
-        Self::host_with(client, session, root, policy, WorkspaceConfig::default()).await
+        Self::host_with(client, peer, root, policy, WorkspaceConfig::default()).await
     }
 
     /// [`Self::host`], but with an explicit [`WorkspaceConfig`] so
     /// callers can override the state directory.
     ///
-    /// On a fresh `state_dir`: creates a new doc and persists its
-    /// `NamespaceId` to `state_dir/doc-id`. On a populated
-    /// `state_dir`: opens the previously-published doc, **runs a
-    /// reconcile pass** (tombstones doc entries whose backing files
-    /// disappeared while we were down), and then re-publishes the
+    /// On a fresh `state_dir`: creates a new doc, derives a
+    /// [`SessionId`] from its [`NamespaceId`], and registers with the
+    /// daemon at that derived id. Persists the namespace bytes to
+    /// `state_dir/doc-id`. On a populated `state_dir`: opens the
+    /// previously-published doc, derives the same id again
+    /// (deterministic from the persisted namespace), and asks the
+    /// daemon to resume the existing host record at that id. **Runs
+    /// a reconcile pass** (tombstones doc entries whose backing files
+    /// disappeared while we were down) before re-publishing the
     /// remaining on-disk files. The resulting ticket is byte-stable
-    /// across restarts so any joiner with the old ticket can
-    /// resume.
+    /// across restarts so any joiner with the old ticket can resume.
+    ///
+    /// Errors with [`WorkspaceError::SessionConflict`] when the daemon
+    /// already owns the derived id with a different host peer or as a
+    /// remote-mirror session — see [`ProtocolError::SessionConflict`].
     pub async fn host_with(
         client: &Client,
-        session: SessionId,
+        peer: PeerInfo,
         root: PathBuf,
         policy: AttachPolicy,
         config: WorkspaceConfig,
@@ -407,6 +438,20 @@ impl Workspace {
         let doc_id_path = state_dir.join(DOC_ID_FILE);
         let (doc, returning) = open_or_create_doc(&node, &doc_id_path).await?;
 
+        // Derive the session id from the persisted NamespaceId
+        // *before* registering with the daemon. First host and every
+        // subsequent restart land on the same id — that's what
+        // gives us resume across daemon restarts.
+        let session_id = crate::session_id::session_id_for(doc.id());
+
+        // Register with the daemon. `Some(session_id)` either creates
+        // the session at this id (first host) or resumes the existing
+        // local-host record (returning host). A `SessionConflict`
+        // means a different peer already owns this id locally — the
+        // user is pointing two daemons at the same state dir or
+        // started two workspaces from one daemon.
+        let join_ticket = register_host(client, peer, session_id).await?;
+
         let (tx, rx) = mpsc::channel(EVENT_BUFFER);
         let echo_guard = EchoGuard::new();
 
@@ -430,7 +475,7 @@ impl Workspace {
             .await
             .map_err(|e| WorkspaceError::Doc(format!("share doc: {e}")))?;
 
-        publish_ticket(client, session, &ticket, &rules).await?;
+        publish_ticket(client, session_id, &ticket, &rules).await?;
 
         let blobs = node.blobs.clone();
         Ok((
@@ -445,6 +490,8 @@ impl Workspace {
                 node: tokio::sync::Mutex::new(Some(node)),
                 rules,
                 compiled_rules,
+                session_id,
+                join_ticket: Some(join_ticket),
             },
             rx,
         ))
@@ -577,9 +624,41 @@ impl Workspace {
                 node: tokio::sync::Mutex::new(Some(node)),
                 rules,
                 compiled_rules,
+                session_id: session,
+                join_ticket: None,
             },
             rx,
         ))
+    }
+
+    /// The artel session id this workspace is attached to.
+    ///
+    /// On the host: derived from the local `NamespaceId` via
+    /// [`crate::session_id_for`] — re-hosting the same workspace dir
+    /// always lands on the same id, so a joiner who held the old
+    /// ticket can keep receiving messages across the host's daemon
+    /// restart.
+    ///
+    /// On the joiner: whatever the daemon's `JoinSession` reply
+    /// returned (the host's id, propagated through the artel
+    /// session).
+    #[must_use]
+    pub const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    /// The artel-session [`JoinTicket`] the daemon issued when this
+    /// workspace registered as host. `None` on joiners — they
+    /// already had a ticket to get here.
+    ///
+    /// Hand this ticket to a peer's [`Request::JoinSession`] to add
+    /// them to the underlying artel session. Joiners then call
+    /// [`Self::join`] (or [`Self::join_with`]) and the workspace's
+    /// `workspace.ticket` system message brings the doc-side ticket
+    /// over for them.
+    #[must_use]
+    pub const fn join_ticket(&self) -> Option<&JoinTicket> {
+        self.join_ticket.as_ref()
     }
 
     /// Borrow the underlying `iroh-docs` document.
@@ -764,6 +843,34 @@ async fn scan_and_publish_existing(
         echo_guard.record_local_publish(path, &bytes).await;
     }
     Ok(())
+}
+
+/// Issue `Request::HostSession { peer, session: Some(session_id) }`
+/// against the daemon and return the [`JoinTicket`] from the reply.
+/// Maps the daemon's resume-conflict variant to
+/// [`WorkspaceError::SessionConflict`] so callers can distinguish
+/// "wrong peer at this state dir" from generic IPC failures.
+async fn register_host(
+    client: &Client,
+    peer: PeerInfo,
+    session_id: SessionId,
+) -> Result<JoinTicket, WorkspaceError> {
+    match client
+        .request(Request::HostSession {
+            peer,
+            session: Some(session_id),
+        })
+        .await
+    {
+        Ok(Response::HostSession { ticket, .. }) => Ok(ticket),
+        Ok(other) => Err(WorkspaceError::Iroh(format!(
+            "unexpected response to HostSession: {other:?}",
+        ))),
+        Err(ClientError::Protocol(ProtocolError::SessionConflict(id))) => {
+            Err(WorkspaceError::SessionConflict(id))
+        }
+        Err(err) => Err(WorkspaceError::Client(err)),
+    }
 }
 
 /// Broadcast `ticket` + `rules` over `session` as a

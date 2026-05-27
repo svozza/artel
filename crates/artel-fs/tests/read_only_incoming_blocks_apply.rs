@@ -37,18 +37,6 @@ async fn applier_drops_incoming_read_only_insert() {
 
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
     let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
-    let (session, ticket) = match alice
-        .request(Request::HostSession {
-            peer: alice_peer.clone(),
-            session: None,
-        })
-        .await
-        .unwrap()
-    {
-        Response::HostSession { session, ticket } => (session, ticket),
-        other => panic!("HostSession: got {other:?}"),
-    };
-
     let rules = PathRules {
         default: Mode::ReadWrite,
         rules: vec![PathRule {
@@ -60,7 +48,7 @@ async fn applier_drops_incoming_read_only_insert() {
     let alice_dir = tempfile::tempdir().unwrap();
     let (alice_ws, _alice_events) = Workspace::host_with(
         &alice,
-        session,
+        alice_peer,
         alice_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
         WorkspaceConfig::default()
@@ -69,6 +57,11 @@ async fn applier_drops_incoming_read_only_insert() {
     )
     .await
     .expect("Workspace::host_with");
+    let session = alice_ws.session_id();
+    let ticket = alice_ws
+        .join_ticket()
+        .expect("host has join_ticket")
+        .clone();
     let alice_ws = Arc::new(alice_ws);
     let alice_handle = Arc::clone(&alice_ws).run().await;
 

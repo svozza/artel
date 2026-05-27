@@ -23,7 +23,7 @@ use artel_client::Client;
 use artel_daemon::shutdown::Shutdown;
 use artel_daemon::{Daemon, DaemonConfig};
 use artel_fs::{AttachPolicy, PolicyViolation, Workspace, WorkspaceConfig, WorkspaceError};
-use artel_protocol::{PeerId, PeerInfo, Request, Response};
+use artel_protocol::{PeerId, PeerInfo};
 use iroh_docs::store::Query;
 use tempfile::TempDir;
 
@@ -70,26 +70,14 @@ impl DaemonHarness {
     }
 }
 
-async fn fresh_session(client: &Client) -> artel_protocol::SessionId {
-    let peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "host");
-    match client
-        .request(Request::HostSession {
-            peer,
-            session: None,
-        })
-        .await
-        .unwrap()
-    {
-        Response::HostSession { session, .. } => session,
-        other => panic!("HostSession: got {other:?}"),
-    }
+fn host_peer() -> PeerInfo {
+    PeerInfo::new(PeerId::from_bytes([1; 32]), "host")
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn host_require_empty_rejects_non_empty_dir_without_creating_state() {
     let harness = DaemonHarness::spawn().await;
     let client = Client::connect(&harness.socket).await.unwrap();
-    let session = fresh_session(&client).await;
 
     let ws_dir = TempDir::new().unwrap();
     tokio::fs::write(ws_dir.path().join("user-data.txt"), b"surprise!")
@@ -98,7 +86,7 @@ async fn host_require_empty_rejects_non_empty_dir_without_creating_state() {
 
     let err = Workspace::host(
         &client,
-        session,
+        host_peer(),
         ws_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
     )
@@ -137,7 +125,6 @@ async fn host_require_empty_rejects_non_empty_dir_without_creating_state() {
 async fn host_allow_existing_publishes_pre_seeded_contents() {
     let harness = DaemonHarness::spawn().await;
     let client = Client::connect(&harness.socket).await.unwrap();
-    let session = fresh_session(&client).await;
 
     let ws_dir = TempDir::new().unwrap();
     tokio::fs::write(ws_dir.path().join("README.md"), b"hello")
@@ -146,7 +133,7 @@ async fn host_allow_existing_publishes_pre_seeded_contents() {
 
     let (ws, _events) = Workspace::host(
         &client,
-        session,
+        host_peer(),
         ws_dir.path().to_path_buf(),
         AttachPolicy::AllowExisting,
     )
@@ -179,12 +166,11 @@ async fn host_allow_existing_publishes_pre_seeded_contents() {
 async fn host_require_empty_accepts_truly_empty_dir() {
     let harness = DaemonHarness::spawn().await;
     let client = Client::connect(&harness.socket).await.unwrap();
-    let session = fresh_session(&client).await;
 
     let ws_dir = TempDir::new().unwrap();
     let (ws, _events) = Workspace::host_with(
         &client,
-        session,
+        host_peer(),
         ws_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
         WorkspaceConfig::default(),

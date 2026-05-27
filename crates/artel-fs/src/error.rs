@@ -4,6 +4,7 @@ use std::io;
 use std::path::PathBuf;
 
 use artel_client::ClientError;
+use artel_protocol::SessionId;
 
 use crate::rules::PathRulesError;
 use crate::ticket::TicketEnvelopeError;
@@ -48,6 +49,15 @@ pub enum WorkspaceError {
     /// [`crate::PathRules`] failed validation at originate-time.
     #[error("path rules: {0}")]
     PathRules(#[from] PathRulesError),
+
+    /// The daemon rejected `HostSession { session: Some(id) }` because a
+    /// different host or a remote-mirror session already owns this id.
+    /// In practice this means the user is pointing two different
+    /// daemons (or two different peers within one daemon) at the same
+    /// artel-fs state directory, which the v1 model doesn't support —
+    /// the namespace's derived session id has exactly one owner.
+    #[error("session id {0} already owned by a different host or kind")]
+    SessionConflict(SessionId),
 
     /// IPC roundtrip via the artel client failed.
     #[error(transparent)]

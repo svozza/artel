@@ -27,17 +27,6 @@ async fn rules_round_trip_via_envelope() {
 
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
     let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
-    let (session, artel_ticket) = match alice
-        .request(Request::HostSession {
-            peer: alice_peer.clone(),
-            session: None,
-        })
-        .await
-        .unwrap()
-    {
-        Response::HostSession { session, ticket } => (session, ticket),
-        other => panic!("HostSession: got {other:?}"),
-    };
 
     let configured_rules = PathRules {
         default: Mode::ReadOnly,
@@ -56,7 +45,7 @@ async fn rules_round_trip_via_envelope() {
     let alice_dir = tempfile::tempdir().unwrap();
     let (alice_ws, _alice_ws_events) = Workspace::host_with(
         &alice,
-        session,
+        alice_peer,
         alice_dir.path().to_path_buf(),
         AttachPolicy::AllowExisting,
         WorkspaceConfig::default()
@@ -65,6 +54,11 @@ async fn rules_round_trip_via_envelope() {
     )
     .await
     .expect("Workspace::host_with");
+    let session = alice_ws.session_id();
+    let artel_ticket = alice_ws
+        .join_ticket()
+        .expect("host has join_ticket")
+        .clone();
 
     // Sanity: the host stores its own rules.
     assert_eq!(alice_ws.rules(), &configured_rules);

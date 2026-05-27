@@ -18,7 +18,7 @@ use artel_client::Client;
 use artel_daemon::shutdown::Shutdown;
 use artel_daemon::{Daemon, DaemonConfig};
 use artel_fs::{AttachPolicy, TICKET_ACTION, Workspace, ticket as fs_ticket};
-use artel_protocol::{Event, MessageKind, PeerId, PeerInfo, Request, Response};
+use artel_protocol::{Event, MessageKind, PeerId, PeerInfo, Request};
 use iroh_docs::DocTicket;
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -71,41 +71,32 @@ impl DaemonHarness {
 async fn host_lands_ticket_on_session() {
     let harness = DaemonHarness::spawn().await;
 
-    // Alice hosts an artel session and a workspace on top of it.
     let alice = Client::connect(&harness.socket).await.unwrap();
     let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
-    let session = match alice
-        .request(Request::HostSession {
-            peer: alice_peer.clone(),
-            session: None,
-        })
-        .await
-        .unwrap()
-    {
-        Response::HostSession { session, .. } => session,
-        other => panic!("HostSession: got {other:?}"),
-    };
 
-    // A second client subscribes so we can observe the system
-    // message Alice's workspace will broadcast. Bob's client uses
-    // the same daemon — local clients see their own session
-    // events.
-    let bob = Client::connect(&harness.socket).await.unwrap();
-    // Bob has to be a member of the session before Subscribe is
-    // legal; use the artel session ticket.
-    let _ = bob
-        .request(Request::HostSession {
-            peer: PeerInfo::new(PeerId::from_bytes([2; 32]), "bob"),
-            session: None,
-        })
+    // Stand the workspace up. The temp dir gets a single seed file
+    // so we exercise the scan-and-publish path too. The workspace
+    // itself owns the `HostSession` round-trip — it derives the
+    // session id from the local NamespaceId and registers with the
+    // daemon.
+    let ws_dir = tempfile::tempdir().unwrap();
+    tokio::fs::write(ws_dir.path().join("README.md"), b"hello workspace")
         .await
         .unwrap();
-    // Actually — for a local-only daemon we can't have two hosts of
-    // the same session, and joining via JoinSession requires the
-    // ticket. Drop the bob-host call: we just have alice subscribe
-    // to her own session.
-    drop(bob);
 
+    let (workspace, _ws_events) = Workspace::host(
+        &alice,
+        alice_peer,
+        ws_dir.path().to_path_buf(),
+        AttachPolicy::AllowExisting,
+    )
+    .await
+    .expect("Workspace::host");
+    let session = workspace.session_id();
+
+    // Subscribe *after* `host` returns. The daemon replays the
+    // session log on subscribe, so the `workspace.ticket` system
+    // message published during `host` is still observed here.
     let _ = alice
         .request(Request::Subscribe {
             session,
@@ -114,22 +105,6 @@ async fn host_lands_ticket_on_session() {
         .await
         .unwrap();
     let mut events = alice.take_events().await.expect("events");
-
-    // Stand the workspace up. The temp dir gets a single seed file
-    // so we exercise the scan-and-publish path too.
-    let ws_dir = tempfile::tempdir().unwrap();
-    tokio::fs::write(ws_dir.path().join("README.md"), b"hello workspace")
-        .await
-        .unwrap();
-
-    let (workspace, _ws_events) = Workspace::host(
-        &alice,
-        session,
-        ws_dir.path().to_path_buf(),
-        AttachPolicy::AllowExisting,
-    )
-    .await
-    .expect("Workspace::host");
 
     // Pull events until we see the ticket system message.
     let payload = timeout(Duration::from_secs(15), async {

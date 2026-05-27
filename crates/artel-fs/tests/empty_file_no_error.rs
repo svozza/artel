@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use artel_client::Client;
 use artel_fs::{AttachPolicy, Workspace, WorkspaceEvent, path_to_key};
-use artel_protocol::{PeerId, PeerInfo, Request, Response};
+use artel_protocol::{PeerId, PeerInfo};
 use futures_util::StreamExt;
 use iroh_docs::store::Query;
 use tempfile::TempDir;
@@ -54,21 +54,10 @@ async fn spawn_host_workspace() -> (
     .await;
     let client = Client::connect(&daemon.socket).await.unwrap();
     let peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "host");
-    let session = match client
-        .request(Request::HostSession {
-            peer,
-            session: None,
-        })
-        .await
-        .unwrap()
-    {
-        Response::HostSession { session, .. } => session,
-        other => panic!("HostSession: got {other:?}"),
-    };
     let dir = tempfile::tempdir().unwrap();
     let (ws, events) = Workspace::host(
         &client,
-        session,
+        peer,
         dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
     )

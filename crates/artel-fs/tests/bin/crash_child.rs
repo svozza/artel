@@ -42,7 +42,7 @@ use std::time::Duration;
 
 use artel_client::Client;
 use artel_fs::{AttachPolicy, Workspace, WorkspaceConfig};
-use artel_protocol::{PeerId, PeerInfo, Request, Response};
+use artel_protocol::{PeerId, PeerInfo};
 
 #[derive(Debug)]
 struct Args {
@@ -144,30 +144,22 @@ async fn run(args: Args) -> Result<(), String> {
         .await
         .map_err(|e| format!("connect daemon: {e}"))?;
 
-    let (session, ticket) = match client
-        .request(Request::HostSession {
-            peer,
-            session: None,
-        })
-        .await
-        .map_err(|e| format!("HostSession: {e}"))?
-    {
-        Response::HostSession { session, ticket } => (session, ticket),
-        other => return Err(format!("HostSession unexpected response: {other:?}")),
-    };
-    emit(&format!("HOSTED {session}"));
-    emit(&format!("TICKET {}", ticket.as_str()));
-
     let cfg = WorkspaceConfig::default().with_state_dir(args.state_dir.clone());
     let (ws, mut events) = Workspace::host_with(
         &client,
-        session,
+        peer,
         args.root.clone(),
         AttachPolicy::AllowExisting,
         cfg,
     )
     .await
     .map_err(|e| format!("Workspace::host_with: {e}"))?;
+    let session = ws.session_id();
+    let ticket = ws
+        .join_ticket()
+        .ok_or_else(|| "host workspace missing join_ticket".to_string())?;
+    emit(&format!("HOSTED {session}"));
+    emit(&format!("TICKET {}", ticket.as_str()));
     let ws = Arc::new(ws);
     let _handle = Arc::clone(&ws).run().await;
     emit("WORKSPACE_UP");

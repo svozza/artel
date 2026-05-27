@@ -16,7 +16,7 @@ use artel_client::Client;
 use artel_daemon::shutdown::Shutdown;
 use artel_daemon::{Daemon, DaemonConfig};
 use artel_fs::{AttachPolicy, Workspace};
-use artel_protocol::{PeerId, PeerInfo, Request, Response};
+use artel_protocol::{PeerId, PeerInfo};
 use tempfile::TempDir;
 
 struct DaemonHarness {
@@ -64,17 +64,6 @@ async fn require_empty_accepts_dir_with_only_artel_fs_state() {
     let harness = DaemonHarness::spawn().await;
     let client = Client::connect(&harness.socket).await.unwrap();
     let peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "host");
-    let session = match client
-        .request(Request::HostSession {
-            peer,
-            session: None,
-        })
-        .await
-        .unwrap()
-    {
-        Response::HostSession { session, .. } => session,
-        other => panic!("HostSession: got {other:?}"),
-    };
 
     // Pre-create the state dir with the layout a previous lifetime
     // would have left behind. Real `iroh.key` content isn't needed —
@@ -86,7 +75,7 @@ async fn require_empty_accepts_dir_with_only_artel_fs_state() {
 
     let (ws, _events) = Workspace::host(
         &client,
-        session,
+        peer,
         ws_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
     )

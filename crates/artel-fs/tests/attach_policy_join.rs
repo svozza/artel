@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use artel_client::Client;
 use artel_fs::{AttachPolicy, PolicyViolation, Workspace, WorkspaceConfig, WorkspaceError};
-use artel_protocol::{PeerId, PeerInfo, Request, Response};
+use artel_protocol::{PeerId, PeerInfo, Request, Response, SessionId};
 use tempfile::TempDir;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -36,28 +36,21 @@ async fn join_require_empty_rejects_non_empty_dir_without_creating_state() {
     // get anywhere near the host's iroh node.
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
     let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
-    let (session, artel_ticket) = match alice
-        .request(Request::HostSession {
-            peer: alice_peer,
-            session: None,
-        })
-        .await
-        .unwrap()
-    {
-        Response::HostSession { session, ticket } => (session, ticket),
-        other => panic!("HostSession: got {other:?}"),
-    };
-
     let alice_dir = TempDir::new().unwrap();
     let (alice_ws, _) = Workspace::host_with(
         &alice,
-        session,
+        alice_peer,
         alice_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
         WorkspaceConfig::default().with_address_lookup_override(workspace_lookup_a),
     )
     .await
     .expect("Workspace::host");
+    let session = alice_ws.session_id();
+    let artel_ticket = alice_ws
+        .join_ticket()
+        .expect("host has join_ticket")
+        .clone();
     let alice_ws = Arc::new(alice_ws);
 
     // Bob joins the artel session and tries to mount a workspace
@@ -133,20 +126,8 @@ async fn join_init_from_existing_is_rejected() {
     let client = Client::connect(&daemon.socket).await.unwrap();
 
     // We need *some* session id to pass to `join`, but the policy
-    // check fires before any IPC, so the value is immaterial. Mint
-    // one via HostSession on the same client.
-    let peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "joiner");
-    let session = match client
-        .request(Request::HostSession {
-            peer,
-            session: None,
-        })
-        .await
-        .unwrap()
-    {
-        Response::HostSession { session, .. } => session,
-        other => panic!("HostSession: got {other:?}"),
-    };
+    // check fires before any IPC, so the value is immaterial.
+    let session = SessionId::new_random();
 
     let join_dir = TempDir::new().unwrap();
     let err = tokio::time::timeout(
