@@ -149,11 +149,21 @@ E2E test in `crates/artel-daemon/tests/host_resume.rs` (new file — mirrors the
 
 ## Sub-slice 1c — artel-fs: derive a stable session id from `NamespaceId`
 
-**Goal:** `Workspace::host_with` derives a deterministic `SessionId` from the workspace's `NamespaceId` and passes it through `Client::host_session` (or directly via `Client::request(Request::HostSession { ..., session: Some(id) })` — see below). A re-host of the same dir lands on the same session id, gives the same gossip topic (topic = `session_id[..16]`, unchanged), and lets an existing joiner resume.
+**Goal:** `Workspace::host_with` becomes the single entry point for hosting an artel-fs workspace: it opens (or creates) the local namespace, derives the session id from it, and issues `HostSession` *itself*. A re-host of the same dir lands on the same session id, gives the same gossip topic, and lets an existing joiner resume seamlessly across the host's daemon restart.
+
+### Why this shape (approach A)
+
+The earlier draft of this plan had `host_with` *verify* that the caller had supplied the right session id (via a separate `derive_session_id` helper). That shape is broken on first host: the caller has no `doc-id` yet, so `derive_session_id` returns `None`, the caller passes `None` to `HostSession`, the daemon mints a random id `id_random`, and the workspace's persisted record sits at `id_random`. On the next restart, `derive_session_id` returns `Some(id_derived)` (from the now-persisted `NamespaceId`). The caller passes `Some(id_derived)`, the daemon takes the *create* branch (no record at `id_derived`), and a fresh empty session is stamped — leaving the original log orphaned at `id_random`.
+
+The fix is to make `host_with` own the HostSession call. It opens the namespace, derives the id, calls `HostSession { session: Some(derived) }` exactly once, and the same id is used on first host and every subsequent resume. No race between caller and workspace, no mismatch path to worry about.
+
+This trades a wider `host_with` signature change (loses the `session: SessionId` arg, gains a `peer: PeerInfo` arg) against eliminating an entire bug class. Per `feedback_no_speculative_abstractions`, ship the simpler shape that's correct on day one. The signature change touches every artel-fs test (~16 call sites) plus the consumer's lone host call; mechanical update.
+
+The naming (`host_with`, "host") is on borrowed time anyway — ADR-001 § "Future evolution" signals a symmetric P2P direction where "host" stops being privileged. Approach A's structure (`open_namespace → derive_id → register_with_daemon`) is exactly what the symmetric peer flow will look like; only the verb name changes when that lands.
 
 ### Files touched
 
-- `crates/artel-fs/src/lib.rs` — declare a new `pub mod session_id;` (or inline into `keystore.rs`; new file is cleaner). Re-export `pub use session_id::session_id_for;`.
+- `crates/artel-fs/src/lib.rs` — declare `pub mod session_id;` and re-export `pub use session_id::session_id_for;`.
 - `crates/artel-fs/src/session_id.rs` — **new module.**
   ```rust
   use artel_protocol::SessionId;
@@ -169,32 +179,34 @@ E2E test in `crates/artel-daemon/tests/host_resume.rs` (new file — mirrors the
   pub fn session_id_for(ns: NamespaceId) -> SessionId {
       let hash = blake3::keyed_hash(DOMAIN_TAG, ns.as_bytes());
       let mut bytes: [u8; 16] = hash.as_bytes()[..16].try_into().unwrap();
-      // UUID v8 variant bits per RFC 9562 §5.8: high nibble of byte 6
-      // is 0b1000 (version 8), high two bits of byte 8 are 0b10
-      // (RFC variant). Brainstorm explicitly chose v8.
+      // UUID v8 variant bits per RFC 9562 §5.8.
       bytes[6] = (bytes[6] & 0x0F) | 0x80;
       bytes[8] = (bytes[8] & 0x3F) | 0x80;
       SessionId::from_bytes(bytes)
   }
   ```
-  `blake3::keyed_hash` requires a `&[u8; 32]` key — pad the tag to 32 bytes. The padded tag is itself part of the v1 contract; future versions (`v2` etc.) get a new padded constant.
+  `blake3::keyed_hash` requires a `&[u8; 32]` key — pad the tag to 32 bytes. The exact byte sequence of the padded tag is part of the v1 contract; a unit test pins it.
 - `crates/artel-fs/src/workspace.rs`:
-  - `host_with` derivation point: after `open_or_create_doc` succeeds (we have `doc.id() -> NamespaceId` at that moment, regardless of returning vs. fresh), compute `let derived_id = session_id_for(doc.id());`. Pass `Some(derived_id)` through to the daemon.
-  - The daemon call site for hosting today is buried inside the artel-client API (`Client::request(Request::HostSession { peer })` is what the consumer of `Workspace::host_with` does *before* calling `Workspace::host_with` — `host_with` itself takes a `session: SessionId` arg already). Re-read of `host_with` confirms: the workspace consumer picks the session id by issuing `HostSession` themselves, then passes the resulting `SessionId` to `Workspace::host_with`. **The plumbing that needs to change is at the level of whatever helper the consumer uses.**
-
-    Two shapes the consumer can take:
-    1. The consumer calls `client.request(Request::HostSession { peer, session: None })` themselves and threads the returned id into `Workspace::host_with`. This is the existing pattern.
-    2. We add a `Workspace`-side helper that does the host-then-attach atomically. This *is* a useful helper, but it's the ergonomics of roadmap item 3 (`Workspace::resume`), which is out of scope.
-
-    Per the brainstorm: "`artel-fs::Workspace::host_with` derives a deterministic session id ... and passes it on every host call." The consumer-driven shape (1) means the brainstorm's promise has to be realised inside `host_with` — but `host_with` already takes a `session: SessionId` from outside. The resolution: `host_with` can't unilaterally re-host on the consumer's behalf without changing its arg list.
-
-    **Decision:** make `host_with` *verify* that the supplied `session` matches the derived id when state is returning, and propagate the derived id outward via a new helper. Concretely:
-
-    - Add `Workspace::derive_session_id(state_dir: &Path) -> Result<Option<SessionId>, WorkspaceError>` — a free helper (or static method) that reads the persisted `doc-id` file and returns `Some(session_id_for(ns))` if present, `None` if not. Unit test it. Consumers call this *before* `HostSession` and pass the result as the `session` field.
-    - In `host_with`, after `open_or_create_doc` resolves the `NamespaceId`, **assert** (or rather: warn-log on mismatch) that the supplied `session: SessionId` arg equals `session_id_for(doc.id())`. A mismatch means the consumer didn't use `derive_session_id`, which is a contract violation: surface a `WorkspaceError::SessionIdMismatch { expected, got }` and bail. This makes the deterministic-id contract enforceable.
-
-    This shape is consistent with the brainstorm's stated property ("re-host of the same dir always lands on the same session id") *and* keeps the consumer-driven host pattern. The alternative — making `host_with` issue `HostSession` itself — changes the public API and tangles with the no-`HostOptions`-struct constraint.
-  - Add `WorkspaceError::SessionIdMismatch { expected: SessionId, got: SessionId }` to `crates/artel-fs/src/error.rs`.
+  - **Signature change.** `Workspace::host_with` drops its `session: SessionId` parameter and gains `peer: PeerInfo`. New shape:
+    ```rust
+    pub async fn host_with(
+        client: &Client,
+        peer: PeerInfo,
+        root: PathBuf,
+        policy: AttachPolicy,
+        config: WorkspaceConfig,
+    ) -> Result<(Self, mpsc::Receiver<WorkspaceEvent>), WorkspaceError>
+    ```
+    Returns `(Workspace, events)` as today, *plus* the new `Workspace::session_id` accessor (see below) so callers that need the id post-construction can read it.
+  - **Body restructure.** Order today is: enforce policy → ensure state dir → spawn node → `open_or_create_doc` → reconcile/scan → `share` → `publish_ticket(client, session, ticket, rules)`. New order:
+    1. Enforce policy, ensure state dir, spawn node (unchanged).
+    2. `open_or_create_doc` → `(doc, returning)`. We now have `doc.id()` (a `NamespaceId`) regardless of returning/fresh.
+    3. `let session_id = session_id_for(doc.id());` — pure, no fallible step.
+    4. `client.request(Request::HostSession { peer, session: Some(session_id) })` — single round trip. On `Ok`, the daemon returned the same id back (1b's resume-or-create-with-id path). On `Err(SessionConflict(_))`, propagate as `WorkspaceError::SessionConflict`.
+    5. Continue with reconcile (if returning) → scan → share → `publish_ticket(client, session_id, ticket, rules)`.
+  - **Store the id on `Workspace`.** Add `session_id: SessionId` field plus `pub fn session_id(&self) -> SessionId` accessor. Useful for tests and for any consumer that needs the id without re-deriving.
+  - Add `WorkspaceError::SessionConflict(SessionId)` to `crates/artel-fs/src/error.rs`. Maps from `ClientError::Protocol(ProtocolError::SessionConflict(id))` at the point we issue HostSession; surface to callers so they can present the error meaningfully.
+  - The existing `WorkspaceError::Client(ClientError)` arm absorbs all other `request` failures unchanged.
 
 ### Public API additions
 
@@ -204,50 +216,77 @@ pub fn session_id_for(ns: NamespaceId) -> SessionId;
 
 // artel-fs::workspace
 impl Workspace {
-    /// Read the persisted `NamespaceId` at `state_dir/doc-id` and
-    /// derive its stable [`SessionId`] for use with
-    /// `Request::HostSession { session: Some(...) }`. Returns
-    /// `Ok(None)` when the workspace has never been hosted (no
-    /// persisted `doc-id`).
-    pub fn derive_session_id(state_dir: &Path) -> Result<Option<SessionId>, WorkspaceError>;
+    /// The artel session id this workspace is attached to. For
+    /// hosts this is `session_id_for(self.doc.id())` — derived
+    /// from the local NamespaceId so a re-host of the same dir
+    /// lands on the same id. For joiners this is whatever the
+    /// daemon said `JoinSession` returned.
+    pub fn session_id(&self) -> SessionId;
+}
+
+// artel-fs::error
+pub enum WorkspaceError {
+    // ... existing variants
+    /// The daemon rejected `HostSession { session: Some(id) }`
+    /// because a different host or a remote-mirror session
+    /// already owns this id. In practice this means the user is
+    /// pointing two different daemons at the same artel state
+    /// dir, which we don't support today.
+    SessionConflict(SessionId),
 }
 ```
+
+### Migration of existing call sites
+
+Every test that currently does:
+```rust
+let (session, ticket) = match client.request(Request::HostSession { peer, session: None }).await? { ... };
+let (ws, events) = Workspace::host_with(&client, session, root, policy, cfg).await?;
+```
+becomes:
+```rust
+let (ws, events) = Workspace::host_with(&client, peer, root, policy, cfg).await?;
+let session = ws.session_id();
+```
+
+Tests that need the join ticket separately (most do, to drive a Bob in the same test) still get it the same way they do today — by subscribing to the workspace events stream and waiting for the `workspace.ticket` system message. That part doesn't change.
+
+Affected files (approximately, from a `Workspace::host_with` grep):
+- `crates/artel-fs/tests/{disk_resume,host_restart_ticket_stable,ticket_envelope_round_trip,ticket_envelope_rejects_old_shape,read_only_*,attach_policy_host,attach_policy_join,join_bulk_export,live_edit,delete_propagates,round_trip,default_read_write_unchanged_behaviour,mixed_rules_first_match_wins,empty_file_no_error,host_publishes_ticket}.rs`
+- `crates/artel-fs/tests/bin/crash_child.rs` (the one consumer that runs in a child process)
+- `crates/artel-fs/tests/run_readiness.rs`, `attach_policy_state_dir_only.rs`
+
+Mechanical change. Don't introduce semantic differences while migrating.
 
 ### Tests added
 
 Unit tests in `crates/artel-fs/src/session_id.rs`:
-- `session_id_is_stable_for_a_given_namespace_id` — call `session_id_for` twice on the same `NamespaceId::from(&[7u8; 32])`, assert byte-identical.
+- `session_id_is_stable_for_a_given_namespace_id` — call `session_id_for` twice on the same `NamespaceId::from([7u8; 32])`, assert byte-identical.
 - `session_id_differs_for_distinct_namespace_ids` — two arbitrary distinct `NamespaceId`s map to distinct session ids.
 - `session_id_has_uuid_v8_variant_bits` — assert byte 6 high nibble is `0x8` and byte 8 high two bits are `0b10`.
-- A small proptest generating random `[u8; 32]` inputs and verifying both stability and v8 bits.
+- `domain_tag_byte_sequence_is_pinned` — assert `DOMAIN_TAG` equals the exact 32-byte literal. Catches accidental edits that would silently change every workspace's session id.
+- A proptest generating random `[u8; 32]` namespace bytes and verifying stability + v8 bits.
 
-Unit tests in `crates/artel-fs/src/workspace.rs::tests`:
-- `derive_session_id_returns_none_for_fresh_state_dir` — tempdir, no `doc-id` file, returns `Ok(None)`.
-- `derive_session_id_returns_consistent_id_for_persisted_doc_id` — write a synthetic `doc-id` file (32 bytes) and assert `derive_session_id` returns `Some(session_id_for(NamespaceId::from(...)))` matching a hand-computed reference.
-- `host_with_rejects_session_id_not_derived_from_namespace` — pre-seed a `state_dir` with a known `doc-id` and call `host_with` with a fabricated `SessionId::new_random()`. Assert `Err(WorkspaceError::SessionIdMismatch { .. })`.
+E2E test in `crates/artel-fs/tests/host_resume_session_id.rs` (new file). Cleanest fixture is a single `Pair` (Alice's daemon + Bob's daemon, cross-seeded MemoryLookup) plus an Alice daemon restart in the middle:
 
-E2E test `crates/artel-fs/tests/host_resume_session_id.rs` (new file, mirrors `crates/artel-fs/tests/disk_resume.rs`'s `Pair`-fixture shape):
-1. Spin a host-side `Pair` (Alice's daemon + Bob's daemon, cross-seeded `MemoryLookup`).
-2. Alice: `derive_session_id(state_dir)` → `None`. Issue `HostSession { peer, session: None }` → get `id1`. Call `Workspace::host_with(client, id1, root, AllowExisting, default config)` — confirm it succeeds. **At first-time host, there's no `doc-id` yet** — so the helper returns `None`, the consumer passes `None` to `HostSession`, the daemon mints a random id, and `host_with` then sees the random id passed by the caller versus the derived id from the freshly-created `NamespaceId`.
-
-   **Resolution:** the contract is "if `derive_session_id` returns `Some`, the host MUST use it; if it returns `None`, the host MUST issue `HostSession { session: None }` and trust the daemon to mint." `host_with`'s mismatch check needs a corresponding allowance: if `state_dir/doc-id` did *not* exist before `open_or_create_doc` (the `returning == false` branch), `host_with` *adopts* the random id as the workspace's id and skips the mismatch check. This is fine because the freshly-minted random id and the derived id will, on subsequent restarts, be the same (the `NamespaceId` is now persisted, so `derive_session_id` returns `Some(...)` next time).
-
-   Concretely: `host_with` knows whether `open_or_create_doc` returned `(_, returning=true)` or `(_, returning=false)`. The mismatch check fires only on `returning=true`. The fresh-host path skips it.
-
-3. Continue test: shut Alice's daemon down (taking the workspace with it). Spin a fresh daemon at the same state dir. Re-host: `let id2 = derive_session_id(state_dir)?.expect("doc-id is persisted");` — call `HostSession { session: Some(id2) }` → daemon resume path (1b) takes over and returns `id2`. Assert `id2 == id1`.
-4. Assert the gossip topic byte-derived from `id2` equals the topic derived from `id1` (the `topic_for` function lives in `gossip_bridge.rs`; we don't import it but compute `id2.as_bytes()[..16]` directly to match the topic-derivation contract).
-5. **The user-visible property test:** Bob joined Alice in step 2 with the *original* ticket. After Alice's daemon restart and re-host, Bob's existing connection is still subscribed to the same gossip topic. Assert that Alice can `Send` a message after re-host and Bob receives it. (This is the actual point of the work; without it the rest is theatre.)
+1. Spin `Pair`. Alice's `Workspace::host_with` runs against an empty workspace dir. The constructor derives `id1 = session_id_for(doc.id())` and registers it with daemon A. Capture `id1` via `alice_ws.session_id()`. Capture the published ticket via Alice's IPC subscribe loop (existing test pattern).
+2. Bob joins via the captured ticket; assert his workspace mirrors Alice's (existing pattern, just enough to prove the live path works).
+3. Alice's daemon shuts down. The workspace dir's state (`iroh.key`, `doc-id`, redb store) is untouched. Spawn a fresh Alice daemon at the same state dir.
+4. Alice calls `Workspace::host_with` *again* on the same root. The constructor re-opens the persisted `NamespaceId`, computes `id2 = session_id_for(doc.id())`, calls `HostSession { session: Some(id2) }`. Daemon's resume path (1b) reuses the existing record. Assert `alice_ws.session_id() == id1`.
+5. Assert that Bob's mirror (still alive in Daemon B, still subscribed to the gossip topic derived from `id1 == id2`) receives a fresh `Send` from Alice after the re-host. **This is the user-visible property; without it the rest is theatre.**
+6. (Optional but cheap) assert that the gossip-topic bytes from `id2` equal those from `id1` — `topic_for(id) = id.as_bytes()[..16]` per `gossip_bridge.rs`, which we don't import; recompute inline.
 
 ### Definition of done
 
-1. `session_id_for(NamespaceId) -> SessionId` exists; pure, deterministic, v8-tagged, no I/O.
-2. `Workspace::derive_session_id(state_dir)` exposed; returns `None` for fresh dirs, `Some(stable_id)` for hosted dirs.
-3. `host_with` enforces "supplied session id matches `session_id_for(doc.id())`" on the returning-host path; allows mismatch on first-host (where the daemon-minted id is *adopted* as the new namespace's id).
-4. Re-hosting the same dir lands on the same session id and the same gossip topic across daemon restarts.
-5. An existing joiner's mirror keeps receiving messages from the host across the host's daemon restart (e2e proven).
-6. fmt + clippy clean both feature modes.
+1. `session_id_for(NamespaceId) -> SessionId` exists; pure, deterministic, v8-tagged, no I/O. Domain tag bytes pinned by test.
+2. `Workspace::host_with` signature is `(client, peer, root, policy, config)`. The function opens the namespace, derives the session id, registers with the daemon via `HostSession { session: Some(...) }`, and proceeds with the existing reconcile/scan/publish-ticket flow.
+3. `Workspace::session_id() -> SessionId` accessor exposed.
+4. `WorkspaceError::SessionConflict(SessionId)` added; mapped from the daemon's protocol-level variant at the request site.
+5. Re-hosting the same dir under a fresh daemon lands on the same `SessionId` and same gossip topic; an existing joiner keeps receiving messages from the host across the host's daemon restart (e2e proven).
+6. All existing tests migrated to the new `host_with` signature; suite stays green.
+7. fmt + clippy clean both feature modes.
 
-**Commit subject:** `artel-fs: derive stable SessionId from NamespaceId; resume on re-host`
+**Commit subject:** `artel-fs: derive stable SessionId from NamespaceId; host_with takes ownership of HostSession`
 
 ---
 
