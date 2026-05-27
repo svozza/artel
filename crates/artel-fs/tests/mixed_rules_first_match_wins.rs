@@ -10,12 +10,14 @@
 
 mod common;
 
+use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use artel_client::Client;
 use artel_fs::{AttachPolicy, Mode, PathRule, PathRules, Workspace, WorkspaceConfig};
 use artel_protocol::{PeerId, PeerInfo, Request, Response};
+use tokio::time::sleep;
 
 use common::wait_for_file;
 
@@ -23,51 +25,81 @@ use common::wait_for_file;
 async fn first_match_wins_carries_through_wire() {
     // Phase 1: broad ReadWrite rule precedes narrow ReadOnly. The
     // narrow rule is unreachable; `docs/secret/foo.txt` propagates.
-    let propagated = run_with_rules(PathRules {
-        default: Mode::ReadWrite,
-        rules: vec![
-            PathRule {
-                glob: "docs/**".into(),
-                mode: Mode::ReadWrite,
-            },
-            PathRule {
-                glob: "docs/secret/**".into(),
-                mode: Mode::ReadOnly,
-            },
-        ],
-    })
+    // Drive timing positively — poll for the secret on Bob's side.
+    run_with_rules(
+        PathRules {
+            default: Mode::ReadWrite,
+            rules: vec![
+                PathRule {
+                    glob: "docs/**".into(),
+                    mode: Mode::ReadWrite,
+                },
+                PathRule {
+                    glob: "docs/secret/**".into(),
+                    mode: Mode::ReadOnly,
+                },
+            ],
+        },
+        Expectation::Propagates,
+    )
     .await;
-    assert!(
-        propagated,
-        "first-match-wins broken: ReadWrite-first should let docs/secret/foo.txt through",
-    );
 
     // Phase 2: reorder. Narrow ReadOnly precedes broad ReadWrite.
-    // Now `docs/secret/foo.txt` is blocked.
-    let propagated_reversed = run_with_rules(PathRules {
-        default: Mode::ReadWrite,
-        rules: vec![
-            PathRule {
-                glob: "docs/secret/**".into(),
-                mode: Mode::ReadOnly,
-            },
-            PathRule {
-                glob: "docs/**".into(),
-                mode: Mode::ReadWrite,
-            },
-        ],
-    })
+    // Now `docs/secret/foo.txt` is blocked. Drive timing via a
+    // marker file written *after* the secret — once Bob has the
+    // marker, the secret would have arrived too if the rule weren't
+    // blocking it.
+    run_with_rules(
+        PathRules {
+            default: Mode::ReadWrite,
+            rules: vec![
+                PathRule {
+                    glob: "docs/secret/**".into(),
+                    mode: Mode::ReadOnly,
+                },
+                PathRule {
+                    glob: "docs/**".into(),
+                    mode: Mode::ReadWrite,
+                },
+            ],
+        },
+        Expectation::Blocked,
+    )
     .await;
-    assert!(
-        !propagated_reversed,
-        "first-match-wins broken: ReadOnly-first should block docs/secret/foo.txt",
-    );
 }
 
-/// Stand a host/joiner pair up with `rules`; write
-/// `docs/secret/foo.txt` and a marker; return whether the secret
-/// reached Bob.
-async fn run_with_rules(rules: PathRules) -> bool {
+/// What the test expects to happen to `docs/secret/foo.txt` on
+/// Bob's side. Each variant uses the shape-appropriate signal:
+/// `Propagates` polls for the file directly (positive); `Blocked`
+/// waits for a sentinel marker that was written *after* the secret
+/// and then asserts the secret is still absent.
+#[derive(Clone, Copy, Debug)]
+enum Expectation {
+    Propagates,
+    Blocked,
+}
+
+/// Budget for the positive path: how long to wait for the secret to
+/// reach Bob before failing. Generous because we go through
+/// debounce + doc → sync → applier.
+const PROPAGATE_BUDGET: Duration = Duration::from_secs(15);
+const POLL: Duration = Duration::from_millis(100);
+
+async fn poll_for(path: &Path, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        if path.exists() {
+            return true;
+        }
+        sleep(POLL).await;
+    }
+    false
+}
+
+/// Stand a host/joiner pair up with `rules`, write
+/// `docs/secret/foo.txt` (and a marker), then verify the
+/// `expectation` against Bob's filesystem.
+async fn run_with_rules(rules: PathRules, expectation: Expectation) {
     let common::Pair {
         daemon_a,
         daemon_b,
@@ -132,9 +164,39 @@ async fn run_with_rules(rules: PathRules) -> bool {
         .await
         .unwrap();
 
-    wait_for_file(&bob_dir.path().join("marker.txt"), b"go").await;
-
-    let propagated = bob_dir.path().join("docs/secret/foo.txt").exists();
+    let bob_secret = bob_dir.path().join("docs/secret/foo.txt");
+    match expectation {
+        Expectation::Propagates => {
+            // Positive case: poll the secret directly. The marker
+            // signal is *not* a substitute here — top-level marker
+            // and nested secret travel through independent
+            // debounce/publish paths and the marker can land on
+            // Bob first even though the secret was written first.
+            assert!(
+                poll_for(&bob_secret, PROPAGATE_BUDGET).await,
+                "first-match-wins broken: ReadWrite-first should let \
+                 docs/secret/foo.txt through within {PROPAGATE_BUDGET:?}",
+            );
+        }
+        Expectation::Blocked => {
+            // Negative case: wait for the marker (written *after*
+            // the secret) to arrive on Bob. Once it has, the
+            // pipeline has had at least one full round-trip — if
+            // the secret were going to leak, it would have arrived
+            // by now too. The check stays a single `.exists()` to
+            // catch a near-simultaneous leak; if marker-arrival
+            // turns out to be insufficient settling for the
+            // negative path, this would be the next thing to
+            // tighten (e.g. a brief spin after marker arrival).
+            wait_for_file(&bob_dir.path().join("marker.txt"), b"go").await;
+            assert!(
+                !bob_secret.exists(),
+                "first-match-wins broken: ReadOnly-first should block \
+                 docs/secret/foo.txt; it leaked to {}",
+                bob_secret.display(),
+            );
+        }
+    }
 
     alice_ws.shutdown().await;
     bob_ws.shutdown().await;
@@ -144,6 +206,4 @@ async fn run_with_rules(rules: PathRules) -> bool {
     drop(bob);
     daemon_a.stop().await;
     daemon_b.stop().await;
-
-    propagated
 }
