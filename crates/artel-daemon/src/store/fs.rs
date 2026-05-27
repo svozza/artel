@@ -29,7 +29,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use super::{SessionKind, SessionRecord, SessionStore};
+use super::{SessionKind, SessionRecord, SessionStore, StoredAttachment};
 
 /// Maximum size of one log frame's payload, in bytes. Same cap as the
 /// IPC transport — a frame too big to send over IPC isn't worth
@@ -40,6 +40,10 @@ const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 const META_FILE: &str = "meta.json";
 /// Per-session log file name.
 const LOG_FILE: &str = "log";
+/// Per-session subdirectory for opaque consumer attachments.
+const ATTACHMENTS_DIR: &str = "attachments";
+/// Suffix on attachment files; the prefix is the kind, hex-encoded.
+const ATTACHMENT_FILE_SUFFIX: &str = ".bin";
 
 /// Permission applied to the sessions root and per-session subdirs.
 const DIR_MODE: u32 = 0o700;
@@ -187,6 +191,126 @@ impl SessionStore for FsLogStore {
         .await
         .map_err(|e| join_to_io(&e))?
     }
+
+    async fn put_attachment(
+        &self,
+        session: SessionId,
+        kind: &str,
+        payload: &[u8],
+    ) -> io::Result<bool> {
+        let session_dir = self.session_dir(session);
+        let kind = kind.to_owned();
+        let payload = payload.to_vec();
+        if payload.len() > MAX_FRAME_SIZE {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("attachment payload too large: {} bytes", payload.len()),
+            ));
+        }
+        tokio::task::spawn_blocking(move || -> io::Result<bool> {
+            // Existence test mirrors load_all's: only directories that
+            // already pass `load_one` count as "known sessions". A bare
+            // `is_dir` check is enough here because Registry won't call
+            // us with an id whose dir is half-built — `create` runs
+            // first and it lays down both meta and log atomically.
+            if !session_dir.is_dir() {
+                return Ok(false);
+            }
+            let attachments_dir = session_dir.join(ATTACHMENTS_DIR);
+            ensure_dir(&attachments_dir, DIR_MODE)?;
+            let path = attachments_dir.join(attachment_filename(&kind));
+            write_attachment(&path, &payload)?;
+            Ok(true)
+        })
+        .await
+        .map_err(|e| join_to_io(&e))?
+    }
+
+    async fn list_attachments(
+        &self,
+        kind_filter: Option<&str>,
+    ) -> io::Result<Vec<StoredAttachment>> {
+        let root = self.root.clone();
+        let kind_filter = kind_filter.map(str::to_owned);
+        tokio::task::spawn_blocking(move || -> io::Result<Vec<StoredAttachment>> {
+            let mut out = Vec::new();
+            let entries = match std::fs::read_dir(&root) {
+                Ok(it) => it,
+                Err(err) if err.kind() == ErrorKind::NotFound => return Ok(out),
+                Err(err) => return Err(err),
+            };
+            for entry in entries {
+                let entry = entry?;
+                let session_path = entry.path();
+                if !session_path.is_dir() {
+                    continue;
+                }
+                let Some(id_str) = session_path.file_name().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let session_id: SessionId = match id_str.parse() {
+                    Ok(id) => id,
+                    Err(_) => continue, // unparseable session dir — load_all warns on it
+                };
+                let attachments_dir = session_path.join(ATTACHMENTS_DIR);
+                let attachment_entries = match std::fs::read_dir(&attachments_dir) {
+                    Ok(it) => it,
+                    Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                    Err(err) => return Err(err),
+                };
+                for att in attachment_entries {
+                    let att = att?;
+                    let path = att.path();
+                    let Some(kind) = decode_attachment_filename(&path) else {
+                        warn!(
+                            file = %path.display(),
+                            "skipping attachment: filename is not lowercase-hex(<kind>) + .bin",
+                        );
+                        continue;
+                    };
+                    if let Some(filter) = &kind_filter
+                        && filter != &kind
+                    {
+                        continue;
+                    }
+                    let metadata = std::fs::metadata(&path)?;
+                    if metadata.len() > MAX_FRAME_SIZE as u64 {
+                        warn!(
+                            file = %path.display(),
+                            size = metadata.len(),
+                            "skipping attachment: payload exceeds MAX_FRAME_SIZE",
+                        );
+                        continue;
+                    }
+                    let payload = std::fs::read(&path)?;
+                    out.push(StoredAttachment {
+                        session: session_id,
+                        kind,
+                        payload,
+                    });
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| join_to_io(&e))?
+    }
+
+    async fn delete_attachment(&self, session: SessionId, kind: &str) -> io::Result<()> {
+        let path = self
+            .session_dir(session)
+            .join(ATTACHMENTS_DIR)
+            .join(attachment_filename(kind));
+        tokio::task::spawn_blocking(move || -> io::Result<()> {
+            match std::fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+                Err(err) => Err(err),
+            }
+        })
+        .await
+        .map_err(|e| join_to_io(&e))?
+    }
 }
 
 /// On-disk meta document. Kept distinct from `SessionRecord` so the
@@ -255,6 +379,76 @@ fn read_meta(path: &Path) -> io::Result<Meta> {
     let bytes = std::fs::read(path)?;
     serde_json::from_slice(&bytes)
         .map_err(|e| io::Error::new(ErrorKind::InvalidData, format!("meta json: {e}")))
+}
+
+/// Filename for `(kind)`: lowercase-hex(utf8(kind)) + `.bin`.
+///
+/// Hex avoids case collisions on macOS's default filesystem, slashes
+/// in `kind`, and other OS-illegal characters. These files are never
+/// user-facing — direct readers go through `list_attachments`.
+fn attachment_filename(kind: &str) -> String {
+    let bytes = kind.as_bytes();
+    let mut s = String::with_capacity(bytes.len() * 2 + ATTACHMENT_FILE_SUFFIX.len());
+    for b in bytes {
+        // No-alloc per-byte hex.
+        s.push(char::from_digit(u32::from(b >> 4), 16).expect("nibble"));
+        s.push(char::from_digit(u32::from(b & 0xF), 16).expect("nibble"));
+    }
+    s.push_str(ATTACHMENT_FILE_SUFFIX);
+    s
+}
+
+/// Inverse of [`attachment_filename`]. Returns `None` if `path` does
+/// not have the expected `<lowercase-hex>.bin` shape: non-`.bin`
+/// suffix, odd-length stem, non-`[0-9a-f]` characters, or stem
+/// that decodes to non-utf8 bytes.
+fn decode_attachment_filename(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name.strip_suffix(ATTACHMENT_FILE_SUFFIX)?;
+    if !stem.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(stem.len() / 2);
+    let mut chars = stem.chars();
+    while let (Some(hi), Some(lo)) = (chars.next(), chars.next()) {
+        // Require lowercase: keeps one canonical on-disk shape so a
+        // dir written by one daemon and read by another (or the same
+        // daemon after a code change) can never disagree on file
+        // identity.
+        let hi = decode_lower_hex_nibble(hi)?;
+        let lo = decode_lower_hex_nibble(lo)?;
+        bytes.push((hi << 4) | lo);
+    }
+    String::from_utf8(bytes).ok()
+}
+
+const fn decode_lower_hex_nibble(c: char) -> Option<u8> {
+    match c {
+        '0'..='9' => Some(c as u8 - b'0'),
+        'a'..='f' => Some(c as u8 - b'a' + 10),
+        _ => None,
+    }
+}
+
+/// Atomic write of an attachment payload.
+///
+/// Same `<path>.tmp` + fsync + rename + chmod-0o600 dance as
+/// [`write_meta`]; the only thing different is the file content
+/// (raw bytes vs. JSON).
+fn write_attachment(path: &Path, payload: &[u8]) -> io::Result<()> {
+    let tmp = path.with_extension("bin.tmp");
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)?;
+        f.write_all(payload)?;
+        f.sync_all()?;
+    }
+    chmod(&tmp, FILE_MODE)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// Atomic write: `path.tmp` + fsync + rename.
@@ -679,5 +873,242 @@ mod tests {
         let _store = FsLogStore::open(&nested).unwrap();
         let mode = std::os::unix::fs::MetadataExt::mode(&std::fs::metadata(&nested).unwrap());
         assert_eq!(mode & 0o777, DIR_MODE);
+    }
+
+    // ---- attachments ----
+
+    const KIND_V1: &str = "artel-fs/workspace/v1";
+
+    #[tokio::test]
+    async fn put_then_list_attachment_round_trips() {
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+
+        let payload = b"opaque-bytes".to_vec();
+        let ok = store
+            .put_attachment(record(1).id, KIND_V1, &payload)
+            .await
+            .unwrap();
+        assert!(ok);
+
+        let listed = store.list_attachments(None).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session, record(1).id);
+        assert_eq!(listed[0].kind, KIND_V1);
+        assert_eq!(listed[0].payload, payload);
+    }
+
+    #[tokio::test]
+    async fn put_attachment_overwrites_existing_at_same_kind() {
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+
+        store
+            .put_attachment(record(1).id, KIND_V1, b"first")
+            .await
+            .unwrap();
+        store
+            .put_attachment(record(1).id, KIND_V1, b"second")
+            .await
+            .unwrap();
+
+        let listed = store.list_attachments(None).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].payload, b"second");
+    }
+
+    #[tokio::test]
+    async fn put_attachment_for_unknown_session_returns_false() {
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        // No create() — session dir doesn't exist.
+        let id = SessionId::from_bytes([0xaa; 16]);
+        let ok = store.put_attachment(id, KIND_V1, b"x").await.unwrap();
+        assert!(!ok);
+
+        // Verify nothing landed on disk.
+        assert!(!dir.path().join(id.to_string()).exists());
+    }
+
+    #[tokio::test]
+    async fn list_attachments_filters_by_kind_exact_match() {
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+        store.create(&record(2)).await.unwrap();
+
+        store
+            .put_attachment(record(1).id, KIND_V1, b"a")
+            .await
+            .unwrap();
+        store
+            .put_attachment(record(1).id, "other/kind/v1", b"b")
+            .await
+            .unwrap();
+        store
+            .put_attachment(record(2).id, KIND_V1, b"c")
+            .await
+            .unwrap();
+
+        let v1_only = store.list_attachments(Some(KIND_V1)).await.unwrap();
+        assert_eq!(v1_only.len(), 2);
+        for entry in &v1_only {
+            assert_eq!(entry.kind, KIND_V1);
+        }
+
+        let others = store.list_attachments(Some("other/kind/v1")).await.unwrap();
+        assert_eq!(others.len(), 1);
+        assert_eq!(others[0].payload, b"b");
+    }
+
+    #[tokio::test]
+    async fn list_attachments_returns_empty_when_no_attachments() {
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+        let listed = store.list_attachments(None).await.unwrap();
+        assert!(listed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_attachment_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+        store
+            .put_attachment(record(1).id, KIND_V1, b"x")
+            .await
+            .unwrap();
+
+        store
+            .delete_attachment(record(1).id, KIND_V1)
+            .await
+            .unwrap();
+        store
+            .delete_attachment(record(1).id, KIND_V1)
+            .await
+            .unwrap();
+
+        assert!(store.list_attachments(None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_attachment_on_unknown_session_is_ok() {
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        let id = SessionId::from_bytes([0xaa; 16]);
+        store.delete_attachment(id, KIND_V1).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_session_cascades_attachments() {
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+        store
+            .put_attachment(record(1).id, KIND_V1, b"a")
+            .await
+            .unwrap();
+        store
+            .put_attachment(record(1).id, "other/kind/v1", b"b")
+            .await
+            .unwrap();
+
+        store.delete(record(1).id).await.unwrap();
+
+        // No attachments remain — the cascade fell out of remove_dir_all.
+        assert!(store.list_attachments(None).await.unwrap().is_empty());
+        let attachments_dir = dir
+            .path()
+            .join(record(1).id.to_string())
+            .join(ATTACHMENTS_DIR);
+        assert!(!attachments_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn attachment_filename_is_hex_encoded() {
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+        store
+            .put_attachment(record(1).id, KIND_V1, b"x")
+            .await
+            .unwrap();
+
+        // lowercase-hex(b"artel-fs/workspace/v1") + ".bin"
+        let expected =
+            "61727465".to_string() + "6c2d66732f776f726b73706163652f7631" + ATTACHMENT_FILE_SUFFIX;
+        let path = dir
+            .path()
+            .join(record(1).id.to_string())
+            .join(ATTACHMENTS_DIR)
+            .join(expected);
+        assert!(
+            path.exists(),
+            "expected hex-encoded attachment at {}",
+            path.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn non_hex_attachment_filenames_are_skipped_with_warning() {
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+        store
+            .put_attachment(record(1).id, KIND_V1, b"valid")
+            .await
+            .unwrap();
+
+        // Drop a non-hex filename next to the valid one.
+        let attachments_dir = dir
+            .path()
+            .join(record(1).id.to_string())
+            .join(ATTACHMENTS_DIR);
+        std::fs::write(attachments_dir.join("not-hex.bin"), b"junk").unwrap();
+
+        let listed = store.list_attachments(None).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].kind, KIND_V1);
+    }
+
+    #[tokio::test]
+    async fn oversized_attachment_payload_is_skipped() {
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+
+        // Drop a too-large file directly. We bypass put_attachment
+        // because that path would reject MAX_FRAME_SIZE-sized writes;
+        // we want to exercise list_attachments's defence-in-depth
+        // skip-and-warn path for files that somehow appeared on disk.
+        let attachments_dir = dir
+            .path()
+            .join(record(1).id.to_string())
+            .join(ATTACHMENTS_DIR);
+        ensure_dir(&attachments_dir, DIR_MODE).unwrap();
+        let path = attachments_dir.join(attachment_filename(KIND_V1));
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(MAX_FRAME_SIZE as u64 + 1).unwrap();
+        f.sync_all().unwrap();
+
+        let listed = store.list_attachments(None).await.unwrap();
+        assert!(listed.is_empty(), "expected oversized file to be skipped");
+    }
+
+    #[tokio::test]
+    async fn put_attachment_rejects_oversized_payload() {
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+
+        let payload = vec![0u8; MAX_FRAME_SIZE + 1];
+        let err = store
+            .put_attachment(record(1).id, KIND_V1, &payload)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
     }
 }

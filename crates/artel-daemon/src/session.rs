@@ -25,7 +25,7 @@ use artel_protocol::{
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, broadcast};
 
-use crate::store::{DynStore, SessionKind, SessionRecord};
+use crate::store::{DynStore, SessionKind, SessionRecord, StoredAttachment};
 
 /// Capacity of the per-session broadcast channel.
 ///
@@ -877,6 +877,55 @@ impl Registry {
         Ok(message)
     }
 
+    /// Persist (or overwrite) a consumer-tagged attachment against
+    /// `session`. The daemon never inspects `payload`; consumers
+    /// (e.g. `artel-fs`) namespace `kind` and ship a postcard-encoded
+    /// blob.
+    ///
+    /// Returns [`SessionError::UnknownSession`] when `session` is not
+    /// known to the daemon. Idempotent within a `(session, kind)`
+    /// pair: re-registering overwrites. Attachments cascade-delete
+    /// with their session — see [`crate::store::SessionStore::delete`].
+    pub(crate) async fn register_attachment(
+        &self,
+        session: SessionId,
+        kind: String,
+        payload: Vec<u8>,
+    ) -> Result<(), SessionError> {
+        match self.store.put_attachment(session, &kind, &payload).await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(SessionError::UnknownSession(session)),
+            Err(err) => Err(SessionError::Storage(err)),
+        }
+    }
+
+    /// List every attachment matching `kind_filter`. `None` returns
+    /// all kinds across all sessions; `Some(k)` returns only those
+    /// tagged with `k`. Order unspecified.
+    pub(crate) async fn list_attachments(
+        &self,
+        kind_filter: Option<&str>,
+    ) -> Result<Vec<StoredAttachment>, SessionError> {
+        self.store
+            .list_attachments(kind_filter)
+            .await
+            .map_err(SessionError::Storage)
+    }
+
+    /// Remove the attachment at `(session, kind)` without removing
+    /// the session itself. Idempotent: missing session OR missing
+    /// attachment returns `Ok(())`.
+    pub(crate) async fn forget_attachment(
+        &self,
+        session: SessionId,
+        kind: String,
+    ) -> Result<(), SessionError> {
+        self.store
+            .delete_attachment(session, &kind)
+            .await
+            .map_err(SessionError::Storage)
+    }
+
     /// Subscribe to live events for `session`, optionally backfilling
     /// every message with `seq > since` first.
     pub async fn subscribe(
@@ -1637,5 +1686,117 @@ mod tests {
 
         // Session is still here.
         assert_eq!(r.list().await.len(), 1);
+    }
+
+    // ---- attachments ----
+
+    const KIND_V1: &str = "artel-fs/workspace/v1";
+
+    #[tokio::test]
+    async fn register_attachment_persists_via_store() {
+        let r = registry();
+        let alice = peer(1, "alice");
+        let (id, _) = r.host(alice, None).await.unwrap();
+        r.register_attachment(id, KIND_V1.into(), b"payload".to_vec())
+            .await
+            .unwrap();
+        let listed = r.list_attachments(None).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session, id);
+        assert_eq!(listed[0].kind, KIND_V1);
+        assert_eq!(listed[0].payload, b"payload");
+    }
+
+    #[tokio::test]
+    async fn register_attachment_for_unknown_session_returns_unknown_session_error() {
+        let r = registry();
+        let bogus = SessionId::new_random();
+        let err = r
+            .register_attachment(bogus, KIND_V1.into(), b"x".to_vec())
+            .await
+            .unwrap_err();
+        assert_eq!(err, SessionError::UnknownSession(bogus));
+    }
+
+    #[tokio::test]
+    async fn list_attachments_returns_entries_across_multiple_sessions() {
+        let r = registry();
+        let (id1, _) = r.host(peer(1, "alice"), None).await.unwrap();
+        let (id2, ticket2) = r.host(peer(2, "bob"), None).await.unwrap();
+        let _ = ticket2;
+        r.register_attachment(id1, KIND_V1.into(), b"one".to_vec())
+            .await
+            .unwrap();
+        r.register_attachment(id2, KIND_V1.into(), b"two".to_vec())
+            .await
+            .unwrap();
+
+        let mut listed = r.list_attachments(None).await.unwrap();
+        listed.sort_by_key(|s| s.session);
+        let mut want = vec![id1, id2];
+        want.sort();
+        assert_eq!(listed.iter().map(|s| s.session).collect::<Vec<_>>(), want);
+    }
+
+    #[tokio::test]
+    async fn forget_attachment_removes_entry() {
+        let r = registry();
+        let (id, _) = r.host(peer(1, "alice"), None).await.unwrap();
+        r.register_attachment(id, KIND_V1.into(), b"x".to_vec())
+            .await
+            .unwrap();
+        r.forget_attachment(id, KIND_V1.into()).await.unwrap();
+        assert!(r.list_attachments(None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cascade_removes_attachments_when_host_leaves() {
+        let r = registry();
+        let alice = peer(1, "alice");
+        let (id, _) = r.host(alice.clone(), None).await.unwrap();
+        r.register_attachment(id, KIND_V1.into(), b"x".to_vec())
+            .await
+            .unwrap();
+
+        r.leave(id, alice.id).await.unwrap();
+
+        // Session is gone and so is the attachment — list_attachments
+        // returns empty rather than a dangling entry.
+        assert!(r.list_attachments(None).await.unwrap().is_empty());
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn cascade_removes_attachments_when_remote_session_closes() {
+        let daemon_peer = PeerId::from_bytes([7; 32]);
+        let remote_host = peer(1, "alice");
+        let session_id = SessionId::from_bytes([0xaa; 16]);
+        let me = peer(2, "bob");
+
+        let store = Arc::new(crate::store::MemoryStore::new());
+        let record = SessionRecord {
+            id: session_id,
+            host: remote_host.id,
+            members: HashSet::from([remote_host.id, me.id]),
+            head: Seq::ZERO,
+            log: Vec::new(),
+            kind: SessionKind::Remote,
+        };
+        store.create(&record).await.unwrap();
+        let r = Registry::load(
+            daemon_peer,
+            WireEndpointAddr::id_only(daemon_peer),
+            store.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        r.register_attachment(session_id, KIND_V1.into(), b"x".to_vec())
+            .await
+            .unwrap();
+        r.host_closed_session(session_id).await.unwrap();
+
+        assert!(r.list_attachments(None).await.unwrap().is_empty());
     }
 }

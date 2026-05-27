@@ -585,12 +585,61 @@ async fn dispatch(
                 }
             }
         }
-        Request::RegisterAttachment { .. }
+        req @ (Request::RegisterAttachment { .. }
         | Request::ListAttachments { .. }
-        | Request::ForgetAttachment { .. } => Response::Error {
-            error: ProtocolError::Internal(
-                "attachment RPCs require daemon support — see slice 2b".into(),
-            ),
+        | Request::ForgetAttachment { .. }) => dispatch_attachment(registry, req).await,
+    }
+}
+
+/// Dispatch the three attachment RPCs. Pulled out of `dispatch` so
+/// the parent function stays under clippy's `too_many_lines` cap;
+/// the attachment surface is independent of session membership and
+/// has no business sharing the membership-tracking machinery.
+async fn dispatch_attachment(registry: &Registry, request: Request) -> Response {
+    match request {
+        Request::RegisterAttachment {
+            session,
+            kind,
+            payload,
+        } => match registry.register_attachment(session, kind, payload).await {
+            Ok(()) => Response::AttachmentRegistered,
+            Err(err) => Response::Error {
+                error: session_error_to_protocol(&err),
+            },
+        },
+        Request::ListAttachments { kind } => {
+            match registry.list_attachments(kind.as_deref()).await {
+                Ok(stored) => Response::Attachments {
+                    entries: stored
+                        .into_iter()
+                        .map(|s| artel_protocol::Attachment {
+                            session: s.session,
+                            kind: s.kind,
+                            payload: s.payload,
+                        })
+                        .collect(),
+                },
+                Err(err) => Response::Error {
+                    error: session_error_to_protocol(&err),
+                },
+            }
+        }
+        Request::ForgetAttachment { session, kind } => {
+            match registry.forget_attachment(session, kind).await {
+                Ok(()) => Response::AttachmentForgotten,
+                Err(err) => Response::Error {
+                    error: session_error_to_protocol(&err),
+                },
+            }
+        }
+        // dispatch_attachment is only called from `dispatch` with one
+        // of the three attachment variants. Other variants would be a
+        // routing bug — surface as Internal so the client gets a clear
+        // error instead of a panic.
+        other => Response::Error {
+            error: ProtocolError::Internal(format!(
+                "dispatch_attachment called with non-attachment variant: {other:?}",
+            )),
         },
     }
 }

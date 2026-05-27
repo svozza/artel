@@ -22,12 +22,13 @@ use async_trait::async_trait;
 
 #[cfg(test)]
 use super::SessionKind;
-use super::{SessionRecord, SessionStore};
+use super::{SessionRecord, SessionStore, StoredAttachment};
 
 /// In-memory store. Cheap to construct; tests use one per scenario.
 #[derive(Debug, Default)]
 pub(crate) struct MemoryStore {
     inner: Mutex<HashMap<SessionId, SessionRecord>>,
+    attachments: Mutex<HashMap<(SessionId, String), Vec<u8>>>,
 }
 
 impl MemoryStore {
@@ -76,6 +77,14 @@ impl SessionStore for MemoryStore {
 
     async fn delete(&self, session: SessionId) -> io::Result<()> {
         self.inner.lock().expect("poisoned").remove(&session);
+        // Cascade: per the SessionStore::delete contract, any
+        // attachments tied to this session must vanish atomically.
+        // The disk store gets this for free via remove_dir_all; here
+        // we have to iterate.
+        self.attachments
+            .lock()
+            .expect("poisoned")
+            .retain(|(s, _), _| *s != session);
         Ok(())
     }
 
@@ -87,6 +96,48 @@ impl SessionStore for MemoryStore {
             .values()
             .cloned()
             .collect())
+    }
+
+    async fn put_attachment(
+        &self,
+        session: SessionId,
+        kind: &str,
+        payload: &[u8],
+    ) -> io::Result<bool> {
+        if !self.inner.lock().expect("poisoned").contains_key(&session) {
+            return Ok(false);
+        }
+        self.attachments
+            .lock()
+            .expect("poisoned")
+            .insert((session, kind.to_owned()), payload.to_vec());
+        Ok(true)
+    }
+
+    async fn list_attachments(
+        &self,
+        kind_filter: Option<&str>,
+    ) -> io::Result<Vec<StoredAttachment>> {
+        Ok(self
+            .attachments
+            .lock()
+            .expect("poisoned")
+            .iter()
+            .filter(|((_, k), _)| kind_filter.is_none_or(|f| f == k))
+            .map(|((session, kind), payload)| StoredAttachment {
+                session: *session,
+                kind: kind.clone(),
+                payload: payload.clone(),
+            })
+            .collect())
+    }
+
+    async fn delete_attachment(&self, session: SessionId, kind: &str) -> io::Result<()> {
+        self.attachments
+            .lock()
+            .expect("poisoned")
+            .remove(&(session, kind.to_owned()));
+        Ok(())
     }
 }
 
@@ -188,5 +239,109 @@ mod tests {
         let loaded = store.load_all().await.unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].kind, SessionKind::Remote);
+    }
+
+    // ---- attachments ----
+
+    const KIND_V1: &str = "artel-fs/workspace/v1";
+
+    #[tokio::test]
+    async fn put_then_list_attachment_round_trips() {
+        let store = MemoryStore::new();
+        store.create(&record()).await.unwrap();
+        let ok = store
+            .put_attachment(record().id, KIND_V1, b"opaque")
+            .await
+            .unwrap();
+        assert!(ok);
+        let listed = store.list_attachments(None).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].kind, KIND_V1);
+        assert_eq!(listed[0].payload, b"opaque");
+    }
+
+    #[tokio::test]
+    async fn put_attachment_overwrites_existing_at_same_kind() {
+        let store = MemoryStore::new();
+        store.create(&record()).await.unwrap();
+        store
+            .put_attachment(record().id, KIND_V1, b"first")
+            .await
+            .unwrap();
+        store
+            .put_attachment(record().id, KIND_V1, b"second")
+            .await
+            .unwrap();
+        let listed = store.list_attachments(None).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].payload, b"second");
+    }
+
+    #[tokio::test]
+    async fn put_attachment_for_unknown_session_returns_false() {
+        let store = MemoryStore::new();
+        let ok = store
+            .put_attachment(SessionId::from_bytes([9; 16]), KIND_V1, b"x")
+            .await
+            .unwrap();
+        assert!(!ok);
+        assert!(store.list_attachments(None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_attachments_filters_by_kind_exact_match() {
+        let store = MemoryStore::new();
+        store.create(&record()).await.unwrap();
+        store
+            .put_attachment(record().id, KIND_V1, b"a")
+            .await
+            .unwrap();
+        store
+            .put_attachment(record().id, "other/kind/v1", b"b")
+            .await
+            .unwrap();
+
+        let v1_only = store.list_attachments(Some(KIND_V1)).await.unwrap();
+        assert_eq!(v1_only.len(), 1);
+        assert_eq!(v1_only[0].payload, b"a");
+    }
+
+    #[tokio::test]
+    async fn delete_attachment_is_idempotent() {
+        let store = MemoryStore::new();
+        store.create(&record()).await.unwrap();
+        store
+            .put_attachment(record().id, KIND_V1, b"x")
+            .await
+            .unwrap();
+        store.delete_attachment(record().id, KIND_V1).await.unwrap();
+        store.delete_attachment(record().id, KIND_V1).await.unwrap();
+        assert!(store.list_attachments(None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_attachment_on_unknown_session_is_ok() {
+        let store = MemoryStore::new();
+        store
+            .delete_attachment(SessionId::from_bytes([9; 16]), KIND_V1)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_session_cascades_attachments() {
+        let store = MemoryStore::new();
+        store.create(&record()).await.unwrap();
+        store
+            .put_attachment(record().id, KIND_V1, b"a")
+            .await
+            .unwrap();
+        store
+            .put_attachment(record().id, "other/kind/v1", b"b")
+            .await
+            .unwrap();
+
+        store.delete(record().id).await.unwrap();
+        assert!(store.list_attachments(None).await.unwrap().is_empty());
     }
 }
