@@ -482,39 +482,38 @@ What's missing:
    `docs/plans/2026-05-26-stable-session-id-plan.md`. Sub-slices 1a
    (protocol), 1b (daemon), 1c (artel-fs) all landed; 1d is this
    roadmap update.
-2. **Workspace registry on the daemon side.** Today nothing maps
-   `(local_path, session_id)` → workspace state dir, so a
-   restarted client has no way to enumerate "what workspaces does
-   this daemon know about?" without reading `~/.artel/`
-   filesystem state directly. Add `Request::ListWorkspaces` plus
-   `Request::ForgetWorkspace`; backing store extends `FsLogStore`
-   (or sibling) with a `workspaces.toml` keyed by session id.
-   Single source of truth, survives daemon restarts, usable by
-   any client (CLI, future GUI, whatever the consumer is).
-3. **`Workspace::resume`?** Today `Workspace::host_with` already
-   does the right thing if `.artel-fs/` exists — it opens the
-   existing namespace, runs the reconcile pass, re-broadcasts the
-   ticket. So no new constructor needed; consumers just call
-   `host_with` again. The structural-identity property (same
-   `NamespaceId`, same host `NodeId(s)`) is what existing joiners'
-   tickets actually depend on; byte-identity of the whole ticket
-   is too strong because address-discovery info inside a ticket
-   can drift legitimately (e.g. relay URL list ordering — see
-   `disk_resume.rs` line 222).
-
-Concrete first deliverable — DONE.
-`tests/host_restart_ticket_stable.rs` (commit pending; see
-`docs/brainstorms/2026-05-26-host-restart-ticket-stable-brainstorm.md`)
-hosts, captures the published ticket envelope, shuts down,
-re-hosts the same dir, captures phase 2, and asserts the
-NamespaceId + host NodeId(s) are stable across the boundary.
-Single iroh-disabled daemon, no joiner, ~3.5s — sharper
-regression surface than `disk_resume.rs`'s ~15s end-to-end
-scenario which already covers the same property bundled with
-the rest of the join/restart flow.
-
-After that, the registry + session-id work can land as separate
-slices.
+2. **~~Workspace registry on the daemon side.~~** DONE. The wire
+   shape is *attachment*-shaped, not workspace-shaped per ADR-001's
+   layering — the daemon never inspects payloads. Three new RPCs:
+   `Request::RegisterAttachment` / `ListAttachments` /
+   `ForgetAttachment` (and a `Response::Attachments` carrying a
+   `Vec<Attachment>`); `PROTOCOL_VERSION` bumped 2 → 3. Daemon
+   stores per-session attachments under
+   `<session>/attachments/<lowercase-hex(kind)>.bin`, cascading
+   with the session via `remove_dir_all`. `artel-fs` defines
+   `WorkspaceAttachmentV1` (postcard, schema frozen for
+   `KIND_V1 = "artel-fs/workspace/v1"`) and registers on
+   `Workspace::host_with` / `join_with`; consumers enumerate via
+   the typed `list_known_workspaces` helper. Both leave paths
+   cascade: host-leave closes the session and clears all
+   attachments; joiner-leave on a `Remote` mirror drops the mirror
+   entirely and clears the joiner's attachment. See
+   `docs/brainstorms/2026-05-27-workspace-registry-brainstorm.md`
+   and `docs/plans/2026-05-27-workspace-registry-plan.md`.
+   Sub-slices 2a (protocol), 2b (daemon storage + cascade + IPC
+   handlers), 2c (artel-fs registration + `list_known_workspaces`)
+   all landed; 2d is this roadmap update + ADR-001 addendum.
+3. **~~`Workspace::resume`?~~** DONE in place — `Workspace::host_with`
+   already does the right thing if `.artel-fs/` exists: opens the
+   existing namespace (via 1c's `session_id_for` derivation), runs
+   the reconcile pass, re-broadcasts the ticket. No new constructor
+   needed; consumers just call `host_with` again. The structural-
+   identity property (same `NamespaceId`, same host `NodeId(s)`) is
+   what existing joiners' tickets actually depend on; byte-identity
+   of the whole ticket is too strong because address-discovery info
+   inside a ticket can drift legitimately (e.g. relay URL list
+   ordering — see `disk_resume.rs` line 222). Pinned by
+   `tests/host_restart_ticket_stable.rs`.
 
 #### Stale-daemon detection and cleanup
 
