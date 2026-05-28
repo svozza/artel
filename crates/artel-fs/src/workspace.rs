@@ -18,6 +18,7 @@ use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use artel_client::{Client, ClientError};
@@ -287,8 +288,29 @@ pub enum WorkspaceEvent {
 /// A live, attached filesystem workspace.
 ///
 /// Construct via [`Self::host`] or [`Self::join`]. Hold the value
-/// to keep the underlying iroh node alive; drop it (or call
-/// [`Self::shutdown`]) to tear down.
+/// to keep the underlying iroh node alive.
+///
+/// # Shutdown contract
+///
+/// Callers **must** call [`Self::shutdown`] (and `await` it) before
+/// dropping. Drop alone does not close the underlying iroh
+/// `Endpoint`: the workspace's QUIC + n0 relay session leaks until
+/// the relay's stale-session timeout expires (typically minutes).
+/// Because `iroh.key` is persisted, the next host of the same state
+/// dir spawns a node with the **same** `EndpointId`; n0's relay
+/// rejects the second connection with "Another endpoint connected
+/// with the same endpoint id. No more messages will be received." —
+/// [`Self::host_with`] then hangs in [`iroh::Endpoint::online`]
+/// waiting for relay confirmation that never arrives. Symptom in
+/// production runs (e.g. the chat harness): post-restart writes
+/// from the host stop reaching peers because outbound gossip can't
+/// fan out.
+///
+/// `Drop` emits a loud `tracing::error!` *and* an `eprintln!` when
+/// the workspace is dropped without `shutdown` so a violator notices
+/// even without a tracing subscriber. The error is loud on purpose;
+/// silencing it means accepting that the next host of this state
+/// dir will hang.
 ///
 /// Spawn the watcher + applier with [`Self::run`].
 #[derive(Debug)]
@@ -348,6 +370,11 @@ pub struct Workspace {
     /// already had a ticket to get here, the workspace doesn't need
     /// to round-trip it. Read via [`Self::join_ticket`].
     pub(crate) join_ticket: Option<JoinTicket>,
+    /// Drop-bomb sentinel. Flipped to `true` by [`Self::shutdown`];
+    /// [`Drop`] checks it and screams if it's still `false` so a
+    /// caller that drops without shutting down notices in any
+    /// logged run. See struct docs for why this matters.
+    pub(crate) did_shutdown: AtomicBool,
 }
 
 impl Workspace {
@@ -585,6 +612,7 @@ impl Workspace {
                 compiled_rules,
                 session_id,
                 join_ticket: Some(join_ticket),
+                did_shutdown: AtomicBool::new(false),
             },
             rx,
         ))
@@ -788,6 +816,7 @@ impl Workspace {
                 compiled_rules,
                 session_id: session,
                 join_ticket: None,
+                did_shutdown: AtomicBool::new(false),
             },
             rx,
         ))
@@ -916,18 +945,64 @@ impl Workspace {
         join
     }
 
-    /// Trigger graceful shutdown. The node is taken out of its slot
-    /// and torn down; subsequent calls are no-ops.
+    /// Trigger graceful shutdown.
+    ///
+    /// Cancels the shutdown token (stopping the watcher + applier
+    /// loops) and consumes the underlying [`WorkspaceNode`] —
+    /// `Router::shutdown` walks down to `Endpoint::close`, which is
+    /// the load-bearing call: without it the iroh QUIC + n0 relay
+    /// session leaks until n0's stale-session timeout fires, and
+    /// the next host of the same state dir is rejected by the relay
+    /// because `iroh.key` is persisted (same `EndpointId`).
+    ///
+    /// **Must** be `await`ed before the workspace is dropped. See
+    /// the struct docs for the full failure mode and why `Drop`
+    /// alone isn't enough.
+    ///
+    /// Subsequent calls are no-ops — the node is `Option::take`'d
+    /// out of its slot on first call.
     pub async fn shutdown(&self) {
         debug!(target: "artel_fs::workspace", "shutdown: cancelling token");
         self.shutdown_token.cancel();
-        let mut slot = self.node.lock().await;
-        if let Some(node) = slot.take() {
+        let taken = {
+            let mut slot = self.node.lock().await;
+            slot.take()
+        };
+        if let Some(node) = taken {
             debug!(target: "artel_fs::workspace", "shutdown: tearing down iroh node");
             node.shutdown().await;
             debug!(target: "artel_fs::workspace", "shutdown: iroh node torn down");
         } else {
             debug!(target: "artel_fs::workspace", "shutdown: node already taken");
+        }
+        // Sentinel for the Drop bomb. `Release` so a thread that
+        // observes the flag in `Drop` (after the Workspace's owning
+        // Arc moves into the destructor) sees every shutdown effect.
+        self.did_shutdown.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for Workspace {
+    /// Drop bomb: scream if the workspace was dropped without an
+    /// `await`ed [`Self::shutdown`]. We can't run async cleanup from
+    /// `Drop` (no `await`, no safe `block_on` from inside a tokio
+    /// runtime), so all we can do is make the misuse loud.
+    ///
+    /// Two channels because tracing might not be subscribed in some
+    /// runtime configurations (CLI binaries, test harnesses,
+    /// throwaway examples like `chat-harness`); `eprintln!` is the
+    /// belt-and-braces fallback.
+    fn drop(&mut self) {
+        if !self.did_shutdown.load(Ordering::Acquire) {
+            let msg = "Workspace dropped without calling shutdown(). \
+                The iroh Endpoint will not close cleanly; if iroh.key is \
+                persisted (the default), the next host of this state dir \
+                will be rejected by the n0 relay (\"Another endpoint \
+                connected with the same endpoint id\") until the \
+                relay's stale-session timeout fires. \
+                Call workspace.shutdown().await before dropping.";
+            tracing::error!(target: "artel_fs::workspace", "{msg}");
+            eprintln!("[artel-fs] {msg}");
         }
     }
 }

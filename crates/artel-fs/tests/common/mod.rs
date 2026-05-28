@@ -155,6 +155,82 @@ pub async fn spawn_daemon_with_lookup(state: DaemonState, lookup: MemoryLookup) 
     }
 }
 
+/// Daemon state paths whose on-disk directory is owned by the caller.
+/// Use this when a test needs to stop a daemon and respawn another at
+/// the same paths (e.g. mid-session restart scenarios). Compare with
+/// [`DaemonState`], which bundles a [`TempDir`] and is wiped on stop.
+pub struct DaemonPaths {
+    pub socket: PathBuf,
+    pub pid: PathBuf,
+    pub sessions: PathBuf,
+    pub iroh_key: PathBuf,
+}
+
+impl DaemonPaths {
+    /// Build paths that all live under `root`. The caller owns `root`
+    /// (typically a [`TempDir`]) so it survives across daemon restarts.
+    pub fn at(root: &Path) -> Self {
+        Self {
+            socket: root.join("daemon.sock"),
+            pid: root.join("daemon.pid"),
+            sessions: root.join("sessions"),
+            iroh_key: root.join("iroh.key"),
+        }
+    }
+}
+
+/// A running daemon whose on-disk state is owned by the caller. Cf.
+/// [`RunningDaemon`], which owns its [`TempDir`] and wipes state on
+/// `stop()`. Designed for restart-scenario tests that need to stand a
+/// fresh daemon up at the same paths after the previous one exited.
+pub struct DaemonHandle {
+    pub socket: PathBuf,
+    pub iroh_addr: Option<iroh::EndpointAddr>,
+    pub shutdown: Arc<Shutdown>,
+    pub join: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+impl DaemonHandle {
+    pub async fn stop(self) {
+        self.shutdown.trigger();
+        timeout(Duration::from_secs(10), self.join)
+            .await
+            .expect("daemon did not exit within 10s")
+            .expect("daemon panicked")
+            .expect("daemon io");
+    }
+}
+
+/// Bring an iroh-enabled daemon up at fixed paths. Pass
+/// `Some(lookup)` to share an in-process [`MemoryLookup`] with peer
+/// daemons / workspaces (eliminates the n0 production discovery
+/// path); pass `None` to use full n0 discovery (relays + DNS),
+/// which is what production runs against. The directory containing
+/// `paths` is the caller's responsibility — it must outlive the
+/// daemon and any planned restarts.
+pub async fn spawn_daemon_at(paths: &DaemonPaths, lookup: Option<MemoryLookup>) -> DaemonHandle {
+    let daemon = Daemon::start(DaemonConfig {
+        socket_path: paths.socket.clone(),
+        pid_path: paths.pid.clone(),
+        sessions_dir: paths.sessions.clone(),
+        daemon_peer_id: FALLBACK_PEER,
+        iroh_key_path: Some(paths.iroh_key.clone()),
+        address_lookup: lookup.map(AddressLookupOverride),
+    })
+    .await
+    .expect("daemon start");
+    let iroh_addr = daemon.iroh().map(|rt| rt.endpoint.addr());
+    let shutdown = daemon.shutdown_handle();
+    let socket = daemon.socket_path().to_path_buf();
+    let join = tokio::spawn(daemon.run());
+    DaemonHandle {
+        socket,
+        iroh_addr,
+        shutdown,
+        join,
+    }
+}
+
 /// Two cross-seeded daemons plus the [`MemoryLookup`] handles the
 /// caller hands to each side's [`artel_fs::WorkspaceConfig`].
 ///

@@ -40,6 +40,7 @@ nix = { workspace = true }
 pretty_assertions.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "process", "rt-multi-thread", "test-util", "time"] }
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
@@ -50,6 +51,16 @@ workspace = true
 [[bin]]
 name = "crash_child"
 path = "tests/bin/crash_child.rs"
+test = false
+doctest = false
+bench = false
+
+# Helper binary used by `tests/drop_bomb.rs` to verify
+# `Workspace::Drop` fires (resp. stays quiet) on the ungraceful
+# (resp. graceful) shutdown path. Same `CARGO_BIN_EXE_*` pattern.
+[[bin]]
+name = "drop_bomb_child"
+path = "tests/bin/drop_bomb_child.rs"
 test = false
 doctest = false
 bench = false
