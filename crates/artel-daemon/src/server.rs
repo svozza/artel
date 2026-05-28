@@ -126,6 +126,16 @@ pub struct IrohRuntime {
     /// Protocol router; calling `.shutdown().await` cleans up both
     /// the accept loop and the endpoint.
     pub router: iroh::protocol::Router,
+    /// In-memory address-lookup service the gossip bridge populates
+    /// with each inbound ticket's wire-form addr before subscribing.
+    /// Same instance lives in `endpoint.address_lookup()` so the
+    /// inserts are visible to iroh's resolver chain immediately.
+    /// Sidesteps the pkarr/DNS propagation race that otherwise
+    /// pushes the joiner-side gossip subscribe to
+    /// `JOIN_READY_TIMEOUT` whenever a fresh joiner dials a host
+    /// whose pkarr publish hasn't propagated yet. See
+    /// `crate::gossip_bridge::GossipBridge::join_session`.
+    pub addr_hint: iroh::address_lookup::memory::MemoryLookup,
 }
 
 /// A running daemon. Hold the value to keep the daemon alive; drop it
@@ -202,11 +212,17 @@ impl Daemon {
 
         // Build the gossip bridge once we have the runtime. Lives
         // for the daemon's lifetime; sessions register themselves
-        // with it as they're hosted/joined.
+        // with it as they're hosted/joined. The `addr_hint`
+        // [`MemoryLookup`] is shared by reference: same instance
+        // lives in `endpoint.address_lookup()` so adds via the
+        // bridge are visible to iroh's resolver chain immediately.
         #[cfg(feature = "iroh")]
-        let bridge = iroh
-            .as_ref()
-            .map(|rt| Arc::new(crate::gossip_bridge::GossipBridge::new(rt.gossip.clone())));
+        let bridge = iroh.as_ref().map(|rt| {
+            Arc::new(crate::gossip_bridge::GossipBridge::new(
+                rt.gossip.clone(),
+                rt.addr_hint.clone(),
+            ))
+        });
 
         let store: crate::store::DynStore = Arc::new(
             crate::store::FsLogStore::open(&config.sessions_dir)
@@ -656,6 +672,21 @@ async fn resolve_iroh_runtime(
         .map_err(|e| StartError::Iroh(format!("bind endpoint: {e}")))?;
     let peer_id = artel_protocol::PeerId::from_bytes(*endpoint.id().as_bytes());
 
+    // Install a per-daemon `MemoryLookup` alongside the configured
+    // pkarr/DNS chain. The bridge holds a clone and populates it
+    // with each inbound ticket's wire-form addr before subscribing
+    // to a session's gossip topic — bypassing the propagation race
+    // that otherwise leaves a fresh joiner waiting on pkarr+DNS for
+    // up to `JOIN_READY_TIMEOUT`. The lookup adds zero cost when
+    // it's empty (iroh's resolver chain just falls through to the
+    // next service) so installing it unconditionally is safe across
+    // both `EndpointSetup::Production` and `EndpointSetup::Testing`.
+    let addr_hint = iroh::address_lookup::memory::MemoryLookup::with_provenance("artel-ticket");
+    endpoint
+        .address_lookup()
+        .map_err(|e| StartError::Iroh(format!("address_lookup: {e}")))?
+        .add(addr_hint.clone());
+
     // Gossip needs a clone of the endpoint to register itself for the
     // ALPN; the Router does the actual accepting.
     let gossip = iroh_gossip::net::Gossip::builder().spawn(endpoint.clone());
@@ -669,6 +700,7 @@ async fn resolve_iroh_runtime(
             endpoint,
             gossip,
             router,
+            addr_hint,
         }),
     ))
 }

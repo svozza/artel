@@ -37,14 +37,18 @@
 //! same id lands on the same topic by construction.
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use artel_protocol::gossip::{self, GossipBody};
 use artel_protocol::rpc::SendPayload;
+use artel_protocol::ticket::WireEndpointAddr;
 use artel_protocol::{PeerId, PeerInfo, ProtocolError, Seq, SessionId, SessionMessage};
 use bytes::Bytes;
 use futures_util::StreamExt;
+use iroh::EndpointAddr;
+use iroh::address_lookup::memory::MemoryLookup;
 use iroh_gossip::api::Event as IrohGossipEvent;
 use iroh_gossip::net::Gossip;
 use iroh_gossip::proto::TopicId;
@@ -87,6 +91,15 @@ pub(crate) struct GossipBridge {
     /// `SendRequest`; if the registry has been dropped, the request
     /// is silently ignored (the daemon is shutting down).
     registry: Mutex<Weak<Registry>>,
+    /// Local address-lookup service the bridge populates with the
+    /// host's wire-form addr from each inbound join ticket. Cloned
+    /// from the [`MemoryLookup`] installed in the daemon's iroh
+    /// `Endpoint` at startup, so `add_endpoint_info` calls here are
+    /// visible to iroh's resolver chain immediately. Sidesteps the
+    /// pkarr/DNS propagation race that otherwise pushes joiner-side
+    /// gossip subscribe to `JOIN_READY_TIMEOUT` whenever a joiner
+    /// dials a host whose pkarr publish hasn't propagated yet.
+    addr_hint: MemoryLookup,
 }
 
 #[derive(Debug)]
@@ -119,20 +132,24 @@ enum SessionRole {
 }
 
 impl GossipBridge {
-    /// Construct a bridge wrapping `gossip`. The daemon's
-    /// [`iroh::Endpoint`] does its own discovery via the configured
-    /// [`crate::EndpointSetup`] — this used to take a
-    /// `MemoryLookup` the bridge would seed on join, but
-    /// `EndpointSetup::Testing`'s [`iroh::test_utils::DnsPkarrServer`]
-    /// publishes the host's addr automatically and
-    /// `EndpointSetup::Production` resolves it from n0's DNS, so
-    /// the bridge no longer needs an addr-book back-channel.
-    pub(crate) fn new(gossip: Gossip) -> Self {
+    /// Construct a bridge wrapping `gossip`. The `addr_hint`
+    /// [`MemoryLookup`] must be the same instance installed in the
+    /// iroh `Endpoint`'s address-lookup chain at startup; the bridge
+    /// populates it with each inbound ticket's wire-form addr in
+    /// [`Self::join_session`] so the very first dial has the host's
+    /// relay url + direct addrs in hand without waiting for pkarr
+    /// propagation. `EndpointSetup::Testing`'s
+    /// [`iroh::test_utils::DnsPkarrServer`] and
+    /// `EndpointSetup::Production`'s n0 DNS still serve as the
+    /// fallback / canonical address-lookup chain — `addr_hint` is a
+    /// best-effort short-circuit, not a replacement.
+    pub(crate) fn new(gossip: Gossip, addr_hint: MemoryLookup) -> Self {
         Self {
             gossip,
             sessions: Mutex::new(HashMap::new()),
             pending_sends: Mutex::new(HashMap::new()),
             registry: Mutex::new(Weak::new()),
+            addr_hint,
         }
     }
 
@@ -165,6 +182,14 @@ impl GossipBridge {
     /// forwarder task that decodes inbound gossip frames and pushes
     /// the resulting [`SessionMessage`]s into `on_message`.
     ///
+    /// `host_addr` is the wire-form addr the ticket carried; if it
+    /// has any usable transport info (relay url or direct addrs) we
+    /// install it into [`Self::addr_hint`] before subscribing, so
+    /// the very first dial doesn't have to wait on pkarr/DNS
+    /// propagation. The pkarr+DNS chain still services later
+    /// resolutions and other endpoints; this is a synchronous
+    /// shortcut for the join-time race.
+    ///
     /// Once the gossip mesh is up, broadcasts a
     /// [`GossipBody::JoinAnnouncement`] carrying `joiner` so the
     /// host can admit the peer to membership and emit
@@ -177,10 +202,29 @@ impl GossipBridge {
         session: SessionId,
         joiner: PeerInfo,
         host_peer: PeerId,
+        host_addr: &WireEndpointAddr,
         on_message: impl Fn(SessionMessage) + Send + Sync + 'static,
     ) -> Result<(), BridgeError> {
         let host_endpoint_id = iroh::EndpointId::from_bytes(host_peer.as_bytes())
             .map_err(|e| BridgeError::Iroh(format!("bad host peer id: {e}")))?;
+        // Seed the addr-hint memory lookup BEFORE subscribing so
+        // iroh's first attempt to resolve `host_endpoint_id` finds
+        // the relay url / direct addrs the ticket carried. The
+        // wire-form addr's `peer_id` was already self-consistency-
+        // checked by `ticket::decode`; we re-validate here against
+        // the parameter we're keying on so a future caller that
+        // builds the WireEndpointAddr by hand can't smuggle a
+        // mismatched id past us.
+        if host_addr.peer_id != host_peer {
+            return Err(BridgeError::InvalidAddr(format!(
+                "host_addr.peer_id {:?} does not match host_peer {:?}",
+                host_addr.peer_id, host_peer,
+            )));
+        }
+        if !host_addr.relay_url.is_empty() || !host_addr.direct_addrs.is_empty() {
+            let endpoint_addr = wire_addr_to_iroh(host_addr).map_err(BridgeError::InvalidAddr)?;
+            self.addr_hint.add_endpoint_info(endpoint_addr);
+        }
         self.subscribe_inner(
             session,
             vec![host_endpoint_id],
@@ -672,6 +716,11 @@ fn session_error_to_wire(err: &SessionError) -> ProtocolError {
         SessionError::AlreadyJoined(s) => ProtocolError::AlreadyJoined(*s),
         SessionError::InvalidTicket => ProtocolError::InvalidTicket,
         SessionError::Storage(io_err) => ProtocolError::Internal(format!("storage: {io_err}")),
+        // The bridge currently doesn't surface InvalidAddr to the
+        // wire layer (it fails the local join only), but keep the
+        // mapping defensive: if a future code path forwards one
+        // through here we still want it as a generic Internal so
+        // ticket-parser detail doesn't leak.
         SessionError::InvalidAddr(msg) => ProtocolError::Internal(format!("invalid addr: {msg}")),
         SessionError::Internal(msg) => ProtocolError::Internal(msg.clone()),
         SessionError::NotHost => ProtocolError::NotHost,
@@ -715,6 +764,36 @@ pub(crate) enum BridgeError {
     /// this exact error back through its IPC reply.
     #[error("host rejected send: {0}")]
     HostRejected(#[source] ProtocolError),
+
+    /// `join_session` was called with a [`WireEndpointAddr`] whose
+    /// fields couldn't be parsed into the iroh form (bad relay URL,
+    /// peer-id mismatch, etc.). The registry maps this to
+    /// [`crate::session::SessionError::InvalidAddr`]; over the wire
+    /// it surfaces as a generic `Internal` error so we don't leak
+    /// parser detail.
+    #[error("invalid host addr in ticket: {0}")]
+    InvalidAddr(String),
+}
+
+/// Convert a wire-form [`WireEndpointAddr`] into an iroh
+/// [`EndpointAddr`]. Empty `relay_url` means "no home relay" and
+/// is allowed; a non-empty value that fails to parse as a URL is
+/// rejected as [`BridgeError::InvalidAddr`]. The
+/// `WireEndpointAddr`'s `peer_id` is the source of truth for the
+/// returned `EndpointAddr`'s id.
+fn wire_addr_to_iroh(addr: &WireEndpointAddr) -> Result<EndpointAddr, String> {
+    let endpoint_id = iroh::EndpointId::from_bytes(addr.peer_id.as_bytes())
+        .map_err(|e| format!("peer id: {e}"))?;
+    let mut iroh_addr = EndpointAddr::new(endpoint_id);
+    if !addr.relay_url.is_empty() {
+        let url = iroh::RelayUrl::from_str(&addr.relay_url)
+            .map_err(|e| format!("relay_url: {e}"))?;
+        iroh_addr = iroh_addr.with_relay_url(url);
+    }
+    for direct in &addr.direct_addrs {
+        iroh_addr = iroh_addr.with_ip_addr(*direct);
+    }
+    Ok(iroh_addr)
 }
 
 #[cfg(test)]

@@ -571,18 +571,32 @@ impl Registry {
                 });
             };
 
-            // The wire-form `host_addr` (relay url + direct IPs) is
-            // ignored here on purpose: under both production
-            // (`presets::N0` → n0 DNS) and test
-            // (`presets::Minimal + DnsPkarrServer`) endpoint setups,
-            // the host's pkarr-published record carries that data
-            // already. The bootstrap `host_peer` is enough; iroh's
-            // configured address-lookup chain resolves it.
-            let _ = host_addr;
+            // Wire `host_addr` is used as a synchronous addr hint to
+            // sidestep pkarr propagation: the bridge feeds it into
+            // its `MemoryLookup` before subscribing so the very
+            // first dial finds the host's relay url + direct addrs
+            // without waiting on n0 DNS / `DnsPkarrServer`. Falling
+            // back on pkarr alone produced a ~500ms-to-15s race in
+            // production where a fresh joiner would hit
+            // `JOIN_READY_TIMEOUT` before the host's record reached
+            // their resolver. The wire format is re-validated at
+            // the bridge boundary; a bad addr surfaces as
+            // [`SessionError::InvalidAddr`].
             bridge
-                .join_session(session_id, joiner.clone(), *host_peer_id, on_message)
+                .join_session(
+                    session_id,
+                    joiner.clone(),
+                    *host_peer_id,
+                    host_addr,
+                    on_message,
+                )
                 .await
-                .map_err(|e| SessionError::Internal(e.to_string()))?;
+                .map_err(|e| match e {
+                    crate::gossip_bridge::BridgeError::InvalidAddr(msg) => {
+                        SessionError::InvalidAddr(msg)
+                    }
+                    other => SessionError::Internal(other.to_string()),
+                })?;
 
             Ok(arc)
         }
@@ -884,6 +898,14 @@ impl Registry {
                 ),
                 Err(crate::gossip_bridge::BridgeError::Iroh(msg)) => {
                     Err(SessionError::Internal(format!("gossip: {msg}")))
+                }
+                // `send_remote` doesn't take a wire-form addr, so
+                // `InvalidAddr` shouldn't surface here today; map it
+                // defensively the same way [`Self::join`] does so a
+                // future refactor that funnels addr-validation
+                // through `send_remote` doesn't silently flatten it.
+                Err(crate::gossip_bridge::BridgeError::InvalidAddr(msg)) => {
+                    Err(SessionError::InvalidAddr(msg))
                 }
             };
         }
