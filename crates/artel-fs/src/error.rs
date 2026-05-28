@@ -59,6 +59,14 @@ pub enum WorkspaceError {
     #[error("session id {0} already owned by a different host or kind")]
     SessionConflict(SessionId),
 
+    /// The daemon reported that the session vanished mid-stand-up
+    /// (for example, a concurrent `LeaveSession` from another handle,
+    /// or a registry-side eviction race). Surfaced from the
+    /// constructors so callers can distinguish "session is gone, try
+    /// again from scratch" from a generic IPC failure.
+    #[error("session id {0} vanished during workspace stand-up")]
+    SessionVanished(SessionId),
+
     /// IPC roundtrip via the artel client failed.
     #[error(transparent)]
     Client(#[from] ClientError),

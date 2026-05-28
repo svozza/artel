@@ -33,6 +33,16 @@ use artel_protocol::{Attachment, PeerId, PeerInfo, Request, Response};
 use tempfile::TempDir;
 use tokio::time::timeout;
 
+/// Canonicalise a test path the same best-effort way the workspace
+/// constructors do (mirrors the `canonicalise` helper in
+/// `crates/artel-fs/src/workspace.rs`). Tempfile paths on macOS
+/// round-trip through `/private/var/...`, so any assertion comparing
+/// a stored attachment path against a test-constructed path needs to
+/// pass both through the same fn.
+fn canon(p: &std::path::Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
 /// Raw IPC list — used to verify that [`list_known_workspaces`]
 /// matches a hand-rolled `ListAttachments` round-trip.
 async fn raw_list(client: &Client, kind: Option<&str>) -> Vec<Attachment> {
@@ -126,15 +136,12 @@ async fn host_workspace_registers_attachment_via_ipc() {
 
     let decoded = WorkspaceAttachmentV1::decode(&entries[0].payload).expect("decode payload");
     assert_eq!(decoded.role, WorkspaceRole::Host);
-    // `host_with` canonicalises `root` and resolves `state_dir` against
-    // it; canonicalising the test paths the same way is the only
-    // robust comparison (tempfile paths on macOS round-trip through
+    // `host_with` canonicalises both `root` and `state_dir`;
+    // canonicalising the test paths the same way is the only robust
+    // comparison (tempfile paths on macOS round-trip through
     // `/private/var/...`).
-    assert_eq!(
-        decoded.local_path,
-        std::fs::canonicalize(ws_root.path()).unwrap_or_else(|_| ws_root.path().to_path_buf()),
-    );
-    assert_eq!(decoded.state_dir, ws_state.path());
+    assert_eq!(decoded.local_path, canon(ws_root.path()));
+    assert_eq!(decoded.state_dir, canon(ws_state.path()));
 
     workspace.shutdown().await;
     drop(alice);
@@ -240,10 +247,7 @@ async fn list_known_workspaces_helper_returns_typed_view() {
     assert_eq!(known.len(), 1);
     assert_eq!(known[0].session, session);
     assert_eq!(known[0].attachment.role, WorkspaceRole::Host);
-    assert_eq!(
-        known[0].attachment.local_path,
-        std::fs::canonicalize(ws_root.path()).unwrap_or_else(|_| ws_root.path().to_path_buf()),
-    );
+    assert_eq!(known[0].attachment.local_path, canon(ws_root.path()));
 
     workspace.shutdown().await;
     drop(alice);

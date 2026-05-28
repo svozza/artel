@@ -406,10 +406,15 @@ impl Workspace {
         policy: AttachPolicy,
         config: WorkspaceConfig,
     ) -> Result<(Self, mpsc::Receiver<WorkspaceEvent>), WorkspaceError> {
-        let root = canonicalise(&root);
-        // Materialise the workspace dir before the state dir so the
-        // (default) `<root>/.artel-fs/` placement doesn't fail.
+        // Materialise the workspace dir *before* canonicalising so the
+        // canonical form is stable across first and subsequent attaches
+        // (canonicalize errors on a non-existent path; the previous
+        // shape silently fell back to the raw input, registering a
+        // different `local_path` shape between phase 1 and phase 2 of
+        // the same workspace's lifecycle). Materialise root first;
+        // canonicalise; then create state_dir.
         tokio::fs::create_dir_all(&root).await?;
+        let root = canonicalise(&root).await;
         let state_dir = config.resolve(&root);
 
         // Enforce the policy *before* any state-dir or iroh-node
@@ -424,8 +429,57 @@ impl Workspace {
         let compiled_rules = rules.compile()?;
 
         ensure_state_dir(&state_dir)?;
+        // Canonicalise after ensure_state_dir so the attachment payload
+        // (and every consumer of `state_dir` below) carries an absolute
+        // canonical path. Without this, a user passing
+        // `with_state_dir(PathBuf::from("./state"))` would register a
+        // cwd-relative path the daemon can't resolve from another
+        // process.
+        let state_dir = canonicalise(&state_dir).await;
 
-        let node = WorkspaceNode::spawn(&state_dir, config.address_lookup_override.clone()).await?;
+        // From here on, any failure must roll back the daemon-side
+        // session and the iroh node we acquire. Build the rollback
+        // guard up-front; populate as we go; disarm on success.
+        let mut rb = WorkspaceRollback::default();
+        match Self::host_with_inner(
+            client,
+            peer,
+            root,
+            state_dir,
+            rules,
+            compiled_rules,
+            config.address_lookup_override,
+            &mut rb,
+        )
+        .await
+        {
+            Ok(out) => Ok(out),
+            Err(err) => {
+                rb.rollback(client).await;
+                Err(err)
+            }
+        }
+    }
+
+    /// Inner half of [`Self::host_with`] that runs everything past the
+    /// "no rollback needed yet" point. Populates `rb` as fallible
+    /// state is acquired so the outer fn can undo on Err.
+    #[allow(clippy::too_many_arguments)]
+    async fn host_with_inner(
+        client: &Client,
+        peer: PeerInfo,
+        root: PathBuf,
+        state_dir: PathBuf,
+        rules: PathRules,
+        compiled_rules: CompiledPathRules,
+        address_lookup_override: Option<iroh::address_lookup::memory::MemoryLookup>,
+        rb: &mut WorkspaceRollback,
+    ) -> Result<(Self, mpsc::Receiver<WorkspaceEvent>), WorkspaceError> {
+        let node = WorkspaceNode::spawn(&state_dir, address_lookup_override).await?;
+        rb.node = Some(node);
+        // Borrow the node back for the rest of the constructor — it
+        // moves into `Self` at the end via `rb.disarm()`.
+        let node = rb.node.as_ref().expect("just stored");
 
         // Persistent docs store; default-author is managed by
         // iroh-docs at `state_dir/docs/default-author`.
@@ -436,7 +490,7 @@ impl Workspace {
             .map_err(|e| WorkspaceError::Doc(format!("author_default: {e}")))?;
 
         let doc_id_path = state_dir.join(DOC_ID_FILE);
-        let (doc, returning) = open_or_create_doc(&node, &doc_id_path).await?;
+        let (doc, returning) = open_or_create_doc(node, &doc_id_path).await?;
 
         // Derive the session id from the persisted NamespaceId
         // *before* registering with the daemon. First host and every
@@ -451,6 +505,9 @@ impl Workspace {
         // user is pointing two daemons at the same state dir or
         // started two workspaces from one daemon.
         let join_ticket = register_host(client, peer, session_id).await?;
+        // Arm the LeaveSession rollback the moment we own this
+        // session in the daemon.
+        rb.leave_on_rollback = Some(session_id);
 
         // Register a typed workspace attachment so a CLI / GUI can
         // enumerate this workspace without reading `~/.artel/`
@@ -462,10 +519,9 @@ impl Workspace {
         // publish_ticket so the workspace becomes visible to
         // discovery as soon as the session exists, not only after a
         // potentially-slow scan finishes. The 2b cascade clears the
-        // attachment if the host then `LeaveSession`s; a host that
-        // crashes mid-scan leaves a stale attachment behind that the
-        // brainstorm's `last_seen` fast-follow will let consumers
-        // prune.
+        // attachment when LeaveSession fires (including from our
+        // rollback path), so we don't need a separate
+        // `forget_attachment` arming for the host.
         register_workspace_attachment(
             client,
             session_id,
@@ -500,6 +556,11 @@ impl Workspace {
 
         publish_ticket(client, session_id, &ticket, &rules).await?;
 
+        // All fallible work is done — pull the node out of the
+        // rollback guard so it lives in the constructed Workspace.
+        let node = std::mem::take(rb)
+            .disarm()
+            .expect("rb.node populated above");
         let blobs = node.blobs.clone();
         Ok((
             Self {
@@ -563,8 +624,12 @@ impl Workspace {
         policy: AttachPolicy,
         config: WorkspaceConfig,
     ) -> Result<(Self, mpsc::Receiver<WorkspaceEvent>), WorkspaceError> {
-        let root = canonicalise(&root);
+        // Materialise root before canonicalising — see host_with for
+        // the same reasoning (canonicalize errors on a non-existent
+        // path; raw-input fallback registers a different shape across
+        // attaches).
         tokio::fs::create_dir_all(&root).await?;
+        let root = canonicalise(&root).await;
         let state_dir = config.resolve(&root);
 
         // Enforce the policy before any state-dir / iroh-node /
@@ -573,8 +638,50 @@ impl Workspace {
         enforce_attach_policy(&root, &state_dir, policy, AttachSide::Join)?;
 
         ensure_state_dir(&state_dir)?;
+        // Canonicalise — see host_with for the same reasoning. The
+        // attachment payload + iroh node + every later use of
+        // state_dir now sees the canonical absolute form.
+        let state_dir = canonicalise(&state_dir).await;
 
-        let node = WorkspaceNode::spawn(&state_dir, config.address_lookup_override.clone()).await?;
+        // From here on, any failure must shut down the iroh node and
+        // (once registered) forget the joiner-side attachment.
+        // Unlike the host, we do NOT issue LeaveSession on rollback —
+        // caller's session membership is a precondition, not
+        // something the constructor acquired.
+        let mut rb = WorkspaceRollback::default();
+        match Self::join_with_inner(
+            client,
+            session,
+            root,
+            state_dir,
+            config.join_ticket_timeout,
+            config.address_lookup_override,
+            &mut rb,
+        )
+        .await
+        {
+            Ok(out) => Ok(out),
+            Err(err) => {
+                rb.rollback(client).await;
+                Err(err)
+            }
+        }
+    }
+
+    /// Inner half of [`Self::join_with`] — see `host_with_inner` for
+    /// the same rollback-tracking pattern.
+    async fn join_with_inner(
+        client: &Client,
+        session: SessionId,
+        root: PathBuf,
+        state_dir: PathBuf,
+        join_ticket_timeout: Option<Duration>,
+        address_lookup_override: Option<iroh::address_lookup::memory::MemoryLookup>,
+        rb: &mut WorkspaceRollback,
+    ) -> Result<(Self, mpsc::Receiver<WorkspaceEvent>), WorkspaceError> {
+        let node = WorkspaceNode::spawn(&state_dir, address_lookup_override).await?;
+        rb.node = Some(node);
+        let node = rb.node.as_ref().expect("just stored");
         // Joiners don't persist a per-workspace `doc-id` — they
         // import the host's namespace from the ticket each time.
         // The default author is still useful for stamping our own
@@ -607,7 +714,7 @@ impl Workspace {
             .await
             .ok_or_else(|| WorkspaceError::Iroh("client events already taken".into()))?;
 
-        let envelope = wait_for_ticket(&mut events, session, config.join_ticket_timeout).await?;
+        let envelope = wait_for_ticket(&mut events, session, join_ticket_timeout).await?;
         // The host's rules are authoritative — `config.rules` on the
         // joiner side is dropped on the floor here. Documented on
         // `WorkspaceConfig::rules`. Compile here too so the joiner's
@@ -623,20 +730,15 @@ impl Workspace {
             .await
             .map_err(|e| WorkspaceError::Doc(format!("doc import: {e}")))?;
 
-        // Drain live events until the first sync round has finished
-        // and pending content has settled. Without this, `get_many`
-        // returns an empty result and the bulk export is a no-op
-        // because the doc state hasn't replicated yet.
-        wait_for_initial_sync(live).await?;
-
-        // Register the typed attachment now that the join has reached
-        // a working doc handle. Symmetric to the host side: register
-        // *after* the session is wired up and *before* the long-
-        // running `bulk_export` so the workspace shows up in
-        // `list_known_workspaces` as soon as the session is live, not
-        // only after a potentially-slow disk-seeding step finishes.
-        // Mid-`bulk_export` crashes leave an attachment behind; the
-        // brainstorm's `last_seen` fast-follow covers stale-pruning.
+        // Register the typed attachment as soon as the doc handle is
+        // alive — *before* `wait_for_initial_sync` (a 30 s blocking
+        // wait) and *before* `bulk_export`. A joiner whose host is
+        // offline would otherwise sit invisible to discovery for the
+        // full sync timeout — exactly the case where local
+        // enumeration is most useful. Symmetric with the host side's
+        // register-before-scan ordering: the workspace becomes
+        // visible the moment the session is wired up, not after a
+        // potentially-slow seeding step.
         register_workspace_attachment(
             client,
             session,
@@ -645,12 +747,23 @@ impl Workspace {
             crate::attachment::WorkspaceRole::Joiner,
         )
         .await?;
+        // Arm attachment-forget rollback now that the entry exists.
+        rb.forget_attachment = Some(session);
+
+        // Drain live events until the first sync round has finished
+        // and pending content has settled. Without this, `get_many`
+        // returns an empty result and the bulk export is a no-op
+        // because the doc state hasn't replicated yet.
+        wait_for_initial_sync(live).await?;
 
         let (tx, rx) = mpsc::channel(EVENT_BUFFER);
         let echo_guard = EchoGuard::new();
 
         bulk_export(&root, &doc, &node.blobs, &compiled_rules, &echo_guard, &tx).await?;
 
+        let node = std::mem::take(rb)
+            .disarm()
+            .expect("rb.node populated above");
         let blobs = node.blobs.clone();
         Ok((
             Self {
@@ -885,6 +998,78 @@ async fn scan_and_publish_existing(
     Ok(())
 }
 
+/// Tracks daemon-side and iroh-side state acquired during a workspace
+/// constructor (`Workspace::host_with` / `Workspace::join_with`) so
+/// that an error after the fallible-but-rollback-able point can
+/// undo what's been done.
+///
+/// Why explicit rather than `Drop`: rollback requires async work
+/// (`LeaveSession` IPC, `WorkspaceNode::shutdown`), and `Drop` is
+/// sync. The constructor calls `rollback().await` on its error
+/// paths; on success it `disarm`s and extracts the node back so the
+/// `Workspace` can own it.
+///
+/// Joiner-side note: `leave_on_rollback` is intentionally `None` on
+/// the joiner. Joiners didn't issue `JoinSession` from inside
+/// `Workspace::join_with` — caller membership is a precondition, so
+/// rolling back our partial workspace stand-up shouldn't unmember
+/// them from a session they joined externally. We only forget the
+/// joiner-side attachment.
+#[derive(Default)]
+struct WorkspaceRollback {
+    /// Send `LeaveSession` for this session on rollback (cascades the
+    /// attachment via the 2b `delete(session)` cascade). Set after
+    /// `register_host` succeeds; left `None` on the joiner.
+    leave_on_rollback: Option<SessionId>,
+    /// Forget this `(session, KIND_V1)` attachment on rollback.
+    /// Used on the joiner side, where `leave_on_rollback` is None.
+    forget_attachment: Option<SessionId>,
+    /// Shut this node down on rollback. Set after
+    /// `WorkspaceNode::spawn` succeeds.
+    node: Option<WorkspaceNode>,
+}
+
+impl WorkspaceRollback {
+    /// Successful path: return the node so the caller can hand it to
+    /// the constructed `Workspace`. After this, no rollback fires.
+    fn disarm(mut self) -> Option<WorkspaceNode> {
+        self.leave_on_rollback = None;
+        self.forget_attachment = None;
+        self.node.take()
+    }
+
+    /// Best-effort cleanup. Errors are logged and swallowed — the
+    /// caller is already returning a different `WorkspaceError` and
+    /// rollback shouldn't mask it.
+    async fn rollback(mut self, client: &Client) {
+        if let Some(session) = self.leave_on_rollback.take()
+            && let Err(err) = client.request(Request::LeaveSession { session }).await
+        {
+            tracing::warn!(
+                %session,
+                error = %err,
+                "rollback: LeaveSession failed; daemon retains orphan session",
+            );
+        }
+        if let Some(session) = self.forget_attachment.take() {
+            let req = Request::ForgetAttachment {
+                session,
+                kind: crate::attachment::KIND_V1.to_string(),
+            };
+            if let Err(err) = client.request(req).await {
+                tracing::warn!(
+                    %session,
+                    error = %err,
+                    "rollback: ForgetAttachment failed; daemon retains orphan attachment",
+                );
+            }
+        }
+        if let Some(node) = self.node.take() {
+            node.shutdown().await;
+        }
+    }
+}
+
 /// Issue `Request::HostSession { peer, session: Some(session_id) }`
 /// against the daemon and return the [`JoinTicket`] from the reply.
 /// Maps the daemon's resume-conflict variant to
@@ -935,19 +1120,27 @@ async fn register_workspace_attachment(
         role,
     }
     .encode()?;
-    let resp = client
+    match client
         .request(Request::RegisterAttachment {
             session,
             kind: crate::attachment::KIND_V1.to_string(),
             payload,
         })
         .await
-        .map_err(WorkspaceError::Client)?;
-    match resp {
-        Response::AttachmentRegistered => Ok(()),
-        other => Err(WorkspaceError::Iroh(format!(
+    {
+        Ok(Response::AttachmentRegistered) => Ok(()),
+        Ok(other) => Err(WorkspaceError::Iroh(format!(
             "unexpected response to RegisterAttachment: {other:?}",
         ))),
+        // Distinguish "session vanished mid-stand-up" from generic
+        // IPC failure so callers can retry the whole flow vs surface
+        // a transport error. The cascade-via-LeaveSession from
+        // another handle, or a registry eviction race, both surface
+        // here as ProtocolError::UnknownSession.
+        Err(ClientError::Protocol(ProtocolError::UnknownSession(id))) => {
+            Err(WorkspaceError::SessionVanished(id))
+        }
+        Err(err) => Err(WorkspaceError::Client(err)),
     }
 }
 
@@ -1167,11 +1360,15 @@ async fn bulk_export(
     Ok(())
 }
 
-/// Best-effort canonicalisation. Falls back to the input path if
-/// `canonicalize` fails (e.g., the dir doesn't exist yet) — callers
-/// are expected to pass an existing dir.
-fn canonicalise(p: &Path) -> PathBuf {
-    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+/// Best-effort canonicalisation. Falls back to the input path on
+/// any error — callers must `create_dir_all` first if they need a
+/// canonical form. Async to keep the constructors off blocking
+/// `std::fs::canonicalize` (network/slow mounts can stall the
+/// reactor thread for tens of seconds).
+async fn canonicalise(p: &Path) -> PathBuf {
+    tokio::fs::canonicalize(p)
+        .await
+        .unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// Which side of an attach is being checked. Drives the
