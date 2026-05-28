@@ -55,7 +55,7 @@ The core principle: substrate (daemon + protocol) is foundational; `artel-fs` is
       role:       WorkspaceRole,  // enum { Host, Joiner }
   }
   ```
-  Kind tag: `"artel-fs/workspace/v1"`. `Workspace::host_with` / `join_with` issue `RegisterAttachment` after a successful attach. **Fast-follow:** add `last_seen: Option<i64>` (Unix epoch seconds) — additive, `Option<>`-typed so postcard `#[serde(default)]` covers it without a kind bump. Useful for "this workspace hasn't been touched in 6 months, prune it?" workflows. If we later want it *required*, kind bumps to `v2`.
+  Kind tag: `"artel-fs/workspace/v1"`. `Workspace::host_with` / `join_with` issue `RegisterAttachment` after a successful attach. **Fast-follow:** add `last_seen: i64` (Unix epoch seconds) for "this workspace hasn't been touched in 6 months, prune it?" workflows. The schema is frozen for `KIND_V1` — postcard rejects payloads whose field count doesn't match exactly, so even an `Option<>` field requires a parallel `KIND_V2` constant + struct + helper; consumers query both kinds and merge.
 
 - **`ForgetAttachment` is entry-only.** It does NOT delete the on-disk `state_dir` or any consumer-side state. Destructive deletion is never implicit. A future "purge workspace" CLI verb could combine `ForgetAttachment` + `rm -rf state_dir` explicitly.
 

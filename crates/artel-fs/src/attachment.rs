@@ -14,9 +14,14 @@
 //!   Bumping it is a breaking change; the v1 → v2 migration ships a
 //!   parallel [`KIND_V1`]-style constant rather than mutating this
 //!   one.
-//! - [`WorkspaceAttachmentV1`] is the postcard-encoded payload. New
-//!   fields land as `Option<>`-typed with `#[serde(default)]` until a
-//!   required field forces a `KIND_V2` bump.
+//! - [`WorkspaceAttachmentV1`] is the postcard-encoded payload. The
+//!   schema is **fixed** for the lifetime of `KIND_V1` — postcard
+//!   does not honour `#[serde(default)]` for missing trailing fields
+//!   (it returns `DeserializeUnexpectedEnd`, see the
+//!   `workspace_attachment_v1_decode_rejects_truncated_bytes` test),
+//!   so adding any field — even an `Option<>` — would silently drop
+//!   pre-existing on-disk payloads at decode time. New fields require
+//!   a parallel `KIND_V2` constant + struct + helper.
 //!
 //! Decode failures in [`list_known_workspaces`] are warn-and-skipped
 //! rather than propagated — see the brainstorm + plan §"Risks" for
@@ -67,10 +72,11 @@ pub enum WorkspaceRole {
 /// Wire-stable v1 payload for the `artel-fs/workspace/v1` attachment
 /// kind. Postcard-encoded into the opaque [`Attachment::payload`].
 ///
-/// Fields are deliberately conservative — see the brainstorm's
-/// "fast-follow" note for `last_seen`. New fields land as
-/// `Option<>`-typed with `#[serde(default)]` until a required field
-/// forces a `KIND_V2` bump.
+/// **Schema is frozen.** Postcard rejects any payload that doesn't
+/// match the field count exactly — adding a field (even an
+/// `Option<>`) would `DeserializeUnexpectedEnd` on every existing
+/// on-disk entry. New fields land as a parallel `WorkspaceAttachmentV2`
+/// + `KIND_V2` constant; consumers query both and merge.
 ///
 /// [`Attachment::payload`]: artel_protocol::Attachment::payload
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

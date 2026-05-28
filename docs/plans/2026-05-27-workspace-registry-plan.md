@@ -445,10 +445,12 @@ This is the spot where the "no speculative abstractions" memory note reads as to
   /// attachment kind. Postcard-encoded into the opaque
   /// `Attachment::payload`.
   ///
-  /// Fields are deliberately conservative — see the brainstorm's
-  /// "fast-follow" note for `last_seen`. New fields land as
-  /// `Option<>`-typed with `#[serde(default)]` until a required field
-  /// forces a `KIND_V2` bump.
+  /// Schema is frozen for `KIND_V1` — postcard rejects payloads
+  /// whose field count doesn't match exactly (no `serde(default)`
+  /// honoured for missing trailing fields). New fields require a
+  /// parallel `KIND_V2` + struct + helper; consumers query both
+  /// kinds and merge. See the brainstorm's `last_seen` fast-follow
+  /// for the first such planned bump.
   #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
   pub struct WorkspaceAttachmentV1 {
       /// Canonicalised workspace root (where the user's files live).
@@ -683,7 +685,7 @@ None — documentation only.
 ### Things this plan explicitly does not do
 
 - **No multi-attachment-per-(session, kind).** Single slot per `(session, kind)`. If a use case for multi-slot shows up, ripping out and adding a `name` field is acceptable; alpha.
-- **No `last_seen: i64` field on `WorkspaceAttachmentV1`.** Fast-follow per the brainstorm. Add as `Option<i64>` with `#[serde(default)]` when a real consumer needs stale-pruning.
+- **No `last_seen: i64` field on `WorkspaceAttachmentV1`.** Fast-follow per the brainstorm. Adding it requires a parallel `KIND_V2` + `WorkspaceAttachmentV2` (postcard rejects field-count mismatches, so `serde(default)` won't paper over an additive field on `KIND_V1`).
 - **No CLI `artel workspace list` verb.** Out of scope for the registry slice; ships separately on top of `list_known_workspaces`.
 - **No GUI / non-Rust client work.** The IPC surface is what this slice ships; client work is a downstream concern.
 - **No `RegistryBackend` trait, no `AttachmentCodec` trait, no plugin system.** Per the layering principle at the top: the daemon has one storage path (`SessionStore`), `artel-fs` has one schema (`WorkspaceAttachmentV1`). Future schemas land as parallel kinds, not via runtime dispatch.

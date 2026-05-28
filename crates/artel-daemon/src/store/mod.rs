@@ -112,8 +112,16 @@ pub(crate) trait SessionStore: Send + Sync + std::fmt::Debug {
     ///
     /// `None` returns all kinds across all sessions; `Some(k)` returns
     /// only attachments tagged with `k`. Order is unspecified — callers
-    /// that care should sort client-side. Skip-and-warn semantics on
-    /// unparseable on-disk entries (mirrors [`Self::load_all`]).
+    /// that care should sort client-side.
+    ///
+    /// Two skip categories with different observability:
+    /// - **Skip-and-warn** on unparseable on-disk entries — corruption,
+    ///   filename that doesn't decode, oversized payloads (mirrors
+    ///   [`Self::load_all`]). Logged via `tracing::warn!`.
+    /// - **Skip-on-vanish** when an entry disappears mid-iteration
+    ///   because [`Self::delete`]'s cascade is racing this call. Silent
+    ///   — these are expected concurrency outcomes, not corruption,
+    ///   and warning every cascade-race would flood logs with noise.
     async fn list_attachments(
         &self,
         kind_filter: Option<&str>,

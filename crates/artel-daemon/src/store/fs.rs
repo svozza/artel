@@ -303,8 +303,9 @@ impl SessionStore for FsLogStore {
                     // result, the metadata stat, and the read can each
                     // return NotFound; treat that as "the entry vanished
                     // mid-list" and skip rather than failing the whole
-                    // call. Mirrors the skip-and-warn contract on
-                    // SessionStore::list_attachments.
+                    // call. This is the skip-on-vanish path the trait doc
+                    // calls out — silent on purpose; cascade-races are
+                    // expected concurrency, not corruption.
                     let att = match att {
                         Ok(a) => a,
                         Err(err) if err.kind() == ErrorKind::NotFound => continue,
