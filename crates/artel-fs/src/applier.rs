@@ -19,6 +19,7 @@ use iroh_docs::Entry;
 use iroh_docs::engine::LiveEvent;
 use iroh_docs::store::Query;
 use tokio::sync::oneshot;
+use tracing::{debug, warn};
 
 use crate::echo_guard::PENDING_RELEASE_GRACE;
 use crate::filter::{FilterDecision, SkipReason, WorkspaceFilter};
@@ -48,6 +49,7 @@ pub(crate) async fn run(workspace: Arc<Workspace>, ready: oneshot::Sender<()>) {
     let mut events = match workspace.doc.subscribe().await {
         Ok(s) => s,
         Err(err) => {
+            warn!(target: "artel_fs::applier", %err, "doc.subscribe failed");
             let _ = workspace
                 .events
                 .send(WorkspaceEvent::Error(format!("subscribe failed: {err}")))
@@ -55,6 +57,11 @@ pub(crate) async fn run(workspace: Arc<Workspace>, ready: oneshot::Sender<()>) {
             return;
         }
     };
+    debug!(
+        target: "artel_fs::applier",
+        root = %workspace.root.display(),
+        "subscribed to doc live events"
+    );
     // Subscription is live. Signal readiness so callers blocked in
     // `Workspace::run().await` can proceed. `send` only fails if
     // the receiver was dropped — fine to ignore.
@@ -68,23 +75,39 @@ pub(crate) async fn run(workspace: Arc<Workspace>, ready: oneshot::Sender<()>) {
 
     loop {
         tokio::select! {
-            () = workspace.shutdown_token.cancelled() => return,
+            () = workspace.shutdown_token.cancelled() => {
+                debug!(target: "artel_fs::applier", "shutdown token tripped, exiting applier loop");
+                return;
+            }
             ev = events.next() => {
                 match ev {
                     Some(Ok(LiveEvent::InsertRemote { entry, .. })) => {
+                        debug!(
+                            target: "artel_fs::applier",
+                            key = %String::from_utf8_lossy(entry.key()),
+                            content_len = entry.content_len(),
+                            "InsertRemote"
+                        );
                         handle_entry(&workspace, &guard, &filter, entry).await;
                     }
                     Some(Ok(LiveEvent::ContentReady { hash })) => {
+                        debug!(target: "artel_fs::applier", %hash, "ContentReady");
                         handle_content_ready(&workspace, &guard, &filter, hash).await;
                     }
-                    Some(Ok(_)) => {}
+                    Some(Ok(other)) => {
+                        debug!(target: "artel_fs::applier", event = ?other, "ignored live event");
+                    }
                     Some(Err(err)) => {
+                        warn!(target: "artel_fs::applier", %err, "doc event error");
                         let _ = workspace
                             .events
                             .send(WorkspaceEvent::Error(format!("doc event error: {err}")))
                             .await;
                     }
-                    None => return,
+                    None => {
+                        debug!(target: "artel_fs::applier", "live event stream ended; exiting applier loop");
+                        return;
+                    }
                 }
             }
         }
@@ -100,6 +123,12 @@ async fn handle_entry(
     let path = match keys::key_to_path(&workspace.root, entry.key()) {
         Ok(p) => p,
         Err(err) => {
+            warn!(
+                target: "artel_fs::applier",
+                key = %String::from_utf8_lossy(entry.key()),
+                %err,
+                "invalid key in remote entry"
+            );
             let _ = workspace
                 .events
                 .send(WorkspaceEvent::Error(format!("invalid key: {err}")))
@@ -116,6 +145,7 @@ async fn handle_entry(
     // function, so this single gate covers both cold and ready paths.
     let rel = path.strip_prefix(&workspace.root).unwrap_or(&path);
     if workspace.compiled_rules.mode_for(rel) == Mode::ReadOnly {
+        debug!(target: "artel_fs::applier", path = %path.display(), "rules: skip ReadOnly incoming");
         let _ = workspace
             .events
             .send(WorkspaceEvent::SkippedReadOnly {
@@ -127,6 +157,7 @@ async fn handle_entry(
     }
 
     if entry.content_len() == 0 {
+        debug!(target: "artel_fs::applier", path = %path.display(), "applying tombstone (remove_file)");
         let _ = tokio::fs::remove_file(&path).await;
         let _ = workspace
             .events
@@ -137,6 +168,7 @@ async fn handle_entry(
 
     match filter.check(&path) {
         FilterDecision::Skip(SkipReason::TooLarge { size }) => {
+            debug!(target: "artel_fs::applier", path = %path.display(), size, "filter: skip too-large incoming");
             let _ = workspace
                 .events
                 .send(WorkspaceEvent::SkippedTooLarge {
@@ -146,19 +178,32 @@ async fn handle_entry(
                 .await;
             return;
         }
-        FilterDecision::Skip(_) => return,
+        FilterDecision::Skip(reason) => {
+            debug!(target: "artel_fs::applier", path = %path.display(), reason = ?reason, "filter: skip incoming");
+            return;
+        }
         FilterDecision::Include => {}
     }
 
     // Bytes not yet available locally — applier::run will retry on
     // ContentReady.
-    let Ok(bytes) = workspace
+    let bytes = match workspace
         .blobs
         .blobs()
         .get_bytes(entry.content_hash())
         .await
-    else {
-        return;
+    {
+        Ok(b) => b,
+        Err(err) => {
+            debug!(
+                target: "artel_fs::applier",
+                path = %path.display(),
+                hash = %entry.content_hash(),
+                %err,
+                "blob bytes not yet available; awaiting ContentReady"
+            );
+            return;
+        }
     };
 
     guard.mark_remote_write(&path, &bytes).await;
@@ -168,6 +213,7 @@ async fn handle_entry(
     }
 
     if let Err(err) = tokio::fs::write(&path, &bytes).await {
+        warn!(target: "artel_fs::applier", path = %path.display(), %err, "fs::write failed");
         let _ = workspace
             .events
             .send(WorkspaceEvent::Error(format!(
@@ -178,6 +224,7 @@ async fn handle_entry(
         return;
     }
 
+    debug!(target: "artel_fs::applier", path = %path.display(), len = bytes.len(), "applied remote write to disk");
     guard.release_after(path.clone(), PENDING_RELEASE_GRACE);
     let _ = workspace
         .events
@@ -199,6 +246,7 @@ async fn handle_content_ready(
     let stream = match workspace.doc.get_many(Query::all()).await {
         Ok(s) => s,
         Err(err) => {
+            warn!(target: "artel_fs::applier", %hash, %err, "get_many failed in ContentReady handler");
             let _ = workspace
                 .events
                 .send(WorkspaceEvent::Error(format!("get_many failed: {err}")))
@@ -208,10 +256,13 @@ async fn handle_content_ready(
     };
     let mut stream = Box::pin(stream);
 
+    let mut matched = 0usize;
     while let Some(res) = stream.next().await {
         let Ok(entry) = res else { continue };
         if entry.content_hash() == hash {
+            matched += 1;
             handle_entry(workspace, guard, filter, entry).await;
         }
     }
+    debug!(target: "artel_fs::applier", %hash, matched, "ContentReady scan complete");
 }

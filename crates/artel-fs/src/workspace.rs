@@ -37,6 +37,7 @@ use iroh_docs::store::Query;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
+use tracing::{debug, warn};
 use walkdir::WalkDir;
 
 use crate::echo_guard::{EchoGuard, PENDING_RELEASE_GRACE};
@@ -491,6 +492,12 @@ impl Workspace {
 
         let doc_id_path = state_dir.join(DOC_ID_FILE);
         let (doc, returning) = open_or_create_doc(node, &doc_id_path).await?;
+        debug!(
+            target: "artel_fs::workspace",
+            namespace = %doc.id(),
+            returning,
+            "host_with: doc opened"
+        );
 
         // Derive the session id from the persisted NamespaceId
         // *before* registering with the daemon. First host and every
@@ -539,12 +546,14 @@ impl Workspace {
         // matters — tombstoning after re-publishing would erase
         // legitimate entries laid down by the scan.
         if returning {
+            debug!(target: "artel_fs::workspace", root = %root.display(), "host_with: reconciling doc against disk");
             reconcile_doc_against_disk(&root, &doc, author, &tx).await?;
         }
 
         // Pre-populate the doc from disk *before* we share the
         // ticket — joiners that import after this scan see the
         // current snapshot via initial sync.
+        debug!(target: "artel_fs::workspace", root = %root.display(), "host_with: scan_and_publish_existing");
         scan_and_publish_existing(&root, &doc, author, &compiled_rules, &echo_guard, &tx).await?;
 
         // Share with full addressing info so the ticket is enough
@@ -881,6 +890,7 @@ impl Workspace {
     /// returned `JoinHandle` resolves once both have exited.
     #[must_use]
     pub async fn run(self: std::sync::Arc<Self>) -> tokio::task::JoinHandle<()> {
+        debug!(target: "artel_fs::workspace", root = %self.root.display(), "run: spawning watcher + applier");
         let watcher_ws = std::sync::Arc::clone(&self);
         let applier_ws = std::sync::Arc::clone(&self);
         let (watcher_ready_tx, watcher_ready_rx) = tokio::sync::oneshot::channel::<()>();
@@ -896,17 +906,28 @@ impl Workspace {
         // failure); the WorkspaceEvent::Error already surfaces the
         // cause, and we still hand back the JoinHandle so callers
         // can shut down cleanly.
-        let (_, _) = tokio::join!(watcher_ready_rx, applier_ready_rx);
+        let (watcher_res, applier_res) = tokio::join!(watcher_ready_rx, applier_ready_rx);
+        debug!(
+            target: "artel_fs::workspace",
+            watcher_ready = watcher_res.is_ok(),
+            applier_ready = applier_res.is_ok(),
+            "run: both halves signalled (or errored)"
+        );
         join
     }
 
     /// Trigger graceful shutdown. The node is taken out of its slot
     /// and torn down; subsequent calls are no-ops.
     pub async fn shutdown(&self) {
+        debug!(target: "artel_fs::workspace", "shutdown: cancelling token");
         self.shutdown_token.cancel();
         let mut slot = self.node.lock().await;
         if let Some(node) = slot.take() {
+            debug!(target: "artel_fs::workspace", "shutdown: tearing down iroh node");
             node.shutdown().await;
+            debug!(target: "artel_fs::workspace", "shutdown: iroh node torn down");
+        } else {
+            debug!(target: "artel_fs::workspace", "shutdown: node already taken");
         }
     }
 }
@@ -929,6 +950,8 @@ async fn scan_and_publish_existing(
     events: &mpsc::Sender<WorkspaceEvent>,
 ) -> Result<(), WorkspaceError> {
     let filter = WorkspaceFilter::new(root);
+    let mut published = 0usize;
+    let mut skipped = 0usize;
     for entry in WalkDir::new(root).follow_links(false).into_iter().flatten() {
         if !entry.file_type().is_file() {
             continue;
@@ -944,12 +967,16 @@ async fn scan_and_publish_existing(
                     .await;
                 continue;
             }
-            FilterDecision::Skip(_) => continue,
+            FilterDecision::Skip(_) => {
+                skipped += 1;
+                continue;
+            }
             FilterDecision::Include => {}
         }
 
         let rel = path.strip_prefix(root).unwrap_or(path);
         if rules.mode_for(rel) == Mode::ReadOnly {
+            skipped += 1;
             let _ = events
                 .send(WorkspaceEvent::SkippedReadOnly {
                     path: path.to_path_buf(),
@@ -984,7 +1011,9 @@ async fn scan_and_publish_existing(
             }
         };
         let bytes = Bytes::from(bytes);
+        let len = bytes.len();
         if let Err(err) = doc.set_bytes(author, key, bytes.clone()).await {
+            warn!(target: "artel_fs::workspace", path = %path.display(), len, %err, "scan: set_bytes failed");
             let _ = events
                 .send(WorkspaceEvent::Error(format!(
                     "scan publish {} failed: {err}",
@@ -993,8 +1022,11 @@ async fn scan_and_publish_existing(
                 .await;
             continue;
         }
+        published += 1;
+        debug!(target: "artel_fs::workspace", path = %path.display(), len, "scan: published");
         echo_guard.record_local_publish(path, &bytes).await;
     }
+    debug!(target: "artel_fs::workspace", root = %root.display(), published, skipped, "scan_and_publish_existing complete");
     Ok(())
 }
 
@@ -1567,8 +1599,11 @@ async fn reconcile_doc_against_disk(
         .map_err(|e| WorkspaceError::Doc(format!("reconcile get_many: {e}")))?;
     tokio::pin!(stream);
 
+    let mut scanned = 0usize;
+    let mut tombstoned = 0usize;
     while let Some(res) = stream.next().await {
         let Ok(entry) = res else { continue };
+        scanned += 1;
         // Defensive: should be unreachable given the default query.
         if entry.content_len() == 0 {
             continue;
@@ -1577,6 +1612,12 @@ async fn reconcile_doc_against_disk(
         let path = match keys::key_to_path(root, entry.key()) {
             Ok(p) => p,
             Err(err) => {
+                warn!(
+                    target: "artel_fs::workspace",
+                    key = %String::from_utf8_lossy(entry.key()),
+                    %err,
+                    "reconcile: invalid key"
+                );
                 let _ = events
                     .send(WorkspaceEvent::Error(format!(
                         "reconcile invalid key: {err}"
@@ -1586,19 +1627,30 @@ async fn reconcile_doc_against_disk(
             }
         };
         if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            debug!(target: "artel_fs::workspace", path = %path.display(), "reconcile: tombstoning entry not on disk");
             // `Doc::del` writes a tombstone for `prefix`. The key
             // we hand it is exact, so it tombstones just this
             // entry.
             if let Err(err) = doc.del(author, entry.key().to_vec()).await {
+                warn!(target: "artel_fs::workspace", path = %path.display(), %err, "reconcile: tombstone failed");
                 let _ = events
                     .send(WorkspaceEvent::Error(format!(
                         "reconcile tombstone {}: {err}",
                         path.display(),
                     )))
                     .await;
+            } else {
+                tombstoned += 1;
             }
         }
     }
+    debug!(
+        target: "artel_fs::workspace",
+        root = %root.display(),
+        scanned,
+        tombstoned,
+        "reconcile_doc_against_disk complete"
+    );
     Ok(())
 }
 

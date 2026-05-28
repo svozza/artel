@@ -17,6 +17,7 @@ use notify::EventKind;
 use notify_debouncer_full::DebounceEventResult;
 
 use tokio::sync::oneshot;
+use tracing::{debug, warn};
 
 use crate::filter::{FilterDecision, SkipReason, WorkspaceFilter};
 use crate::rules::Mode;
@@ -59,8 +60,20 @@ pub(crate) async fn run(workspace: Arc<Workspace>, ready: oneshot::Sender<()>) {
         Duration::from_millis(300),
         None,
         move |res: DebounceEventResult| {
-            let Ok(events) = res else { return };
+            let events = match res {
+                Ok(e) => e,
+                Err(errs) => {
+                    warn!(target: "artel_fs::watcher", errors = ?errs, "debouncer callback received error batch");
+                    return;
+                }
+            };
             for ev in events {
+                debug!(
+                    target: "artel_fs::watcher",
+                    kind = ?ev.event.kind,
+                    paths = ?ev.event.paths,
+                    "debouncer event"
+                );
                 match &ev.event.kind {
                     EventKind::Modify(_) | EventKind::Create(_) => {
                         for path in &ev.event.paths {
@@ -94,6 +107,11 @@ pub(crate) async fn run(workspace: Arc<Workspace>, ready: oneshot::Sender<()>) {
             .await;
         return;
     }
+    debug!(
+        target: "artel_fs::watcher",
+        root = %workspace.root.display(),
+        "debouncer attached recursive watch"
+    );
     // Watch is attached. Signal readiness so callers blocked in
     // `Workspace::run().await` can proceed. `send` only fails if the
     // receiver was dropped, which means the caller stopped waiting
@@ -111,7 +129,10 @@ pub(crate) async fn run(workspace: Arc<Workspace>, ready: oneshot::Sender<()>) {
 
     loop {
         tokio::select! {
-            () = workspace.shutdown_token.cancelled() => return,
+            () = workspace.shutdown_token.cancelled() => {
+                debug!(target: "artel_fs::watcher", "shutdown token tripped, exiting watcher loop");
+                return;
+            }
             change = rx.recv() => {
                 match change {
                     Some(LocalChange::Modified(path)) => {
@@ -120,7 +141,10 @@ pub(crate) async fn run(workspace: Arc<Workspace>, ready: oneshot::Sender<()>) {
                     Some(LocalChange::Removed(path)) => {
                         on_removed(&workspace, path).await;
                     }
-                    None => return,
+                    None => {
+                        debug!(target: "artel_fs::watcher", "notify channel closed, exiting watcher loop");
+                        return;
+                    }
                 }
             }
         }
@@ -133,8 +157,10 @@ async fn on_modified(
     guard: &EchoGuard,
     path: PathBuf,
 ) {
+    debug!(target: "artel_fs::watcher", path = %path.display(), "on_modified entered");
     match filter.check(&path) {
         FilterDecision::Skip(SkipReason::TooLarge { size }) => {
+            debug!(target: "artel_fs::watcher", path = %path.display(), size, "filter: skip too-large");
             let _ = workspace
                 .events
                 .send(WorkspaceEvent::SkippedTooLarge {
@@ -144,7 +170,10 @@ async fn on_modified(
                 .await;
             return;
         }
-        FilterDecision::Skip(_) => return,
+        FilterDecision::Skip(reason) => {
+            debug!(target: "artel_fs::watcher", path = %path.display(), reason = ?reason, "filter: skip");
+            return;
+        }
         FilterDecision::Include => {}
     }
 
@@ -157,6 +186,7 @@ async fn on_modified(
     // mask it.
     let rel = path.strip_prefix(&workspace.root).unwrap_or(&path);
     if workspace.compiled_rules.mode_for(rel) == Mode::ReadOnly {
+        debug!(target: "artel_fs::watcher", path = %path.display(), "rules: skip ReadOnly outgoing");
         let _ = workspace
             .events
             .send(WorkspaceEvent::SkippedReadOnly {
@@ -176,12 +206,16 @@ async fn on_modified(
             // deletion propagate cross-platform. Linux does send
             // `Remove`, and `on_removed` would handle it before we
             // got here.
+            debug!(target: "artel_fs::watcher", path = %path.display(), "read NotFound -> tombstone");
             on_removed(workspace, path).await;
             return;
         }
         // Other read errors (permission, transient I/O) — drop
         // silently; a subsequent event will retry.
-        Err(_) => return,
+        Err(err) => {
+            warn!(target: "artel_fs::watcher", path = %path.display(), %err, "read failed; dropping event");
+            return;
+        }
     };
 
     // Skip zero-length files: iroh-docs reserves zero-length entries
@@ -193,10 +227,12 @@ async fn on_modified(
     // probably by storing an inline marker in the entry's metadata
     // or splitting "presence" from "content" at the doc layer.
     if bytes.is_empty() {
+        debug!(target: "artel_fs::watcher", path = %path.display(), "skip zero-length file");
         return;
     }
 
     if guard.should_skip_local(&path, &bytes).await {
+        debug!(target: "artel_fs::watcher", path = %path.display(), len = bytes.len(), "echo-guard: skip local (peer-driven write)");
         return;
     }
 
@@ -215,15 +251,19 @@ async fn on_modified(
     };
 
     let bytes = Bytes::from(bytes);
+    let len = bytes.len();
+    debug!(target: "artel_fs::watcher", path = %path.display(), len, "publishing via set_bytes");
     match workspace
         .doc
         .set_bytes(workspace.author, key, bytes.clone())
         .await
     {
         Ok(_) => {
+            debug!(target: "artel_fs::watcher", path = %path.display(), len, "set_bytes ok");
             guard.record_local_publish(&path, &bytes).await;
         }
         Err(err) => {
+            warn!(target: "artel_fs::watcher", path = %path.display(), len, %err, "set_bytes failed");
             let _ = workspace
                 .events
                 .send(WorkspaceEvent::Error(format!(
@@ -236,6 +276,7 @@ async fn on_modified(
 }
 
 async fn on_removed(workspace: &Arc<Workspace>, path: PathBuf) {
+    debug!(target: "artel_fs::watcher", path = %path.display(), "on_removed entered");
     // Belt-and-braces with `on_modified`: on macOS, FSEvents reports
     // post-unlink as `Modify(Metadata)` and `on_modified` already
     // gates on `ReadOnly` before its own fallthrough into here. On
@@ -243,6 +284,7 @@ async fn on_removed(workspace: &Arc<Workspace>, path: PathBuf) {
     // gate, so the rule check has to live here too.
     let rel = path.strip_prefix(&workspace.root).unwrap_or(&path);
     if workspace.compiled_rules.mode_for(rel) == Mode::ReadOnly {
+        debug!(target: "artel_fs::watcher", path = %path.display(), "rules: skip ReadOnly outgoing tombstone");
         let _ = workspace
             .events
             .send(WorkspaceEvent::SkippedReadOnly {
@@ -252,8 +294,19 @@ async fn on_removed(workspace: &Arc<Workspace>, path: PathBuf) {
             .await;
         return;
     }
-    let Ok(key) = keys::path_to_key(&workspace.root, &path) else {
-        return;
+    let key = match keys::path_to_key(&workspace.root, &path) {
+        Ok(k) => k,
+        Err(err) => {
+            warn!(target: "artel_fs::watcher", path = %path.display(), %err, "path_to_key failed for tombstone");
+            return;
+        }
     };
-    let _ = workspace.doc.del(workspace.author, key).await;
+    match workspace.doc.del(workspace.author, key).await {
+        Ok(removed) => {
+            debug!(target: "artel_fs::watcher", path = %path.display(), removed, "doc.del ok");
+        }
+        Err(err) => {
+            warn!(target: "artel_fs::watcher", path = %path.display(), %err, "doc.del failed");
+        }
+    }
 }
