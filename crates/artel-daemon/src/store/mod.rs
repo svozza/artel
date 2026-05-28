@@ -62,10 +62,19 @@ pub(crate) trait SessionStore: Send + Sync + std::fmt::Debug {
 
     /// Forget the session entirely. Used when the host leaves.
     ///
-    /// **Cascade invariant:** any attachments associated with `session`
-    /// must be removed atomically with the session itself. The on-disk
-    /// implementation gets this for free via `remove_dir_all`; the
-    /// in-memory implementation must explicitly clear them.
+    /// **Cascade invariant:** when this returns, any attachments
+    /// associated with `session` must also be gone. The on-disk
+    /// implementation gets this for free from `remove_dir_all`; the
+    /// in-memory implementation bundles attachments into the session
+    /// entry so a single map remove sweeps both.
+    ///
+    /// Concurrency: the *store* does NOT serialize `delete` against
+    /// concurrent [`Self::put_attachment`] calls for the same session
+    /// — a put that races a delete may land an attachment whose
+    /// session has just been removed. Callers (today: only
+    /// [`super::super::session::Registry`]) MUST hold the per-session
+    /// `Mutex<Session>` across both calls so cascade and put cannot
+    /// interleave at the store boundary.
     async fn delete(&self, session: SessionId) -> io::Result<()>;
 
     /// Load every session this store knows about. Called once at
@@ -86,6 +95,11 @@ pub(crate) trait SessionStore: Send + Sync + std::fmt::Debug {
     /// `Ok(true)` on success. Disk-backed implementations must cap
     /// `payload` length at the same `MAX_FRAME_SIZE` the log uses;
     /// over-cap writes return `io::ErrorKind::InvalidData`.
+    ///
+    /// Concurrency: see [`Self::delete`] — the store does not
+    /// serialize put-vs-delete races. The Registry holds its
+    /// per-session `Mutex<Session>` across this call to keep the
+    /// cascade invariant.
     async fn put_attachment(
         &self,
         session: SessionId,

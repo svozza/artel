@@ -730,26 +730,23 @@ impl Registry {
             // Already closed (or never present). Nothing to do.
             return Ok(());
         };
-        {
+        // Hold the per-session lock across the store cascade so a
+        // concurrent `register_attachment` (which also takes this
+        // lock) cannot land an attachment after the cascade runs.
+        // Same shape as `leave`'s critical section.
+        let events_tx = {
             let s = session_arc.lock().await;
             if s.kind != SessionKind::Remote {
                 tracing::warn!(?session, "ignoring SessionClosed for a non-remote session",);
                 return Ok(());
             }
-        }
-
-        self.store
-            .delete(session)
-            .await
-            .map_err(SessionError::Storage)?;
-
-        // Snapshot the broadcast channel so we can fire the
-        // SessionClosed event after dropping the per-session
-        // arc — same shape as `send` and `ensure_member`.
-        let events_tx = {
-            let s = session_arc.lock().await;
+            self.store
+                .delete(session)
+                .await
+                .map_err(SessionError::Storage)?;
             s.events_tx.clone()
         };
+
         self.sessions.write().await.remove(&session);
         let _ = events_tx.send(Event::SessionClosed { session });
 
@@ -886,14 +883,33 @@ impl Registry {
     /// known to the daemon. Idempotent within a `(session, kind)`
     /// pair: re-registering overwrites. Attachments cascade-delete
     /// with their session — see [`crate::store::SessionStore::delete`].
+    ///
+    /// Holds the per-session `Mutex<Session>` across the store write
+    /// so a concurrent [`Self::leave`] (host) or
+    /// [`Self::host_closed_session`] (remote mirror) cannot run its
+    /// cascade between our existence check and the put — that would
+    /// orphan the attachment. This is the synchronization point the
+    /// store's [`crate::store::SessionStore::put_attachment`] doc
+    /// references.
     pub(crate) async fn register_attachment(
         &self,
         session: SessionId,
         kind: String,
         payload: Vec<u8>,
     ) -> Result<(), SessionError> {
+        let session_arc = {
+            let guard = self.sessions.read().await;
+            guard
+                .get(&session)
+                .cloned()
+                .ok_or(SessionError::UnknownSession(session))?
+        };
+        let _s = session_arc.lock().await;
         match self.store.put_attachment(session, &kind, &payload).await {
             Ok(true) => Ok(()),
+            // The session existed when we took the lock but the store
+            // disagrees — treat as UnknownSession; this is the only
+            // way `Ok(false)` is reachable now.
             Ok(false) => Err(SessionError::UnknownSession(session)),
             Err(err) => Err(SessionError::Storage(err)),
         }
@@ -902,6 +918,11 @@ impl Registry {
     /// List every attachment matching `kind_filter`. `None` returns
     /// all kinds across all sessions; `Some(k)` returns only those
     /// tagged with `k`. Order unspecified.
+    ///
+    /// Does not take per-session locks — a concurrent register or
+    /// cascade may shift the result by one entry but cannot produce
+    /// a torn read of any individual attachment (each store op is
+    /// itself atomic at the file/map-entry granularity).
     pub(crate) async fn list_attachments(
         &self,
         kind_filter: Option<&str>,
@@ -915,11 +936,25 @@ impl Registry {
     /// Remove the attachment at `(session, kind)` without removing
     /// the session itself. Idempotent: missing session OR missing
     /// attachment returns `Ok(())`.
+    ///
+    /// Holds the per-session lock when the session is known so a
+    /// concurrent register cannot resurrect the attachment between
+    /// our delete and the caller observing the empty list. If the
+    /// session is already gone (cascade ran), the store's idempotent
+    /// `delete_attachment` returns `Ok(())` directly.
     pub(crate) async fn forget_attachment(
         &self,
         session: SessionId,
         kind: String,
     ) -> Result<(), SessionError> {
+        let session_arc = {
+            let guard = self.sessions.read().await;
+            guard.get(&session).cloned()
+        };
+        let _maybe_lock = match &session_arc {
+            Some(arc) => Some(arc.lock().await),
+            None => None,
+        };
         self.store
             .delete_attachment(session, &kind)
             .await
@@ -1798,5 +1833,59 @@ mod tests {
         r.host_closed_session(session_id).await.unwrap();
 
         assert!(r.list_attachments(None).await.unwrap().is_empty());
+    }
+
+    /// Race-regression: `register_attachment` vs. `leave` on the same
+    /// session. Without the per-session lock in `register_attachment`
+    /// + the matching lock in `leave`'s critical section, the put
+    /// could land *after* the cascade ran, orphaning the attachment.
+    ///
+    /// Drives the race deterministically: spawn a register task and
+    /// a leave task, await both, then assert the cascade contract:
+    /// either register won (attachment present, session still there)
+    /// or leave won (no session, no attachment) — never both.
+    /// Loops to give the scheduler many chances to interleave; any
+    /// orphan is a hard failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn race_register_attachment_vs_leave_does_not_orphan() {
+        for _ in 0..200 {
+            let r = Arc::new(registry());
+            let alice = peer(1, "alice");
+            let (id, _) = r.host(alice.clone(), None).await.unwrap();
+
+            let r1 = Arc::clone(&r);
+            let r2 = Arc::clone(&r);
+            let alice_id = alice.id;
+            let register = tokio::spawn(async move {
+                r1.register_attachment(id, KIND_V1.into(), b"x".to_vec())
+                    .await
+            });
+            let leave = tokio::spawn(async move { r2.leave(id, alice_id).await });
+
+            // Both tasks must complete (one will race-win, the other
+            // may see UnknownSession or the cascade already-ran path).
+            let _ = register.await.unwrap();
+            let _ = leave.await.unwrap();
+
+            // Cascade contract: if the session is gone, no attachment
+            // for it may survive in the store.
+            let listed = r.list_attachments(None).await.unwrap();
+            for entry in &listed {
+                assert_eq!(
+                    entry.session, id,
+                    "stray attachment for unknown session: {entry:?}"
+                );
+            }
+            // The session may or may not still exist depending on
+            // which task observably won. If it doesn't, list_attachments
+            // must be empty.
+            let session_present = r.list().await.iter().any(|s| s.id == id);
+            if !session_present {
+                assert!(
+                    listed.is_empty(),
+                    "session gone but attachment leaked: {listed:?}",
+                );
+            }
+        }
     }
 }

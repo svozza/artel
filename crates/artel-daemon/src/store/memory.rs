@@ -24,11 +24,32 @@ use async_trait::async_trait;
 use super::SessionKind;
 use super::{SessionRecord, SessionStore, StoredAttachment};
 
+/// One session's record plus its attachments.
+///
+/// Bundling them under one map entry means the cascade in `delete` is
+/// a single `HashMap::remove` — no separate attachment map to keep in
+/// sync, and no possibility of an attachment outliving its session
+/// even under concurrent calls. Mirrors how `FsLogStore` gets the
+/// cascade for free from `remove_dir_all`.
+#[derive(Clone, Debug)]
+struct SessionEntry {
+    record: SessionRecord,
+    attachments: HashMap<String, Vec<u8>>,
+}
+
+impl SessionEntry {
+    fn new(record: SessionRecord) -> Self {
+        Self {
+            record,
+            attachments: HashMap::new(),
+        }
+    }
+}
+
 /// In-memory store. Cheap to construct; tests use one per scenario.
 #[derive(Debug, Default)]
 pub(crate) struct MemoryStore {
-    inner: Mutex<HashMap<SessionId, SessionRecord>>,
-    attachments: Mutex<HashMap<(SessionId, String), Vec<u8>>>,
+    inner: Mutex<HashMap<SessionId, SessionEntry>>,
 }
 
 impl MemoryStore {
@@ -43,48 +64,42 @@ impl SessionStore for MemoryStore {
         self.inner
             .lock()
             .expect("poisoned")
-            .insert(record.id, record.clone());
+            .insert(record.id, SessionEntry::new(record.clone()));
         Ok(())
     }
 
     async fn append(&self, session: SessionId, message: &SessionMessage) -> io::Result<()> {
         let mut guard = self.inner.lock().expect("poisoned");
-        let record = guard
+        let entry = guard
             .get_mut(&session)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown session"))?;
-        record.head = message.seq;
-        record.log.push(message.clone());
+        entry.record.head = message.seq;
+        entry.record.log.push(message.clone());
         Ok(())
     }
 
     async fn add_member(&self, session: SessionId, peer: &PeerInfo) -> io::Result<()> {
         let mut guard = self.inner.lock().expect("poisoned");
-        let record = guard
+        let entry = guard
             .get_mut(&session)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown session"))?;
-        record.members.insert(peer.id);
+        entry.record.members.insert(peer.id);
         Ok(())
     }
 
     async fn remove_member(&self, session: SessionId, peer: PeerId) -> io::Result<()> {
         let mut guard = self.inner.lock().expect("poisoned");
-        let record = guard
+        let entry = guard
             .get_mut(&session)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown session"))?;
-        record.members.remove(&peer);
+        entry.record.members.remove(&peer);
         Ok(())
     }
 
     async fn delete(&self, session: SessionId) -> io::Result<()> {
+        // Single map entry → cascade is one remove. Attachments live
+        // *inside* the SessionEntry, so they vanish by ownership.
         self.inner.lock().expect("poisoned").remove(&session);
-        // Cascade: per the SessionStore::delete contract, any
-        // attachments tied to this session must vanish atomically.
-        // The disk store gets this for free via remove_dir_all; here
-        // we have to iterate.
-        self.attachments
-            .lock()
-            .expect("poisoned")
-            .retain(|(s, _), _| *s != session);
         Ok(())
     }
 
@@ -94,7 +109,7 @@ impl SessionStore for MemoryStore {
             .lock()
             .expect("poisoned")
             .values()
-            .cloned()
+            .map(|entry| entry.record.clone())
             .collect())
     }
 
@@ -104,13 +119,11 @@ impl SessionStore for MemoryStore {
         kind: &str,
         payload: &[u8],
     ) -> io::Result<bool> {
-        if !self.inner.lock().expect("poisoned").contains_key(&session) {
+        let mut guard = self.inner.lock().expect("poisoned");
+        let Some(entry) = guard.get_mut(&session) else {
             return Ok(false);
-        }
-        self.attachments
-            .lock()
-            .expect("poisoned")
-            .insert((session, kind.to_owned()), payload.to_vec());
+        };
+        entry.attachments.insert(kind.to_owned(), payload.to_vec());
         Ok(true)
     }
 
@@ -118,25 +131,28 @@ impl SessionStore for MemoryStore {
         &self,
         kind_filter: Option<&str>,
     ) -> io::Result<Vec<StoredAttachment>> {
-        Ok(self
-            .attachments
-            .lock()
-            .expect("poisoned")
-            .iter()
-            .filter(|((_, k), _)| kind_filter.is_none_or(|f| f == k))
-            .map(|((session, kind), payload)| StoredAttachment {
-                session: *session,
-                kind: kind.clone(),
-                payload: payload.clone(),
-            })
-            .collect())
+        let guard = self.inner.lock().expect("poisoned");
+        let mut out = Vec::new();
+        for (session, entry) in guard.iter() {
+            for (kind, payload) in &entry.attachments {
+                if kind_filter.is_some_and(|f| f != kind) {
+                    continue;
+                }
+                out.push(StoredAttachment {
+                    session: *session,
+                    kind: kind.clone(),
+                    payload: payload.clone(),
+                });
+            }
+        }
+        Ok(out)
     }
 
     async fn delete_attachment(&self, session: SessionId, kind: &str) -> io::Result<()> {
-        self.attachments
-            .lock()
-            .expect("poisoned")
-            .remove(&(session, kind.to_owned()));
+        let mut guard = self.inner.lock().expect("poisoned");
+        if let Some(entry) = guard.get_mut(&session) {
+            entry.attachments.remove(kind);
+        }
         Ok(())
     }
 }

@@ -23,6 +23,7 @@
 use std::collections::HashSet;
 use std::io::{self, ErrorKind, Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use artel_protocol::{PeerId, PeerInfo, Seq, SessionId, SessionMessage};
 use async_trait::async_trait;
@@ -44,6 +45,15 @@ const LOG_FILE: &str = "log";
 const ATTACHMENTS_DIR: &str = "attachments";
 /// Suffix on attachment files; the prefix is the kind, hex-encoded.
 const ATTACHMENT_FILE_SUFFIX: &str = ".bin";
+
+/// Per-process counter feeding [`unique_tmp_path`].
+///
+/// Combined with the process pid, this makes each attachment write's
+/// tmp filename unique even if the same `(session, kind)` is being
+/// written by two concurrent callers. Sharing one tmp path between
+/// writers would let `create+truncate` interleave their bytes, so the
+/// final file (after rename) could be a corrupted mixture.
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Permission applied to the sessions root and per-session subdirs.
 const DIR_MODE: u32 = 0o700;
@@ -261,6 +271,18 @@ impl SessionStore for FsLogStore {
                 for att in attachment_entries {
                     let att = att?;
                     let path = att.path();
+                    // In-flight or crashed write_attachment: skip
+                    // silently rather than warn. unique_tmp_path
+                    // names them `<base>.<pid>.<counter>.tmp` — we
+                    // emit lowercase ourselves, exact-match is fine.
+                    #[allow(clippy::case_sensitive_file_extension_comparisons)]
+                    if path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.ends_with(".tmp"))
+                    {
+                        continue;
+                    }
                     let Some(kind) = decode_attachment_filename(&path) else {
                         warn!(
                             file = %path.display(),
@@ -432,23 +454,50 @@ const fn decode_lower_hex_nibble(c: char) -> Option<u8> {
 
 /// Atomic write of an attachment payload.
 ///
-/// Same `<path>.tmp` + fsync + rename + chmod-0o600 dance as
-/// [`write_meta`]; the only thing different is the file content
-/// (raw bytes vs. JSON).
+/// Same fsync + rename + chmod-0o600 dance as [`write_meta`], but the
+/// tmp filename is unique per writer (pid + monotonic counter) rather
+/// than deterministic per `(session, kind)`. Two concurrent writers
+/// with the same `kind` would otherwise share one tmp file, where
+/// `create+truncate` and `write_all` can interleave and corrupt the
+/// final post-rename payload.
 fn write_attachment(path: &Path, payload: &[u8]) -> io::Result<()> {
-    let tmp = path.with_extension("bin.tmp");
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp)?;
-        f.write_all(payload)?;
-        f.sync_all()?;
+    let tmp = unique_tmp_path(path);
+    let result = (|| -> io::Result<()> {
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&tmp)?;
+            f.write_all(payload)?;
+            f.sync_all()?;
+        }
+        chmod(&tmp, FILE_MODE)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        // Best-effort: the unique-tmp path was ours alone; if rename
+        // never landed, leave nothing dangling for `list_attachments`
+        // to warn about on every call.
+        let _ = std::fs::remove_file(&tmp);
     }
-    chmod(&tmp, FILE_MODE)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    result
+}
+
+/// Build a tmp path for `path` that is unique within this process.
+///
+/// Format: `<basename>.<pid>.<counter>.tmp` next to the destination.
+/// Lives in the same directory so the rename is on-device (no
+/// cross-fs copy) and inherits the parent's permissions.
+fn unique_tmp_path(path: &Path) -> PathBuf {
+    let pid = std::process::id();
+    let counter = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut name = path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(format!(".{pid}.{counter}.tmp"));
+    path.with_file_name(name)
 }
 
 /// Atomic write: `path.tmp` + fsync + rename.
@@ -1110,5 +1159,65 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    /// Race-regression: two concurrent writers of the same
+    /// `(session, kind)` must not corrupt the final file. With a
+    /// deterministic tmp path, both writers shared one `<hex>.bin.tmp`
+    /// — `create+truncate` could interleave, and the renamed file
+    /// would hold a mixture of both payloads. Unique tmp filenames
+    /// (`<base>.<pid>.<counter>.tmp`) make the contention land on the
+    /// final rename instead, where one of the two valid payloads wins
+    /// atomically.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_put_attachment_same_kind_does_not_corrupt() {
+        for _ in 0..50 {
+            let dir = tempdir().unwrap();
+            let store = std::sync::Arc::new(FsLogStore::open(dir.path()).unwrap());
+            store.create(&record(1)).await.unwrap();
+
+            let payload_a = vec![0xAAu8; 4096];
+            let payload_b = vec![0xBBu8; 4096];
+            let store_a = std::sync::Arc::clone(&store);
+            let store_b = std::sync::Arc::clone(&store);
+            let pa = payload_a.clone();
+            let pb = payload_b.clone();
+            let task_a = tokio::spawn(async move {
+                store_a
+                    .put_attachment(record(1).id, KIND_V1, &pa)
+                    .await
+                    .unwrap();
+            });
+            let task_b = tokio::spawn(async move {
+                store_b
+                    .put_attachment(record(1).id, KIND_V1, &pb)
+                    .await
+                    .unwrap();
+            });
+            task_a.await.unwrap();
+            task_b.await.unwrap();
+
+            let listed = store.list_attachments(None).await.unwrap();
+            assert_eq!(listed.len(), 1);
+            // The winning payload is whichever rename landed second.
+            // It MUST be one of the two valid payloads — never a mix.
+            let p = &listed[0].payload;
+            assert!(
+                p == &payload_a || p == &payload_b,
+                "corrupted final payload: first 8 bytes = {:?}",
+                &p[..8.min(p.len())],
+            );
+
+            // No `.tmp` files left dangling.
+            let attachments_dir = dir
+                .path()
+                .join(record(1).id.to_string())
+                .join(ATTACHMENTS_DIR);
+            for entry in std::fs::read_dir(&attachments_dir).unwrap() {
+                let name = entry.unwrap().file_name();
+                let name = name.to_string_lossy();
+                assert!(!name.ends_with(".tmp"), "left a tmp file behind: {name}");
+            }
+        }
     }
 }
