@@ -55,7 +55,7 @@ async fn spawn_at(state: &StateDir) -> RunningDaemon {
         sessions_dir: state.sessions.clone(),
         daemon_peer_id: FALLBACK_PEER,
         iroh_key_path: Some(state.iroh_key.clone()),
-        address_lookup: None,
+        endpoint_setup: artel_daemon::EndpointSetup::Production,
     })
     .await
     .expect("daemon start");
@@ -161,7 +161,7 @@ async fn no_iroh_key_path_keeps_synthetic_peer_id() {
         sessions_dir: root.path().join("sessions"),
         daemon_peer_id: FALLBACK_PEER,
         iroh_key_path: None,
-        address_lookup: None,
+        endpoint_setup: artel_daemon::EndpointSetup::Production,
     })
     .await
     .expect("daemon start");

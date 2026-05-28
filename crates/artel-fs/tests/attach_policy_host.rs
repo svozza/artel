@@ -49,7 +49,7 @@ impl DaemonHarness {
             sessions_dir: sessions,
             daemon_peer_id: PeerId::from_bytes([0xee; 32]),
             iroh_key_path: None,
-            address_lookup: None,
+            endpoint_setup: artel_daemon::EndpointSetup::Production,
         })
         .await
         .expect("daemon start");

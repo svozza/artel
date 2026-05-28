@@ -7,6 +7,8 @@
 
 mod common;
 
+use common::testing_setup;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -23,8 +25,7 @@ async fn alice_delete_propagates_to_bob() {
     let common::Pair {
         daemon_a,
         daemon_b,
-        workspace_lookup_a,
-        workspace_lookup_b,
+        dns_pkarr,
     } = common::spawn_pair().await;
 
     // Alice hosts; her workspace starts with one seed file so the
@@ -42,7 +43,7 @@ async fn alice_delete_propagates_to_bob() {
         alice_peer,
         alice_dir.path().to_path_buf(),
         AttachPolicy::AllowExisting,
-        WorkspaceConfig::default().with_address_lookup_override(workspace_lookup_a),
+        WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
     )
     .await
     .expect("Workspace::host");
@@ -73,7 +74,7 @@ async fn alice_delete_propagates_to_bob() {
         session,
         bob_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
-        WorkspaceConfig::default().with_address_lookup_override(workspace_lookup_b),
+        WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
     )
     .await
     .expect("Workspace::join");

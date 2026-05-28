@@ -23,13 +23,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use artel_daemon::shutdown::Shutdown;
-use artel_daemon::{AddressLookupOverride, Daemon, DaemonConfig};
+use artel_daemon::{Daemon, DaemonConfig, EndpointSetup};
 use artel_protocol::PeerId;
-use iroh::address_lookup::memory::MemoryLookup;
+use iroh::test_utils::DnsPkarrServer;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
 pub const FALLBACK_PEER: PeerId = PeerId::from_bytes([0xee; 32]);
+
+/// How long to wait for a freshly-bound endpoint to publish its
+/// pkarr record to the localhost server.
+pub const PKARR_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct State {
     pub root: TempDir,
@@ -71,14 +75,21 @@ impl RunningDaemon {
     }
 }
 
-pub async fn spawn_daemon(state: State, lookup: MemoryLookup) -> RunningDaemon {
+/// Build the [`EndpointSetup::Testing`] variant for `dns_pkarr`.
+pub fn testing_setup(dns_pkarr: &Arc<DnsPkarrServer>) -> EndpointSetup {
+    EndpointSetup::Testing {
+        dns_pkarr: Arc::clone(dns_pkarr),
+    }
+}
+
+pub async fn spawn_daemon(state: State, setup: EndpointSetup) -> RunningDaemon {
     let daemon = Daemon::start(DaemonConfig {
         socket_path: state.socket.clone(),
         pid_path: state.pid.clone(),
         sessions_dir: state.sessions.clone(),
         daemon_peer_id: FALLBACK_PEER,
         iroh_key_path: Some(state.iroh_key.clone()),
-        address_lookup: Some(AddressLookupOverride(lookup)),
+        endpoint_setup: setup,
     })
     .await
     .expect("daemon start");
@@ -95,19 +106,26 @@ pub async fn spawn_daemon(state: State, lookup: MemoryLookup) -> RunningDaemon {
     }
 }
 
-/// Spin two daemons up and cross-seed their address books. Returns
-/// `(daemon_a, daemon_b)` ready for one of them to host and the
-/// other to join.
-pub async fn spawn_pair() -> (RunningDaemon, RunningDaemon) {
-    let lookup_a = MemoryLookup::new();
-    let lookup_b = MemoryLookup::new();
+/// Spin two daemons up sharing one localhost
+/// [`DnsPkarrServer`]. Returns
+/// `(daemon_a, daemon_b, dns_pkarr)` ready for one of them to host
+/// and the other to join. Waits until both daemons' pkarr records
+/// are queryable before returning so the first dial doesn't race
+/// the publish.
+pub async fn spawn_pair() -> (RunningDaemon, RunningDaemon, Arc<DnsPkarrServer>) {
+    let dns_pkarr = Arc::new(DnsPkarrServer::run().await.expect("DnsPkarrServer::run"));
 
-    let daemon_a = spawn_daemon(fresh_state(), lookup_a.clone()).await;
-    let daemon_b = spawn_daemon(fresh_state(), lookup_b.clone()).await;
-    lookup_a.add_endpoint_info(daemon_b.iroh_addr.clone());
-    lookup_b.add_endpoint_info(daemon_a.iroh_addr.clone());
+    let daemon_a = spawn_daemon(fresh_state(), testing_setup(&dns_pkarr)).await;
+    let daemon_b = spawn_daemon(fresh_state(), testing_setup(&dns_pkarr)).await;
 
-    (daemon_a, daemon_b)
+    for daemon in [&daemon_a, &daemon_b] {
+        dns_pkarr
+            .on_endpoint(&daemon.iroh_addr.id, PKARR_READY_TIMEOUT)
+            .await
+            .expect("daemon endpoint pkarr-published");
+    }
+
+    (daemon_a, daemon_b, dns_pkarr)
 }
 
 /// Wait for `events` to deliver an `Event::Message` whose payload

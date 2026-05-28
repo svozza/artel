@@ -21,7 +21,6 @@
 use std::path::Path;
 
 use iroh::Endpoint;
-use iroh::address_lookup::memory::MemoryLookup;
 use iroh::protocol::Router;
 use iroh_blobs::BlobsProtocol;
 use iroh_blobs::store::fs::FsStore;
@@ -29,6 +28,7 @@ use iroh_docs::protocol::Docs;
 use iroh_gossip::net::Gossip;
 
 use crate::WorkspaceError;
+use crate::endpoint_setup::EndpointSetup;
 use crate::keystore::load_or_create_secret;
 
 /// Per-`Workspace` iroh runtime. Held for the workspace's lifetime;
@@ -58,44 +58,28 @@ impl WorkspaceNode {
     ///
     /// Reuses any state already present, creates whatever's missing.
     ///
-    /// `address_lookup_override` swaps the production discovery path
-    /// (`presets::N0` — pkarr publish + DNS resolve via the n0
-    /// infrastructure) for a caller-supplied [`MemoryLookup`] on top
-    /// of `presets::Minimal`. Real deployments leave it `None`;
-    /// integration tests that run multiple workspace nodes in rapid
-    /// succession use it to take n0's externally-rate-limited DNS off
-    /// the critical path. With `Some(_)`, the relay-fallback path
-    /// is also disabled (Minimal has no relay), so the
-    /// `endpoint.online()` rendezvous is skipped — there's nothing to
-    /// rendezvous with.
+    /// `setup` controls the discovery layer (production n0 vs.
+    /// localhost test fixtures). [`EndpointSetup::Production`] also
+    /// awaits [`Endpoint::online`] for home-relay readiness;
+    /// [`EndpointSetup::Testing`] skips it (Minimal has no relay
+    /// and would hang).
     pub(crate) async fn spawn(
         state_dir: &Path,
-        address_lookup_override: Option<MemoryLookup>,
+        setup: &EndpointSetup,
     ) -> Result<Self, WorkspaceError> {
         let secret = load_or_create_secret(&state_dir.join("iroh.key"))
             .map_err(|e| WorkspaceError::Iroh(format!("workspace key: {e}")))?;
 
-        let endpoint = match address_lookup_override.clone() {
-            Some(lookup) => Endpoint::builder(iroh::endpoint::presets::Minimal)
-                .secret_key(secret)
-                .address_lookup(lookup)
-                .bind()
-                .await
-                .map_err(|e| WorkspaceError::Iroh(format!("bind endpoint: {e}")))?,
-            None => Endpoint::builder(iroh::endpoint::presets::N0)
-                .secret_key(secret)
-                .bind()
-                .await
-                .map_err(|e| WorkspaceError::Iroh(format!("bind endpoint: {e}")))?,
-        };
-
-        // When tests inject a MemoryLookup, also seed our own addr
-        // into it so peers cross-seeded with the same lookup can
-        // resolve us. The daemon does the same dance in its
-        // gossip_bridge — keep the test fixture symmetric.
-        if let Some(lookup) = address_lookup_override.as_ref() {
-            lookup.add_endpoint_info(endpoint.addr());
-        }
+        // Start from `presets::Empty` (no defaults set) and let the
+        // `EndpointSetup::apply` chain layer the discovery preset of
+        // its choice. Both Production (N0) and Testing (Minimal +
+        // DnsPkarrServer) set the crypto provider via the Minimal
+        // preset they each include.
+        let endpoint = setup
+            .apply(Endpoint::builder(iroh::endpoint::presets::Empty).secret_key(secret))
+            .bind()
+            .await
+            .map_err(|e| WorkspaceError::Iroh(format!("bind endpoint: {e}")))?;
 
         let gossip = Gossip::builder().spawn(endpoint.clone());
 
@@ -131,14 +115,13 @@ impl WorkspaceNode {
             .accept(iroh_docs::ALPN, docs.clone())
             .spawn();
 
-        // Block until the endpoint is ready to accept; without this a
-        // joiner that follows immediately can race us. `online()`
-        // resolves on home-relay readiness, which only exists under
-        // the N0 preset — Minimal+MemoryLookup has no relay and
-        // would hang here forever. Skipping is safe because the
-        // direct UDP path is bound by the time `bind().await`
-        // returned.
-        if address_lookup_override.is_none() {
+        // Production: block until the home-relay handshake
+        // completes so a joiner that follows immediately doesn't
+        // race us. Testing: skip — `presets::Minimal` has no relay
+        // and `online()` would never resolve. Direct UDP is already
+        // bound by the time `bind().await` returned, and the
+        // localhost pkarr+DNS pair publishes our addr synchronously.
+        if setup.awaits_relay() {
             endpoint.online().await;
         }
 

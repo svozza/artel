@@ -5,6 +5,8 @@
 //! in-process without going through `fork`/`exec`.
 
 #[cfg(feature = "iroh")]
+pub(crate) mod endpoint_setup;
+#[cfg(feature = "iroh")]
 pub(crate) mod gossip_bridge;
 #[cfg(feature = "iroh")]
 pub(crate) mod iroh_key;
@@ -15,5 +17,7 @@ pub mod shutdown;
 pub(crate) mod store;
 
 #[cfg(feature = "iroh")]
+pub use endpoint_setup::EndpointSetup;
+#[cfg(feature = "iroh")]
 pub use server::IrohRuntime;
-pub use server::{AddressLookupOverride, Daemon, DaemonConfig, StartError};
+pub use server::{Daemon, DaemonConfig, StartError};

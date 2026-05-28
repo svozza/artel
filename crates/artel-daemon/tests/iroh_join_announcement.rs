@@ -20,7 +20,7 @@ use tokio::time::timeout;
 
 #[tokio::test]
 async fn joiner_announces_membership_without_sending() {
-    let (daemon_a, daemon_b) = common::spawn_pair().await;
+    let (daemon_a, daemon_b, _dns_pkarr) = common::spawn_pair().await;
 
     // Alice on daemon A hosts and subscribes to her own session so we
     // can observe events for incoming peers.

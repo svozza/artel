@@ -21,6 +21,7 @@
 mod applier;
 pub mod attachment;
 pub mod echo_guard;
+mod endpoint_setup;
 pub mod error;
 pub mod filter;
 pub mod keys;
@@ -36,6 +37,7 @@ pub use attachment::{
     KIND_V1, KnownWorkspace, WorkspaceAttachmentV1, WorkspaceRole, list_known_workspaces,
 };
 pub use echo_guard::EchoGuard;
+pub use endpoint_setup::EndpointSetup;
 pub use error::{PolicyViolation, WorkspaceError};
 pub use filter::{FilterDecision, MAX_FILE_SIZE, SkipReason, WorkspaceFilter};
 pub use keys::{KEY_PREFIX, key_to_path, path_to_key};

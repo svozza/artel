@@ -4,3 +4,9 @@
 .idea
 .vscode
 .claude/settings.local.json
+
+# Throwaway test harnesses that aren't part of the public surface.
+# Live inside the worktree so they can pull `{ workspace = true }`
+# deps without restating versions; kept out of git so the public
+# repo doesn't carry TUI / Bedrock / etc. integration code.
+/examples/

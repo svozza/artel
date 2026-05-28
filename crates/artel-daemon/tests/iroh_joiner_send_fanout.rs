@@ -18,7 +18,7 @@ use pretty_assertions::assert_eq;
 
 #[tokio::test]
 async fn joiner_send_round_trips_through_host() {
-    let (daemon_a, daemon_b) = common::spawn_pair().await;
+    let (daemon_a, daemon_b, _dns_pkarr) = common::spawn_pair().await;
 
     // Alice on daemon A hosts.
     let alice_client = Client::connect(&daemon_a.socket).await.unwrap();

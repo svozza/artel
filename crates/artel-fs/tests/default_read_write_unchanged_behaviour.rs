@@ -10,6 +10,8 @@
 
 mod common;
 
+use common::testing_setup;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,8 +26,7 @@ async fn default_rules_give_unchanged_round_trip() {
     let common::Pair {
         daemon_a,
         daemon_b,
-        workspace_lookup_a,
-        workspace_lookup_b,
+        dns_pkarr,
     } = common::spawn_pair().await;
 
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
@@ -43,7 +44,7 @@ async fn default_rules_give_unchanged_round_trip() {
         alice_peer,
         alice_dir.path().to_path_buf(),
         AttachPolicy::AllowExisting,
-        WorkspaceConfig::default().with_address_lookup_override(workspace_lookup_a),
+        WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
     )
     .await
     .expect("Workspace::host_with");
@@ -72,7 +73,7 @@ async fn default_rules_give_unchanged_round_trip() {
         session,
         bob_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
-        WorkspaceConfig::default().with_address_lookup_override(workspace_lookup_b),
+        WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
     )
     .await
     .expect("Workspace::join_with");

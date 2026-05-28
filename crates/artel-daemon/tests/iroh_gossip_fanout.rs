@@ -17,7 +17,7 @@ use pretty_assertions::assert_eq;
 
 #[tokio::test]
 async fn host_sends_message_joiner_observes_via_gossip() {
-    let (daemon_a, daemon_b) = common::spawn_pair().await;
+    let (daemon_a, daemon_b, _dns_pkarr) = common::spawn_pair().await;
 
     // Alice on daemon A hosts.
     let alice_client = Client::connect(&daemon_a.socket).await.unwrap();

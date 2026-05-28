@@ -29,12 +29,15 @@
 
 mod common;
 
+use common::{daemon_testing_setup, testing_setup};
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use artel_client::Client;
 use artel_fs::{AttachPolicy, Workspace, WorkspaceConfig, session_id_for};
 use artel_protocol::{PeerId, PeerInfo, Request, Response};
+use iroh::test_utils::DnsPkarrServer;
 use tempfile::TempDir;
 
 // Long, deliberately linear two-phase scenario — extracting per-phase
@@ -46,7 +49,7 @@ use tempfile::TempDir;
 #[allow(clippy::too_many_lines, clippy::used_underscore_binding)]
 #[tokio::test(flavor = "multi_thread")]
 async fn re_hosting_recovers_session_id_and_resumes_message_flow() {
-    let shared = iroh::address_lookup::memory::MemoryLookup::new();
+    let dns_pkarr = Arc::new(DnsPkarrServer::run().await.unwrap());
 
     // Alice's persistent state: workspace root, workspace state dir,
     // and daemon state (iroh.key + sessions). All three outlive the
@@ -67,15 +70,15 @@ async fn re_hosting_recovers_session_id_and_resumes_message_flow() {
     // ---------------------------------------------------------------
     // Phase 1: Alice on daemon A1, Bob on daemon B. Live sync works.
     // ---------------------------------------------------------------
-    let daemon_b = common::spawn_daemon_with_lookup(bob_daemon_state, shared.clone()).await;
-    let daemon_a1 = common::spawn_daemon_with_lookup(alice_daemon_state, shared.clone()).await;
-    shared.add_endpoint_info(daemon_a1.iroh_addr.clone().expect("daemon_a1 iroh addr"));
-    shared.add_endpoint_info(daemon_b.iroh_addr.clone().expect("daemon_b iroh addr"));
+    let daemon_b =
+        common::spawn_daemon_with_setup(bob_daemon_state, daemon_testing_setup(&dns_pkarr)).await;
+    let daemon_a1 =
+        common::spawn_daemon_with_setup(alice_daemon_state, daemon_testing_setup(&dns_pkarr)).await;
 
     let alice_a1 = Client::connect(&daemon_a1.socket).await.unwrap();
     let alice_cfg = WorkspaceConfig::default()
         .with_state_dir(alice_wstate.path().to_path_buf())
-        .with_address_lookup_override(shared.clone());
+        .with_endpoint_setup(testing_setup(&dns_pkarr));
     let (alice_ws_1, _alice_events_1) = Workspace::host_with(
         &alice_a1,
         alice_peer.clone(),
@@ -114,7 +117,7 @@ async fn re_hosting_recovers_session_id_and_resumes_message_flow() {
 
     let bob_cfg = WorkspaceConfig::default()
         .with_state_dir(bob_wstate.path().to_path_buf())
-        .with_address_lookup_override(shared.clone());
+        .with_endpoint_setup(testing_setup(&dns_pkarr));
     let (bob_ws, _bob_events) = Workspace::join_with(
         &bob,
         session_id_1,
@@ -171,13 +174,14 @@ async fn re_hosting_recovers_session_id_and_resumes_message_flow() {
     // ---------------------------------------------------------------
     // Phase 2: fresh daemon A2 against Alice's same state dir.
     // ---------------------------------------------------------------
-    let daemon_a2 = common::spawn_daemon_with_lookup(alice_daemon_state_2, shared.clone()).await;
-    shared.add_endpoint_info(daemon_a2.iroh_addr.clone().expect("daemon_a2 iroh addr"));
+    let daemon_a2 =
+        common::spawn_daemon_with_setup(alice_daemon_state_2, daemon_testing_setup(&dns_pkarr))
+            .await;
 
     let alice_a2 = Client::connect(&daemon_a2.socket).await.unwrap();
     let alice_cfg_2 = WorkspaceConfig::default()
         .with_state_dir(alice_wstate.path().to_path_buf())
-        .with_address_lookup_override(shared.clone());
+        .with_endpoint_setup(testing_setup(&dns_pkarr));
     let (alice_ws_2, _alice_events_2) = Workspace::host_with(
         &alice_a2,
         alice_peer,

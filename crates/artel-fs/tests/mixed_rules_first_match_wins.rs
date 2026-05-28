@@ -10,6 +10,8 @@
 
 mod common;
 
+use common::testing_setup;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -103,8 +105,7 @@ async fn run_with_rules(rules: PathRules, expectation: Expectation) {
     let common::Pair {
         daemon_a,
         daemon_b,
-        workspace_lookup_a,
-        workspace_lookup_b,
+        dns_pkarr,
     } = common::spawn_pair().await;
 
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
@@ -116,7 +117,7 @@ async fn run_with_rules(rules: PathRules, expectation: Expectation) {
         alice_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
         WorkspaceConfig::default()
-            .with_address_lookup_override(workspace_lookup_a)
+            .with_endpoint_setup(testing_setup(&dns_pkarr))
             .with_rules(rules),
     )
     .await
@@ -146,7 +147,7 @@ async fn run_with_rules(rules: PathRules, expectation: Expectation) {
         session,
         bob_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
-        WorkspaceConfig::default().with_address_lookup_override(workspace_lookup_b),
+        WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
     )
     .await
     .expect("Workspace::join_with");

@@ -42,6 +42,7 @@ use tracing::{debug, warn};
 use walkdir::WalkDir;
 
 use crate::echo_guard::{EchoGuard, PENDING_RELEASE_GRACE};
+use crate::endpoint_setup::EndpointSetup;
 use crate::error::{PolicyViolation, WorkspaceError};
 use crate::filter::{FilterDecision, SkipReason, WorkspaceFilter};
 use crate::keys;
@@ -144,22 +145,21 @@ pub struct WorkspaceConfig {
     /// wrong ticket, daemons that can't reach each other).
     pub join_ticket_timeout: Option<Duration>,
 
-    /// Override the workspace's iroh-side discovery layer. Real
-    /// deployments leave this `None` — the workspace endpoint runs
-    /// `iroh::endpoint::presets::N0` and discovers peers via n0's
-    /// pkarr publish + DNS resolve. Integration tests that spin up
-    /// many workspace nodes in rapid succession set
-    /// [`Some(MemoryLookup)`] to swap discovery for an in-process
-    /// lookup table; this also disables the relay path (`Minimal`
-    /// preset has no relay) so n0's externally-rate-limited
-    /// services are entirely off the critical path.
+    /// Pick the workspace endpoint's discovery layer. Real
+    /// deployments use [`EndpointSetup::Production`] (the default —
+    /// `presets::N0`, pkarr publish + DNS resolve via n0
+    /// infrastructure, with home-relay readiness on `online()`).
+    /// Integration tests that spin up many workspace nodes in
+    /// rapid succession use [`EndpointSetup::Testing`] with a
+    /// shared `Arc<DnsPkarrServer>` so discovery runs against a
+    /// localhost pkarr+DNS pair — deterministic, fast, no n0
+    /// rate-limit exposure.
     ///
-    /// Mirrors the daemon's
-    /// [`artel_daemon::AddressLookupOverride`] knob — daemons and
-    /// workspaces share the same shape so test fixtures can seed
-    /// both with one cross-seeded lookup. See `tests/common/mod.rs`
-    /// (`spawn_pair`) for the canonical use.
-    pub address_lookup_override: Option<iroh::address_lookup::memory::MemoryLookup>,
+    /// Mirrors the daemon's [`DaemonConfig::endpoint_setup`] —
+    /// daemons and workspaces share the same shape so test fixtures
+    /// can hand one `Arc<DnsPkarrServer>` to both. See
+    /// `tests/common/mod.rs` (`spawn_pair`) for the canonical use.
+    pub endpoint_setup: EndpointSetup,
 
     /// Per-path read/write rules for this workspace.
     ///
@@ -193,15 +193,13 @@ impl WorkspaceConfig {
         self
     }
 
-    /// Set an in-process address lookup to substitute for n0's
-    /// pkarr/DNS discovery. See [`Self::address_lookup_override`]
-    /// for when this is appropriate (essentially: tests only).
+    /// Pick the workspace endpoint's discovery layer. See
+    /// [`Self::endpoint_setup`] for variant semantics. Production
+    /// is the default; tests pass an [`EndpointSetup::Testing`]
+    /// constructed from a shared `Arc<DnsPkarrServer>`.
     #[must_use]
-    pub fn with_address_lookup_override(
-        mut self,
-        lookup: iroh::address_lookup::memory::MemoryLookup,
-    ) -> Self {
-        self.address_lookup_override = Some(lookup);
+    pub fn with_endpoint_setup(mut self, setup: EndpointSetup) -> Self {
+        self.endpoint_setup = setup;
         self
     }
 
@@ -476,7 +474,7 @@ impl Workspace {
             state_dir,
             rules,
             compiled_rules,
-            config.address_lookup_override,
+            &config.endpoint_setup,
             &mut rb,
         )
         .await
@@ -500,10 +498,10 @@ impl Workspace {
         state_dir: PathBuf,
         rules: PathRules,
         compiled_rules: CompiledPathRules,
-        address_lookup_override: Option<iroh::address_lookup::memory::MemoryLookup>,
+        endpoint_setup: &EndpointSetup,
         rb: &mut WorkspaceRollback,
     ) -> Result<(Self, mpsc::Receiver<WorkspaceEvent>), WorkspaceError> {
-        let node = WorkspaceNode::spawn(&state_dir, address_lookup_override).await?;
+        let node = WorkspaceNode::spawn(&state_dir, endpoint_setup).await?;
         rb.node = Some(node);
         // Borrow the node back for the rest of the constructor — it
         // moves into `Self` at the end via `rb.disarm()`.
@@ -692,7 +690,7 @@ impl Workspace {
             root,
             state_dir,
             config.join_ticket_timeout,
-            config.address_lookup_override,
+            &config.endpoint_setup,
             &mut rb,
         )
         .await
@@ -713,10 +711,10 @@ impl Workspace {
         root: PathBuf,
         state_dir: PathBuf,
         join_ticket_timeout: Option<Duration>,
-        address_lookup_override: Option<iroh::address_lookup::memory::MemoryLookup>,
+        endpoint_setup: &EndpointSetup,
         rb: &mut WorkspaceRollback,
     ) -> Result<(Self, mpsc::Receiver<WorkspaceEvent>), WorkspaceError> {
-        let node = WorkspaceNode::spawn(&state_dir, address_lookup_override).await?;
+        let node = WorkspaceNode::spawn(&state_dir, endpoint_setup).await?;
         rb.node = Some(node);
         let node = rb.node.as_ref().expect("just stored");
         // Joiners don't persist a per-workspace `doc-id` — they

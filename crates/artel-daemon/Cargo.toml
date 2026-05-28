@@ -15,6 +15,11 @@ default = ["iroh"]
 # synthetic peer id, useful for tests and embeds that don't want the
 # network stack.
 iroh = ["dep:iroh", "dep:iroh-gossip", "dep:rand", "dep:bytes"]
+# Exposes `EndpointSetup::Testing { dns_pkarr }`, gated by iroh's
+# own `test-utils` feature so `iroh::test_utils::DnsPkarrServer` is
+# in scope. Implies `iroh` (the type only exists with a real
+# endpoint).
+test-utils = ["iroh", "iroh?/test-utils"]
 
 [dependencies]
 artel-protocol = { workspace = true, features = ["tokio"] }
@@ -37,8 +42,9 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 artel-client = { workspace = true }
+artel-daemon = { path = ".", features = ["test-utils"] }
 bytes = { workspace = true }
-iroh = { workspace = true }
+iroh = { workspace = true, features = ["test-utils"] }
 iroh-gossip = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }

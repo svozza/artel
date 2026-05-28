@@ -38,7 +38,7 @@ const SYSTEM_ACTION: &str = "workspace.ticket";
 #[tokio::test]
 #[allow(clippy::used_underscore_binding)]
 async fn joiner_replays_system_message_after_daemon_restart() {
-    let (daemon_a, daemon_b) = common::spawn_pair().await;
+    let (daemon_a, daemon_b, dns_pkarr) = common::spawn_pair().await;
 
     // Alice hosts.
     let alice_client = Client::connect(&daemon_a.socket).await.unwrap();
@@ -117,15 +117,12 @@ async fn joiner_replays_system_message_after_daemon_restart() {
         .expect("bob daemon join")
         .expect("bob daemon io");
 
-    // Spawn a fresh daemon at bob's same paths. Reuse alice's
-    // lookup so cross-seeding still works (each daemon's
-    // MemoryLookup is shared in-process, so a fresh daemon at
-    // the same iroh-key picks up alice's addr automatically). We
-    // build a fresh lookup since the first one was moved into
-    // the original daemon; the alice-side lookup still has bob's
-    // addr in it from the first cross-seed.
-    let lookup_b_2 = iroh::address_lookup::memory::MemoryLookup::new();
-    let daemon_b_2 = common::spawn_daemon(bob_state_2, lookup_b_2).await;
+    // Spawn a fresh daemon at bob's same paths. Reuse the shared
+    // `Arc<DnsPkarrServer>` so the new daemon's pkarr publish
+    // lands on the same localhost server alice is querying
+    // against — no cross-seeding needed, the pkarr+DNS pair is
+    // the address book.
+    let daemon_b_2 = common::spawn_daemon(bob_state_2, common::testing_setup(&dns_pkarr)).await;
     // No cross-seeding needed for this test: we're only reading
     // bob's local replay path. Bob's daemon doesn't dial alice
     // again because Subscribe just walks the persisted log.

@@ -8,6 +8,13 @@ repository.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+# Exposes `EndpointSetup::Testing { dns_pkarr }`, gated by iroh's
+# own `test-utils` feature so `iroh::test_utils::DnsPkarrServer` is
+# in scope. Off by default; integration tests turn it on (the
+# `dev-dependency` on `iroh` below already pulls it in for tests).
+test-utils = ["iroh/test-utils"]
+
 [dependencies]
 artel-client.workspace = true
 artel-protocol.workspace = true
@@ -33,9 +40,11 @@ unicode-normalization = "0.1"
 walkdir = "2"
 
 [dev-dependencies]
-artel-daemon = { path = "../artel-daemon" }
+artel-daemon = { path = "../artel-daemon", features = ["test-utils"] }
+artel-fs = { path = ".", features = ["test-utils"] }
 bytes.workspace = true
 futures-util.workspace = true
+iroh = { workspace = true, features = ["test-utils"] }
 nix = { workspace = true }
 pretty_assertions.workspace = true
 tempfile.workspace = true

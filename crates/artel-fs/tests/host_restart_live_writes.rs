@@ -43,11 +43,15 @@ use std::time::Duration;
 use artel_client::Client;
 use artel_fs::{AttachPolicy, TICKET_ACTION, Workspace, WorkspaceConfig, ticket as fs_ticket};
 use artel_protocol::{Event, MessageKind, PeerId, PeerInfo, Request, Response};
+use iroh::test_utils::DnsPkarrServer;
 use iroh_docs::DocTicket;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
-use common::{DaemonPaths, FILE_BUDGET, Pair, spawn_daemon_at, spawn_pair, wait_for_file};
+use common::{
+    DaemonPaths, FILE_BUDGET, daemon_testing_setup, fresh_state, spawn_daemon_at,
+    spawn_daemon_with_setup, testing_setup, wait_for_file,
+};
 
 const TICKET_BUDGET: Duration = Duration::from_secs(15);
 
@@ -67,35 +71,27 @@ async fn alice_post_restart_writes_reach_bob() {
     let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     let bob_peer = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
 
-    // Phase 1: bring alice's daemon up alongside bob's via spawn_pair,
-    // but immediately stop alice's so we can respawn at our own
-    // caller-owned paths. The reason we still go through spawn_pair
-    // is to seed the shared MemoryLookup with bob's iroh addr — we
-    // need the same lookup handle to survive across alice's daemon
-    // respawns so bob remains addressable from alice's perspective.
-    let Pair {
-        daemon_a: alice_throwaway,
-        daemon_b: bob_daemon,
-        workspace_lookup_a: alice_workspace_lookup,
-        workspace_lookup_b: bob_workspace_lookup,
-    } = spawn_pair().await;
-    // We don't use the throwaway alice daemon — drop the handle (which
-    // stops it) and respawn one we own at the right paths.
-    alice_throwaway.stop().await;
-
-    let alice_daemon = spawn_daemon_at(&alice_paths, Some(alice_workspace_lookup.clone())).await;
-    // Re-seed alice's daemon iroh-addr into the shared lookup so bob
-    // can dial alice when alice's workspace tries to reconcile.
-    if let Some(addr) = alice_daemon.iroh_addr.clone() {
-        alice_workspace_lookup.add_endpoint_info(addr);
-    }
+    // Phase 1: bring up the shared `DnsPkarrServer` directly, then
+    // spawn alice's daemon at caller-owned paths so the same on-disk
+    // state (including iroh secret) survives the mid-test restart.
+    // Bob's daemon uses `fresh_state()` since it doesn't restart.
+    //
+    // Under the `DnsPkarrServer` fixture, every endpoint that holds a
+    // clone of the same `Arc<DnsPkarrServer>` resolves via the same
+    // localhost server, so cross-seeding addresses (the old
+    // `MemoryLookup` dance) is unnecessary — alice's restart re-uses
+    // the same iroh secret from disk and republishes to the same
+    // pkarr server automatically.
+    let dns_pkarr = Arc::new(DnsPkarrServer::run().await.expect("DnsPkarrServer::run"));
+    let alice_daemon = spawn_daemon_at(&alice_paths, daemon_testing_setup(&dns_pkarr)).await;
+    let bob_daemon = spawn_daemon_with_setup(fresh_state(), daemon_testing_setup(&dns_pkarr)).await;
 
     // Phase 1: alice hosts, bob joins, exchange one file each way to
     // confirm baseline propagation before any restarts.
     let alice = Client::connect(&alice_daemon.socket).await.unwrap();
     let alice_cfg = WorkspaceConfig::default()
         .with_state_dir(alice_wstate.path().to_path_buf())
-        .with_address_lookup_override(alice_workspace_lookup.clone());
+        .with_endpoint_setup(testing_setup(&dns_pkarr));
     let (alice_ws, _alice_ws_events) = Workspace::host_with(
         &alice,
         alice_peer.clone(),
@@ -140,7 +136,7 @@ async fn alice_post_restart_writes_reach_bob() {
 
     let bob_cfg = WorkspaceConfig::default()
         .with_state_dir(bob_wstate.path().to_path_buf())
-        .with_address_lookup_override(bob_workspace_lookup.clone());
+        .with_endpoint_setup(testing_setup(&dns_pkarr));
     let (bob_ws, _bob_ws_events) = Workspace::join_with(
         &bob,
         session,
@@ -177,15 +173,15 @@ async fn alice_post_restart_writes_reach_bob() {
     alice_daemon.stop().await;
 
     // Phase 3: alice respawns. Same daemon-state dir, same workspace
-    // state dir, same root.
-    let alice_daemon = spawn_daemon_at(&alice_paths, Some(alice_workspace_lookup.clone())).await;
-    if let Some(addr) = alice_daemon.iroh_addr.clone() {
-        alice_workspace_lookup.add_endpoint_info(addr);
-    }
+    // state dir, same root. The shared `DnsPkarrServer` survives
+    // (it's held by this test, not by the daemon), so alice's new
+    // endpoint republishes to the same localhost server bob already
+    // knows about — no manual address-book reseed needed.
+    let alice_daemon = spawn_daemon_at(&alice_paths, daemon_testing_setup(&dns_pkarr)).await;
     let alice = Client::connect(&alice_daemon.socket).await.unwrap();
     let alice_cfg = WorkspaceConfig::default()
         .with_state_dir(alice_wstate.path().to_path_buf())
-        .with_address_lookup_override(alice_workspace_lookup.clone());
+        .with_endpoint_setup(testing_setup(&dns_pkarr));
     let (alice_ws, _alice_ws_events) = Workspace::host_with(
         &alice,
         alice_peer,

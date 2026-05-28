@@ -21,14 +21,17 @@
 
 mod common;
 
+use common::daemon_testing_setup;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use artel_client::Client;
-use artel_fs::{AttachPolicy, Workspace, WorkspaceEvent, path_to_key};
+use artel_fs::{AttachPolicy, Workspace, WorkspaceConfig, WorkspaceEvent, path_to_key};
 use artel_protocol::{PeerId, PeerInfo};
 use futures_util::StreamExt;
+use iroh::test_utils::DnsPkarrServer;
 use iroh_docs::store::Query;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -39,6 +42,9 @@ const POLL: Duration = Duration::from_millis(50);
 /// Minimal harness: one daemon, one client, one host workspace.
 /// The joiner side is irrelevant for this property — empty-file
 /// rejection is purely about the host's watcher → `set_bytes` path.
+/// Returns the [`Arc<DnsPkarrServer>`] so the caller can keep it
+/// alive for the workspace's lifetime — dropping it shuts down
+/// the localhost pkarr+DNS pair the workspace endpoint needs.
 async fn spawn_host_workspace() -> (
     common::RunningDaemon,
     Client,
@@ -46,26 +52,28 @@ async fn spawn_host_workspace() -> (
     tokio::task::JoinHandle<()>,
     mpsc::Receiver<WorkspaceEvent>,
     TempDir,
+    Arc<DnsPkarrServer>,
 ) {
-    let daemon = common::spawn_daemon_with_lookup(
-        common::fresh_state(),
-        iroh::address_lookup::memory::MemoryLookup::new(),
-    )
-    .await;
+    let dns_pkarr = Arc::new(DnsPkarrServer::run().await.expect("dns_pkarr"));
+    let daemon =
+        common::spawn_daemon_with_setup(common::fresh_state(), daemon_testing_setup(&dns_pkarr))
+            .await;
     let client = Client::connect(&daemon.socket).await.unwrap();
     let peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "host");
     let dir = tempfile::tempdir().unwrap();
-    let (ws, events) = Workspace::host(
+    let cfg = WorkspaceConfig::default().with_endpoint_setup(common::testing_setup(&dns_pkarr));
+    let (ws, events) = Workspace::host_with(
         &client,
         peer,
         dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
+        cfg,
     )
     .await
-    .expect("Workspace::host");
+    .expect("Workspace::host_with");
     let ws = Arc::new(ws);
     let handle = Arc::clone(&ws).run().await;
-    (daemon, client, ws, handle, events, dir)
+    (daemon, client, ws, handle, events, dir, dns_pkarr)
 }
 
 /// Drain `events` into a thread-shared `Vec<String>` of error
@@ -110,7 +118,7 @@ async fn wait_for_entry(ws: &Workspace, path: &std::path::Path, budget: Duration
 
 #[tokio::test(flavor = "multi_thread")]
 async fn touching_empty_file_does_not_error_and_does_not_publish() {
-    let (daemon, client, ws, handle, events, dir) = spawn_host_workspace().await;
+    let (daemon, client, ws, handle, events, dir, _dns_pkarr) = spawn_host_workspace().await;
     let errors = collect_errors(events);
 
     // `touch` an empty file. canonicalise the workspace's root

@@ -121,7 +121,10 @@ fn build_config(args: &Args) -> Result<DaemonConfig, String> {
         sessions_dir,
         daemon_peer_id,
         iroh_key_path,
-        address_lookup: None,
+        #[cfg(feature = "iroh")]
+        endpoint_setup: artel_daemon::EndpointSetup::default(),
+        #[cfg(not(feature = "iroh"))]
+        endpoint_setup: (),
     })
 }
 

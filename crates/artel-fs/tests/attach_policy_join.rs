@@ -14,12 +14,15 @@
 
 mod common;
 
+use common::{daemon_testing_setup, testing_setup};
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use artel_client::Client;
 use artel_fs::{AttachPolicy, PolicyViolation, Workspace, WorkspaceConfig, WorkspaceError};
 use artel_protocol::{PeerId, PeerInfo, Request, Response, SessionId};
+use iroh::test_utils::DnsPkarrServer;
 use tempfile::TempDir;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -27,8 +30,7 @@ async fn join_require_empty_rejects_non_empty_dir_without_creating_state() {
     let common::Pair {
         daemon_a,
         daemon_b,
-        workspace_lookup_a,
-        workspace_lookup_b: _,
+        dns_pkarr,
     } = common::spawn_pair().await;
 
     // Stand the host up so there's a real session + ticket to join
@@ -42,7 +44,7 @@ async fn join_require_empty_rejects_non_empty_dir_without_creating_state() {
         alice_peer,
         alice_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
-        WorkspaceConfig::default().with_address_lookup_override(workspace_lookup_a),
+        WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
     )
     .await
     .expect("Workspace::host");
@@ -118,11 +120,10 @@ async fn join_require_empty_rejects_non_empty_dir_without_creating_state() {
 async fn join_init_from_existing_is_rejected() {
     // No host needed — the policy check fires before the joiner
     // does any session work.
-    let daemon = common::spawn_daemon_with_lookup(
-        common::fresh_state(),
-        iroh::address_lookup::memory::MemoryLookup::new(),
-    )
-    .await;
+    let dns_pkarr = Arc::new(DnsPkarrServer::run().await.unwrap());
+    let daemon =
+        common::spawn_daemon_with_setup(common::fresh_state(), daemon_testing_setup(&dns_pkarr))
+            .await;
     let client = Client::connect(&daemon.socket).await.unwrap();
 
     // We need *some* session id to pass to `join`, but the policy

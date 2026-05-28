@@ -18,6 +18,8 @@
 
 mod common;
 
+use common::testing_setup;
+
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -60,8 +62,7 @@ async fn workspace_state_survives_graceful_restart() {
         let common::Pair {
             daemon_a,
             daemon_b,
-            workspace_lookup_a,
-            workspace_lookup_b,
+            dns_pkarr,
         } = common::spawn_pair().await;
 
         let alice = Client::connect(&daemon_a.socket).await.unwrap();
@@ -71,7 +72,7 @@ async fn workspace_state_survives_graceful_restart() {
         // returns the daemon-issued artel ticket.
         let alice_cfg = WorkspaceConfig::default()
             .with_state_dir(alice_wstate.path().to_path_buf())
-            .with_address_lookup_override(workspace_lookup_a);
+            .with_endpoint_setup(testing_setup(&dns_pkarr));
         let (alice_ws, _alice_ws_events) = Workspace::host_with(
             &alice,
             alice_peer.clone(),
@@ -121,7 +122,7 @@ async fn workspace_state_survives_graceful_restart() {
 
         let bob_cfg = WorkspaceConfig::default()
             .with_state_dir(bob_wstate.path().to_path_buf())
-            .with_address_lookup_override(workspace_lookup_b);
+            .with_endpoint_setup(testing_setup(&dns_pkarr));
         let (bob_ws, _bob_ws_events) = Workspace::join_with(
             &bob,
             session,
@@ -181,15 +182,14 @@ async fn workspace_state_survives_graceful_restart() {
     let common::Pair {
         daemon_a,
         daemon_b,
-        workspace_lookup_a,
-        workspace_lookup_b,
+        dns_pkarr,
     } = common::spawn_pair().await;
 
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
 
     let alice_cfg = WorkspaceConfig::default()
         .with_state_dir(alice_wstate.path().to_path_buf())
-        .with_address_lookup_override(workspace_lookup_a);
+        .with_endpoint_setup(testing_setup(&dns_pkarr));
     let (alice_ws, _alice_ws_events) = Workspace::host_with(
         &alice,
         alice_peer,
@@ -248,7 +248,7 @@ async fn workspace_state_survives_graceful_restart() {
 
     let bob_cfg = WorkspaceConfig::default()
         .with_state_dir(bob_wstate.path().to_path_buf())
-        .with_address_lookup_override(workspace_lookup_b);
+        .with_endpoint_setup(testing_setup(&dns_pkarr));
     let (bob_ws, _bob_ws_events) = Workspace::join_with(
         &bob,
         session,

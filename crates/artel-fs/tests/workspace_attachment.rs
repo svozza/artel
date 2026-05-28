@@ -18,6 +18,8 @@
 
 mod common;
 
+use common::{daemon_testing_setup, testing_setup};
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,6 +32,7 @@ use artel_fs::{
     list_known_workspaces,
 };
 use artel_protocol::{Attachment, PeerId, PeerInfo, Request, Response};
+use iroh::test_utils::DnsPkarrServer;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
@@ -80,7 +83,7 @@ impl DaemonHarness {
             sessions_dir: sessions,
             daemon_peer_id: PeerId::from_bytes([0xee; 32]),
             iroh_key_path: None,
-            address_lookup: None,
+            endpoint_setup: artel_daemon::EndpointSetup::Production,
         })
         .await
         .expect("daemon start");
@@ -107,21 +110,22 @@ impl DaemonHarness {
 #[tokio::test(flavor = "multi_thread")]
 async fn host_workspace_registers_attachment_via_ipc() {
     let harness = DaemonHarness::spawn().await;
+    let dns_pkarr = Arc::new(DnsPkarrServer::run().await.unwrap());
 
     let alice = Client::connect(&harness.socket).await.unwrap();
     let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
 
     let ws_root = tempfile::tempdir().unwrap();
     let ws_state = tempfile::tempdir().unwrap();
-    // Plumb MemoryLookup so the workspace's iroh node skips n0
-    // discovery (`endpoint.online()` waits on n0 home-relay
-    // registration under presets::N0; that's externally rate-limited
-    // and flakes in CI). No peer participates in this test, so an
-    // empty-but-present MemoryLookup is enough to take the Minimal
-    // preset path.
+    // Plumb a localhost `DnsPkarrServer` so the workspace's iroh
+    // node skips n0 discovery (`endpoint.online()` waits on n0
+    // home-relay registration under presets::N0; that's externally
+    // rate-limited and flakes in CI). No peer participates in this
+    // test, so a per-test localhost server is enough to take the
+    // testing preset path.
     let cfg = WorkspaceConfig::default()
         .with_state_dir(ws_state.path().to_path_buf())
-        .with_address_lookup_override(iroh::address_lookup::memory::MemoryLookup::new());
+        .with_endpoint_setup(testing_setup(&dns_pkarr));
 
     let (workspace, _events) = Workspace::host_with(
         &alice,
@@ -164,8 +168,7 @@ async fn join_workspace_registers_attachment_via_ipc() {
     let common::Pair {
         daemon_a,
         daemon_b,
-        workspace_lookup_a,
-        workspace_lookup_b,
+        dns_pkarr,
     } = pair;
 
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
@@ -176,7 +179,7 @@ async fn join_workspace_registers_attachment_via_ipc() {
         alice_peer,
         alice_root.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
-        WorkspaceConfig::default().with_address_lookup_override(workspace_lookup_a),
+        WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
     )
     .await
     .expect("Workspace::host");
@@ -203,7 +206,7 @@ async fn join_workspace_registers_attachment_via_ipc() {
         session,
         bob_root.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
-        WorkspaceConfig::default().with_address_lookup_override(workspace_lookup_b),
+        WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
     )
     .await
     .expect("Workspace::join");
@@ -234,14 +237,15 @@ async fn join_workspace_registers_attachment_via_ipc() {
 #[tokio::test(flavor = "multi_thread")]
 async fn list_known_workspaces_helper_returns_typed_view() {
     let harness = DaemonHarness::spawn().await;
+    let dns_pkarr = Arc::new(DnsPkarrServer::run().await.unwrap());
 
     let alice = Client::connect(&harness.socket).await.unwrap();
     let alice_peer = PeerInfo::new(PeerId::from_bytes([3; 32]), "alice");
     let ws_root = tempfile::tempdir().unwrap();
-    // MemoryLookup → workspace iroh node uses Minimal preset, skips
-    // n0 discovery. See `host_workspace_registers_attachment_via_ipc`.
-    let cfg = WorkspaceConfig::default()
-        .with_address_lookup_override(iroh::address_lookup::memory::MemoryLookup::new());
+    // Localhost `DnsPkarrServer` → workspace iroh node uses testing
+    // preset, skips n0 discovery. See
+    // `host_workspace_registers_attachment_via_ipc`.
+    let cfg = WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr));
     let (workspace, _events) = Workspace::host_with(
         &alice,
         alice_peer,
@@ -278,7 +282,12 @@ async fn attachment_persists_across_daemon_restart() {
     // its host daemon crashing. Re-host at the same state dir, then
     // assert `list_known_workspaces` reports the same workspace
     // entry — same session, same paths, same role.
-    let shared = iroh::address_lookup::memory::MemoryLookup::new();
+    //
+    // The localhost `DnsPkarrServer` is shared across both phases
+    // (cloned into each daemon and into each workspace) so the
+    // pkarr publish from phase 1 outlives the daemon restart and
+    // phase 2 republishes against the same fixture.
+    let dns_pkarr = Arc::new(DnsPkarrServer::run().await.unwrap());
 
     let alice_root = TempDir::new().unwrap();
     let alice_wstate = TempDir::new().unwrap();
@@ -286,13 +295,13 @@ async fn attachment_persists_across_daemon_restart() {
     let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
 
     // Phase 1: host once, capture session id and attachment.
-    let daemon_a1 = common::spawn_daemon_with_lookup(alice_daemon_state, shared.clone()).await;
-    shared.add_endpoint_info(daemon_a1.iroh_addr.clone().expect("daemon_a1 iroh addr"));
+    let daemon_a1 =
+        common::spawn_daemon_with_setup(alice_daemon_state, daemon_testing_setup(&dns_pkarr)).await;
 
     let alice_a1 = Client::connect(&daemon_a1.socket).await.unwrap();
     let cfg_1 = WorkspaceConfig::default()
         .with_state_dir(alice_wstate.path().to_path_buf())
-        .with_address_lookup_override(shared.clone());
+        .with_endpoint_setup(testing_setup(&dns_pkarr));
     let (alice_ws_1, _alice_events_1) = Workspace::host_with(
         &alice_a1,
         alice_peer.clone(),
@@ -331,8 +340,9 @@ async fn attachment_persists_across_daemon_restart() {
     // Phase 2: fresh daemon, same state dir, same workspace. Stable
     // session id means the attachment from phase 1 is still indexed
     // under the same `(session, kind)` key on disk.
-    let daemon_a2 = common::spawn_daemon_with_lookup(alice_daemon_state_2, shared.clone()).await;
-    shared.add_endpoint_info(daemon_a2.iroh_addr.clone().expect("daemon_a2 iroh addr"));
+    let daemon_a2 =
+        common::spawn_daemon_with_setup(alice_daemon_state_2, daemon_testing_setup(&dns_pkarr))
+            .await;
 
     let alice_a2 = Client::connect(&daemon_a2.socket).await.unwrap();
 
@@ -367,7 +377,7 @@ async fn attachment_persists_across_daemon_restart() {
     // stable, which is the property the constructor uniquely provides.
     let cfg_2 = WorkspaceConfig::default()
         .with_state_dir(alice_wstate.path().to_path_buf())
-        .with_address_lookup_override(shared.clone());
+        .with_endpoint_setup(testing_setup(&dns_pkarr));
     let (alice_ws_2, _alice_events_2) = Workspace::host_with(
         &alice_a2,
         alice_peer,
@@ -395,14 +405,15 @@ async fn attachment_persists_across_daemon_restart() {
 #[tokio::test(flavor = "multi_thread")]
 async fn attachment_removed_on_host_leave_session() {
     let harness = DaemonHarness::spawn().await;
+    let dns_pkarr = Arc::new(DnsPkarrServer::run().await.unwrap());
 
     let alice = Client::connect(&harness.socket).await.unwrap();
     let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     let ws_root = tempfile::tempdir().unwrap();
-    // MemoryLookup → workspace iroh node uses Minimal preset, skips
-    // n0 discovery. See `host_workspace_registers_attachment_via_ipc`.
-    let cfg = WorkspaceConfig::default()
-        .with_address_lookup_override(iroh::address_lookup::memory::MemoryLookup::new());
+    // Localhost `DnsPkarrServer` → workspace iroh node uses testing
+    // preset, skips n0 discovery. See
+    // `host_workspace_registers_attachment_via_ipc`.
+    let cfg = WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr));
     let (workspace, _events) = Workspace::host_with(
         &alice,
         alice_peer,
@@ -450,8 +461,7 @@ async fn attachment_removed_on_joiner_leave_session() {
     let common::Pair {
         daemon_a,
         daemon_b,
-        workspace_lookup_a,
-        workspace_lookup_b,
+        dns_pkarr,
     } = pair;
 
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
@@ -462,7 +472,7 @@ async fn attachment_removed_on_joiner_leave_session() {
         alice_peer,
         alice_root.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
-        WorkspaceConfig::default().with_address_lookup_override(workspace_lookup_a),
+        WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
     )
     .await
     .expect("Workspace::host");
@@ -489,7 +499,7 @@ async fn attachment_removed_on_joiner_leave_session() {
         session,
         bob_root.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
-        WorkspaceConfig::default().with_address_lookup_override(workspace_lookup_b),
+        WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
     )
     .await
     .expect("Workspace::join");

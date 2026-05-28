@@ -16,6 +16,8 @@
 
 mod common;
 
+use common::testing_setup;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -49,8 +51,7 @@ async fn round_trip_once(run: usize) {
     let common::Pair {
         daemon_a,
         daemon_b,
-        workspace_lookup_a,
-        workspace_lookup_b,
+        dns_pkarr,
     } = pair;
 
     // Alice on daemon A hosts the artel session + workspace.
@@ -62,7 +63,7 @@ async fn round_trip_once(run: usize) {
         alice_peer,
         alice_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
-        WorkspaceConfig::default().with_address_lookup_override(workspace_lookup_a),
+        WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
     )
     .await
     .expect("Workspace::host");
@@ -92,7 +93,7 @@ async fn round_trip_once(run: usize) {
         session,
         bob_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
-        WorkspaceConfig::default().with_address_lookup_override(workspace_lookup_b),
+        WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
     )
     .await
     .expect("Workspace::join");

@@ -17,13 +17,14 @@ use artel_fs::{AttachPolicy, Workspace, WorkspaceConfig};
 use artel_protocol::{PeerId, PeerInfo, Request, Response};
 use tokio::time::sleep;
 
+use common::testing_setup;
+
 #[tokio::test(flavor = "multi_thread")]
 async fn live_edit_propagates_host_to_joiner() {
     let common::Pair {
         daemon_a,
         daemon_b,
-        workspace_lookup_a,
-        workspace_lookup_b,
+        dns_pkarr,
     } = common::spawn_pair().await;
 
     // Alice hosts.
@@ -36,7 +37,7 @@ async fn live_edit_propagates_host_to_joiner() {
         alice_peer,
         alice_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
-        WorkspaceConfig::default().with_address_lookup_override(workspace_lookup_a),
+        WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
     )
     .await
     .expect("Workspace::host");
@@ -66,7 +67,7 @@ async fn live_edit_propagates_host_to_joiner() {
         session,
         bob_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
-        WorkspaceConfig::default().with_address_lookup_override(workspace_lookup_b),
+        WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
     )
     .await
     .expect("Workspace::join");

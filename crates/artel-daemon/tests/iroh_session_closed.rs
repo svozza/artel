@@ -21,7 +21,7 @@ use tokio::time::timeout;
 
 #[tokio::test]
 async fn host_close_propagates_session_closed_to_joiner() {
-    let (daemon_a, daemon_b) = common::spawn_pair().await;
+    let (daemon_a, daemon_b, _dns_pkarr) = common::spawn_pair().await;
 
     // Alice on daemon A hosts.
     let alice_client = Client::connect(&daemon_a.socket).await.unwrap();

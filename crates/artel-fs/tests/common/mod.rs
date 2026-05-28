@@ -1,28 +1,24 @@
 //! Shared fixtures for `artel-fs` integration tests.
 //!
 //! Two flavours of harness:
-//! - [`spawn_local_daemon`] — single iroh-disabled daemon, used by
-//!   tests that only exercise client IPC paths (e.g.
-//!   `host_publishes_ticket.rs`).
-//! - [`spawn_pair`] — two iroh-enabled daemons with cross-seeded
-//!   [`MemoryLookup`]s. Mirrors `artel-daemon`'s test fixture so the
-//!   artel session traffic between the two daemons doesn't depend
-//!   on the n0 relay infrastructure being reachable.
+//! - [`spawn_local_daemon`] / [`DaemonHarness`]-style — single
+//!   iroh-disabled daemon, used by tests that only exercise client
+//!   IPC paths (e.g. `host_publishes_ticket.rs`).
+//! - [`spawn_pair`] — two iroh-enabled daemons sharing one
+//!   localhost [`DnsPkarrServer`]. Mirrors `artel-daemon`'s test
+//!   fixture so the artel session traffic between the two daemons
+//!   doesn't depend on n0's pkarr/DNS infrastructure being
+//!   reachable.
 //!
-//! [`spawn_pair`] returns the same [`MemoryLookup`] handles back to
-//! the caller as [`Pair::workspace_lookup_a`] /
-//! [`Pair::workspace_lookup_b`] so callers can plumb them into the
-//! `address_lookup_override` field of [`artel_fs::WorkspaceConfig`].
-//! Doing so takes the per-workspace iroh nodes off n0 too, which
-//! eliminates the rapid-iteration flakiness traced in
-//! `docs/handoff-stale-daemon.md` (n0 DNS publish/resolve has
-//! external rate limits and TTLs that fresh-tempdir tests have no
-//! reason to be paying).
-//!
-//! Tests that exercise the production discovery path (e.g.
-//! `iroh_docs_smoke.rs`) deliberately *don't* use this fixture —
-//! they keep `presets::N0` so the discovery contract stays under
-//! regression coverage somewhere.
+//! [`spawn_pair`] hands the same [`Arc<DnsPkarrServer>`] back to
+//! the caller as [`Pair::dns_pkarr`] so tests can plumb it into
+//! per-workspace [`artel_fs::WorkspaceConfig`]s via
+//! [`WorkspaceConfig::with_endpoint_setup`]. All four endpoints
+//! (daemon A, daemon B, workspace A, workspace B) sharing the same
+//! pkarr+DNS pair is what makes cross-peer tests deterministic —
+//! every endpoint that holds a clone of the same Arc resolves to
+//! the same shared state, exactly the same code path as production
+//! except the localhost transport.
 
 #![allow(dead_code, unreachable_pub, clippy::redundant_pub_crate)]
 
@@ -31,10 +27,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use artel_daemon::shutdown::Shutdown;
-use artel_daemon::{AddressLookupOverride, Daemon, DaemonConfig};
+use artel_daemon::{Daemon, DaemonConfig, EndpointSetup as DaemonEndpointSetup};
+use artel_fs::EndpointSetup as FsEndpointSetup;
 use artel_protocol::PeerId;
 use futures_util::StreamExt;
-use iroh::address_lookup::memory::MemoryLookup;
+use iroh::test_utils::DnsPkarrServer;
 use iroh_docs::api::Doc;
 use iroh_docs::store::Query;
 use tempfile::TempDir;
@@ -45,6 +42,14 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Default deadline budget. 15s covers notify debounce (300ms) +
 /// doc `set_bytes` + sync + applier + `tokio::fs::write` under load.
 pub const FILE_BUDGET: Duration = Duration::from_secs(15);
+
+/// How long to wait for a freshly-bound endpoint to publish its
+/// pkarr record to the localhost server. Generous because endpoint
+/// startup includes reading the on-disk secret + binding QUIC + the
+/// pkarr publish loop kicking in. A failure here means the test
+/// would have raced regardless; surfacing it as a fixture-side
+/// timeout makes the cause clear.
+pub const PKARR_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Poll `path` until it contains `expected` exactly, or panic with
 /// the path on timeout.
@@ -129,16 +134,45 @@ impl RunningDaemon {
     }
 }
 
+/// Build the daemon-side `EndpointSetup::Testing` variant from
+/// the shared fixture. `Arc::clone` is cheap (refcount bump); the
+/// `dns_pkarr` field stays the same across every endpoint that
+/// uses this fixture, so all of them resolve via the same
+/// localhost server.
+pub fn daemon_testing_setup(dns_pkarr: &Arc<DnsPkarrServer>) -> DaemonEndpointSetup {
+    DaemonEndpointSetup::Testing {
+        dns_pkarr: Arc::clone(dns_pkarr),
+    }
+}
+
+/// Workspace-side companion to [`daemon_testing_setup`]. The
+/// daemon and workspace each define their own `EndpointSetup`
+/// enum (peer crates, neither depending on the other) so
+/// cross-crate setup values can't be shared by type. Both wrap
+/// the same `Arc<DnsPkarrServer>`. `WorkspaceConfig` callers
+/// pass this in; `DaemonConfig` callers pass [`daemon_testing_setup`].
+pub fn testing_setup(dns_pkarr: &Arc<DnsPkarrServer>) -> FsEndpointSetup {
+    FsEndpointSetup::Testing {
+        dns_pkarr: Arc::clone(dns_pkarr),
+    }
+}
+
 /// Bring an iroh-enabled daemon up against the supplied
-/// `MemoryLookup` (used for cross-daemon addressing in tests).
-pub async fn spawn_daemon_with_lookup(state: DaemonState, lookup: MemoryLookup) -> RunningDaemon {
+/// [`EndpointSetup`]. Used by [`spawn_pair`] for the shared
+/// `Testing` setup; tests that need a single daemon (e.g. the
+/// single-daemon attachment cases in `workspace_attachment.rs`)
+/// can call this directly with their own per-test fixture.
+pub async fn spawn_daemon_with_setup(
+    state: DaemonState,
+    setup: DaemonEndpointSetup,
+) -> RunningDaemon {
     let daemon = Daemon::start(DaemonConfig {
         socket_path: state.socket.clone(),
         pid_path: state.pid.clone(),
         sessions_dir: state.sessions.clone(),
         daemon_peer_id: FALLBACK_PEER,
         iroh_key_path: Some(state.iroh_key.clone()),
-        address_lookup: Some(AddressLookupOverride(lookup)),
+        endpoint_setup: setup,
     })
     .await
     .expect("daemon start");
@@ -201,21 +235,21 @@ impl DaemonHandle {
     }
 }
 
-/// Bring an iroh-enabled daemon up at fixed paths. Pass
-/// `Some(lookup)` to share an in-process [`MemoryLookup`] with peer
-/// daemons / workspaces (eliminates the n0 production discovery
-/// path); pass `None` to use full n0 discovery (relays + DNS),
-/// which is what production runs against. The directory containing
-/// `paths` is the caller's responsibility — it must outlive the
-/// daemon and any planned restarts.
-pub async fn spawn_daemon_at(paths: &DaemonPaths, lookup: Option<MemoryLookup>) -> DaemonHandle {
+/// Bring an iroh-enabled daemon up at fixed paths.
+///
+/// Pass [`EndpointSetup::Testing`] (built via [`testing_setup`]) for
+/// fast deterministic tests; pass [`EndpointSetup::Production`] (the
+/// default) for real-n0 tests. The directory containing `paths` is
+/// the caller's responsibility — it must outlive the daemon and any
+/// planned restarts.
+pub async fn spawn_daemon_at(paths: &DaemonPaths, setup: DaemonEndpointSetup) -> DaemonHandle {
     let daemon = Daemon::start(DaemonConfig {
         socket_path: paths.socket.clone(),
         pid_path: paths.pid.clone(),
         sessions_dir: paths.sessions.clone(),
         daemon_peer_id: FALLBACK_PEER,
         iroh_key_path: Some(paths.iroh_key.clone()),
-        address_lookup: lookup.map(AddressLookupOverride),
+        endpoint_setup: setup,
     })
     .await
     .expect("daemon start");
@@ -231,52 +265,62 @@ pub async fn spawn_daemon_at(paths: &DaemonPaths, lookup: Option<MemoryLookup>) 
     }
 }
 
-/// Two cross-seeded daemons plus the [`MemoryLookup`] handles the
-/// caller hands to each side's [`artel_fs::WorkspaceConfig`].
-///
-/// Returned as a struct rather than a long tuple so adding a new
-/// handle (e.g. a third daemon, a fourth lookup) doesn't ripple
-/// through every test's `let (a, b) = spawn_pair().await;`.
+/// Two daemons sharing one [`DnsPkarrServer`]. Tests that call
+/// [`spawn_pair`] hand `dns_pkarr` clones into every workspace
+/// they create so the workspace endpoints resolve via the same
+/// localhost server.
 pub struct Pair {
     pub daemon_a: RunningDaemon,
     pub daemon_b: RunningDaemon,
-    /// Hand to daemon A's workspace via
-    /// `WorkspaceConfig::with_address_lookup_override`.
-    pub workspace_lookup_a: MemoryLookup,
-    /// Hand to daemon B's workspace via
-    /// `WorkspaceConfig::with_address_lookup_override`.
-    pub workspace_lookup_b: MemoryLookup,
+    /// The shared localhost DNS+pkarr fixture. Cloned into both
+    /// daemons (already done) and into each workspace's
+    /// `EndpointSetup::Testing` (caller's responsibility, via
+    /// [`testing_setup`]). The fixture's localhost servers stay
+    /// alive as long as any clone of this Arc exists.
+    pub dns_pkarr: Arc<DnsPkarrServer>,
 }
 
-/// Spin two daemons up and cross-seed their address books so the
-/// artel session traffic flows between them. The same lookups are
-/// returned via [`Pair::workspace_lookup_a`] /
-/// [`Pair::workspace_lookup_b`] so the per-workspace iroh nodes
-/// can share the same discovery substrate — both daemon and
-/// workspace endpoints participate in one in-process address
-/// book and n0's externally-rate-limited DNS layer is fully off
-/// the test's critical path.
+/// Spin two daemons up sharing a single localhost
+/// [`DnsPkarrServer`].
 ///
-/// All four nodes (daemon A, daemon B, workspace A, workspace B)
-/// share **one** underlying [`MemoryLookup`] map (cloned across
-/// participants — the inner state is `Arc<RwLock<BTreeMap>>`, so
-/// clones share storage). Any node that registers itself becomes
-/// resolvable to every other node. Two-lookup cross-seeding can't
-/// work for workspaces: workspace A's id isn't known when daemon B
-/// is constructed and vice versa, so a clone-on-creation pattern
-/// is the only setup that's race-free at fixture time.
+/// Both daemons publish their pkarr records to the shared server
+/// during [`Daemon::start`]'s endpoint bind; this helper waits via
+/// [`DnsPkarrServer::on_endpoint`] until each one is queryable
+/// before returning, so the first cross-peer dial in the test
+/// can't race the publish. Eliminates the propagation-window
+/// flakes that the old `MemoryLookup` fixture papered over.
 pub async fn spawn_pair() -> Pair {
-    let shared = MemoryLookup::new();
+    let dns_pkarr = Arc::new(DnsPkarrServer::run().await.expect("DnsPkarrServer::run"));
 
-    let daemon_a = spawn_daemon_with_lookup(fresh_state(), shared.clone()).await;
-    let daemon_b = spawn_daemon_with_lookup(fresh_state(), shared.clone()).await;
-    shared.add_endpoint_info(daemon_a.iroh_addr.clone().expect("daemon_a iroh addr"));
-    shared.add_endpoint_info(daemon_b.iroh_addr.clone().expect("daemon_b iroh addr"));
+    let daemon_a = spawn_daemon_with_setup(fresh_state(), daemon_testing_setup(&dns_pkarr)).await;
+    let daemon_b = spawn_daemon_with_setup(fresh_state(), daemon_testing_setup(&dns_pkarr)).await;
+
+    for daemon in [&daemon_a, &daemon_b] {
+        let addr = daemon.iroh_addr.as_ref().expect("daemon iroh addr");
+        wait_for_endpoint(&dns_pkarr, &addr.id).await;
+    }
 
     Pair {
         daemon_a,
         daemon_b,
-        workspace_lookup_a: shared.clone(),
-        workspace_lookup_b: shared,
+        dns_pkarr,
     }
+}
+
+/// Wait until `endpoint_id` has published its pkarr record to the
+/// shared localhost server, or panic on timeout.
+///
+/// Use this on the *workspace* endpoints too: a workspace's iroh
+/// node binds during [`artel_fs::Workspace::host_with`] /
+/// [`artel_fs::Workspace::join_with`] and pkarr-publishes shortly
+/// after; tests that immediately dial the other side from a
+/// freshly-constructed workspace can race the publish. The
+/// daemon-side `spawn_pair` already gates on the daemon endpoints,
+/// but tests that observe workspace-to-workspace traffic
+/// (everything in the cross-peer suite) want this gate too.
+pub async fn wait_for_endpoint(dns_pkarr: &DnsPkarrServer, endpoint_id: &iroh::EndpointId) {
+    dns_pkarr
+        .on_endpoint(endpoint_id, PKARR_READY_TIMEOUT)
+        .await
+        .expect("endpoint pkarr-published in time");
 }

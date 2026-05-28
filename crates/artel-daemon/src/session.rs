@@ -571,16 +571,16 @@ impl Registry {
                 });
             };
 
-            let host_endpoint_addr =
-                wire_addr_to_iroh(host_peer_id, host_addr).map_err(SessionError::InvalidAddr)?;
+            // The wire-form `host_addr` (relay url + direct IPs) is
+            // ignored here on purpose: under both production
+            // (`presets::N0` → n0 DNS) and test
+            // (`presets::Minimal + DnsPkarrServer`) endpoint setups,
+            // the host's pkarr-published record carries that data
+            // already. The bootstrap `host_peer` is enough; iroh's
+            // configured address-lookup chain resolves it.
+            let _ = host_addr;
             bridge
-                .join_session(
-                    session_id,
-                    joiner.clone(),
-                    *host_peer_id,
-                    host_endpoint_addr,
-                    on_message,
-                )
+                .join_session(session_id, joiner.clone(), *host_peer_id, on_message)
                 .await
                 .map_err(|e| SessionError::Internal(e.to_string()))?;
 
@@ -1047,35 +1047,6 @@ impl Registry {
 /// host peer id is decoded but not yet used (Phase 2c will route on
 /// it). Any decode failure surfaces as [`SessionError::InvalidTicket`]
 /// so the daemon doesn't leak parser internals over the wire.
-/// Convert a wire-form host addr into an iroh `EndpointAddr`. The
-/// relay URL string parses as a [`iroh::RelayUrl`]; direct addrs
-/// pass through. Surfaces parse errors as a [`String`] so the
-/// caller can map to [`SessionError::InvalidAddr`] without leaking
-/// iroh types.
-#[cfg(feature = "iroh")]
-fn wire_addr_to_iroh(
-    host_peer_id: &PeerId,
-    addr: &WireEndpointAddr,
-) -> Result<iroh::EndpointAddr, String> {
-    use iroh::TransportAddr;
-
-    let id = iroh::EndpointId::from_bytes(host_peer_id.as_bytes())
-        .map_err(|e| format!("bad endpoint id: {e}"))?;
-    let mut endpoint_addr = iroh::EndpointAddr::new(id);
-    if !addr.relay_url.is_empty() {
-        let relay: iroh::RelayUrl = addr
-            .relay_url
-            .parse()
-            .map_err(|e| format!("relay url: {e}"))?;
-        endpoint_addr = endpoint_addr.with_relay_url(relay);
-    }
-    if !addr.direct_addrs.is_empty() {
-        endpoint_addr =
-            endpoint_addr.with_addrs(addr.direct_addrs.iter().map(|s| TransportAddr::Ip(*s)));
-    }
-    Ok(endpoint_addr)
-}
-
 fn parse_ticket(ticket: &JoinTicket) -> Result<SessionTicket, SessionError> {
     ticket::decode(ticket.as_str()).map_err(|err| {
         // Log the underlying TicketError at debug; the wire-facing

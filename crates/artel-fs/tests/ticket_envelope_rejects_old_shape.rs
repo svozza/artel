@@ -14,6 +14,8 @@
 
 mod common;
 
+use common::testing_setup;
+
 use std::time::Duration;
 
 use artel_client::Client;
@@ -28,8 +30,7 @@ async fn joiner_rejects_old_shape_doc_ticket_payload() {
     let common::Pair {
         daemon_a,
         daemon_b,
-        workspace_lookup_a: _,
-        workspace_lookup_b,
+        dns_pkarr,
     } = common::spawn_pair().await;
 
     // Alice hosts the artel session but does NOT stand up a
@@ -94,7 +95,7 @@ async fn joiner_rejects_old_shape_doc_ticket_payload() {
             session,
             bob_dir.path().to_path_buf(),
             AttachPolicy::RequireEmpty,
-            WorkspaceConfig::default().with_address_lookup_override(workspace_lookup_b),
+            WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
         ),
     )
     .await

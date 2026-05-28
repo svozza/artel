@@ -53,10 +53,10 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
 
     // Real n0 discovery — both daemons get `None` for address
     // lookup, so they go through pkarr + DNS like production.
-    let alice_daemon = spawn_daemon_at(&alice_paths, None).await;
+    let alice_daemon = spawn_daemon_at(&alice_paths, artel_daemon::EndpointSetup::Production).await;
     let bob_daemon_state = fresh_state();
     let bob_paths = DaemonPaths::at(bob_daemon_state.root.path());
-    let bob_daemon = spawn_daemon_at(&bob_paths, None).await;
+    let bob_daemon = spawn_daemon_at(&bob_paths, artel_daemon::EndpointSetup::Production).await;
 
     // Phase 1: alice hosts, bob joins, exchange one file each way.
     let alice = Client::connect(&alice_daemon.socket).await.unwrap();
@@ -136,7 +136,7 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
     // Phase 3: alice respawns at the same daemon-state and
     // workspace-state dirs. iroh.key + doc-id keep her identity
     // stable; n0 discovery has to find bob via pkarr/DNS again.
-    let alice_daemon = spawn_daemon_at(&alice_paths, None).await;
+    let alice_daemon = spawn_daemon_at(&alice_paths, artel_daemon::EndpointSetup::Production).await;
     let alice = Client::connect(&alice_daemon.socket).await.unwrap();
     let alice_cfg = WorkspaceConfig::default().with_state_dir(alice_wstate.path().to_path_buf());
     let (alice_ws, _alice_ws_events) = Workspace::host_with(

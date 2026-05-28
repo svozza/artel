@@ -8,11 +8,10 @@
 //! two endpoints. **No `Registry` traffic** is involved here; that
 //! plumbing arrives in 2c-2.
 //!
-//! Discovery is bypassed by giving each daemon a [`MemoryLookup`]
-//! and seeding it with the other endpoint's [`EndpointAddr`] before
-//! subscribing. That's also how we expect production tests to keep
-//! running deterministically without relying on the n0 relay
-//! infrastructure being reachable.
+//! Discovery runs against a localhost
+//! [`iroh::test_utils::DnsPkarrServer`] shared by both daemons —
+//! same code path as production, just pointing at a localhost
+//! pkarr+DNS pair instead of n0's. Deterministic and fast.
 
 #![cfg(feature = "iroh")]
 
@@ -21,11 +20,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use artel_daemon::shutdown::Shutdown;
-use artel_daemon::{AddressLookupOverride, Daemon, DaemonConfig};
+use artel_daemon::{Daemon, DaemonConfig, EndpointSetup};
 use artel_protocol::PeerId;
 use bytes::Bytes;
 use futures_util::StreamExt;
-use iroh::address_lookup::memory::MemoryLookup;
+use iroh::test_utils::DnsPkarrServer;
 use iroh_gossip::api::Event;
 use iroh_gossip::proto::TopicId;
 use tempfile::TempDir;
@@ -53,14 +52,16 @@ fn fresh_state() -> State {
     }
 }
 
-async fn spawn_daemon(state: &State, lookup: MemoryLookup) -> RunningDaemon {
+async fn spawn_daemon(state: &State, dns_pkarr: &Arc<DnsPkarrServer>) -> RunningDaemon {
     let daemon = Daemon::start(DaemonConfig {
         socket_path: state.socket.clone(),
         pid_path: state.pid.clone(),
         sessions_dir: state.sessions.clone(),
         daemon_peer_id: FALLBACK_PEER,
         iroh_key_path: Some(state.iroh_key.clone()),
-        address_lookup: Some(AddressLookupOverride(lookup)),
+        endpoint_setup: EndpointSetup::Testing {
+            dns_pkarr: Arc::clone(dns_pkarr),
+        },
     })
     .await
     .expect("daemon start");
@@ -94,16 +95,12 @@ impl RunningDaemon {
 
 #[tokio::test]
 async fn two_daemons_exchange_a_payload_over_gossip() {
+    let dns_pkarr = Arc::new(DnsPkarrServer::run().await.expect("dns_pkarr"));
     let state_a = fresh_state();
     let state_b = fresh_state();
 
-    // Each daemon gets its own MemoryLookup; we hold a clone so we
-    // can seed the *other* daemon's EndpointAddr after both are up.
-    let lookup_a = MemoryLookup::new();
-    let lookup_b = MemoryLookup::new();
-
-    let daemon_a = spawn_daemon(&state_a, lookup_a.clone()).await;
-    let daemon_b = spawn_daemon(&state_b, lookup_b.clone()).await;
+    let daemon_a = spawn_daemon(&state_a, &dns_pkarr).await;
+    let daemon_b = spawn_daemon(&state_b, &dns_pkarr).await;
 
     let addr_a = daemon_a.runtime.endpoint.addr();
     let addr_b = daemon_b.runtime.endpoint.addr();
@@ -111,10 +108,19 @@ async fn two_daemons_exchange_a_payload_over_gossip() {
     let id_b = addr_b.id;
     assert_ne!(id_a, id_b, "both daemons must have distinct identities");
 
-    // Cross-seed: A learns where B lives, B learns where A lives.
-    // Without this, the gossip subscribe wouldn't be able to dial.
-    lookup_a.add_endpoint_info(addr_b);
-    lookup_b.add_endpoint_info(addr_a);
+    // Wait until both daemons' pkarr records are queryable on the
+    // shared localhost server. Without this, the joiner's first
+    // dial can race the publisher's announce loop. The timeout
+    // budget is generous; a real failure here is a publish loop
+    // bug, not a network race.
+    dns_pkarr
+        .on_endpoint(&id_a, Duration::from_secs(10))
+        .await
+        .expect("daemon A pkarr-published");
+    dns_pkarr
+        .on_endpoint(&id_b, Duration::from_secs(10))
+        .await
+        .expect("daemon B pkarr-published");
 
     // Both subscribe to the same topic. A is the "host" (empty
     // bootstrap); B bootstraps from A.

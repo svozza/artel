@@ -242,12 +242,23 @@ async fn steady_state_sigkill_preserves_state() {
     // discovery path. They're slower and flakier than the in-process
     // tests because of it; that's the price of testing a real
     // SIGKILL → restart cycle. See `docs/handoff-stale-daemon.md`.
-    let common::Pair {
-        daemon_a,
-        daemon_b,
-        workspace_lookup_a: _,
-        workspace_lookup_b: _,
-    } = common::spawn_pair().await;
+    // Crash-recovery tests are inherently real-n0: the child binary
+    // runs in a separate process, so it can't share an in-process
+    // `DnsPkarrServer` (or any other in-process discovery fixture)
+    // with the parent. Both sides go through n0's production
+    // discovery path. Slower and flakier than the in-process suite
+    // — that's the price of testing a real SIGKILL → restart cycle.
+    // See `docs/handoff-stale-daemon.md`.
+    let daemon_a = common::spawn_daemon_with_setup(
+        common::fresh_state(),
+        artel_daemon::EndpointSetup::Production,
+    )
+    .await;
+    let daemon_b = common::spawn_daemon_with_setup(
+        common::fresh_state(),
+        artel_daemon::EndpointSetup::Production,
+    )
+    .await;
 
     let alice_root = tempfile::tempdir().unwrap();
     let alice_wstate = tempfile::tempdir().unwrap();
@@ -350,12 +361,23 @@ async fn steady_state_sigkill_preserves_state() {
 async fn mid_scan_sigkill_recovers_via_reconcile() {
     const N: usize = 16;
 
-    let common::Pair {
-        daemon_a,
-        daemon_b,
-        workspace_lookup_a: _,
-        workspace_lookup_b: _,
-    } = common::spawn_pair().await;
+    // Crash-recovery tests are inherently real-n0: the child binary
+    // runs in a separate process, so it can't share an in-process
+    // `DnsPkarrServer` (or any other in-process discovery fixture)
+    // with the parent. Both sides go through n0's production
+    // discovery path. Slower and flakier than the in-process suite
+    // — that's the price of testing a real SIGKILL → restart cycle.
+    // See `docs/handoff-stale-daemon.md`.
+    let daemon_a = common::spawn_daemon_with_setup(
+        common::fresh_state(),
+        artel_daemon::EndpointSetup::Production,
+    )
+    .await;
+    let daemon_b = common::spawn_daemon_with_setup(
+        common::fresh_state(),
+        artel_daemon::EndpointSetup::Production,
+    )
+    .await;
 
     let alice_root = tempfile::tempdir().unwrap();
     let alice_wstate = tempfile::tempdir().unwrap();
@@ -433,12 +455,23 @@ async fn mid_scan_sigkill_recovers_via_reconcile() {
 /// the prior process didn't get to publish.
 #[tokio::test(flavor = "multi_thread")]
 async fn mid_write_sigkill_resyncs_on_restart() {
-    let common::Pair {
-        daemon_a,
-        daemon_b,
-        workspace_lookup_a: _,
-        workspace_lookup_b: _,
-    } = common::spawn_pair().await;
+    // Crash-recovery tests are inherently real-n0: the child binary
+    // runs in a separate process, so it can't share an in-process
+    // `DnsPkarrServer` (or any other in-process discovery fixture)
+    // with the parent. Both sides go through n0's production
+    // discovery path. Slower and flakier than the in-process suite
+    // — that's the price of testing a real SIGKILL → restart cycle.
+    // See `docs/handoff-stale-daemon.md`.
+    let daemon_a = common::spawn_daemon_with_setup(
+        common::fresh_state(),
+        artel_daemon::EndpointSetup::Production,
+    )
+    .await;
+    let daemon_b = common::spawn_daemon_with_setup(
+        common::fresh_state(),
+        artel_daemon::EndpointSetup::Production,
+    )
+    .await;
 
     let alice_root = tempfile::tempdir().unwrap();
     let alice_wstate = tempfile::tempdir().unwrap();

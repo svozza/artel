@@ -40,7 +40,9 @@ impl DaemonHarness {
             sessions_dir: tempdir.path().join("sessions"),
             daemon_peer_id: DAEMON_PEER,
             iroh_key_path: None,
-            address_lookup: None,
+            // Default; ignored because `iroh_key_path: None` keeps
+            // the daemon local-only — no endpoint stood up.
+            endpoint_setup: artel_daemon::EndpointSetup::default(),
         })
         .await
         .expect("daemon start");

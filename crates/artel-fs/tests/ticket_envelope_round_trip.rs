@@ -8,6 +8,8 @@
 
 mod common;
 
+use common::testing_setup;
+
 use std::time::Duration;
 
 use artel_client::Client;
@@ -21,8 +23,7 @@ async fn rules_round_trip_via_envelope() {
     let common::Pair {
         daemon_a,
         daemon_b,
-        workspace_lookup_a,
-        workspace_lookup_b,
+        dns_pkarr,
     } = common::spawn_pair().await;
 
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
@@ -49,7 +50,7 @@ async fn rules_round_trip_via_envelope() {
         alice_dir.path().to_path_buf(),
         AttachPolicy::AllowExisting,
         WorkspaceConfig::default()
-            .with_address_lookup_override(workspace_lookup_a)
+            .with_endpoint_setup(testing_setup(&dns_pkarr))
             .with_rules(configured_rules.clone()),
     )
     .await
@@ -94,7 +95,7 @@ async fn rules_round_trip_via_envelope() {
             bob_dir.path().to_path_buf(),
             AttachPolicy::RequireEmpty,
             WorkspaceConfig::default()
-                .with_address_lookup_override(workspace_lookup_b)
+                .with_endpoint_setup(testing_setup(&dns_pkarr))
                 .with_rules(bob_distractor_rules.clone()),
         ),
     )

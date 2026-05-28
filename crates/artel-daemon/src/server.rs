@@ -22,6 +22,8 @@ use tokio::sync::{Mutex as AsyncMutex, broadcast};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
+#[cfg(feature = "iroh")]
+use crate::endpoint_setup::EndpointSetup;
 use crate::pidfile::{PidError, PidFile};
 use crate::session::{Registry, SessionError, Subscription};
 use crate::shutdown::{Shutdown, ShutdownToken};
@@ -48,37 +50,28 @@ pub struct DaemonConfig {
     /// in place of [`Self::daemon_peer_id`]. When `None`, the daemon
     /// stays local-only and advertises the synthetic peer id.
     pub iroh_key_path: Option<PathBuf>,
-    /// Optional override for the iroh endpoint's address-lookup
-    /// system. Real deployments leave this `None` and let iroh
-    /// discover peers via DNS/relay; integration tests that run two
-    /// in-process daemons on `localhost` use it to seed each
-    /// daemon with the other's [`iroh::EndpointAddr`] and skip
-    /// network discovery.
+    /// Pick the iroh endpoint's discovery layer when the `iroh`
+    /// feature is on and an [`Self::iroh_key_path`] is supplied.
+    /// Real deployments use [`EndpointSetup::Production`] (default
+    /// — `presets::N0`, pkarr publish + DNS resolve via n0
+    /// infrastructure). Integration tests use
+    /// [`EndpointSetup::Testing`] with a shared
+    /// `Arc<DnsPkarrServer>` so two in-process daemons share a
+    /// localhost pkarr+DNS pair instead of paying n0's external
+    /// rate limits.
     ///
-    /// Only meaningful when the `iroh` feature is on and an
-    /// [`Self::iroh_key_path`] is supplied. The field is
-    /// unconditionally present so callers can construct
-    /// [`DaemonConfig`] with the same struct literal regardless of
-    /// feature flags; without `iroh`, the inner type is a unit
-    /// placeholder and the option must be `None`.
-    pub address_lookup: Option<AddressLookupOverride>,
+    /// Without the `iroh` feature this field is unconditionally
+    /// present so callers can construct [`DaemonConfig`] with the
+    /// same struct literal regardless of feature flags; the
+    /// `Production` default works in either case (the value is
+    /// just ignored in the no-iroh build).
+    #[cfg(feature = "iroh")]
+    pub endpoint_setup: EndpointSetup,
+    /// Placeholder so the struct shape doesn't drift between
+    /// feature flags. Always `()` without `iroh`.
+    #[cfg(not(feature = "iroh"))]
+    pub endpoint_setup: (),
 }
-
-/// Iroh-feature-conditional payload for
-/// [`DaemonConfig::address_lookup`].
-///
-/// With the `iroh` feature on, this wraps a
-/// [`iroh::address_lookup::memory::MemoryLookup`]; without the
-/// feature it's an uninhabited type, so the option always
-/// serialises to `None`.
-#[cfg(feature = "iroh")]
-#[derive(Debug, Clone)]
-pub struct AddressLookupOverride(pub iroh::address_lookup::memory::MemoryLookup);
-
-/// Iroh-feature-off placeholder — uninhabited.
-#[cfg(not(feature = "iroh"))]
-#[derive(Debug, Clone)]
-pub enum AddressLookupOverride {}
 
 /// Errors returned from [`Daemon::start`].
 #[derive(Debug, thiserror::Error)]
@@ -184,16 +177,11 @@ impl Daemon {
         // - Otherwise: use the caller-supplied peer id and don't
         //   stand up any iroh runtime. Keeps tests fast and lets
         //   embeds opt out of the network stack entirely.
-        // Keep a clone of the MemoryLookup (if any) so the gossip
-        // bridge can reach into it later when joiners arrive with
-        // out-of-band addrs to seed.
-        #[cfg(feature = "iroh")]
-        let address_lookup_for_bridge = config.address_lookup.as_ref().map(|o| o.0.clone());
         #[cfg(feature = "iroh")]
         let (daemon_peer_id, iroh) = resolve_iroh_runtime(
             config.iroh_key_path.as_deref(),
             config.daemon_peer_id,
-            config.address_lookup,
+            &config.endpoint_setup,
         )
         .await?;
         #[cfg(not(feature = "iroh"))]
@@ -216,12 +204,9 @@ impl Daemon {
         // for the daemon's lifetime; sessions register themselves
         // with it as they're hosted/joined.
         #[cfg(feature = "iroh")]
-        let bridge = iroh.as_ref().map(|rt| {
-            Arc::new(crate::gossip_bridge::GossipBridge::new(
-                rt.gossip.clone(),
-                address_lookup_for_bridge,
-            ))
-        });
+        let bridge = iroh
+            .as_ref()
+            .map(|rt| Arc::new(crate::gossip_bridge::GossipBridge::new(rt.gossip.clone())));
 
         let store: crate::store::DynStore = Arc::new(
             crate::store::FsLogStore::open(&config.sessions_dir)
@@ -655,18 +640,17 @@ async fn dispatch_attachment(registry: &Registry, request: Request) -> Response 
 async fn resolve_iroh_runtime(
     key_path: Option<&std::path::Path>,
     fallback_peer_id: artel_protocol::PeerId,
-    address_lookup: Option<AddressLookupOverride>,
+    setup: &EndpointSetup,
 ) -> Result<(artel_protocol::PeerId, Option<IrohRuntime>), StartError> {
     let Some(path) = key_path else {
         return Ok((fallback_peer_id, None));
     };
     let secret =
         crate::iroh_key::load_or_create(path).map_err(|e| StartError::Iroh(e.to_string()))?;
-    let mut builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0).secret_key(secret);
-    if let Some(AddressLookupOverride(lookup)) = address_lookup {
-        builder = builder.address_lookup(lookup);
-    }
-    let endpoint = builder
+    // Start from `presets::Empty` so the `EndpointSetup::apply` chain
+    // has full control over which discovery preset gets layered in.
+    let endpoint = setup
+        .apply(iroh::Endpoint::builder(iroh::endpoint::presets::Empty).secret_key(secret))
         .bind()
         .await
         .map_err(|e| StartError::Iroh(format!("bind endpoint: {e}")))?;
@@ -840,7 +824,10 @@ mod tests {
             sessions_dir,
             daemon_peer_id: PeerId::from_bytes([0xee; 32]),
             iroh_key_path: None,
-            address_lookup: None,
+            #[cfg(feature = "iroh")]
+            endpoint_setup: EndpointSetup::default(),
+            #[cfg(not(feature = "iroh"))]
+            endpoint_setup: (),
         }
     }
 

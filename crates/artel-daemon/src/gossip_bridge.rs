@@ -45,8 +45,6 @@ use artel_protocol::rpc::SendPayload;
 use artel_protocol::{PeerId, PeerInfo, ProtocolError, Seq, SessionId, SessionMessage};
 use bytes::Bytes;
 use futures_util::StreamExt;
-use iroh::EndpointAddr;
-use iroh::address_lookup::memory::MemoryLookup;
 use iroh_gossip::api::Event as IrohGossipEvent;
 use iroh_gossip::net::Gossip;
 use iroh_gossip::proto::TopicId;
@@ -72,11 +70,6 @@ const SEND_REMOTE_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Debug)]
 pub(crate) struct GossipBridge {
     gossip: Gossip,
-    /// Address book the daemon was built with, when present. Joiners
-    /// inject the host's [`iroh::EndpointAddr`] here so the gossip
-    /// dial finds it. `None` means we're relying on iroh's default
-    /// discovery.
-    address_lookup: Option<MemoryLookup>,
     /// Live topic handles, keyed by session id. We keep the sender
     /// alive for the lifetime of the session so broadcasts work; the
     /// receiver is owned by a forwarder task whose `JoinHandle` lives
@@ -126,14 +119,17 @@ enum SessionRole {
 }
 
 impl GossipBridge {
-    /// Construct a bridge wrapping `gossip`. `address_lookup` is the
-    /// same handle the daemon's [`iroh::Endpoint`] was built with;
-    /// joiners reach into it to seed the host's addr before
-    /// subscribing.
-    pub(crate) fn new(gossip: Gossip, address_lookup: Option<MemoryLookup>) -> Self {
+    /// Construct a bridge wrapping `gossip`. The daemon's
+    /// [`iroh::Endpoint`] does its own discovery via the configured
+    /// [`crate::EndpointSetup`] — this used to take a
+    /// `MemoryLookup` the bridge would seed on join, but
+    /// `EndpointSetup::Testing`'s [`iroh::test_utils::DnsPkarrServer`]
+    /// publishes the host's addr automatically and
+    /// `EndpointSetup::Production` resolves it from n0's DNS, so
+    /// the bridge no longer needs an addr-book back-channel.
+    pub(crate) fn new(gossip: Gossip) -> Self {
         Self {
             gossip,
-            address_lookup,
             sessions: Mutex::new(HashMap::new()),
             pending_sends: Mutex::new(HashMap::new()),
             registry: Mutex::new(Weak::new()),
@@ -161,12 +157,13 @@ impl GossipBridge {
             .await
     }
 
-    /// Subscribe to a session's gossip topic as **joiner**. Seeds
-    /// the daemon's address book with `host_addr` so the gossip
-    /// dial succeeds, then subscribes with `host_peer` as the
-    /// bootstrap. Spawns a forwarder task that decodes inbound
-    /// gossip frames and pushes the resulting [`SessionMessage`]s
-    /// into `on_message`.
+    /// Subscribe to a session's gossip topic as **joiner**.
+    /// Subscribes with `host_peer` as the bootstrap and lets iroh's
+    /// configured discovery (n0 DNS in production, the test
+    /// `DnsPkarrServer` under [`crate::EndpointSetup::Testing`])
+    /// resolve the host's `EndpointAddr` on demand. Spawns a
+    /// forwarder task that decodes inbound gossip frames and pushes
+    /// the resulting [`SessionMessage`]s into `on_message`.
     ///
     /// Once the gossip mesh is up, broadcasts a
     /// [`GossipBody::JoinAnnouncement`] carrying `joiner` so the
@@ -180,12 +177,8 @@ impl GossipBridge {
         session: SessionId,
         joiner: PeerInfo,
         host_peer: PeerId,
-        host_addr: EndpointAddr,
         on_message: impl Fn(SessionMessage) + Send + Sync + 'static,
     ) -> Result<(), BridgeError> {
-        if let Some(lookup) = &self.address_lookup {
-            lookup.add_endpoint_info(host_addr);
-        }
         let host_endpoint_id = iroh::EndpointId::from_bytes(host_peer.as_bytes())
             .map_err(|e| BridgeError::Iroh(format!("bad host peer id: {e}")))?;
         self.subscribe_inner(
