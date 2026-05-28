@@ -707,6 +707,8 @@ None — documentation only.
 
 6. **Postcard-decode failures in `list_known_workspaces` are silently skipped.** A future `KIND_V1` schema breakage (adding a required field) would surface as warn-and-skip, not an error. This is the conservative choice — a single bad payload shouldn't take down enumeration — but it does mean a bug that corrupts payloads goes unnoticed unless someone reads logs. Mitigation: `list_known_workspaces` uses `tracing::warn!` so a structured-logging consumer can alert. If we ever want strict mode, a sibling `list_known_workspaces_strict` is the additive way.
 
+7. **Joiner-side `LeaveSession` does not cascade the joiner's attachment.** `Registry::leave` only invokes `store.delete(session)` when the leaver is the host (which closes the session). For a joiner, it calls `store.remove_member` and the session record (and therefore the attachment) lingers — `list_known_workspaces` keeps reporting the workspace even after the joiner has left. Pinned by `joiner_leave_session_does_not_cascade_attachment_today` as a fail-loud regression-trap: the day a fix lands the test will fail and force the brainstorm/plan/test to be re-aligned. Two reasonable closes (each a separate slice): (a) `Workspace::shutdown` issues an explicit `ForgetAttachment` before tearing down; (b) `Registry::leave` for a non-host on a remote-mirror with no other local consumers fully drops the mirror (which would also cascade the attachment via the existing 2b `remove_dir_all`).
+
 ---
 
 ## Critical files for implementation

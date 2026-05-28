@@ -432,3 +432,109 @@ async fn attachment_removed_on_host_leave_session() {
     drop(alice);
     harness.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn joiner_leave_session_does_not_cascade_attachment_today() {
+    // Pins the *current* (deliberately documented) gap in the
+    // cascade contract: the daemon's `Registry::leave` cascades the
+    // store's attachments only on a host-leave (which closes the
+    // session). A joiner's `LeaveSession` calls `remove_member`,
+    // which preserves the session record — and therefore preserves
+    // the joiner's attachment in `<session>/attachments/`.
+    //
+    // The brainstorm's `last_seen` fast-follow + an explicit
+    // `ForgetAttachment` emitted by `Workspace::shutdown` (or by a
+    // future joiner-leave path that fully drops the remote-mirror)
+    // are the two reasonable ways to close this gap. Until one of
+    // those lands, this test fails-loud if a future change makes the
+    // joiner-side cascade work — at which point flip the assertion
+    // and update the brainstorm/plan.
+    //
+    // The companion `attachment_removed_on_host_leave_session` test
+    // covers the host-side cascade that *does* work today.
+    let pair = common::spawn_pair().await;
+    let common::Pair {
+        daemon_a,
+        daemon_b,
+        workspace_lookup_a,
+        workspace_lookup_b,
+    } = pair;
+
+    let alice = Client::connect(&daemon_a.socket).await.unwrap();
+    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
+    let alice_root = tempfile::tempdir().unwrap();
+    let (alice_ws, _alice_events) = Workspace::host_with(
+        &alice,
+        alice_peer,
+        alice_root.path().to_path_buf(),
+        AttachPolicy::RequireEmpty,
+        WorkspaceConfig::default().with_address_lookup_override(workspace_lookup_a),
+    )
+    .await
+    .expect("Workspace::host");
+    let session = alice_ws.session_id();
+    let ticket = alice_ws
+        .join_ticket()
+        .expect("host has join_ticket")
+        .clone();
+
+    let bob = Client::connect(&daemon_b.socket).await.unwrap();
+    let bob_peer = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
+    let resp = bob
+        .request(Request::JoinSession {
+            peer: bob_peer,
+            ticket,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(resp, Response::JoinSession { .. }), "{resp:?}");
+
+    let bob_root = tempfile::tempdir().unwrap();
+    let (bob_ws, _bob_events) = Workspace::join_with(
+        &bob,
+        session,
+        bob_root.path().to_path_buf(),
+        AttachPolicy::RequireEmpty,
+        WorkspaceConfig::default().with_address_lookup_override(workspace_lookup_b),
+    )
+    .await
+    .expect("Workspace::join");
+
+    // Sanity: each daemon has exactly its own attachment.
+    assert_eq!(raw_list(&alice, Some(KIND_V1)).await.len(), 1);
+    assert_eq!(raw_list(&bob, Some(KIND_V1)).await.len(), 1);
+
+    bob.request(Request::LeaveSession { session })
+        .await
+        .expect("bob LeaveSession");
+
+    // CURRENT BEHAVIOUR: bob's joiner attachment lingers. Flip this
+    // assertion when a fix lands.
+    let bob_entries = raw_list(&bob, Some(KIND_V1)).await;
+    assert_eq!(
+        bob_entries.len(),
+        1,
+        "TODO(joiner-cascade): bob's joiner attachment lingers after \
+         LeaveSession because Registry::leave preserves the remote-\
+         mirror session for non-host leavers. See test docstring.",
+    );
+    let bob_decoded = WorkspaceAttachmentV1::decode(&bob_entries[0].payload).expect("bob decode");
+    assert_eq!(bob_decoded.role, WorkspaceRole::Joiner);
+
+    // Alice's host attachment is on a different daemon — fully
+    // untouched by bob's leave.
+    let alice_entries = raw_list(&alice, Some(KIND_V1)).await;
+    assert_eq!(
+        alice_entries.len(),
+        1,
+        "alice's host attachment must NOT be affected by bob leaving",
+    );
+    assert_eq!(alice_entries[0].session, session);
+
+    alice_ws.shutdown().await;
+    bob_ws.shutdown().await;
+    drop(alice);
+    drop(bob);
+    daemon_a.stop().await;
+    daemon_b.stop().await;
+}
