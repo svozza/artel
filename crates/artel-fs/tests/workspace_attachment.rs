@@ -434,24 +434,18 @@ async fn attachment_removed_on_host_leave_session() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn joiner_leave_session_does_not_cascade_attachment_today() {
-    // Pins the *current* (deliberately documented) gap in the
-    // cascade contract: the daemon's `Registry::leave` cascades the
-    // store's attachments only on a host-leave (which closes the
-    // session). A joiner's `LeaveSession` calls `remove_member`,
-    // which preserves the session record — and therefore preserves
-    // the joiner's attachment in `<session>/attachments/`.
+async fn attachment_removed_on_joiner_leave_session() {
+    // Companion to `attachment_removed_on_host_leave_session`. When
+    // the joiner leaves its remote-mirror session, the daemon drops
+    // the mirror entirely (the only local consumer is gone, so
+    // there's nothing left to mirror) and the 2b cascade clears the
+    // joiner's attachment via `store.delete(session)`. Symmetric in
+    // shape with `host_closed_session` — same teardown, just
+    // triggered by a local IPC leave instead of a gossip
+    // `SessionClosed` from the host.
     //
-    // The brainstorm's `last_seen` fast-follow + an explicit
-    // `ForgetAttachment` emitted by `Workspace::shutdown` (or by a
-    // future joiner-leave path that fully drops the remote-mirror)
-    // are the two reasonable ways to close this gap. Until one of
-    // those lands, this test fails-loud if a future change makes the
-    // joiner-side cascade work — at which point flip the assertion
-    // and update the brainstorm/plan.
-    //
-    // The companion `attachment_removed_on_host_leave_session` test
-    // covers the host-side cascade that *does* work today.
+    // The host's own daemon is NOT affected: sessions are per-daemon,
+    // and the joiner's local-mirror leave is not visible upstream.
     let pair = common::spawn_pair().await;
     let common::Pair {
         daemon_a,
@@ -508,18 +502,10 @@ async fn joiner_leave_session_does_not_cascade_attachment_today() {
         .await
         .expect("bob LeaveSession");
 
-    // CURRENT BEHAVIOUR: bob's joiner attachment lingers. Flip this
-    // assertion when a fix lands.
-    let bob_entries = raw_list(&bob, Some(KIND_V1)).await;
-    assert_eq!(
-        bob_entries.len(),
-        1,
-        "TODO(joiner-cascade): bob's joiner attachment lingers after \
-         LeaveSession because Registry::leave preserves the remote-\
-         mirror session for non-host leavers. See test docstring.",
+    assert!(
+        raw_list(&bob, Some(KIND_V1)).await.is_empty(),
+        "bob's joiner attachment must cascade-delete on his LeaveSession",
     );
-    let bob_decoded = WorkspaceAttachmentV1::decode(&bob_entries[0].payload).expect("bob decode");
-    assert_eq!(bob_decoded.role, WorkspaceRole::Joiner);
 
     // Alice's host attachment is on a different daemon — fully
     // untouched by bob's leave.

@@ -564,8 +564,28 @@ impl Registry {
         }
     }
 
-    /// Remove `peer` from `session`. If `peer` is the host, the entire
-    /// session is closed and a [`Event::SessionClosed`] is emitted.
+    /// Remove `peer` from `session`. Three cases, distinguished by
+    /// session [`SessionKind`] and whether the leaver is the host:
+    ///
+    /// 1. **Host of a `Local` session leaves** → the entire session is
+    ///    closed: `store.delete(session)` (cascades any consumer
+    ///    attachments via the store contract), in-memory entry
+    ///    removed, [`Event::SessionClosed`] emitted, gossip topic
+    ///    torn down with a final `SessionClosed` broadcast so remote
+    ///    mirrors see the close.
+    ///
+    /// 2. **Joiner of a `Local` session leaves** → the session keeps
+    ///    going (other members are still in it). Just `remove_member`
+    ///    in the store and emit [`Event::PeerLeft`].
+    ///
+    /// 3. **Joiner of a `Remote` mirror leaves** → the local mirror
+    ///    has no purpose without its only local consumer, so drop it
+    ///    fully: `store.delete(session)` (cascading attachments),
+    ///    in-memory entry removed, [`Event::SessionClosed`] emitted,
+    ///    bridge per-session state forgotten. Symmetric with
+    ///    [`Self::host_closed_session`] — same teardown shape, just
+    ///    triggered by a local IPC leave instead of a gossip
+    ///    `SessionClosed` from the host.
     pub async fn leave(&self, session: SessionId, peer: PeerId) -> Result<(), SessionError> {
         let session_arc = {
             let guard = self.sessions.read().await;
@@ -575,19 +595,29 @@ impl Registry {
                 .ok_or(SessionError::UnknownSession(session))?
         };
 
+        // Decide the disposition under the per-session lock so a
+        // concurrent `register_attachment` (which holds the same
+        // lock) cannot land between our existence check and the
+        // store cascade.
         let host;
-        let session_closed;
+        let kind;
+        let drop_session;
         {
             let mut s = session_arc.lock().await;
             if !s.members.contains(&peer) {
                 return Err(SessionError::NotMember(session));
             }
             host = s.host;
-            session_closed = peer == host;
+            kind = s.kind;
+            // The session's local lifetime ends in two cases: the
+            // host is leaving a Local session (case 1), or the
+            // (sole local) joiner is leaving a Remote mirror
+            // (case 3). Both run the same store-side cascade.
+            drop_session = peer == host || kind == SessionKind::Remote;
 
             // Persist before mutating in-memory state. If this fails,
             // the registry stays consistent with the store.
-            if session_closed {
+            if drop_session {
                 self.store
                     .delete(session)
                     .await
@@ -600,25 +630,28 @@ impl Registry {
             }
 
             s.members.remove(&peer);
-            if session_closed {
+            if drop_session {
                 let _ = s.events_tx.send(Event::SessionClosed { session });
             } else {
                 let _ = s.events_tx.send(Event::PeerLeft { session, peer });
             }
         }
 
-        if session_closed {
+        if drop_session {
             self.sessions.write().await.remove(&session);
-            // Tear down the bridge's per-session topic state so the
-            // forwarder task exits and `bridge.sessions` doesn't grow
-            // unbounded across host-and-close cycles. Best-effort;
-            // the IPC client has already been told the leave
-            // succeeded. Publish `SessionClosed` first so joiners
-            // see the close before the gossip topic goes silent;
-            // forget_session drops the topic immediately after.
+            // Bridge teardown:
+            // - Local-host leave (case 1): publish a final
+            //   `SessionClosed` over gossip so remote mirrors see the
+            //   close, then drop our topic state.
+            // - Remote-mirror leave (case 3): we are NOT the host, so
+            //   we do not publish anything — the host's mirror is
+            //   none of our business. Just drop our local topic
+            //   state so the forwarder task exits.
             #[cfg(feature = "iroh")]
             if let Some(bridge) = &self.bridge {
-                bridge.publish_session_closed(session).await;
+                if peer == host && kind == SessionKind::Local {
+                    bridge.publish_session_closed(session).await;
+                }
                 bridge.forget_session(session).await;
             }
         }
@@ -1833,6 +1866,88 @@ mod tests {
         r.host_closed_session(session_id).await.unwrap();
 
         assert!(r.list_attachments(None).await.unwrap().is_empty());
+    }
+
+    /// A joiner leaving a `Remote` mirror fully drops the mirror —
+    /// store record gone, in-memory entry gone, attachment cascaded,
+    /// `Event::SessionClosed` emitted. Symmetric with
+    /// `host_closed_session`'s teardown but triggered by a local IPC
+    /// leave instead of a gossip `SessionClosed` from the host.
+    #[tokio::test]
+    async fn joiner_leave_remote_drops_mirror_and_cascades_attachment() {
+        let daemon_peer = PeerId::from_bytes([7; 32]);
+        let remote_host = peer(1, "alice");
+        let session_id = SessionId::from_bytes([0xaa; 16]);
+        let me = peer(2, "bob");
+
+        let store = Arc::new(crate::store::MemoryStore::new());
+        let record = SessionRecord {
+            id: session_id,
+            host: remote_host.id,
+            members: HashSet::from([remote_host.id, me.id]),
+            head: Seq::ZERO,
+            log: Vec::new(),
+            kind: SessionKind::Remote,
+        };
+        store.create(&record).await.unwrap();
+        let r = Registry::load(
+            daemon_peer,
+            WireEndpointAddr::id_only(daemon_peer),
+            store.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        r.register_attachment(session_id, KIND_V1.into(), b"x".to_vec())
+            .await
+            .unwrap();
+        let mut sub = r.subscribe(session_id, None).await.unwrap();
+
+        r.leave(session_id, me.id).await.unwrap();
+
+        let event = timeout(Duration::from_millis(100), sub.events.recv())
+            .await
+            .expect("event")
+            .unwrap();
+        assert_eq!(
+            event,
+            Event::SessionClosed {
+                session: session_id,
+            }
+        );
+        assert!(r.list().await.is_empty(), "mirror should be gone");
+        assert!(
+            store.load_all().await.unwrap().is_empty(),
+            "persisted record should be deleted",
+        );
+        assert!(
+            r.list_attachments(None).await.unwrap().is_empty(),
+            "attachment should cascade-delete with the mirror",
+        );
+    }
+
+    /// Joiner of a `Local` session leaving (i.e. another peer left
+    /// our hosted session) keeps the session alive — the host and
+    /// any other members are still in it. Just an unmember +
+    /// `Event::PeerLeft`.
+    #[tokio::test]
+    async fn joiner_leave_local_session_keeps_session_alive() {
+        let r = registry();
+        let host = peer(1, "alice");
+        let bob = peer(2, "bob");
+        let charlie = peer(3, "charlie");
+        let (id, ticket) = r.host(host.clone(), None).await.unwrap();
+        r.join(&ticket, bob.clone()).await.unwrap();
+        r.join(&ticket, charlie.clone()).await.unwrap();
+
+        // Bob (a joiner of our Local session) leaves.
+        r.leave(id, bob.id).await.unwrap();
+
+        // Session still alive: alice + charlie remain.
+        let summaries = r.list().await;
+        assert_eq!(summaries.len(), 1, "session must persist");
+        assert_eq!(summaries[0].peer_count, 2);
     }
 
     /// Race-regression: `register_attachment` vs. `leave` on the same
