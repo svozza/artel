@@ -29,14 +29,12 @@
 //! flake), the DNS TXT lookup returns empty and iroh-docs emits
 //! `sync failed err="Failed to establish connection"` and **does
 //! not retry**. Production consumers would normally have a
-//! reconcile-on-reconnect loop or a periodic re-`start_sync`; the
-//! test reproduces that by calling `start_sync` again with the
-//! host's `EndpointAddr` from the ticket whenever the entry-poll
-//! loop detects no progress. The ticket already carries the
-//! addressing info — using it as a re-attempt seed is the same as
-//! what would happen if discovery had succeeded the first time, so
-//! we still prove the "`DocTicket` alone is enough" property; we
-//! just don't conflate it with "iroh-docs has no retry."
+//! reconcile-on-reconnect loop or a periodic re-`start_sync`. This
+//! test does NOT — the joiner's entry-poll loop simply sleeps 50 ms
+//! between `Doc::get_one` calls and relies on iroh-docs eventually
+//! noticing the host once pkarr propagates. That means a slow
+//! propagation can still trip `DISCOVERY_BUDGET`; the test is best
+//! read as a happy-path canary, not a hardened retry property.
 
 // `phase()` wrapping `Node::spawn()` produces a 21 KiB future
 // because of how iroh-docs' `Docs::spawn` cascades; the test runs
