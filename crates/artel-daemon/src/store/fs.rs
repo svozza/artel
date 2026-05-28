@@ -246,6 +246,19 @@ impl SessionStore for FsLogStore {
                 ),
             ));
         }
+        if kind.is_empty() {
+            // Empty kind hex-encodes to a zero-length stem, producing
+            // the dotfile `.bin`. That round-trips through
+            // `decode_attachment_filename` as `Some("")` and is
+            // unfilterable from any `Some(non_empty_kind)` query, so
+            // a misconfigured caller could persist an entry that no
+            // typed reader ever sees. Reject up-front; consumers must
+            // namespace.
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "attachment kind must be non-empty",
+            ));
+        }
         tokio::task::spawn_blocking(move || -> io::Result<bool> {
             // Existence test mirrors load_all's: only directories that
             // already pass `load_one` count as "known sessions". A bare
@@ -313,14 +326,15 @@ impl SessionStore for FsLogStore {
                     };
                     let path = att.path();
                     // In-flight or crashed write_attachment: skip
-                    // silently rather than warn. unique_tmp_path
-                    // names them `<base>.<pid>.<counter>.tmp` — we
-                    // emit lowercase ourselves, exact-match is fine.
-                    #[allow(clippy::case_sensitive_file_extension_comparisons)]
+                    // silently rather than warn. is_attachment_tmp
+                    // matches only the unique_tmp_path shape, so an
+                    // unrelated `.tmp` file (operator scratch, editor
+                    // backup) falls through to the kind-decode warn
+                    // below.
                     if path
                         .file_name()
                         .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.ends_with(".tmp"))
+                        .is_some_and(is_attachment_tmp)
                     {
                         continue;
                     }
@@ -549,6 +563,43 @@ fn unique_tmp_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// Whether `name` matches the [`unique_tmp_path`] shape:
+/// `<lowercase-hex>.bin.<digits>.<digits>.tmp`. Stricter than a
+/// blanket `*.tmp` so the sweep + the in-list skip won't touch
+/// anything but our own atomic-write tmps. An admin's stray `.tmp`
+/// scratch file alongside attachments is preserved.
+fn is_attachment_tmp(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".tmp") else {
+        return false;
+    };
+    // <hex>.bin.<digits>.<digits>
+    let Some((before_counter, counter)) = stem.rsplit_once('.') else {
+        return false;
+    };
+    if counter.is_empty() || !counter.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let Some((before_pid, pid)) = before_counter.rsplit_once('.') else {
+        return false;
+    };
+    if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    // before_pid is the original `<hex>.bin` filename. Validate the
+    // hex stem so a non-attachment file like `notes.txt.42.7.tmp`
+    // doesn't qualify just because it happens to end in two
+    // numeric segments.
+    let Some(hex_stem) = before_pid.strip_suffix(ATTACHMENT_FILE_SUFFIX) else {
+        return false;
+    };
+    if hex_stem.is_empty() || !hex_stem.len().is_multiple_of(2) {
+        return false;
+    }
+    hex_stem
+        .bytes()
+        .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+}
+
 /// Atomic write: `path.tmp` + fsync + rename.
 fn write_meta(path: &Path, meta: &Meta) -> io::Result<()> {
     let bytes = serde_json::to_vec_pretty(meta)
@@ -677,9 +728,14 @@ fn read_log(path: &Path) -> io::Result<Vec<SessionMessage>> {
 }
 
 /// Walk every `<session>/attachments/` under `root` and unlink any
-/// `*.tmp` files. Called once from [`FsLogStore::open`] to reap
-/// orphans left by a previous daemon that crashed between
-/// `write_attachment`'s `create_new` and the rename.
+/// orphaned attachment-write tmps. Called once from
+/// [`FsLogStore::open`] to reap stragglers left by a previous daemon
+/// that crashed between `write_attachment`'s `create_new` and the
+/// rename.
+///
+/// Filter is [`is_attachment_tmp`] (the [`unique_tmp_path`] shape) —
+/// stricter than `*.tmp` so an admin's scratch file or an editor
+/// backup that happens to live alongside attachments is left alone.
 ///
 /// Best-effort throughout: a missing root, a failing `read_dir` on any
 /// session, or a failing `remove_file` is logged and skipped. Only the
@@ -687,7 +743,6 @@ fn read_log(path: &Path) -> io::Result<Vec<SessionMessage>> {
 /// `meta.json.tmp` (the meta write is atomic at single-writer scope —
 /// only the registry calls it, serialised by per-session locking) or
 /// any unrecognised paths.
-#[allow(clippy::case_sensitive_file_extension_comparisons)]
 fn sweep_tmp_files(root: &Path) {
     let session_iter = match std::fs::read_dir(root) {
         Ok(it) => it,
@@ -717,11 +772,11 @@ fn sweep_tmp_files(root: &Path) {
         for att in att_iter {
             let Ok(att) = att else { continue };
             let path = att.path();
-            let is_tmp = path
+            let matches_tmp = path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.ends_with(".tmp"));
-            if !is_tmp {
+                .is_some_and(is_attachment_tmp);
+            if !matches_tmp {
                 continue;
             }
             match std::fs::remove_file(&path) {
@@ -1366,6 +1421,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn put_attachment_rejects_empty_kind() {
+        // An empty kind would hex-encode to a zero-length stem,
+        // producing the dotfile `.bin`. decode_attachment_filename
+        // round-trips it as `Some("")`, which is unfilterable from any
+        // `Some(non-empty)` query — a misconfigured caller could
+        // persist an entry no typed reader ever sees.
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+        let err = store
+            .put_attachment(record(1).id, "", b"x")
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        // No file laid down on disk.
+        let attachments_dir = dir
+            .path()
+            .join(record(1).id.to_string())
+            .join(ATTACHMENTS_DIR);
+        assert!(
+            !attachments_dir.exists() || attachments_dir.read_dir().unwrap().next().is_none(),
+            "rejected put must not create any attachment file",
+        );
+    }
+
+    #[tokio::test]
     async fn open_sweeps_orphaned_tmp_files() {
         // Simulate a previous daemon crashing mid-write_attachment:
         // an `<base>.<pid>.<counter>.tmp` is left next to a real
@@ -1384,7 +1465,13 @@ mod tests {
             .join(record(1).id.to_string())
             .join(ATTACHMENTS_DIR);
         let real_path = attachments_dir.join(attachment_filename(KIND_V1));
-        let orphan_path = attachments_dir.join("deadbeef.99.42.tmp");
+        // Plant an orphan with the EXACT shape unique_tmp_path
+        // produces: `<hex>.bin.<pid>.<counter>.tmp`. The hex stem is
+        // an arbitrary kind hex-encoded; pid + counter are arbitrary
+        // digits. Any drift in the sweep filter that no longer
+        // matches this real shape makes the test fail.
+        let orphan_hex = attachment_filename("orphan-kind/v1");
+        let orphan_path = attachments_dir.join(format!("{orphan_hex}.99.42.tmp"));
         std::fs::write(&orphan_path, b"orphan").unwrap();
         assert!(orphan_path.exists());
         assert!(real_path.exists());
@@ -1393,6 +1480,44 @@ mod tests {
         let _store2 = FsLogStore::open(dir.path()).unwrap();
         assert!(!orphan_path.exists(), "sweep should have removed tmp");
         assert!(real_path.exists(), "sweep must not touch real attachments");
+    }
+
+    #[tokio::test]
+    async fn open_sweep_leaves_unrelated_tmp_files_alone() {
+        // The sweep filter is is_attachment_tmp (the unique_tmp_path
+        // shape `<hex>.bin.<pid>.<counter>.tmp`). An admin's stray
+        // `.tmp` file or an editor backup that lives in the
+        // attachments/ dir must be preserved across daemon restarts —
+        // the sweep is OUR atomic-write cleanup, not a generic
+        // dotfile reaper.
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+        store
+            .put_attachment(record(1).id, KIND_V1, b"real")
+            .await
+            .unwrap();
+
+        let attachments_dir = dir
+            .path()
+            .join(record(1).id.to_string())
+            .join(ATTACHMENTS_DIR);
+        // Generic .tmp files that don't match the unique_tmp_path
+        // shape — the sweep must leave each of these alone.
+        let unrelated = [
+            attachments_dir.join("notes.tmp"),          // no hex stem
+            attachments_dir.join("notes.txt.42.7.tmp"), // hex stem fails
+            attachments_dir.join("a1b2.bin.foo.7.tmp"), // pid not digits
+            attachments_dir.join("a1b2.bin.42..tmp"),   // empty counter
+        ];
+        for p in &unrelated {
+            std::fs::write(p, b"unrelated").unwrap();
+        }
+
+        let _store2 = FsLogStore::open(dir.path()).unwrap();
+        for p in &unrelated {
+            assert!(p.exists(), "sweep wrongly reaped {}", p.display());
+        }
     }
 
     #[tokio::test]
@@ -1446,5 +1571,33 @@ mod tests {
                 assert_eq!(entry.payload.len(), 64);
             }
         }
+    }
+
+    #[test]
+    fn is_attachment_tmp_pins_the_unique_tmp_path_shape() {
+        // Real shapes unique_tmp_path produces: `<hex>.bin.<pid>.<counter>.tmp`.
+        let real = format!("{}.42.7.tmp", attachment_filename("artel-fs/workspace/v1"));
+        assert!(is_attachment_tmp(&real));
+        assert!(is_attachment_tmp(&format!(
+            "{}.0.0.tmp",
+            attachment_filename("kind"),
+        )));
+        assert!(is_attachment_tmp(&format!(
+            "{}.999999.123456789.tmp",
+            attachment_filename("k"),
+        )));
+
+        // Things that look like tmps but aren't ours:
+        assert!(!is_attachment_tmp("notes.tmp"));
+        assert!(!is_attachment_tmp("notes.txt.42.7.tmp"));
+        assert!(!is_attachment_tmp("ABCD.bin.42.7.tmp")); // uppercase hex
+        assert!(!is_attachment_tmp("abc.bin.42.7.tmp")); // odd-length hex
+        assert!(!is_attachment_tmp("a1b2.bin.foo.7.tmp")); // pid non-digit
+        assert!(!is_attachment_tmp("a1b2.bin.42.bar.tmp")); // counter non-digit
+        assert!(!is_attachment_tmp("a1b2.bin.42..tmp")); // empty counter
+        assert!(!is_attachment_tmp("a1b2.bin..7.tmp")); // empty pid
+        assert!(!is_attachment_tmp(".bin.42.7.tmp")); // empty hex
+        assert!(!is_attachment_tmp("a1b2.bin.42.7")); // missing .tmp
+        assert!(!is_attachment_tmp("a1b2.txt.42.7.tmp")); // wrong .bin slot
     }
 }
