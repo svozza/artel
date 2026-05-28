@@ -512,28 +512,52 @@ impl Registry {
             // Hand the bridge a callback that writes into this very
             // mirror. We deliberately keep a strong Arc in the
             // closure so the session outlives the forwarder task
-            // until forget_session aborts it.
+            // until forget_session aborts it. The store handle is
+            // cloned so the callback can persist each message —
+            // without that, a daemon restart loses the entire
+            // remote-mirror log (`Subscribe { since: None }` replays
+            // nothing on bob's restart, so a joiner that re-runs
+            // `Workspace::join_with` hangs in `wait_for_ticket`
+            // forever waiting for the host's `workspace.ticket`
+            // System message that was never persisted).
             let mirror = Arc::clone(&arc);
+            let store = self.store.clone();
             let session_for_log = session_id;
             let on_message = move |msg: SessionMessage| {
                 let mirror = Arc::clone(&mirror);
+                let store = store.clone();
                 let session_for_log = session_for_log;
                 // Spawn so the gossip forwarder doesn't block on
                 // each message. Acceptable for now; if ordering
                 // ever matters we can replace with a per-session
                 // mpsc.
                 tokio::spawn(async move {
+                    // Persist BEFORE mutating in-memory state so a
+                    // crash mid-callback doesn't leave the mirror's
+                    // in-memory log ahead of disk. Idempotent on
+                    // duplicate seq via the partition_point check
+                    // below — but the store itself doesn't dedupe,
+                    // so we check first.
                     let mut s = mirror.lock().await;
-                    // Insert by seq, skipping duplicates. Messages
-                    // can arrive out-of-order when a Replay is
-                    // landing alongside live broadcasts (joiner
-                    // asked for history, host re-emitted older
-                    // seqs). The log is kept sorted so subsequent
-                    // `Subscribe { since }` replays from the
-                    // mirror are coherent.
                     let pos = s.log.partition_point(|m| m.seq < msg.seq);
                     if pos < s.log.len() && s.log[pos].seq == msg.seq {
-                        // Duplicate; drop quietly.
+                        // Duplicate seq; drop quietly. Already on
+                        // disk from the first delivery.
+                        return;
+                    }
+                    // Persist while holding the lock so a concurrent
+                    // remote-mirror cascade (`leave` of the joiner)
+                    // can't race us. Failure: log, drop the message;
+                    // the host will re-broadcast on Replay if the
+                    // joiner asks again, and the in-memory state stays
+                    // consistent with disk.
+                    if let Err(err) = store.append(session_for_log, &msg).await {
+                        tracing::warn!(
+                            session = ?session_for_log,
+                            seq = ?msg.seq,
+                            error = %err,
+                            "remote-mirror log persist failed; dropping message",
+                        );
                         return;
                     }
                     s.log.insert(pos, msg.clone());
