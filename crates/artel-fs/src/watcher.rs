@@ -8,7 +8,7 @@
 
 #![allow(clippy::redundant_pub_crate)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,7 +16,7 @@ use bytes::Bytes;
 use notify::EventKind;
 use notify_debouncer_full::DebounceEventResult;
 
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
 use crate::filter::{FilterDecision, SkipReason, WorkspaceFilter};
@@ -236,18 +236,8 @@ async fn on_modified(
         return;
     }
 
-    let key = match keys::path_to_key(&workspace.root, &path) {
-        Ok(k) => k,
-        Err(err) => {
-            let _ = workspace
-                .events
-                .send(WorkspaceEvent::Error(format!(
-                    "path_to_key {}: {err}",
-                    path.display()
-                )))
-                .await;
-            return;
-        }
+    let Some(key) = path_to_key_or_emit(&workspace.root, &path, &workspace.events).await else {
+        return;
     };
 
     let bytes = Bytes::from(bytes);
@@ -294,12 +284,8 @@ async fn on_removed(workspace: &Arc<Workspace>, path: PathBuf) {
             .await;
         return;
     }
-    let key = match keys::path_to_key(&workspace.root, &path) {
-        Ok(k) => k,
-        Err(err) => {
-            warn!(target: "artel_fs::watcher", path = %path.display(), %err, "path_to_key failed for tombstone");
-            return;
-        }
+    let Some(key) = path_to_key_or_emit(&workspace.root, &path, &workspace.events).await else {
+        return;
     };
     match workspace.doc.del(workspace.author, key).await {
         Ok(removed) => {
@@ -307,6 +293,134 @@ async fn on_removed(workspace: &Arc<Workspace>, path: PathBuf) {
         }
         Err(err) => {
             warn!(target: "artel_fs::watcher", path = %path.display(), %err, "doc.del failed");
+            let _ = workspace
+                .events
+                .send(WorkspaceEvent::Error(format!(
+                    "tombstone {} failed: {err}",
+                    path.display(),
+                )))
+                .await;
         }
+    }
+}
+
+/// Translate a watcher-observed path to a doc key.
+///
+/// Mirrors the `on_modified` and `on_removed` failure shape: on
+/// [`keys::path_to_key`] error, surface a [`WorkspaceEvent::Error`]
+/// to the events stream and return `None` so the caller can bail out.
+/// Callers that get `None` must NOT continue with a default / empty
+/// key — the contract is "key-or-bail".
+///
+/// Pulled out so the modify- and remove-side flows can't drift in
+/// what they emit on a `path_to_key` failure (the original bug:
+/// `on_modified` emitted [`WorkspaceEvent::Error`] but `on_removed`
+/// only `tracing::warn!`'d, hiding the failure from event-stream
+/// consumers).
+async fn path_to_key_or_emit(
+    root: &Path,
+    path: &Path,
+    events: &mpsc::Sender<WorkspaceEvent>,
+) -> Option<Vec<u8>> {
+    match keys::path_to_key(root, path) {
+        Ok(k) => Some(k),
+        Err(err) => {
+            warn!(target: "artel_fs::watcher", path = %path.display(), %err, "path_to_key failed");
+            let _ = events
+                .send(WorkspaceEvent::Error(format!(
+                    "path_to_key {}: {err}",
+                    path.display(),
+                )))
+                .await;
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the `path_to_key`-failure code path shared by
+    //! [`on_modified`] and [`on_removed`].
+    //!
+    //! Pre-fix `on_removed` only `tracing::warn!`'d on `path_to_key`
+    //! failure while `on_modified` emitted [`WorkspaceEvent::Error`];
+    //! peer never sees the change either way, but the event-stream
+    //! consumer was blind to the remove-side failure. The
+    //! `path_to_key_or_emit` helper consolidates the two so the
+    //! asymmetry can't recur.
+    //!
+    //! Trigger: pass a path that isn't under `root`. `path_to_key`
+    //! calls `strip_prefix(root)` first and returns
+    //! [`crate::WorkspaceError::InvalidPath`] — same code path the
+    //! handoff identifies (an invalid-UTF-8 path component would
+    //! reach the same `Err(InvalidPath)` arm; the `strip_prefix`
+    //! trigger is OS-portable so the test runs on macOS too).
+    use super::*;
+    use std::path::PathBuf;
+    use tokio::sync::mpsc;
+    use tokio::time::{Duration, timeout};
+    use tracing::error;
+
+    fn root() -> PathBuf {
+        PathBuf::from("/workspace")
+    }
+
+    /// `path_to_key_or_emit` returns `None` and emits a
+    /// `WorkspaceEvent::Error` when the input path can't be
+    /// translated. This is the property that `on_removed` was
+    /// missing pre-fix.
+    #[tokio::test]
+    async fn path_to_key_or_emit_surfaces_error_event_on_failure() {
+        let (tx, mut rx) = mpsc::channel::<WorkspaceEvent>(8);
+        // A path that isn't under `root` makes `path_to_key`'s
+        // `strip_prefix` fail.
+        let outside = PathBuf::from("/elsewhere/foo.txt");
+        let result = path_to_key_or_emit(&root(), &outside, &tx).await;
+        assert!(
+            result.is_none(),
+            "path_to_key failure must return None — callers rely on \
+             this to bail out without a bogus key",
+        );
+        let ev = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("event must arrive within 1s")
+            .expect("channel must not close");
+        match ev {
+            WorkspaceEvent::Error(msg) => {
+                assert!(
+                    msg.contains("path_to_key"),
+                    "error event should describe the failing operation: {msg}",
+                );
+                assert!(
+                    msg.contains("foo.txt"),
+                    "error event should mention the offending path: {msg}",
+                );
+            }
+            other => {
+                error!(?other, "unexpected event variant");
+                panic!("expected WorkspaceEvent::Error, got {other:?}");
+            }
+        }
+    }
+
+    /// On the happy path the helper returns the key and emits no
+    /// event — the events stream is reserved for problems.
+    #[tokio::test]
+    async fn path_to_key_or_emit_returns_key_on_success() {
+        let (tx, mut rx) = mpsc::channel::<WorkspaceEvent>(8);
+        let inside = root().join("a").join("b.txt");
+        let key = path_to_key_or_emit(&root(), &inside, &tx)
+            .await
+            .expect("happy-path translation must succeed");
+        assert_eq!(key, b"path/a/b.txt");
+        // Nothing should land on the events channel; a short timeout
+        // is enough — `mpsc::Sender::send` is synchronous from the
+        // helper's POV, so anything published would already be in
+        // the queue.
+        let result = timeout(Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "happy path must not emit an event; got {result:?}",
+        );
     }
 }
