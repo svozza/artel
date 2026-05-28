@@ -113,7 +113,15 @@ async fn host_workspace_registers_attachment_via_ipc() {
 
     let ws_root = tempfile::tempdir().unwrap();
     let ws_state = tempfile::tempdir().unwrap();
-    let cfg = WorkspaceConfig::default().with_state_dir(ws_state.path().to_path_buf());
+    // Plumb MemoryLookup so the workspace's iroh node skips n0
+    // discovery (`endpoint.online()` waits on n0 home-relay
+    // registration under presets::N0; that's externally rate-limited
+    // and flakes in CI). No peer participates in this test, so an
+    // empty-but-present MemoryLookup is enough to take the Minimal
+    // preset path.
+    let cfg = WorkspaceConfig::default()
+        .with_state_dir(ws_state.path().to_path_buf())
+        .with_address_lookup_override(iroh::address_lookup::memory::MemoryLookup::new());
 
     let (workspace, _events) = Workspace::host_with(
         &alice,
@@ -230,12 +238,16 @@ async fn list_known_workspaces_helper_returns_typed_view() {
     let alice = Client::connect(&harness.socket).await.unwrap();
     let alice_peer = PeerInfo::new(PeerId::from_bytes([3; 32]), "alice");
     let ws_root = tempfile::tempdir().unwrap();
+    // MemoryLookup → workspace iroh node uses Minimal preset, skips
+    // n0 discovery. See `host_workspace_registers_attachment_via_ipc`.
+    let cfg = WorkspaceConfig::default()
+        .with_address_lookup_override(iroh::address_lookup::memory::MemoryLookup::new());
     let (workspace, _events) = Workspace::host_with(
         &alice,
         alice_peer,
         ws_root.path().to_path_buf(),
         AttachPolicy::AllowExisting,
-        WorkspaceConfig::default(),
+        cfg,
     )
     .await
     .expect("host_with");
@@ -328,7 +340,10 @@ async fn attachment_persists_across_daemon_restart() {
     // host_with re-registers — that's the durability claim. Phase 2
     // re-register would overwrite (same `(session, kind)`), so reading
     // first proves the on-disk file from phase 1 is what we're
-    // observing.
+    // observing. All three fields are checked here so a daemon-side
+    // regression that drops/corrupts role or state_dir on disk reload
+    // is caught BEFORE phase-2 host_with rewrites the file with
+    // fresh-correct bytes.
     let known_pre_register = list_known_workspaces(&alice_a2)
         .await
         .expect("list pre re-register");
@@ -339,13 +354,17 @@ async fn attachment_persists_across_daemon_restart() {
     );
     assert_eq!(known_pre_register[0].session, session_id_1);
     assert_eq!(
-        known_pre_register[0].attachment.local_path,
-        phase_1_entry.attachment.local_path,
+        known_pre_register[0].attachment, phase_1_entry.attachment,
+        "all attachment fields (local_path + state_dir + role) must \
+         survive daemon restart byte-for-byte",
     );
 
-    // Re-host: idempotent register at the same `(session, KIND_V1)`
-    // overwrites with identical bytes. Still exactly one entry,
-    // still the same session id.
+    // Re-host: confirm the constructor still succeeds against a
+    // pre-existing on-disk attachment (idempotent re-register at the
+    // same `(session, kind)` overwrites with identical bytes). The
+    // post-register equality assertion would be tautological — phase
+    // 2 just rewrote the entry — so we only check the session id is
+    // stable, which is the property the constructor uniquely provides.
     let cfg_2 = WorkspaceConfig::default()
         .with_state_dir(alice_wstate.path().to_path_buf())
         .with_address_lookup_override(shared.clone());
@@ -367,7 +386,6 @@ async fn attachment_persists_across_daemon_restart() {
     let known_2 = list_known_workspaces(&alice_a2).await.expect("list 2");
     assert_eq!(known_2.len(), 1, "phase 2 still one entry");
     assert_eq!(known_2[0].session, session_id_1);
-    assert_eq!(known_2[0].attachment, phase_1_entry.attachment);
 
     alice_ws_2.shutdown().await;
     drop(alice_a2);
@@ -381,12 +399,16 @@ async fn attachment_removed_on_host_leave_session() {
     let alice = Client::connect(&harness.socket).await.unwrap();
     let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     let ws_root = tempfile::tempdir().unwrap();
+    // MemoryLookup → workspace iroh node uses Minimal preset, skips
+    // n0 discovery. See `host_workspace_registers_attachment_via_ipc`.
+    let cfg = WorkspaceConfig::default()
+        .with_address_lookup_override(iroh::address_lookup::memory::MemoryLookup::new());
     let (workspace, _events) = Workspace::host_with(
         &alice,
         alice_peer,
         ws_root.path().to_path_buf(),
         AttachPolicy::AllowExisting,
-        WorkspaceConfig::default(),
+        cfg,
     )
     .await
     .expect("host_with");
