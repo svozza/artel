@@ -697,7 +697,9 @@ fn sweep_tmp_files(root: &Path) {
         }
     };
     for session_entry in session_iter {
-        let Ok(session_entry) = session_entry else { continue };
+        let Ok(session_entry) = session_entry else {
+            continue;
+        };
         let attachments_dir = session_entry.path().join(ATTACHMENTS_DIR);
         let att_iter = match std::fs::read_dir(&attachments_dir) {
             Ok(it) => it,
@@ -1430,10 +1432,8 @@ mod tests {
 
             let store_list = std::sync::Arc::clone(&store);
             let store_del = std::sync::Arc::clone(&store);
-            let list_task =
-                tokio::spawn(async move { store_list.list_attachments(None).await });
-            let delete_task =
-                tokio::spawn(async move { store_del.delete(record(1).id).await });
+            let list_task = tokio::spawn(async move { store_list.list_attachments(None).await });
+            let delete_task = tokio::spawn(async move { store_del.delete(record(1).id).await });
 
             // Both must succeed; the list must NOT propagate NotFound.
             let listed = list_task.await.unwrap();
