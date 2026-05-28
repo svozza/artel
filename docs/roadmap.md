@@ -186,12 +186,16 @@ radius small.
 - The daemon now stands up an `IrohRuntime` ({ Endpoint, Gossip,
   Router }) at start; `Router::shutdown` cleans up everything,
   including the underlying Endpoint, on the way out.
-- `DaemonConfig` gains an opaque `address_lookup:
-  Option<AddressLookupOverride>` so integration tests can seed
-  `MemoryLookup` for direct localhost dialing without touching the
-  n0 relay infrastructure. The override is `pub`-but-uninhabited
-  when the `iroh` feature is off so the struct literal stays
-  feature-flag-free.
+- `DaemonConfig` gains an `endpoint_setup: EndpointSetup` knob so
+  integration tests can swap n0 production discovery for a
+  localhost `iroh::test_utils::DnsPkarrServer` without touching
+  any other daemon code. The field is unconditionally present;
+  `EndpointSetup::default()` (Production / `presets::N0`) works
+  in either feature config. (Originally an opaque
+  `Option<AddressLookupOverride>` wrapping a `MemoryLookup`;
+  migrated to the upstream `DnsPkarrServer` fixture in
+  `bb8892f` after `MemoryLookup` proved too aggressive a
+  short-circuit — see "n0 rate-limit flakiness" below.)
 - `Daemon::iroh()` returns the runtime to embedders/tests. No
   `Registry` changes yet — that comes with 2c-2.
 - 1 new smoke test (`tests/iroh_gossip_smoke.rs`): two in-process
@@ -533,24 +537,55 @@ made four pkarr publish + DNS-lookup calls against
 `dns.iroh.link`, hitting external rate limits the test harness
 had no business paying.
 
-**Fixed in test harness only**: `WorkspaceConfig` gained
-`address_lookup_override: Option<MemoryLookup>`. When set, the
-workspace endpoint switches to `presets::Minimal` plus the
-caller-supplied lookup, fully bypassing the n0 path
-(`endpoint.online()` is also skipped because Minimal has no
-relay to rendezvous with). `tests/common/mod.rs::spawn_pair`
-now hands the same shared `MemoryLookup` to both daemons and
-both workspaces, so all four nodes resolve each other in
-process. Production callers leave the field `None` and continue
-to use n0 discovery unchanged. After the fix, 10/10 pass on the
-rapid-iteration matrix with no sleeps. The `crash_recovery`
-tests deliberately stay on the n0 path — the child binary runs
-in a separate process and can't share an in-memory lookup
-across the boundary; they're slower but functionally correct.
+**First fix (2026-05-25), since superseded**: `WorkspaceConfig`
+gained an `address_lookup_override: Option<MemoryLookup>` knob;
+test harness cross-seeded a shared `MemoryLookup` across both
+daemons and both workspaces. 10/10 passed on the rapid-iteration
+matrix. But the in-memory address book was too aggressive a
+short-circuit — see the host-restart-ungraceful investigation
+below — so the substrate moved on.
 
-`iroh_docs_smoke.rs` continues to exercise the production
-discovery path so the `DocTicket`-carries-enough-addressing
-contract stays under regression coverage somewhere.
+**Current shape (2026-05-28, `bb8892f`)**: substrate now exposes
+`EndpointSetup::{Production, Testing}` on both `WorkspaceConfig`
+and `DaemonConfig`. `Testing` wraps an
+`iroh::test_utils::DnsPkarrServer` — the upstream-recommended
+fixture iroh-docs uses in its own tests. Localhost pkarr-publish
+HTTP server + localhost DNS server with shared state, run for
+the test's lifetime. Same code path as production except for
+the physical infrastructure (no n0 rate limits, no DNS
+propagation race against `dns.iroh.link`). `tests/common/mod.rs`
+hands one `Arc<DnsPkarrServer>` to both daemons and both
+workspaces; the `on_endpoint(&id, timeout)` gate eliminates the
+publish/dial race. Production callers stay on
+`EndpointSetup::Production` (the default — `presets::N0` +
+n0 discovery) unchanged.
+
+`crash_recovery.rs` stays on real n0 by necessity — the child
+binary runs in a separate process and can't share an in-process
+fixture. It's slow, and any failure must be diagnosed via
+`docs/diagnosing-flaky-tests.md` (per-phase timeouts +
+tracing-subscriber + run-until-fail) before being labelled an
+infra issue. "Flaky" is never an acceptable resting state.
+
+Two-tier test pyramid is now:
+- `iroh_docs_smoke_pkarr.rs` (default, deterministic, fast)
+  asserts the `DocTicket`-carries-enough-addressing contract
+  over the localhost fixture.
+- `iroh_docs_smoke.rs` (real n0, kept) asserts the same
+  property over n0's real infrastructure with an
+  application-layer retry loop. Both passing → substrate fine.
+  If the n0 sibling fails while the `_pkarr` sibling passes,
+  that's a hypothesis (production-discovery-only bug vs. infra
+  flake) — not a conclusion. Apply the recipe in
+  `docs/diagnosing-flaky-tests.md` and confirm before
+  labelling.
+
+The migration retired the `MemoryLookup`-based knob entirely;
+the `host_restart_ungraceful_n0` regression-trap test was also
+deleted because `tests/drop_bomb.rs` already pins the
+contract via a child-process stderr capture without paying the
+n0 round-trip. See `docs/diagnosing-flaky-tests.md` for the
+diagnostic recipe and the corrected pyramid.
 
 What's still on the table:
 
@@ -569,9 +604,17 @@ What's still on the table:
 
 Listed for completeness, no detailed plan yet:
 
-- **Capabilities & auth.** Read-only tickets, signed messages,
-  ticket revocation. ADR-001 § "Auth and capability model" — explicitly
-  deferred.
+- **Ticket-level capabilities & auth.** Read-only / write-restricted
+  *tickets* (so a host can hand out a join ticket that grants only
+  read access to the doc), signed messages, ticket revocation.
+  ADR-001 § "Auth and capability model" — explicitly deferred.
+  Distinct from per-path read-only **rules**, which are already
+  shipped as `PathRules { Mode::ReadOnly }` on `WorkspaceConfig`
+  (host binds rules at originate-time; rules ride the ticket
+  envelope; watcher / applier / scan / bulk-export all honour
+  them). The future work here is at the *capability* layer
+  (what does possessing a ticket let you do?) not the path-rule
+  layer (which paths in a doc can be written?).
 - **N-1 protocol-version compatibility.** Today version mismatch is
   fatal. Some scheme that lets a daemon serve clients one version
   behind would smooth upgrades.
