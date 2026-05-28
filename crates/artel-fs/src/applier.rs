@@ -137,12 +137,17 @@ async fn handle_entry(
         }
     };
 
-    // Rule check sits ABOVE the tombstone branch and the filter
-    // check on purpose: a `ReadOnly` path's incoming tombstone must
-    // not trigger `remove_file`, and a `ReadOnly` path's incoming
-    // write must not be applied even if the filter would have let it
-    // through. `handle_content_ready` retries entries through this
-    // function, so this single gate covers both cold and ready paths.
+    // Rule + filter checks sit ABOVE the tombstone branch on
+    // purpose: a `ReadOnly` path's incoming tombstone must not
+    // trigger `remove_file`, AND a hardcoded-skip / gitignored /
+    // too-large path's incoming tombstone must not either. A
+    // peer-published tombstone whose key resolves to a path the
+    // local filter rejects — asymmetric ignore globs across peers,
+    // version drift, an attacker-crafted key targeting `.git/HEAD`
+    // — would otherwise reach `tokio::fs::remove_file` regardless,
+    // deleting state the workspace was never supposed to touch.
+    // `handle_content_ready` retries entries through this function,
+    // so this single gate covers both cold and ready paths.
     let rel = path.strip_prefix(&workspace.root).unwrap_or(&path);
     if workspace.compiled_rules.mode_for(rel) == Mode::ReadOnly {
         debug!(target: "artel_fs::applier", path = %path.display(), "rules: skip ReadOnly incoming");
@@ -152,16 +157,6 @@ async fn handle_entry(
                 path,
                 direction: Direction::Incoming,
             })
-            .await;
-        return;
-    }
-
-    if entry.content_len() == 0 {
-        debug!(target: "artel_fs::applier", path = %path.display(), "applying tombstone (remove_file)");
-        let _ = tokio::fs::remove_file(&path).await;
-        let _ = workspace
-            .events
-            .send(WorkspaceEvent::PeerDeleted { path })
             .await;
         return;
     }
@@ -183,6 +178,16 @@ async fn handle_entry(
             return;
         }
         FilterDecision::Include => {}
+    }
+
+    if entry.content_len() == 0 {
+        debug!(target: "artel_fs::applier", path = %path.display(), "applying tombstone (remove_file)");
+        let _ = tokio::fs::remove_file(&path).await;
+        let _ = workspace
+            .events
+            .send(WorkspaceEvent::PeerDeleted { path })
+            .await;
+        return;
     }
 
     // Bytes not yet available locally — applier::run will retry on

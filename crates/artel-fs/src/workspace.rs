@@ -1403,10 +1403,16 @@ async fn bulk_export(
             }
         };
 
-        // Rule check sits ABOVE the tombstone branch and the filter
-        // check, mirroring `applier::handle_entry`. A `ReadOnly`
-        // path's incoming tombstone must not trigger `remove_file`,
-        // and a `ReadOnly` path's incoming write must not be applied
+        // Filter + rules sit ABOVE the tombstone branch on both
+        // sides (here and in `applier::handle_entry`). A
+        // peer-published tombstone whose key resolves to a path the
+        // local filter rejects — asymmetric ignore globs across
+        // peers, version drift, an attacker-crafted key targeting a
+        // hardcoded-skip path like `.git/HEAD` — would otherwise
+        // reach `tokio::fs::remove_file` regardless. The `ReadOnly`
+        // rule is gated for the same reason: a `ReadOnly` path's
+        // incoming tombstone must not trigger `remove_file`, and a
+        // `ReadOnly` path's incoming write must not be applied
         // even if the filter would have let it through.
         let rel = path.strip_prefix(root).unwrap_or(&path);
         if rules.mode_for(rel) == Mode::ReadOnly {
@@ -1416,12 +1422,6 @@ async fn bulk_export(
                     direction: Direction::Incoming,
                 })
                 .await;
-            continue;
-        }
-
-        if entry.content_len() == 0 {
-            let _ = tokio::fs::remove_file(&path).await;
-            let _ = events.send(WorkspaceEvent::PeerDeleted { path }).await;
             continue;
         }
 
@@ -1437,6 +1437,12 @@ async fn bulk_export(
             }
             FilterDecision::Skip(_) => continue,
             FilterDecision::Include => {}
+        }
+
+        if entry.content_len() == 0 {
+            let _ = tokio::fs::remove_file(&path).await;
+            let _ = events.send(WorkspaceEvent::PeerDeleted { path }).await;
+            continue;
         }
 
         // Bytes not yet available locally → skip; the applier
