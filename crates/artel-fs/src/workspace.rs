@@ -452,6 +452,29 @@ impl Workspace {
         // started two workspaces from one daemon.
         let join_ticket = register_host(client, peer, session_id).await?;
 
+        // Register a typed workspace attachment so a CLI / GUI can
+        // enumerate this workspace without reading `~/.artel/`
+        // directly. The daemon stores it opaquely (ADR-001 § "Daemon
+        // scope: medium"); the schema lives in `crate::attachment`.
+        //
+        // Order matters: register *after* `register_host` (we need
+        // the session id) and *before* reconcile / scan /
+        // publish_ticket so the workspace becomes visible to
+        // discovery as soon as the session exists, not only after a
+        // potentially-slow scan finishes. The 2b cascade clears the
+        // attachment if the host then `LeaveSession`s; a host that
+        // crashes mid-scan leaves a stale attachment behind that the
+        // brainstorm's `last_seen` fast-follow will let consumers
+        // prune.
+        register_workspace_attachment(
+            client,
+            session_id,
+            &root,
+            &state_dir,
+            crate::attachment::WorkspaceRole::Host,
+        )
+        .await?;
+
         let (tx, rx) = mpsc::channel(EVENT_BUFFER);
         let echo_guard = EchoGuard::new();
 
@@ -605,6 +628,23 @@ impl Workspace {
         // returns an empty result and the bulk export is a no-op
         // because the doc state hasn't replicated yet.
         wait_for_initial_sync(live).await?;
+
+        // Register the typed attachment now that the join has reached
+        // a working doc handle. Symmetric to the host side: register
+        // *after* the session is wired up and *before* the long-
+        // running `bulk_export` so the workspace shows up in
+        // `list_known_workspaces` as soon as the session is live, not
+        // only after a potentially-slow disk-seeding step finishes.
+        // Mid-`bulk_export` crashes leave an attachment behind; the
+        // brainstorm's `last_seen` fast-follow covers stale-pruning.
+        register_workspace_attachment(
+            client,
+            session,
+            &root,
+            &state_dir,
+            crate::attachment::WorkspaceRole::Joiner,
+        )
+        .await?;
 
         let (tx, rx) = mpsc::channel(EVENT_BUFFER);
         let echo_guard = EchoGuard::new();
@@ -870,6 +910,44 @@ async fn register_host(
             Err(WorkspaceError::SessionConflict(id))
         }
         Err(err) => Err(WorkspaceError::Client(err)),
+    }
+}
+
+/// Register a [`crate::attachment::WorkspaceAttachmentV1`] against
+/// `session` via [`Request::RegisterAttachment`].
+///
+/// Failure propagates as [`WorkspaceError`] — both the host- and
+/// joiner-side constructors treat a missing attachment as a
+/// stand-up failure rather than degrading silently. A workspace
+/// that's invisible to discovery is a real bug we want surfaced;
+/// the brainstorm + plan §"Risks" explicitly chose this over
+/// graceful degradation.
+async fn register_workspace_attachment(
+    client: &Client,
+    session: SessionId,
+    local_path: &Path,
+    state_dir: &Path,
+    role: crate::attachment::WorkspaceRole,
+) -> Result<(), WorkspaceError> {
+    let payload = crate::attachment::WorkspaceAttachmentV1 {
+        local_path: local_path.to_path_buf(),
+        state_dir: state_dir.to_path_buf(),
+        role,
+    }
+    .encode()?;
+    let resp = client
+        .request(Request::RegisterAttachment {
+            session,
+            kind: crate::attachment::KIND_V1.to_string(),
+            payload,
+        })
+        .await
+        .map_err(WorkspaceError::Client)?;
+    match resp {
+        Response::AttachmentRegistered => Ok(()),
+        other => Err(WorkspaceError::Iroh(format!(
+            "unexpected response to RegisterAttachment: {other:?}",
+        ))),
     }
 }
 

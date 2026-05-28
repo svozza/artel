@@ -19,6 +19,7 @@
 //!   are public so apps and tests can reuse them.
 
 mod applier;
+pub mod attachment;
 pub mod echo_guard;
 pub mod error;
 pub mod filter;
@@ -31,6 +32,9 @@ pub mod ticket;
 mod watcher;
 pub mod workspace;
 
+pub use attachment::{
+    KIND_V1, KnownWorkspace, WorkspaceAttachmentV1, WorkspaceRole, list_known_workspaces,
+};
 pub use echo_guard::EchoGuard;
 pub use error::{PolicyViolation, WorkspaceError};
 pub use filter::{FilterDecision, MAX_FILE_SIZE, SkipReason, WorkspaceFilter};
