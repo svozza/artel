@@ -3,17 +3,18 @@
 //! [`SessionStore`] is the seam between the runtime
 //! `super::session::Registry` and durable storage. The trait is
 //! **crate-private** — it is shaped by the operations the registry
-//! actually performs, not by speculation about future schemas. Two
-//! implementations ship from day one so the trait stays grounded:
+//! actually performs, not by speculation about future schemas.
 //!
-//! - [`MemoryStore`]: in-memory, used by unit tests and as the
-//!   no-persistence baseline.
 //! - [`FsLogStore`]: on-disk, append-only postcard log + JSON meta.
-//!   The shape ADR-001 calls for.
+//!   The shape ADR-001 calls for. Production daemons use this.
+//! - [`MemoryStore`]: in-memory, gated `#[cfg(test)]`. Used by unit
+//!   tests as the no-persistence baseline so the disk impl has a
+//!   reference to compare against. Not present in release builds.
 //!
-//! A future third implementation (e.g. `SQLite`) lands as a drop-in if
-//! its needs fit the trait. If they don't, we grow the trait then —
-//! with two reference implementations to compare against.
+//! A future production-second implementation (e.g. `SQLite`) lands as
+//! a drop-in if its needs fit the trait. If they don't, we grow the
+//! trait then — with the in-memory test-only impl as a parallel
+//! check.
 
 // `redundant_pub_crate` fires because the parent module is already
 // `pub(crate)`, so `pub(crate)` items inside are technically as visible

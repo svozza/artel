@@ -46,6 +46,18 @@ const ATTACHMENTS_DIR: &str = "attachments";
 /// Suffix on attachment files; the prefix is the kind, hex-encoded.
 const ATTACHMENT_FILE_SUFFIX: &str = ".bin";
 
+/// Maximum length of an attachment `kind` in UTF-8 bytes.
+///
+/// The on-disk filename is `lowercase-hex(<kind>) + ".bin"`, i.e.
+/// `2 * kind.len() + 4` bytes. `NAME_MAX` is 255 on Linux ext4 and on
+/// macOS APFS (the latter has been observed to surface `ENAMETOOLONG`
+/// well below that in practice — likely from path normalisation
+/// overhead). 100 bytes of kind → 204 bytes of filename, safely under
+/// every Unix filesystem we ship on. Anything longer is rejected at
+/// the store with `InvalidData` rather than failing inside
+/// `write_attachment` with the OS-leaked `ENAMETOOLONG`.
+const MAX_KIND_LEN: usize = 100;
+
 /// Per-process counter feeding [`unique_tmp_path`].
 ///
 /// Combined with the process pid, this makes each attachment write's
@@ -67,9 +79,17 @@ pub(crate) struct FsLogStore {
 
 impl FsLogStore {
     /// Open (and ensure exists) the sessions directory at `root`.
+    ///
+    /// Also reaps any orphaned `*.tmp` files left by a previous daemon
+    /// that crashed between [`write_attachment`]'s `create_new` and
+    /// the rename. They were already invisible to `list_attachments`
+    /// (the suffix-skip), but without a sweep they'd accumulate
+    /// across crash cycles. Best-effort: a removal failure is logged
+    /// and the open continues.
     pub(crate) fn open(root: impl Into<PathBuf>) -> io::Result<Self> {
         let root = root.into();
         ensure_dir(&root, DIR_MODE)?;
+        sweep_tmp_files(&root);
         Ok(Self { root })
     }
 
@@ -217,6 +237,15 @@ impl SessionStore for FsLogStore {
                 format!("attachment payload too large: {} bytes", payload.len()),
             ));
         }
+        if kind.len() > MAX_KIND_LEN {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "attachment kind too long: {} bytes (max {MAX_KIND_LEN})",
+                    kind.len(),
+                ),
+            ));
+        }
         tokio::task::spawn_blocking(move || -> io::Result<bool> {
             // Existence test mirrors load_all's: only directories that
             // already pass `load_one` count as "known sessions". A bare
@@ -269,7 +298,18 @@ impl SessionStore for FsLogStore {
                     Err(err) => return Err(err),
                 };
                 for att in attachment_entries {
-                    let att = att?;
+                    // A concurrent `delete` (cascade via remove_dir_all)
+                    // can unlink entries while we iterate. The DirEntry
+                    // result, the metadata stat, and the read can each
+                    // return NotFound; treat that as "the entry vanished
+                    // mid-list" and skip rather than failing the whole
+                    // call. Mirrors the skip-and-warn contract on
+                    // SessionStore::list_attachments.
+                    let att = match att {
+                        Ok(a) => a,
+                        Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                        Err(err) => return Err(err),
+                    };
                     let path = att.path();
                     // In-flight or crashed write_attachment: skip
                     // silently rather than warn. unique_tmp_path
@@ -295,7 +335,11 @@ impl SessionStore for FsLogStore {
                     {
                         continue;
                     }
-                    let metadata = std::fs::metadata(&path)?;
+                    let metadata = match std::fs::metadata(&path) {
+                        Ok(m) => m,
+                        Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                        Err(err) => return Err(err),
+                    };
                     if metadata.len() > MAX_FRAME_SIZE as u64 {
                         warn!(
                             file = %path.display(),
@@ -304,7 +348,11 @@ impl SessionStore for FsLogStore {
                         );
                         continue;
                     }
-                    let payload = std::fs::read(&path)?;
+                    let payload = match std::fs::read(&path) {
+                        Ok(p) => p,
+                        Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                        Err(err) => return Err(err),
+                    };
                     out.push(StoredAttachment {
                         session: session_id,
                         kind,
@@ -625,6 +673,65 @@ fn read_log(path: &Path) -> io::Result<Vec<SessionMessage>> {
         "log loaded"
     );
     Ok(out)
+}
+
+/// Walk every `<session>/attachments/` under `root` and unlink any
+/// `*.tmp` files. Called once from [`FsLogStore::open`] to reap
+/// orphans left by a previous daemon that crashed between
+/// `write_attachment`'s `create_new` and the rename.
+///
+/// Best-effort throughout: a missing root, a failing `read_dir` on any
+/// session, or a failing `remove_file` is logged and skipped. Only the
+/// `<session>/attachments/` layer is searched; we do not touch
+/// `meta.json.tmp` (the meta write is atomic at single-writer scope —
+/// only the registry calls it, serialised by per-session locking) or
+/// any unrecognised paths.
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
+fn sweep_tmp_files(root: &Path) {
+    let session_iter = match std::fs::read_dir(root) {
+        Ok(it) => it,
+        Err(err) if err.kind() == ErrorKind::NotFound => return,
+        Err(err) => {
+            warn!(root = %root.display(), error = %err, "tmp sweep: read_dir root failed");
+            return;
+        }
+    };
+    for session_entry in session_iter {
+        let Ok(session_entry) = session_entry else { continue };
+        let attachments_dir = session_entry.path().join(ATTACHMENTS_DIR);
+        let att_iter = match std::fs::read_dir(&attachments_dir) {
+            Ok(it) => it,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => {
+                warn!(
+                    dir = %attachments_dir.display(),
+                    error = %err,
+                    "tmp sweep: read_dir attachments failed",
+                );
+                continue;
+            }
+        };
+        for att in att_iter {
+            let Ok(att) = att else { continue };
+            let path = att.path();
+            let is_tmp = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".tmp"));
+            if !is_tmp {
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => debug!(file = %path.display(), "tmp sweep: removed orphaned tmp"),
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => warn!(
+                    file = %path.display(),
+                    error = %err,
+                    "tmp sweep: remove_file failed",
+                ),
+            }
+        }
+    }
 }
 
 /// Make sure `dir` exists at `mode`. Creates the chain if needed; if
@@ -1217,6 +1324,125 @@ mod tests {
                 let name = entry.unwrap().file_name();
                 let name = name.to_string_lossy();
                 assert!(!name.ends_with(".tmp"), "left a tmp file behind: {name}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn put_attachment_rejects_oversized_kind() {
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+
+        // One byte over the cap. We reject before the OS gets a
+        // chance, so the error stays typed (InvalidData) rather than
+        // ENAMETOOLONG-leaking.
+        let oversized = "k".repeat(MAX_KIND_LEN + 1);
+        let err = store
+            .put_attachment(record(1).id, &oversized, b"x")
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn put_attachment_accepts_kind_at_cap() {
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+
+        let max_kind = "k".repeat(MAX_KIND_LEN);
+        let ok = store
+            .put_attachment(record(1).id, &max_kind, b"x")
+            .await
+            .unwrap();
+        assert!(ok);
+        let listed = store.list_attachments(None).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].kind, max_kind);
+    }
+
+    #[tokio::test]
+    async fn open_sweeps_orphaned_tmp_files() {
+        // Simulate a previous daemon crashing mid-write_attachment:
+        // an `<base>.<pid>.<counter>.tmp` is left next to a real
+        // attachment. Re-opening the store should reap it without
+        // touching the real file.
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+        store
+            .put_attachment(record(1).id, KIND_V1, b"real")
+            .await
+            .unwrap();
+
+        let attachments_dir = dir
+            .path()
+            .join(record(1).id.to_string())
+            .join(ATTACHMENTS_DIR);
+        let real_path = attachments_dir.join(attachment_filename(KIND_V1));
+        let orphan_path = attachments_dir.join("deadbeef.99.42.tmp");
+        std::fs::write(&orphan_path, b"orphan").unwrap();
+        assert!(orphan_path.exists());
+        assert!(real_path.exists());
+
+        // Re-open: triggers the sweep.
+        let _store2 = FsLogStore::open(dir.path()).unwrap();
+        assert!(!orphan_path.exists(), "sweep should have removed tmp");
+        assert!(real_path.exists(), "sweep must not touch real attachments");
+    }
+
+    #[tokio::test]
+    async fn open_sweep_tolerates_missing_root() {
+        // A fresh root that doesn't exist yet: open creates it and
+        // the sweep finds nothing to do. No error.
+        let dir = tempdir().unwrap();
+        let nested = dir.path().join("brand-new");
+        let _store = FsLogStore::open(&nested).unwrap();
+        assert!(nested.is_dir());
+    }
+
+    /// Race-regression for the list-vs-cascade contract: while
+    /// `list_attachments` iterates a session's attachments dir, a
+    /// concurrent `delete` (cascade via `remove_dir_all`) can unlink
+    /// entries out from under it. The store must skip-and-continue —
+    /// per the trait doc — rather than propagating an `io::NotFound`
+    /// up to the caller.
+    ///
+    /// Drives the race deterministically by spawning N attachments,
+    /// then issuing list and delete concurrently many times. Any
+    /// successful list must return either 0..=N entries with no
+    /// torn entries; an `io::Error` is a hard failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn list_attachments_skips_entries_unlinked_mid_iteration() {
+        for _ in 0..50 {
+            let dir = tempdir().unwrap();
+            let store = std::sync::Arc::new(FsLogStore::open(dir.path()).unwrap());
+            store.create(&record(1)).await.unwrap();
+            // Seed many attachments so the iterator has real work to do.
+            for i in 0..32u8 {
+                let kind = format!("kind/{i}");
+                store
+                    .put_attachment(record(1).id, &kind, &[i; 64])
+                    .await
+                    .unwrap();
+            }
+
+            let store_list = std::sync::Arc::clone(&store);
+            let store_del = std::sync::Arc::clone(&store);
+            let list_task =
+                tokio::spawn(async move { store_list.list_attachments(None).await });
+            let delete_task =
+                tokio::spawn(async move { store_del.delete(record(1).id).await });
+
+            // Both must succeed; the list must NOT propagate NotFound.
+            let listed = list_task.await.unwrap();
+            delete_task.await.unwrap().unwrap();
+            let listed = listed.expect("list_attachments must not error on concurrent cascade");
+            // Whatever survived must be well-formed — no torn entries.
+            for entry in &listed {
+                assert!(entry.kind.starts_with("kind/"));
+                assert_eq!(entry.payload.len(), 64);
             }
         }
     }
