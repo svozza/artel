@@ -581,10 +581,24 @@ impl Workspace {
         debug!(target: "artel_fs::workspace", root = %root.display(), "host_with: scan_and_publish_existing");
         scan_and_publish_existing(&root, &doc, author, &compiled_rules, &echo_guard, &tx).await?;
 
-        // Share with full addressing info so the ticket is enough
-        // for joiners to dial without out-of-band addr seeding.
+        // Share with full addressing info (relay URL + direct
+        // addrs) so the ticket carries everything a joiner needs
+        // to dial on the first try. `AddrInfoOptions::default()`
+        // is `Id` — id-only — which forces the joiner's iroh-docs
+        // engine to fall back to pkarr/DNS lookup, racing the
+        // host's publish-propagate window. iroh-docs does NOT
+        // retry a failed first dial, so an id-only ticket on a
+        // fresh peering reproducibly stalls `bulk_export` and
+        // makes the host's pre-existing entries silently miss
+        // the joiner. `RelayAndAddresses` lets iroh-docs's own
+        // memory_lookup (populated in `engine::live::join_peers`
+        // from `DocTicket.nodes`) seed the addr-book before the
+        // first dial — same shape as the daemon-side fix in
+        // `bac631f` for `Registry::join`, applied at the right
+        // layer (the workspace's iroh-docs node, not the daemon's
+        // gossip node).
         let ticket = doc
-            .share(ShareMode::Write, AddrInfoOptions::default())
+            .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
             .await
             .map_err(|e| WorkspaceError::Doc(format!("share doc: {e}")))?;
 
