@@ -19,6 +19,7 @@
 #![allow(clippy::redundant_pub_crate)]
 
 use std::path::Path;
+use std::time::Duration;
 
 use iroh::Endpoint;
 use iroh::protocol::Router;
@@ -30,6 +31,16 @@ use iroh_gossip::net::Gossip;
 use crate::WorkspaceError;
 use crate::endpoint_setup::EndpointSetup;
 use crate::keystore::load_or_create_secret;
+
+/// How long the substrate waits for the home-relay handshake
+/// (`endpoint.online()`) before surfacing
+/// [`WorkspaceError::RelayUnreachable`]. Tight enough to fail fast
+/// when the relay is unreachable (offline laptop, captive portal,
+/// n0 outage), loose enough to cover normal startup. Mirrored in
+/// `artel_daemon::server::HOME_RELAY_BUDGET` — keep the two in
+/// sync until the `EndpointSetup` duplication (handoff finding
+/// #11) is resolved.
+const HOME_RELAY_BUDGET: Duration = Duration::from_secs(30);
 
 /// Per-`Workspace` iroh runtime. Held for the workspace's lifetime;
 /// drop teardown is best-effort via [`Self::shutdown`].
@@ -44,6 +55,16 @@ pub(crate) struct WorkspaceNode {
     /// [`Router::shutdown`] on it during teardown closes the
     /// endpoint for us.
     router: Router,
+    /// Test-only fault-injection flag. When set, the next call to
+    /// [`Self::shutdown`] returns `Err` instead of awaiting the
+    /// real router shutdown. Per-instance (rather than process-
+    /// wide) so two parallel tests in the same integration binary
+    /// don't trip each other's fault injection. Wrapped in an
+    /// `Arc<AtomicBool>` so `Workspace::test_arm_shutdown_failure`
+    /// can hand a clone back to the test harness without holding
+    /// the workspace's node mutex.
+    #[cfg(feature = "test-utils")]
+    pub(crate) shutdown_failure_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl WorkspaceNode {
@@ -121,14 +142,27 @@ impl WorkspaceNode {
         // and `online()` would never resolve. Direct UDP is already
         // bound by the time `bind().await` returned, and the
         // localhost pkarr+DNS pair publishes our addr synchronously.
-        if setup.awaits_relay() {
-            endpoint.online().await;
+        //
+        // The timeout exists to fail fast when the relay is
+        // unreachable (offline laptop, captive portal, n0 outage,
+        // or the `TestingUnreachableRelay` fixture). Without it
+        // `Workspace::host_with` / `join_with` would hang forever
+        // here. Surfacing a typed error lets the caller distinguish
+        // "no relay" from a generic Iroh failure.
+        if setup.awaits_relay()
+            && tokio::time::timeout(HOME_RELAY_BUDGET, endpoint.online())
+                .await
+                .is_err()
+        {
+            return Err(WorkspaceError::RelayUnreachable(HOME_RELAY_BUDGET));
         }
 
         Ok(Self {
             docs,
             blobs,
             router,
+            #[cfg(feature = "test-utils")]
+            shutdown_failure_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -140,16 +174,21 @@ impl WorkspaceNode {
     /// [`crate::Workspace`] Drop bomb can stay armed (a router that
     /// failed to shut down is exactly the misuse the bomb documents).
     pub(crate) async fn shutdown(self) -> Result<(), WorkspaceError> {
-        // Test-only fault injection: when the parent test sets
-        // `force_shutdown_failure(true)`, we synthesise an error
-        // BEFORE touching the real router. Used by
-        // `tests/workspace_shutdown_contract.rs` to prove
+        // Test-only fault injection: when this node's flag is armed
+        // (via `Workspace::test_arm_shutdown_failure`), synthesise
+        // an error BEFORE touching the real router. Per-instance,
+        // so two tests in the same integration binary running in
+        // parallel never trip each other.
+        // `tests/workspace_shutdown_contract.rs` uses this to prove
         // `Workspace::shutdown` propagates router failures and keeps
         // the Drop bomb armed when teardown didn't actually succeed.
         // No production effect — gated entirely on the
         // `test-utils` cargo feature.
         #[cfg(feature = "test-utils")]
-        if test_hooks::take_force_shutdown_failure() {
+        if self
+            .shutdown_failure_flag
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
             // Best-effort: still try to tear the real router down so
             // we don't leak the endpoint into the next test. Ignore
             // its result — the synthesised error is what the test
@@ -166,36 +205,3 @@ impl WorkspaceNode {
     }
 }
 
-/// Test-only fault-injection knobs for [`WorkspaceNode`].
-///
-/// Sole consumer is `tests/workspace_shutdown_contract.rs`, which
-/// needs to coerce `Router::shutdown` into returning `Err` to prove
-/// that [`crate::Workspace::shutdown`] propagates the failure and
-/// leaves the Drop bomb armed. There is no other way to fail an iroh
-/// router shutdown in-process; mocking the entire iroh stack would
-/// be a much bigger surface to maintain.
-///
-/// Single-shot: each `force_shutdown_failure(true)` arms exactly one
-/// failure; the next call to [`WorkspaceNode::shutdown`] consumes
-/// the flag and returns the synthesised error.
-#[cfg(feature = "test-utils")]
-#[allow(unreachable_pub)]
-pub(crate) mod test_hooks {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    static FORCE_SHUTDOWN_FAILURE: AtomicBool = AtomicBool::new(false);
-
-    /// Arm the next [`super::WorkspaceNode::shutdown`] to return an
-    /// error without consulting the real router. Single-shot — the
-    /// flag is consumed on read. Re-exported from the crate root as
-    /// [`crate::test_hooks::force_shutdown_failure`].
-    pub fn force_shutdown_failure(armed: bool) {
-        FORCE_SHUTDOWN_FAILURE.store(armed, Ordering::SeqCst);
-    }
-
-    /// Read-and-clear the fault-injection flag. Called from inside
-    /// [`super::WorkspaceNode::shutdown`].
-    pub(super) fn take_force_shutdown_failure() -> bool {
-        FORCE_SHUTDOWN_FAILURE.swap(false, Ordering::SeqCst)
-    }
-}

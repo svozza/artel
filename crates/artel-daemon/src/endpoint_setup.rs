@@ -31,6 +31,14 @@ pub enum EndpointSetup {
         /// Shared DNS+pkarr fixture.
         dns_pkarr: std::sync::Arc<iroh::test_utils::DnsPkarrServer>,
     },
+    /// Testing-with-an-unreachable-relay: [`iroh::endpoint::presets::Minimal`]
+    /// plus a custom [`iroh::RelayMode`] pointed at an RFC 5737
+    /// TEST-NET-1 address. Drives [`iroh::Endpoint::online`] into
+    /// the timeout path so [`crate::server::Daemon::start`] surfaces
+    /// a typed [`crate::server::StartError::RelayUnreachable`]
+    /// instead of hanging. Mirrors `artel_fs::EndpointSetup`.
+    #[cfg(feature = "test-utils")]
+    TestingUnreachableRelay,
 }
 
 impl std::fmt::Debug for EndpointSetup {
@@ -39,6 +47,8 @@ impl std::fmt::Debug for EndpointSetup {
             Self::Production => f.write_str("EndpointSetup::Production"),
             #[cfg(feature = "test-utils")]
             Self::Testing { .. } => f.write_str("EndpointSetup::Testing { dns_pkarr: <..> }"),
+            #[cfg(feature = "test-utils")]
+            Self::TestingUnreachableRelay => f.write_str("EndpointSetup::TestingUnreachableRelay"),
         }
     }
 }
@@ -66,6 +76,34 @@ impl EndpointSetup {
                     .address_lookup(pkarr_publisher)
                     .dns_resolver(dns_pkarr.dns_resolver())
             }
+            #[cfg(feature = "test-utils")]
+            Self::TestingUnreachableRelay => {
+                let builder = iroh::endpoint::presets::Minimal.apply(builder);
+                // RFC 5737 TEST-NET-1 — guaranteed unrouteable so
+                // the home-relay handshake never completes. See the
+                // sibling variant in `artel_fs::endpoint_setup` for
+                // the full rationale.
+                let url = "https://192.0.2.1/"
+                    .parse::<iroh::RelayUrl>()
+                    .expect("static RFC 5737 TEST-NET-1 url parses");
+                builder.relay_mode(iroh::RelayMode::custom([url]))
+            }
+        }
+    }
+
+    /// Whether this setup connects to a relay. Mirrors
+    /// `artel_fs::EndpointSetup::awaits_relay`. `Production` and
+    /// `TestingUnreachableRelay` do; `Testing` (Minimal +
+    /// `DnsPkarrServer`) does not — calling
+    /// [`iroh::Endpoint::online`] on a `Testing` endpoint hangs
+    /// forever because Minimal has no relay configured.
+    pub(crate) const fn awaits_relay(&self) -> bool {
+        match self {
+            Self::Production => true,
+            #[cfg(feature = "test-utils")]
+            Self::Testing { .. } => false,
+            #[cfg(feature = "test-utils")]
+            Self::TestingUnreachableRelay => true,
         }
     }
 }

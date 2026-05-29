@@ -31,6 +31,37 @@ Read this section FIRST. The detailed finding write-ups below
 are still ground truth for the *open* items, but several have
 already landed — don't re-attempt them.
 
+### ALWAYS redirect long test output to a file and grep it
+
+Tail-truncated terminal output silently hides failures buried
+above the cutoff. The 2026-05-29 session lost meaningful tokens
+re-running tests because a single-`cargo test` failure in
+`workspace_shutdown_contract` was hidden in the middle of the
+captured stream and only the trailing successes showed in the
+tail. Two rules:
+
+1. **Always redirect.** `cargo test ... > /tmp/X.log 2>&1`,
+   then `grep -E "FAILED|^test result" /tmp/X.log` to summarise.
+   Never tail-eyeball.
+2. **Never claim a clean run from a truncated tail.** If the
+   command's exit code is `0` and `grep -c FAILED /tmp/X.log` is
+   `0`, only then is it green.
+
+Same rule for clippy (`grep -E "^(error|warning:)"`) and any
+build that emits more than a few hundred lines.
+
+### Tests must NOT depend on inter-test ordering
+
+Any process-wide static (atomic flag, env var, lock file) shared
+between `#[tokio::test]` fns in the same integration binary is a
+ticking time bomb: cargo runs tests on a thread pool by default,
+so two tests can interleave and trip each other. If you need
+fault injection, wire it per-instance (Arc<AtomicBool> on the
+struct, exposed via a `test_*` method on the public type) — not
+via a `static` in a `test_hooks` module. The 2026-05-29 session
+fixed the `force_shutdown_failure` static-atomic bug exactly
+this way; if you find another, fix it the same way.
+
 ### Required reading before touching tests
 
 **`docs/diagnosing-flaky-tests.md`** — the diagnostic recipe
@@ -47,8 +78,12 @@ labelling anything an n0 infra flake.
 This doc is referenced again from:
 - The `feedback_no_handwaving_flaky_tests.md` memory entry
   (loads automatically — see `MEMORY.md`).
-- The roadmap's "n0 rate-limit flakiness" section (commit
-  `2acaf9f`).
+- `docs/roadmap.md` § "Future" → "Faster `cargo test --workspace`"
+  (the test-tiers / nextest entry — commit `d9d9e0e`). The
+  diagnostic-legibility framing for serialising real-n0 tests
+  belongs there, not in the older "n0 rate-limit flakiness"
+  attribution that `docs/diagnosing-flaky-tests.md` § "What NOT to
+  do" explicitly debunks.
 - The "Conventions a fresh agent should keep" subsection at
   the bottom of this status block.
 
@@ -90,22 +125,35 @@ finding-by-finding workflow below.
 | #13 — `on_removed` event-stream asymmetry | `5fe0812` | both modify and remove paths emit `WorkspaceEvent::Error` via shared `path_to_key_or_emit` helper; unit tests pin the property |
 | Bug A from `host_restart_live_writes_n0` (NOT a numbered original — surfaced 2026-05-29) | `64aeeb1` | `Doc::share` was called with `AddrInfoOptions::default()` (= `Id`-only) despite a comment claiming "full addressing info." Switched to `AddrInfoOptions::RelayAndAddresses`. Pinned by per-phase tracing in the test. Failure rate 1/6 → 1/9 — bug B (#5c below) is the remaining failure |
 | Roadmap drift fix — `2acaf9f` | `2acaf9f` | removed "occasionally flaky; the price of testing" handwaving from `docs/roadmap.md` and linked to `docs/diagnosing-flaky-tests.md` as the required diagnostic recipe |
-| #2 + #3 + #4 — Workspace shutdown contract trio | (this commit) | `Workspace::shutdown` now returns `Result<(), WorkspaceError>`; lock held across the inner `node.shutdown().await` so concurrent callers serialise; sentinel only armed on Ok; rollback site logs the inner error. `WorkspaceNode::shutdown` returns `Result` and gains a `test-utils` fault-injection knob (`artel_fs::test_hooks::force_shutdown_failure`) so tests can coerce the otherwise best-effort router failure path. New integration suite at `tests/workspace_shutdown_contract.rs` pins all three properties on the localhost `DnsPkarrServer` fixture. Public-API change: every shutdown call site (28 tests + chat-harness + drop_bomb_child) updated to `.expect("shutdown")`. `host_restart_live_writes_n0` flipped to `#[ignore]` with a `5c` reference — known-broken until that finding lands, kept on the codebase as a regression trap. **TDD methodology lapse, declared:** the API change (Result return) was made before the test was written; retrospective verification by stashing the production diffs and observing that `tests/workspace_shutdown_contract.rs` doesn't compile against the pre-fix `()` shape (E0432 on `force_shutdown_failure` import + E0599 on `().expect()`) — the API change *is* the contract. A behavioural-only pre-fix test would have required real-n0 (relay-rejection race after concurrent shutdown), which is finding-#5c-territory. Doing it test-first in the strict sense was not feasible here; the lapse is logged so future agents don't repeat the shortcut without a real reason. |
+| #2 + #3 + #4 — Workspace shutdown contract trio | `d9d9e0e` | `Workspace::shutdown` now returns `Result<(), WorkspaceError>`; lock held across the inner `node.shutdown().await` so concurrent callers serialise; sentinel only armed on Ok; rollback site logs the inner error. `WorkspaceNode::shutdown` returns `Result` and gains a `test-utils` fault-injection knob so tests can coerce the otherwise best-effort router failure path. New integration suite at `tests/workspace_shutdown_contract.rs` pins all three properties on the localhost `DnsPkarrServer` fixture. Public-API change: every shutdown call site (28 tests + chat-harness + drop_bomb_child) updated to `.expect("shutdown")`. `host_restart_live_writes_n0` flipped to `#[ignore]` with a `5c` reference — known-broken until that finding lands, kept on the codebase as a regression trap. **TDD methodology lapse, declared:** the API change (Result return) was made before the test was written; retrospective verification by stashing the production diffs and observing that `tests/workspace_shutdown_contract.rs` doesn't compile against the pre-fix `()` shape — the API change *is* the contract. A behavioural-only pre-fix test would have required real-n0 (relay-rejection race after concurrent shutdown), which is finding-#5c-territory. Doing it test-first in the strict sense was not feasible here; the lapse is logged so future agents don't repeat the shortcut without a real reason. **Follow-on (uncommitted, see #6 + #7 row below):** the original fault-injection knob was a process-wide `static AtomicBool` in `node::test_hooks::force_shutdown_failure`; that proved order-dependent under parallel test execution and was replaced with a per-`Workspace` `test_arm_shutdown_failure(&self)` method (per-instance `Arc<AtomicBool>` on the `WorkspaceNode`). The `test_hooks` re-export at `artel_fs::test_hooks::*` is gone; tests call `ws.test_arm_shutdown_failure().await` instead. |
+| #6 + #7 — daemon `endpoint.online()` asymmetry + timeout | (uncommitted in working tree as of this write) | `tokio::time::timeout(30s, endpoint.online())` at both call sites (`crates/artel-fs/src/node.rs:~125` and `crates/artel-daemon/src/server.rs::resolve_iroh_runtime`); typed `WorkspaceError::RelayUnreachable(Duration)` and `StartError::RelayUnreachable(Duration)` surfaced on timeout. Daemon's `EndpointSetup` gains `awaits_relay()` mirroring `artel-fs`. Test scaffolding: new `EndpointSetup::TestingUnreachableRelay` variant (test-utils only, in BOTH crates) using RFC 5737 TEST-NET-1 (`192.0.2.1`) so the relay handshake provably never completes — no external network access required. New integration tests at `crates/artel-fs/tests/relay_unreachable.rs` and `crates/artel-daemon/tests/relay_unreachable.rs`. **Bonus fix surfaced during this work:** the static-atomic fault-injection knob from the trio commit (#2/#3/#4) was order-dependent under parallel test execution; replaced with a per-instance `Workspace::test_arm_shutdown_failure(&self)` method as documented in the trio's row above. **TDD followed properly:** premise probe (direct iroh `online()` against TEST-NET-1) confirmed the bug shape; scaffolding + E2E tests written before the fix; pre-fix the workspace test hung past the harness budget (40s) and the daemon test returned `Ok` (because daemon never awaited `online()`); both green post-fix. |
 
 ### Open (work from here)
 
 In suggested order, with the recommendation at the top.
 
+**Start here:** the next finding is **#5c** (host-restart loses
+addr info for known sync peers). It NEEDS A BRAINSTORM BEFORE
+WRITING CODE — three fix options are written up in the "Findings
+discovered AFTER the original review" section at the bottom of
+this doc (workspace-side persistence / daemon→workspace
+addr-cache / wait for upstream). Don't pick blindly. The
+layer-boundary call (option b) requires checking
+[[feedback-no-speculative-abstractions]] rule 2.
+
+**Before you start:** check `git log --oneline` to see whether
+the #6 + #7 work landed in this session has been committed. If
+it shows up modified-but-uncommitted in `git status`
+(`crates/artel-{fs,daemon}/{src,tests}/...` plus the doc
+changes), it's the bundled commit grouping #4 from below — read
+its row in the Landed table above for the full surface, commit
+it, then move on to #5c. Don't be confused by the
+`relay_unreachable.rs` test files that look "untracked" — they
+landed alongside the fix.
+
 **Tier 3 — production correctness**
-- **#6 + #7 — daemon `endpoint.online()` asymmetry + timeout.**
-  One bundled commit per original §4.
 - **#5c — host-restart loses addr info for known sync peers.**
-  NEEDS A BRAINSTORM BEFORE WRITING CODE — three fix options in
-  the "Findings discovered AFTER the original review" section
-  below (workspace-side persistence / daemon→workspace
-  addr-cache / wait for upstream). Don't pick blindly. The
-  layer-boundary call (option b) requires checking
-  [[feedback-no-speculative-abstractions]] rule 2.
+  See the "Start here" note above.
 
 **Tier 4 — test-flake hardening**
 - **#8 — `Workspace::endpoint_id` accessor + cross-peer test gate.**
@@ -113,7 +161,13 @@ In suggested order, with the recommendation at the top.
   `wait_for_workspace` to gate cross-peer tests on workspace
   endpoints' pkarr publish. Hardens `live_edit`,
   `delete_propagates`, `round_trip`, the read_only_*,
-  `host_restart_live_writes`, etc.
+  `host_restart_live_writes`, etc. **Pairs naturally with the
+  test-tiers/nextest work** in `docs/roadmap.md` § "Future" →
+  "Faster `cargo test --workspace`" (commit `d9d9e0e`) — both are
+  test-infrastructure changes that touch `tests/common/mod.rs` and
+  the cross-peer test pyramid. If you do this finding and the
+  test-tiers cleanup at roughly the same time, they can share a
+  `tests/common/mod.rs` rewrite instead of two passes over it.
 - **#9 — `drop_bomb_child` Testing-fixture.** Adds
   `EndpointSetup::TestingExternal { nameserver, pkarr_url }`
   variant + child-process env plumbing.
@@ -132,8 +186,12 @@ In suggested order, with the recommendation at the top.
 ### Conventions a fresh agent should keep
 
 - **Don't re-attempt the "Landed" rows above** — verify with
-  `git log --oneline` before writing tests, and if the test you
-  were about to write already exists, the finding is done.
+  BOTH `git log --oneline` AND `git status` before writing
+  tests. Some "Landed" rows are committed (commit hash in the
+  Commit column); others may be marked "uncommitted in working
+  tree" — those changes still exist on disk, just not in git
+  history yet. If the test you were about to write already
+  exists (committed or in `git status`), the finding is done.
 - **Real-n0 tests stay `#[ignore]`d for CI**, but run them
   manually 20× per the recipe in `docs/diagnosing-flaky-tests.md`
   before claiming a fix is "real-n0 verified." `cargo test
@@ -380,6 +438,10 @@ the contract-failure trio above.
 
 #### 6. Daemon-side `endpoint.online()` asymmetry
 
+> **DONE (uncommitted in working tree as of this write).** See
+> the Landed table at the top of this doc for the full surface.
+> Write-up retained for archaeology only — do not re-attempt.
+
 - **File**: `crates/artel-daemon/src/server.rs::resolve_iroh_runtime`
   (~654-690) and `crates/artel-daemon/src/endpoint_setup.rs`.
 - **Bug shape**: `WorkspaceNode::spawn` gates `endpoint.online()`
@@ -407,6 +469,10 @@ the contract-failure trio above.
   asymmetry and the duplication in one commit.
 
 #### 7. `endpoint.online().await` has no timeout
+
+> **DONE (uncommitted in working tree as of this write).** See
+> the Landed table at the top of this doc for the full surface.
+> Write-up retained for archaeology only — do not re-attempt.
 
 - **File**: `crates/artel-fs/src/node.rs:142`.
 - **Bug shape**: `if setup.awaits_relay() { endpoint.online().await; }`
@@ -659,8 +725,8 @@ suite. Suggested groups:
    addr discard fix; revives `wire_addr_to_iroh` (or its
    replacement) and re-uses `SessionError::InvalidAddr`. New
    real-n0 test for the propagation-race fast-join.
-4. **Daemon `endpoint.online` + timeout** (#6 + #7): the daemon
-   gains `awaits_relay`; both call sites wrap in `tokio::time::timeout`.
+4. **Daemon `endpoint.online` + timeout** (#6 + #7): DONE in
+   working tree; see the Landed table at the top of this doc.
 5. **EndpointSetup deduplication** (#11 + #15): move enum to a
    shared crate; consolidate the dns_resolver override.
 6. **Workspace endpoint accessor + cross-peer gate** (#8): add

@@ -48,12 +48,3 @@ pub use workspace::{
     AttachPolicy, Direction, TICKET_ACTION, Workspace, WorkspaceConfig, WorkspaceEvent,
 };
 
-/// Test-only fault-injection knobs.
-///
-/// Gated on `feature = "test-utils"`. The integration tests at
-/// `tests/workspace_shutdown_contract.rs` use these to coerce
-/// otherwise-best-effort failure paths in the iroh router.
-#[cfg(feature = "test-utils")]
-pub mod test_hooks {
-    pub use crate::node::test_hooks::force_shutdown_failure;
-}

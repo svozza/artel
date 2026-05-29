@@ -49,7 +49,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use artel_client::Client;
-use artel_fs::test_hooks::force_shutdown_failure;
 use artel_fs::{AttachPolicy, Workspace, WorkspaceConfig, WorkspaceError};
 use artel_protocol::{PeerId, PeerInfo};
 use tempfile::TempDir;
@@ -134,12 +133,15 @@ async fn shutdown_propagates_router_failure_and_keeps_node_consumable() {
     .await
     .expect("Workspace::host_with");
 
-    // Arm the next inner-shutdown to return an error. The fault
-    // injection still drains the real router (best-effort) so we
-    // don't leak the endpoint into the next test, but the outer
+    // Arm THIS workspace's inner-shutdown to return an error. The
+    // fault injection still drains the real router (best-effort) so
+    // we don't leak the endpoint into the next test, but the outer
     // `Workspace::shutdown` sees an `Err` and must NOT arm
-    // `did_shutdown`. Single-shot: the flag is consumed on read.
-    force_shutdown_failure(true);
+    // `did_shutdown`. Per-instance, so a parallel test in this
+    // binary running its own shutdown won't trip our fault.
+    ws.test_arm_shutdown_failure()
+        .await
+        .expect("workspace node still in slot when arming fault");
     let err = timeout(SHUTDOWN_BUDGET, ws.shutdown())
         .await
         .expect("forced-fail shutdown finished within budget")

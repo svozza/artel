@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use artel_protocol::transport::{self, Framed, server::Listener};
 use artel_protocol::{
@@ -27,6 +27,15 @@ use crate::endpoint_setup::EndpointSetup;
 use crate::pidfile::{PidError, PidFile};
 use crate::session::{Registry, SessionError, Subscription};
 use crate::shutdown::{Shutdown, ShutdownToken};
+
+/// How long the daemon waits for the home-relay handshake
+/// (`endpoint.online()`) before surfacing
+/// [`StartError::RelayUnreachable`]. Mirrors
+/// `artel_fs::node::HOME_RELAY_BUDGET` — keep them in sync until
+/// the [`EndpointSetup`] duplication (handoff finding #11) is
+/// resolved and the constant can move alongside the shared enum.
+#[cfg(feature = "iroh")]
+const HOME_RELAY_BUDGET: Duration = Duration::from_secs(30);
 
 /// Configuration for [`Daemon::start`].
 #[derive(Debug, Clone)]
@@ -103,6 +112,14 @@ pub enum StartError {
     #[cfg(feature = "iroh")]
     #[error("iroh: {0}")]
     Iroh(String),
+
+    /// The home-relay handshake (`iroh::Endpoint::online`) didn't
+    /// resolve within the configured budget. Surfaces when the
+    /// configured relay is unreachable. The daemon fails fast
+    /// instead of hanging in [`Daemon::start`] forever.
+    #[cfg(feature = "iroh")]
+    #[error("relay unreachable: home-relay handshake did not complete within {0:?}")]
+    RelayUnreachable(std::time::Duration),
 }
 
 /// iroh-side state held for the daemon's lifetime: the `Endpoint`
@@ -686,6 +703,22 @@ async fn resolve_iroh_runtime(
         .address_lookup()
         .map_err(|e| StartError::Iroh(format!("address_lookup: {e}")))?
         .add(addr_hint.clone());
+
+    // Mirror `WorkspaceNode::spawn`: block on home-relay readiness
+    // when the configured setup uses one, so the daemon doesn't
+    // accept IPC and start broadcasting on gossip before its first
+    // dial out can complete. The timeout exists for the same
+    // reason it does on the workspace side — failing fast on an
+    // unreachable relay (offline laptop, captive portal, n0
+    // outage, or the `TestingUnreachableRelay` fixture) instead of
+    // hanging `Daemon::start` forever.
+    if setup.awaits_relay()
+        && tokio::time::timeout(HOME_RELAY_BUDGET, endpoint.online())
+            .await
+            .is_err()
+    {
+        return Err(StartError::RelayUnreachable(HOME_RELAY_BUDGET));
+    }
 
     // Gossip needs a clone of the endpoint to register itself for the
     // ALPN; the Router does the actual accepting.
