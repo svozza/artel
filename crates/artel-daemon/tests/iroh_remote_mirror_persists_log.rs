@@ -38,7 +38,7 @@ const SYSTEM_ACTION: &str = "workspace.ticket";
 #[tokio::test]
 #[allow(clippy::used_underscore_binding)]
 async fn joiner_replays_system_message_after_daemon_restart() {
-    let (daemon_a, daemon_b, dns_pkarr) = common::spawn_pair().await;
+    let (daemon_a, mut daemon_b, dns_pkarr) = common::spawn_pair().await;
 
     // Alice hosts.
     let alice_client = Client::connect(&daemon_a.socket).await.unwrap();
@@ -103,13 +103,7 @@ async fn joiner_replays_system_message_after_daemon_restart() {
     // we can reconstruct a fresh `State` for the second daemon.
     drop(bob_events_1);
     drop(bob_client_1);
-    let bob_state_2 = common::State {
-        root: daemon_b._state.root,
-        socket: daemon_b._state.socket.clone(),
-        pid: daemon_b._state.pid.clone(),
-        sessions: daemon_b._state.sessions.clone(),
-        iroh_key: daemon_b._state.iroh_key.clone(),
-    };
+    let bob_state_2 = daemon_b._state.take().expect("state present");
     daemon_b.shutdown.trigger();
     timeout(Duration::from_secs(10), daemon_b.join)
         .await

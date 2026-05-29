@@ -100,6 +100,16 @@ pub(crate) struct GossipBridge {
     /// gossip subscribe to `JOIN_READY_TIMEOUT` whenever a joiner
     /// dials a host whose pkarr publish hasn't propagated yet.
     addr_hint: MemoryLookup,
+    /// Shared tracker of `EndpointId`s that have been seeded into
+    /// [`Self::addr_hint`] (or are otherwise worth surveying at
+    /// shutdown). The daemon's [`IrohRuntime`] owns the canonical
+    /// reference; the bridge gets a clone so its inserts are
+    /// visible to the shutdown-snapshot path. iroh 0.98.2 has no
+    /// public iterator over `MemoryLookup` entries, so this
+    /// shadow is the daemon's only enumerable source. Drives
+    /// finding #5c's host-restart peer-addr cache.
+    tracked_peer_ids:
+        Arc<std::sync::Mutex<std::collections::BTreeSet<iroh::EndpointId>>>,
 }
 
 #[derive(Debug)]
@@ -143,13 +153,18 @@ impl GossipBridge {
     /// `EndpointSetup::Production`'s n0 DNS still serve as the
     /// fallback / canonical address-lookup chain — `addr_hint` is a
     /// best-effort short-circuit, not a replacement.
-    pub(crate) fn new(gossip: Gossip, addr_hint: MemoryLookup) -> Self {
+    pub(crate) fn new(
+        gossip: Gossip,
+        addr_hint: MemoryLookup,
+        tracked_peer_ids: Arc<std::sync::Mutex<std::collections::BTreeSet<iroh::EndpointId>>>,
+    ) -> Self {
         Self {
             gossip,
             sessions: Mutex::new(HashMap::new()),
             pending_sends: Mutex::new(HashMap::new()),
             registry: Mutex::new(Weak::new()),
             addr_hint,
+            tracked_peer_ids,
         }
     }
 
@@ -223,7 +238,21 @@ impl GossipBridge {
         }
         if !host_addr.relay_url.is_empty() || !host_addr.direct_addrs.is_empty() {
             let endpoint_addr = wire_addr_to_iroh(host_addr).map_err(BridgeError::InvalidAddr)?;
+            self.tracked_peer_ids
+                .lock()
+                .expect("poisoned")
+                .insert(endpoint_addr.id);
             self.addr_hint.add_endpoint_info(endpoint_addr);
+        } else {
+            // Even id-only seeds are worth tracking: a future
+            // shutdown snapshot may find that iroh has since
+            // learned addrs for this peer through normal discovery,
+            // and we want to persist those so the next daemon
+            // incarnation has a head start.
+            self.tracked_peer_ids
+                .lock()
+                .expect("poisoned")
+                .insert(host_endpoint_id);
         }
         self.subscribe_inner(
             session,
@@ -377,14 +406,29 @@ impl GossipBridge {
         let forwarder = tokio::spawn(async move {
             while let Some(item) = receiver.next().await {
                 match item {
-                    Ok(IrohGossipEvent::Received(msg)) => match gossip::decode(&msg.content) {
-                        Ok(body) => {
-                            handle_inbound_frame(&bridge, session_for_log, &role, body).await;
+                    Ok(IrohGossipEvent::Received(msg)) => {
+                        // Every frame carries the iroh `EndpointId` of
+                        // the peer that delivered it on the gossip
+                        // mesh — the right id for the daemon's
+                        // shutdown-snapshot path (finding #5c). The
+                        // application-level `PeerId` carried inside
+                        // frame bodies is NOT a valid iroh public
+                        // key in general (joiners stamp arbitrary
+                        // 32-byte ids onto outbound `PeerInfo`).
+                        bridge
+                            .tracked_peer_ids
+                            .lock()
+                            .expect("poisoned")
+                            .insert(msg.delivered_from);
+                        match gossip::decode(&msg.content) {
+                            Ok(body) => {
+                                handle_inbound_frame(&bridge, session_for_log, &role, body).await;
+                            }
+                            Err(err) => {
+                                warn!(?err, "gossip frame decode failed; dropping");
+                            }
                         }
-                        Err(err) => {
-                            warn!(?err, "gossip frame decode failed; dropping");
-                        }
-                    },
+                    }
                     Ok(_) => {} // NeighborUp/Down/Lagged: nothing to forward.
                     Err(err) => {
                         warn!(error = %err, "gossip receiver error; forwarder exiting");

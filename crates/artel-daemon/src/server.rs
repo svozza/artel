@@ -153,6 +153,25 @@ pub struct IrohRuntime {
     /// whose pkarr publish hasn't propagated yet. See
     /// `crate::gossip_bridge::GossipBridge::join_session`.
     pub addr_hint: iroh::address_lookup::memory::MemoryLookup,
+    /// Set of `EndpointId`s that have ever been seeded into
+    /// [`Self::addr_hint`] in this daemon incarnation, plus those
+    /// loaded from disk at startup. Drives the
+    /// shutdown-snapshot: at graceful shutdown the daemon walks
+    /// this set, looks up each id's current `RemoteInfo` from the
+    /// endpoint, and persists the result to
+    /// [`Self::peer_addr_cache`]. iroh 0.98.2 has no public
+    /// `remote_info_iter`, so the daemon maintains this shadow.
+    ///
+    /// **Invariant**: every `addr_hint.add_endpoint_info(addr)` call
+    /// must be paired with a `tracked_peer_ids.insert(addr.id)` so
+    /// the snapshot path can find the peer at shutdown. The
+    /// gossip-bridge upholds the pairing in `join_session`.
+    pub(crate) tracked_peer_ids:
+        Arc<std::sync::Mutex<std::collections::BTreeSet<iroh::EndpointId>>>,
+    /// On-disk peer-addr cache. Populated at startup (entries
+    /// seeded into [`Self::addr_hint`]) and overwritten at graceful
+    /// shutdown with a fresh snapshot of [`Self::tracked_peer_ids`].
+    pub(crate) peer_addr_cache: Arc<crate::peer_addr_cache::PeerAddrCache>,
 }
 
 /// A running daemon. Hold the value to keep the daemon alive; drop it
@@ -238,6 +257,7 @@ impl Daemon {
             Arc::new(crate::gossip_bridge::GossipBridge::new(
                 rt.gossip.clone(),
                 rt.addr_hint.clone(),
+                Arc::clone(&rt.tracked_peer_ids),
             ))
         });
 
@@ -391,11 +411,27 @@ impl Daemon {
         // shutdown rather than a hung connection. Router::shutdown
         // closes the underlying Endpoint for us. Best-effort: even
         // if it errors, we still want to release the PID file.
+        //
+        // Before tearing down: snapshot the per-peer addrs iroh has
+        // learned this incarnation so the next daemon startup can
+        // seed `addr_hint` and skip the pkarr/DNS race that
+        // otherwise breaks post-restart sync (handoff finding #5c).
+        // The snapshot must run BEFORE `router.shutdown()` because
+        // that closes the endpoint and `remote_info` returns `None`
+        // afterwards.
         #[cfg(feature = "iroh")]
-        if let Some(IrohRuntime { router, .. }) = iroh
-            && let Err(err) = router.shutdown().await
+        if let Some(IrohRuntime {
+            router,
+            endpoint,
+            tracked_peer_ids,
+            peer_addr_cache,
+            ..
+        }) = iroh
         {
-            warn!(error = %err, "iroh router shutdown failed");
+            snapshot_peer_addrs(&endpoint, &tracked_peer_ids, &peer_addr_cache).await;
+            if let Err(err) = router.shutdown().await {
+                warn!(error = %err, "iroh router shutdown failed");
+            }
         }
 
         // Explicit release lets us surface I/O errors from PID-file
@@ -704,6 +740,31 @@ async fn resolve_iroh_runtime(
         .map_err(|e| StartError::Iroh(format!("address_lookup: {e}")))?
         .add(addr_hint.clone());
 
+    // Restore peer addrs the previous incarnation of this daemon
+    // learned. Without this, a host restart loses every peer addr
+    // iroh was holding in memory — iroh-docs's persistent doc store
+    // keeps id-only `EndpointAddr`s and the post-restart dial races
+    // pkarr/DNS to find peers (handoff finding #5c). Loading is
+    // best-effort: a missing or corrupt cache yields an empty seed,
+    // identical to pre-fix behaviour.
+    let tracked_peer_ids = Arc::new(std::sync::Mutex::new(
+        std::collections::BTreeSet::<iroh::EndpointId>::new(),
+    ));
+    let peer_addr_cache = Arc::new(crate::peer_addr_cache::PeerAddrCache::new(
+        peer_addr_cache_path(path),
+    ));
+    for entry in peer_addr_cache.load() {
+        match crate::peer_addr_cache::iroh_addr_from_entry(&entry) {
+            Ok(iroh_addr) => {
+                tracked_peer_ids.lock().expect("poisoned").insert(iroh_addr.id);
+                addr_hint.add_endpoint_info(iroh_addr);
+            }
+            Err(err) => {
+                warn!(error = %err, "peer_addr_cache: skipping invalid entry");
+            }
+        }
+    }
+
     // Mirror `WorkspaceNode::spawn`: block on home-relay readiness
     // when the configured setup uses one, so the daemon doesn't
     // accept IPC and start broadcasting on gossip before its first
@@ -734,8 +795,62 @@ async fn resolve_iroh_runtime(
             gossip,
             router,
             addr_hint,
+            tracked_peer_ids,
+            peer_addr_cache,
         }),
     ))
+}
+
+/// Path the peer-addr cache lives at, derived from the daemon's
+/// `iroh_key` path. Same parent dir as the secret key — convention
+/// matches the rest of the daemon's per-state-dir files.
+#[cfg(feature = "iroh")]
+fn peer_addr_cache_path(iroh_key_path: &std::path::Path) -> PathBuf {
+    iroh_key_path
+        .parent()
+        .map_or_else(|| PathBuf::from("peer_addrs.postcard"), |p| p.join("peer_addrs.postcard"))
+}
+
+/// Walk every tracked `EndpointId`, ask iroh's endpoint for its
+/// current addr info, and persist the result. Called once at
+/// graceful shutdown, BEFORE `router.shutdown()` (which closes the
+/// endpoint).
+///
+/// Best-effort throughout: a peer the endpoint has no info for is
+/// silently skipped, persistence errors log via `tracing::warn!`
+/// but never block daemon exit.
+#[cfg(feature = "iroh")]
+async fn snapshot_peer_addrs(
+    endpoint: &iroh::Endpoint,
+    tracked_peer_ids: &Arc<std::sync::Mutex<std::collections::BTreeSet<iroh::EndpointId>>>,
+    peer_addr_cache: &crate::peer_addr_cache::PeerAddrCache,
+) {
+    let ids: Vec<iroh::EndpointId> = tracked_peer_ids
+        .lock()
+        .expect("poisoned")
+        .iter()
+        .copied()
+        .collect();
+    debug!(
+        count = ids.len(),
+        "peer_addr_cache: snapshotting tracked peers"
+    );
+    let mut entries = Vec::with_capacity(ids.len());
+    for id in ids {
+        let Some(info) = endpoint.remote_info(id).await else {
+            debug!(peer = %id, "peer_addr_cache: no remote_info, skipping");
+            continue;
+        };
+        // Reconstruct an `EndpointAddr` from the per-peer
+        // `RemoteInfo`. The doc-comment example on
+        // `RemoteInfo::into_addrs` shows this exact pattern.
+        let iroh_addr = iroh::EndpointAddr::from_parts(
+            info.id(),
+            info.into_addrs().map(|addr| addr.into_addr()),
+        );
+        entries.push(crate::peer_addr_cache::entry_from_iroh(&iroh_addr));
+    }
+    peer_addr_cache.save(entries);
 }
 
 /// Convert an `iroh::EndpointAddr` into the wire-friendly form used

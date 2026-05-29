@@ -54,14 +54,42 @@ pub fn fresh_state() -> State {
     }
 }
 
+/// Path-only state for tests that need a daemon to restart at the
+/// SAME paths across multiple incarnations. The caller owns the temp
+/// dir and keeps it alive for the whole test, so files (iroh.key,
+/// cache files, etc.) persist across `stop()`/respawn.
+pub struct RestartState {
+    pub socket: PathBuf,
+    pub pid: PathBuf,
+    pub sessions: PathBuf,
+    pub iroh_key: PathBuf,
+}
+
+impl RestartState {
+    pub fn under(root: &std::path::Path) -> Self {
+        Self {
+            socket: root.join("daemon.sock"),
+            pid: root.join("daemon.pid"),
+            sessions: root.join("sessions"),
+            iroh_key: root.join("iroh.key"),
+        }
+    }
+}
+
 pub struct RunningDaemon {
     pub socket: PathBuf,
     pub iroh_addr: iroh::EndpointAddr,
+    /// Cloned out of the daemon's [`IrohRuntime`] before `run()`
+    /// consumes the `Daemon`. Cheap (the inner state is `Arc`-shared)
+    /// and identical to the instance the daemon's resolver chain
+    /// holds, so direct calls here are visible to iroh's lookups.
+    pub addr_hint: iroh::address_lookup::memory::MemoryLookup,
     pub shutdown: Arc<Shutdown>,
     pub join: tokio::task::JoinHandle<std::io::Result<()>>,
-    /// State dir kept alive for the daemon's lifetime; dropped on
-    /// `stop()` so cleanup runs only after the daemon has exited.
-    pub _state: State,
+    /// Optional caller-owned state dir (kept alive for the daemon's
+    /// lifetime when present; dropped on `stop()`). `None` for
+    /// restart-style tests where the dir outlives the daemon.
+    pub _state: Option<State>,
 }
 
 impl RunningDaemon {
@@ -83,23 +111,44 @@ pub fn testing_setup(dns_pkarr: &Arc<DnsPkarrServer>) -> EndpointSetup {
 }
 
 pub async fn spawn_daemon(state: State, setup: EndpointSetup) -> RunningDaemon {
-    let daemon = Daemon::start(DaemonConfig {
+    let config = DaemonConfig {
         socket_path: state.socket.clone(),
         pid_path: state.pid.clone(),
         sessions_dir: state.sessions.clone(),
         daemon_peer_id: FALLBACK_PEER,
         iroh_key_path: Some(state.iroh_key.clone()),
         endpoint_setup: setup,
-    })
-    .await
-    .expect("daemon start");
-    let iroh_addr = daemon.iroh().expect("iroh runtime").endpoint.addr();
+    };
+    spawn_with_state(config, Some(state)).await
+}
+
+/// Spawn at fixed paths owned by the caller. Used by restart-style
+/// tests that need the state dir (iroh.key, cache file, etc.) to
+/// persist across daemon stop/respawn.
+pub async fn spawn_daemon_at(paths: &RestartState, setup: EndpointSetup) -> RunningDaemon {
+    let config = DaemonConfig {
+        socket_path: paths.socket.clone(),
+        pid_path: paths.pid.clone(),
+        sessions_dir: paths.sessions.clone(),
+        daemon_peer_id: FALLBACK_PEER,
+        iroh_key_path: Some(paths.iroh_key.clone()),
+        endpoint_setup: setup,
+    };
+    spawn_with_state(config, None).await
+}
+
+async fn spawn_with_state(config: DaemonConfig, state: Option<State>) -> RunningDaemon {
+    let daemon = Daemon::start(config).await.expect("daemon start");
+    let iroh_runtime = daemon.iroh().expect("iroh runtime");
+    let iroh_addr = iroh_runtime.endpoint.addr();
+    let addr_hint = iroh_runtime.addr_hint.clone();
     let shutdown = daemon.shutdown_handle();
     let socket = daemon.socket_path().to_path_buf();
     let join = tokio::spawn(daemon.run());
     RunningDaemon {
         socket,
         iroh_addr,
+        addr_hint,
         shutdown,
         join,
         _state: state,

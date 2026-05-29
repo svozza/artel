@@ -88,17 +88,16 @@ fn init_tracing() {
     });
 }
 
-// `#[ignore]`d because the post-restart write reliably loses to the
-// addr-info gap documented as finding #5c in
-// `docs/handoff-code-review-fixes.md`: iroh-docs's persistent peer
-// store keeps id-only `EndpointAddr`s, the post-restart `start_sync`
-// races pkarr/DNS to find bob, the dial fails, and bob never sees
-// alice's post-restart write. The fix needs a brainstorm (workspace-
-// side persistent addr cache vs. daemon→workspace addr-cache vs.
-// upstream change). Run manually with `--ignored` once #5c lands;
-// kept on the codebase as a regression trap.
+// Real-n0 sibling for finding #5c (host-restart peer-addr cache).
+// The deterministic counterpart is
+// `crates/artel-daemon/tests/peer_addr_cache_pkarr.rs`. Keep this
+// `#[ignore]`d in CI per `docs/handoff-code-review-fixes.md`
+// § "Conventions a fresh agent should keep" — real-n0 tests are
+// flaky in CI under back-to-back load. Run manually with
+// `--ignored` per the recipe in `docs/diagnosing-flaky-tests.md`
+// before any change touching session-join / peer-addr paths.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "known failure: finding #5c (host-restart loses peer addr info)"]
+#[ignore = "real-n0; run manually with --ignored before changes touching session-join / peer-addr paths"]
 async fn alice_post_restart_writes_reach_bob_real_n0() {
     init_tracing();
 

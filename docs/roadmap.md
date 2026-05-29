@@ -615,6 +615,16 @@ Listed for completeness, no detailed plan yet:
   them). The future work here is at the *capability* layer
   (what does possessing a ticket let you do?) not the path-rule
   layer (which paths in a doc can be written?).
+- **Peer-identity authentication.** Application-level `PeerInfo.id`
+  is unauthenticated today — any IPC client picks 32 bytes and the
+  daemon ships them inside `JoinAnnouncement` / `SendRequest` /
+  `Message` bodies. A legitimate joiner can spoof authorship and
+  ghost-membership claims; only network-layer identity
+  (`iroh::EndpointId`, authenticated via QUIC) is trustworthy.
+  Prerequisite for meaningful capability enforcement (the ticket-
+  level entry above). See
+  [`docs/roadmap/peer-identity-authentication.md`](roadmap/peer-identity-authentication.md)
+  for failure-mode catalog and the protocol-change design space.
 - **N-1 protocol-version compatibility.** Today version mismatch is
   fatal. Some scheme that lets a daemon serve clients one version
   behind would smooth upgrades.
