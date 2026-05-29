@@ -154,8 +154,8 @@ async fn applier_filter_check_gates_tombstone_for_hardcoded_skip() {
         ".git/HEAD contents must be untouched",
     );
 
-    alice_ws.shutdown().await;
-    bob_ws.shutdown().await;
+    alice_ws.shutdown().await.expect("shutdown");
+    bob_ws.shutdown().await.expect("shutdown");
     let _ = tokio::time::timeout(Duration::from_secs(5), alice_handle).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), bob_handle).await;
     drop(alice);
@@ -264,8 +264,8 @@ async fn bulk_export_filter_check_gates_tombstone_for_hardcoded_skip() {
         ".git/HEAD contents must be untouched",
     );
 
-    bob_ws.shutdown().await;
-    alice_ws.shutdown().await;
+    bob_ws.shutdown().await.expect("shutdown");
+    alice_ws.shutdown().await.expect("shutdown");
     drop(alice);
     drop(bob);
     daemon_a.stop().await;

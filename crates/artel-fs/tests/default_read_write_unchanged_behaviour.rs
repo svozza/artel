@@ -95,8 +95,8 @@ async fn default_rules_give_unchanged_round_trip() {
         .unwrap();
     wait_for_missing(&bob_dir.path().join("live.txt")).await;
 
-    alice_ws.shutdown().await;
-    bob_ws.shutdown().await;
+    alice_ws.shutdown().await.expect("shutdown");
+    bob_ws.shutdown().await.expect("shutdown");
     let _ = tokio::time::timeout(Duration::from_secs(5), alice_handle).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), bob_handle).await;
     drop(alice);

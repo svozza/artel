@@ -105,8 +105,8 @@ async fn post_join_live_write_to_read_only_zone_is_blocked() {
         "alice's post-join watcher regression: locked/x.txt landed in the doc",
     );
 
-    alice_ws.shutdown().await;
-    bob_ws.shutdown().await;
+    alice_ws.shutdown().await.expect("shutdown");
+    bob_ws.shutdown().await.expect("shutdown");
     let _ = tokio::time::timeout(Duration::from_secs(5), alice_handle).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), bob_handle).await;
     drop(alice);

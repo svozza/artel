@@ -139,7 +139,7 @@ async fn re_hosting_recovers_session_id_and_resumes_message_flow() {
     // ---------------------------------------------------------------
     // Tear down Alice's daemon. Keep Bob's daemon + workspace alive.
     // ---------------------------------------------------------------
-    alice_ws_1.shutdown().await;
+    alice_ws_1.shutdown().await.expect("shutdown");
     let _ = tokio::time::timeout(Duration::from_secs(5), alice_handle_1).await;
     drop(alice_a1);
     let alice_daemon_state_2 = {
@@ -226,8 +226,8 @@ async fn re_hosting_recovers_session_id_and_resumes_message_flow() {
         .unwrap();
     common::wait_for_file(&bob_root.path().join("phase2.txt"), b"after-restart").await;
 
-    alice_ws_2.shutdown().await;
-    bob_ws.shutdown().await;
+    alice_ws_2.shutdown().await.expect("shutdown");
+    bob_ws.shutdown().await.expect("shutdown");
     let _ = tokio::time::timeout(Duration::from_secs(5), alice_handle_2).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), bob_handle).await;
     drop(alice_a2);

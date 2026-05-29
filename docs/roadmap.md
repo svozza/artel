@@ -628,6 +628,53 @@ Listed for completeness, no detailed plan yet:
   ~30 lines plus tests — and the right time is the v1 cutover.
 - **Observability.** Structured metrics endpoint, `collab-daemon list`
   → `artel sessions inspect <id>` deeper view.
+- **Faster `cargo test --workspace`.** Today the integration suite
+  is dominated by per-binary serial cost: each `tests/*.rs` becomes
+  its own binary, cargo links them with their full dep tree, and
+  cargo-test runs binaries sequentially even though tests *within*
+  a binary run multi-threaded. Two complementary fixes, in order:
+  - **Adopt `cargo nextest`** as the default runner. Drop-in,
+    parallelises across binaries (closest analog to vitest). Common
+    3–5× wall-clock speedup on integration-heavy suites. Wire into
+    `make test` / CI / pre-commit; keep `cargo test` working as a
+    fallback so first-run experience isn't gated on installing
+    nextest. Use nextest's `test-groups` config to define a tiered
+    pyramid: **tier A** (unit tests + pure-IPC integration tests)
+    runs first and fully parallel; **tier B** (cross-peer
+    `DnsPkarrServer`-backed integration tests) runs only if A
+    passed, parallel within the tier; **tier C** (real-n0 `_n0.rs`
+    tests) runs only if B passed, and **serially against itself**
+    so the captured log from any failure is a single coherent
+    timeline. The reason for serialising C is *not* about
+    saturating n0 — `docs/diagnosing-flaky-tests.md` explicitly
+    debunks the rate-limit attribution that came up in the
+    `iroh_docs_smoke` investigation; the actual flake causes turned
+    out to be unrelated bugs. The reason is diagnostic: concurrent
+    n0-touching tests interleave their tracing output and their
+    pkarr publish/resolve cycles, which makes the recipe in
+    `docs/diagnosing-flaky-tests.md` (per-phase markers + RUST_LOG
+    = wide) much harder to read. Serial keeps the failing-iteration
+    log legible. Failing fast at A also avoids burning the slow C
+    tier when an earlier breakage already disqualifies the run.
+  - **Combine related tests into fewer files.** Today
+    `attach_policy_*.rs` (3 files), `read_only_*.rs` (5), and
+    `host_*.rs` (~5) are one test per file. Within-binary
+    parallelism kicks in once they share a binary, AND we save
+    per-binary link cost. Group by domain + share `spawn_pair`
+    fixtures where safe. Keep `_n0.rs` files separate so
+    `--ignored` filtering stays clean. Caveat: `spawn_pair` calls
+    aren't free (~1–3s each) — a per-binary `OnceCell<Pair>` could
+    amortise, but only for tests whose state doesn't interfere.
+    Selective.
+
+  **What this does NOT fix:** the n0 propagation flakes documented
+  in `iroh_docs_smoke.rs` and `host_restart_live_writes_n0.rs` are
+  about timing on n0's actual servers, not about how many test
+  binaries we spawn. Real-n0 tests should be `#[ignore]`d for CI
+  per `docs/handoff-code-review-fixes.md` § "Conventions a fresh
+  agent should keep" — see also `docs/diagnosing-flaky-tests.md`.
+  Speed and n0 reliability are independent problems with
+  independent fixes.
 - **Symmetric P2P.** ADR-001 § "Future evolution" — drop the
   host-as-sequencer model. Big rethink, not a v2 deliverable.
 - **WASM / non-Rust clients.** ADR-001 § "Non-Rust clients become

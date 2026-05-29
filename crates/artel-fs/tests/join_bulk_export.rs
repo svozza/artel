@@ -101,8 +101,8 @@ async fn joiner_bulk_imports_host_files() {
     assert_eq!(a, b"alpha");
     assert_eq!(b, b"beta");
 
-    bob_ws.shutdown().await;
-    alice_ws.shutdown().await;
+    bob_ws.shutdown().await.expect("shutdown");
+    alice_ws.shutdown().await.expect("shutdown");
     drop(alice);
     drop(bob);
     daemon_a.stop().await;

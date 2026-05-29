@@ -211,8 +211,8 @@ async fn round_trip_once(run: usize) {
     let recovered = key_to_path(bob_ws.root.as_path(), &key).expect("key_to_path");
     assert_eq!(recovered, bob_a_canonical);
 
-    alice_ws.shutdown().await;
-    bob_ws.shutdown().await;
+    alice_ws.shutdown().await.expect("shutdown");
+    bob_ws.shutdown().await.expect("shutdown");
     let _ = tokio::time::timeout(Duration::from_secs(5), alice_handle).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), bob_handle).await;
     drop(alice);

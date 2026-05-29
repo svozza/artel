@@ -144,7 +144,7 @@ async fn watcher_attached_when_run_resolves() {
          — if it didn't, run().await returned before the watcher attached",
     );
 
-    ws.shutdown().await;
+    ws.shutdown().await.expect("shutdown");
     let _ = timeout(Duration::from_secs(5), handle).await;
     drop(client);
     harness.stop().await;
@@ -184,7 +184,7 @@ async fn applier_subscribed_when_run_resolves() {
          — if equal, run().await returned before the applier subscribed",
     );
 
-    ws.shutdown().await;
+    ws.shutdown().await.expect("shutdown");
     let _ = timeout(Duration::from_secs(5), handle).await;
     drop(client);
     harness.stop().await;

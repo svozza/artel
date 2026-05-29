@@ -166,7 +166,7 @@ async fn alice_post_restart_writes_reach_bob() {
     // workspace and daemon keep running. This mirrors the chat-
     // harness scenario where alice Ctrl-Cs and re-launches while
     // bob's window is untouched.
-    alice_ws.shutdown().await;
+    alice_ws.shutdown().await.expect("shutdown");
     let _ = timeout(Duration::from_secs(5), alice_handle).await;
     drop(alice_events);
     drop(alice);
@@ -214,8 +214,8 @@ async fn alice_post_restart_writes_reach_bob() {
     wait_for_file(&bob_root.path().join("post_restart_alice.txt"), b"delta").await;
 
     // Cleanup.
-    alice_ws.shutdown().await;
-    bob_ws.shutdown().await;
+    alice_ws.shutdown().await.expect("shutdown");
+    bob_ws.shutdown().await.expect("shutdown");
     let _ = timeout(Duration::from_secs(5), alice_handle).await;
     let _ = timeout(Duration::from_secs(5), bob_handle).await;
     drop(alice);

@@ -130,8 +130,8 @@ async fn on_removed_does_not_tombstone_read_only_path() {
         "alice's on_removed regression: locked/y.txt has an entry/tombstone in the doc",
     );
 
-    alice_ws.shutdown().await;
-    bob_ws.shutdown().await;
+    alice_ws.shutdown().await.expect("shutdown");
+    bob_ws.shutdown().await.expect("shutdown");
     let _ = tokio::time::timeout(Duration::from_secs(5), alice_handle).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), bob_handle).await;
     drop(alice);

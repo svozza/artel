@@ -112,7 +112,7 @@ async fn run(args: Args) {
             drop(workspace);
         }
         Mode::Graceful => {
-            workspace.shutdown().await;
+            workspace.shutdown().await.expect("shutdown");
             // Subsequent drop must NOT fire the bomb.
         }
     }

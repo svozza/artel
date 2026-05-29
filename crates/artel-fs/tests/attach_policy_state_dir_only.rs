@@ -82,7 +82,7 @@ async fn require_empty_accepts_dir_with_only_artel_fs_state() {
     .await
     .expect("RequireEmpty should accept dir with only .artel-fs/");
 
-    ws.shutdown().await;
+    ws.shutdown().await.expect("shutdown");
     drop(client);
     harness.stop().await;
 }

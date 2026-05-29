@@ -971,26 +971,45 @@ impl Workspace {
     /// the struct docs for the full failure mode and why `Drop`
     /// alone isn't enough.
     ///
-    /// Subsequent calls are no-ops — the node is `Option::take`'d
-    /// out of its slot on first call.
-    pub async fn shutdown(&self) {
+    /// # Concurrency
+    ///
+    /// Holds the node mutex across the `await`, so two concurrent
+    /// `shutdown` callers serialise: caller B blocks until caller A
+    /// has finished tearing the iroh router down, then sees an empty
+    /// slot and returns `Ok(())` immediately. This is the contract a
+    /// fresh same-state-dir host depends on — without it, B could
+    /// return before A's router actually closed and the next
+    /// `Endpoint::online` would race A's lingering relay session.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first router-shutdown failure verbatim; only the
+    /// caller that actually consumed the node can observe it.
+    /// Subsequent callers (and any caller arriving after the node was
+    /// already taken) return `Ok(())`. The Drop bomb stays armed when
+    /// this method returns `Err`, so a violator who logged-and-ignored
+    /// a failed shutdown still sees the loud message on Drop.
+    pub async fn shutdown(&self) -> Result<(), WorkspaceError> {
         debug!(target: "artel_fs::workspace", "shutdown: cancelling token");
         self.shutdown_token.cancel();
-        let taken = {
-            let mut slot = self.node.lock().await;
-            slot.take()
-        };
-        if let Some(node) = taken {
-            debug!(target: "artel_fs::workspace", "shutdown: tearing down iroh node");
-            node.shutdown().await;
-            debug!(target: "artel_fs::workspace", "shutdown: iroh node torn down");
-        } else {
+        // Hold the lock across the await. The contention window is
+        // bounded by iroh's router shutdown (seconds at worst); all
+        // we need is that B can't return claiming completion before
+        // A's router has actually closed. See struct docs.
+        let mut slot = self.node.lock().await;
+        let Some(node) = slot.take() else {
             debug!(target: "artel_fs::workspace", "shutdown: node already taken");
-        }
-        // Sentinel for the Drop bomb. `Release` so a thread that
-        // observes the flag in `Drop` (after the Workspace's owning
-        // Arc moves into the destructor) sees every shutdown effect.
+            return Ok(());
+        };
+        debug!(target: "artel_fs::workspace", "shutdown: tearing down iroh node");
+        node.shutdown().await?;
+        debug!(target: "artel_fs::workspace", "shutdown: iroh node torn down");
+        // Only arm the Drop-bomb sentinel after the router actually
+        // closed cleanly. `Release` so a thread that observes the
+        // flag in `Drop` (after the Workspace's owning Arc moves
+        // into the destructor) sees every shutdown effect.
         self.did_shutdown.store(true, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -1183,8 +1202,13 @@ impl WorkspaceRollback {
                 );
             }
         }
-        if let Some(node) = self.node.take() {
-            node.shutdown().await;
+        if let Some(node) = self.node.take()
+            && let Err(err) = node.shutdown().await
+        {
+            tracing::warn!(
+                error = %err,
+                "rollback: WorkspaceNode shutdown failed; iroh router may not have closed cleanly",
+            );
         }
     }
 }

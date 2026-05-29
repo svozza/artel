@@ -138,8 +138,8 @@ async fn workspace_state_survives_graceful_restart() {
         // Sanity: a.txt makes it to bob.
         wait_for_file(&bob_root.path().join("a.txt"), b"alpha").await;
 
-        alice_ws.shutdown().await;
-        bob_ws.shutdown().await;
+        alice_ws.shutdown().await.expect("shutdown");
+        bob_ws.shutdown().await.expect("shutdown");
         let _ = tokio::time::timeout(Duration::from_secs(5), alice_handle).await;
         let _ = tokio::time::timeout(Duration::from_secs(5), bob_handle).await;
         drop(alice_events);
@@ -283,8 +283,8 @@ async fn workspace_state_survives_graceful_restart() {
         .unwrap();
     wait_for_missing(&bob_root.path().join("b.txt")).await;
 
-    alice_ws.shutdown().await;
-    bob_ws.shutdown().await;
+    alice_ws.shutdown().await.expect("shutdown");
+    bob_ws.shutdown().await.expect("shutdown");
     let _ = tokio::time::timeout(Duration::from_secs(5), alice_handle).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), bob_handle).await;
     drop(alice_events);

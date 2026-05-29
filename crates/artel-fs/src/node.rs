@@ -132,10 +132,70 @@ impl WorkspaceNode {
         })
     }
 
-    /// Tear the node down gracefully. Best-effort; errors are logged.
-    pub(crate) async fn shutdown(self) {
-        if let Err(err) = self.router.shutdown().await {
-            tracing::warn!(error = %err, "workspace iroh router shutdown failed");
+    /// Tear the node down gracefully.
+    ///
+    /// Returns `Err` if `Router::shutdown` reported a teardown failure
+    /// — the relay session may not have closed cleanly. The caller is
+    /// expected to surface that to its own caller so the
+    /// [`crate::Workspace`] Drop bomb can stay armed (a router that
+    /// failed to shut down is exactly the misuse the bomb documents).
+    pub(crate) async fn shutdown(self) -> Result<(), WorkspaceError> {
+        // Test-only fault injection: when the parent test sets
+        // `force_shutdown_failure(true)`, we synthesise an error
+        // BEFORE touching the real router. Used by
+        // `tests/workspace_shutdown_contract.rs` to prove
+        // `Workspace::shutdown` propagates router failures and keeps
+        // the Drop bomb armed when teardown didn't actually succeed.
+        // No production effect — gated entirely on the
+        // `test-utils` cargo feature.
+        #[cfg(feature = "test-utils")]
+        if test_hooks::take_force_shutdown_failure() {
+            // Best-effort: still try to tear the real router down so
+            // we don't leak the endpoint into the next test. Ignore
+            // its result — the synthesised error is what the test
+            // wants to observe.
+            let _ = self.router.shutdown().await;
+            return Err(WorkspaceError::Iroh(
+                "test-utils fault injection: router shutdown forced to fail".into(),
+            ));
         }
+        self.router
+            .shutdown()
+            .await
+            .map_err(|err| WorkspaceError::Iroh(format!("router shutdown: {err}")))
+    }
+}
+
+/// Test-only fault-injection knobs for [`WorkspaceNode`].
+///
+/// Sole consumer is `tests/workspace_shutdown_contract.rs`, which
+/// needs to coerce `Router::shutdown` into returning `Err` to prove
+/// that [`crate::Workspace::shutdown`] propagates the failure and
+/// leaves the Drop bomb armed. There is no other way to fail an iroh
+/// router shutdown in-process; mocking the entire iroh stack would
+/// be a much bigger surface to maintain.
+///
+/// Single-shot: each `force_shutdown_failure(true)` arms exactly one
+/// failure; the next call to [`WorkspaceNode::shutdown`] consumes
+/// the flag and returns the synthesised error.
+#[cfg(feature = "test-utils")]
+#[allow(unreachable_pub)]
+pub(crate) mod test_hooks {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static FORCE_SHUTDOWN_FAILURE: AtomicBool = AtomicBool::new(false);
+
+    /// Arm the next [`super::WorkspaceNode::shutdown`] to return an
+    /// error without consulting the real router. Single-shot — the
+    /// flag is consumed on read. Re-exported from the crate root as
+    /// [`crate::test_hooks::force_shutdown_failure`].
+    pub fn force_shutdown_failure(armed: bool) {
+        FORCE_SHUTDOWN_FAILURE.store(armed, Ordering::SeqCst);
+    }
+
+    /// Read-and-clear the fault-injection flag. Called from inside
+    /// [`super::WorkspaceNode::shutdown`].
+    pub(super) fn take_force_shutdown_failure() -> bool {
+        FORCE_SHUTDOWN_FAILURE.swap(false, Ordering::SeqCst)
     }
 }

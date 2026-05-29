@@ -299,7 +299,7 @@ async fn steady_state_sigkill_preserves_state() {
     // Alice's daemon-state for that session, and the next host
     // restart starts a fresh artel session. Bob will rejoin via
     // the new ticket.
-    bob_ws.shutdown().await;
+    bob_ws.shutdown().await.expect("shutdown");
     let _ = tokio::time::timeout(Duration::from_secs(5), bob_handle).await;
     drop(bob);
 
@@ -343,7 +343,7 @@ async fn steady_state_sigkill_preserves_state() {
     wait_for_file(&bob_root.path().join("post-restart.txt"), b"live-again").await;
 
     child.sigkill().await;
-    bob_ws.shutdown().await;
+    bob_ws.shutdown().await.expect("shutdown");
     let _ = tokio::time::timeout(Duration::from_secs(5), bob_handle).await;
     drop(bob);
     daemon_a.stop().await;
@@ -438,7 +438,7 @@ async fn mid_scan_sigkill_recovers_via_reconcile() {
     }
 
     child.sigkill().await;
-    bob_ws.shutdown().await;
+    bob_ws.shutdown().await.expect("shutdown");
     let _ = tokio::time::timeout(Duration::from_secs(5), bob_handle).await;
     drop(bob);
     daemon_a.stop().await;
@@ -544,7 +544,7 @@ async fn mid_write_sigkill_resyncs_on_restart() {
     }
 
     child.sigkill().await;
-    bob_ws.shutdown().await;
+    bob_ws.shutdown().await.expect("shutdown");
     let _ = tokio::time::timeout(Duration::from_secs(5), bob_handle).await;
     drop(bob);
     daemon_a.stop().await;

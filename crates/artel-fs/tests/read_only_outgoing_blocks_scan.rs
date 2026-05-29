@@ -111,8 +111,8 @@ async fn scan_blocks_outgoing_read_only_preexisting_file() {
         "alice's scan regression: secret/key.txt landed in the doc",
     );
 
-    alice_ws.shutdown().await;
-    bob_ws.shutdown().await;
+    alice_ws.shutdown().await.expect("shutdown");
+    bob_ws.shutdown().await.expect("shutdown");
     let _ = tokio::time::timeout(Duration::from_secs(5), alice_handle).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), bob_handle).await;
     drop(alice);

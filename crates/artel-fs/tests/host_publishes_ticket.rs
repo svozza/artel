@@ -130,7 +130,7 @@ async fn host_lands_ticket_on_session() {
     let envelope = fs_ticket::decode(&payload).expect("envelope decode");
     let _: DocTicket = DocTicket::from_str(&envelope.doc_ticket).expect("valid DocTicket");
 
-    workspace.shutdown().await;
+    workspace.shutdown().await.expect("shutdown");
     drop(events);
     drop(alice);
     harness.stop().await;

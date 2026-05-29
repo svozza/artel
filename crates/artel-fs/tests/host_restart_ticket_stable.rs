@@ -139,7 +139,7 @@ async fn host_once_and_capture_ticket(harness: &DaemonHarness, root: PathBuf) ->
 
     let ticket = drain_until_ticket(&mut events, session).await;
 
-    workspace.shutdown().await;
+    workspace.shutdown().await.expect("shutdown");
     drop(events);
     drop(alice);
     ticket

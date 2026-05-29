@@ -135,8 +135,8 @@ async fn watcher_blocks_outgoing_read_only_write() {
         "expected SkippedReadOnly{{Outgoing}} event for secret/key.txt",
     );
 
-    alice_ws.shutdown().await;
-    bob_ws.shutdown().await;
+    alice_ws.shutdown().await.expect("shutdown");
+    bob_ws.shutdown().await.expect("shutdown");
     let _ = tokio::time::timeout(Duration::from_secs(5), alice_handle).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), bob_handle).await;
     drop(alice);

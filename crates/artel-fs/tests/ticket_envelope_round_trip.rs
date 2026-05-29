@@ -108,8 +108,8 @@ async fn rules_round_trip_via_envelope() {
     assert_eq!(bob_ws.rules(), &configured_rules);
     assert_ne!(bob_ws.rules(), &bob_distractor_rules);
 
-    bob_ws.shutdown().await;
-    alice_ws.shutdown().await;
+    bob_ws.shutdown().await.expect("shutdown");
+    alice_ws.shutdown().await.expect("shutdown");
     drop(alice);
     drop(bob);
     daemon_a.stop().await;

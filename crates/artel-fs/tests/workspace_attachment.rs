@@ -155,7 +155,7 @@ async fn host_workspace_registers_attachment_via_ipc() {
     assert_eq!(decoded.local_path, canon(ws_root.path()));
     assert_eq!(decoded.state_dir, canon(ws_state.path()));
 
-    workspace.shutdown().await;
+    workspace.shutdown().await.expect("shutdown");
     drop(alice);
     harness.stop().await;
 }
@@ -226,8 +226,8 @@ async fn join_workspace_registers_attachment_via_ipc() {
     assert_eq!(bob_decoded.role, WorkspaceRole::Joiner);
     assert_eq!(bob_entries[0].session, session);
 
-    alice_ws.shutdown().await;
-    bob_ws.shutdown().await;
+    alice_ws.shutdown().await.expect("shutdown");
+    bob_ws.shutdown().await.expect("shutdown");
     drop(alice);
     drop(bob);
     daemon_a.stop().await;
@@ -265,7 +265,7 @@ async fn list_known_workspaces_helper_returns_typed_view() {
     assert_eq!(known[0].attachment.role, WorkspaceRole::Host);
     assert_eq!(known[0].attachment.local_path, canon(ws_root.path()));
 
-    workspace.shutdown().await;
+    workspace.shutdown().await.expect("shutdown");
     drop(alice);
     harness.stop().await;
 }
@@ -321,7 +321,7 @@ async fn attachment_persists_across_daemon_restart() {
 
     // Tear down: workspace then daemon. Recover the daemon's
     // on-disk paths so phase 2 can reattach to the same state.
-    alice_ws_1.shutdown().await;
+    alice_ws_1.shutdown().await.expect("shutdown");
     drop(alice_a1);
     let alice_daemon_state_2 = common::DaemonState {
         root: daemon_a1._state.root,
@@ -397,7 +397,7 @@ async fn attachment_persists_across_daemon_restart() {
     assert_eq!(known_2.len(), 1, "phase 2 still one entry");
     assert_eq!(known_2[0].session, session_id_1);
 
-    alice_ws_2.shutdown().await;
+    alice_ws_2.shutdown().await.expect("shutdown");
     drop(alice_a2);
     daemon_a2.stop().await;
 }
@@ -439,7 +439,7 @@ async fn attachment_removed_on_host_leave_session() {
         "LeaveSession should cascade-delete the attachment",
     );
 
-    workspace.shutdown().await;
+    workspace.shutdown().await.expect("shutdown");
     drop(alice);
     harness.stop().await;
 }
@@ -527,8 +527,8 @@ async fn attachment_removed_on_joiner_leave_session() {
     );
     assert_eq!(alice_entries[0].session, session);
 
-    alice_ws.shutdown().await;
-    bob_ws.shutdown().await;
+    alice_ws.shutdown().await.expect("shutdown");
+    bob_ws.shutdown().await.expect("shutdown");
     drop(alice);
     drop(bob);
     daemon_a.stop().await;

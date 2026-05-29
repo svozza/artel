@@ -157,7 +157,7 @@ async fn host_allow_existing_publishes_pre_seeded_contents() {
     }
     assert!(found, "README.md should be published into the doc");
 
-    ws.shutdown().await;
+    ws.shutdown().await.expect("shutdown");
     drop(client);
     harness.stop().await;
 }
@@ -178,7 +178,7 @@ async fn host_require_empty_accepts_truly_empty_dir() {
     .await
     .expect("RequireEmpty should accept fresh empty dir");
 
-    ws.shutdown().await;
+    ws.shutdown().await.expect("shutdown");
     drop(client);
     harness.stop().await;
 }

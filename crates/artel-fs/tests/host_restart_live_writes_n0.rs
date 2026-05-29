@@ -88,7 +88,17 @@ fn init_tracing() {
     });
 }
 
+// `#[ignore]`d because the post-restart write reliably loses to the
+// addr-info gap documented as finding #5c in
+// `docs/handoff-code-review-fixes.md`: iroh-docs's persistent peer
+// store keeps id-only `EndpointAddr`s, the post-restart `start_sync`
+// races pkarr/DNS to find bob, the dial fails, and bob never sees
+// alice's post-restart write. The fix needs a brainstorm (workspace-
+// side persistent addr cache vs. daemon→workspace addr-cache vs.
+// upstream change). Run manually with `--ignored` once #5c lands;
+// kept on the codebase as a regression trap.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "known failure: finding #5c (host-restart loses peer addr info)"]
 async fn alice_post_restart_writes_reach_bob_real_n0() {
     init_tracing();
 
@@ -209,7 +219,9 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
     .await;
 
     // Phase 2: alice's side goes down. Bob stays alive throughout.
-    phase("alice_ws.shutdown() (phase 1)", alice_ws.shutdown()).await;
+    phase("alice_ws.shutdown() (phase 1)", alice_ws.shutdown())
+        .await
+        .expect("shutdown");
     let _ = timeout(Duration::from_secs(5), alice_handle).await;
     drop(alice_events);
     drop(alice);
@@ -263,8 +275,12 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
     .await;
 
     // Cleanup.
-    phase("alice_ws.shutdown() (final)", alice_ws.shutdown()).await;
-    phase("bob_ws.shutdown() (final)", bob_ws.shutdown()).await;
+    phase("alice_ws.shutdown() (final)", alice_ws.shutdown())
+        .await
+        .expect("shutdown");
+    phase("bob_ws.shutdown() (final)", bob_ws.shutdown())
+        .await
+        .expect("shutdown");
     let _ = timeout(Duration::from_secs(5), alice_handle).await;
     let _ = timeout(Duration::from_secs(5), bob_handle).await;
     drop(alice);

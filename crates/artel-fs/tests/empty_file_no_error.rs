@@ -162,7 +162,7 @@ async fn touching_empty_file_does_not_error_and_does_not_publish() {
     );
 
     // Tidy up.
-    ws.shutdown().await;
+    ws.shutdown().await.expect("shutdown");
     let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     drop(client);
     daemon.stop().await;

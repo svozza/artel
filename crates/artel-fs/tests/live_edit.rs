@@ -100,8 +100,8 @@ async fn live_edit_propagates_host_to_joiner() {
 
     // Tear down: stop the workspaces so their tasks exit, then the
     // daemons.
-    alice_ws.shutdown().await;
-    bob_ws.shutdown().await;
+    alice_ws.shutdown().await.expect("shutdown");
+    bob_ws.shutdown().await.expect("shutdown");
     let _ = tokio::time::timeout(Duration::from_secs(5), alice_handle).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), bob_handle).await;
     drop(alice);

@@ -109,7 +109,7 @@ async fn join_require_empty_rejects_non_empty_dir_without_creating_state() {
         .expect("local-edit.md still readable");
     assert_eq!(preserved, b"don't clobber me");
 
-    alice_ws.shutdown().await;
+    alice_ws.shutdown().await.expect("shutdown");
     drop(alice);
     drop(bob);
     daemon_a.stop().await;
