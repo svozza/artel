@@ -177,7 +177,7 @@ impl Node {
 /// failure with a phase label so the cause is visible without
 /// having to bisect the test body.
 #[tokio::test(flavor = "multi_thread")]
-async fn doc_ticket_round_trips_without_manual_address_seeding() {
+async fn doc_ticket_round_trips_without_manual_address_seeding_n0() {
     init_tracing();
 
     let host = phase(

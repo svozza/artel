@@ -76,7 +76,7 @@ impl RunningDaemon {
 }
 
 #[tokio::test]
-async fn endpoint_id_is_stable_across_daemon_restarts() {
+async fn endpoint_id_is_stable_across_daemon_restarts_n0() {
     let state = fresh_state_dir();
 
     // First boot generates and persists the key.
@@ -104,7 +104,7 @@ async fn endpoint_id_is_stable_across_daemon_restarts() {
 }
 
 #[tokio::test]
-async fn host_ticket_carries_a_real_endpoint_addr() {
+async fn host_ticket_carries_a_real_endpoint_addr_n0() {
     // When iroh is wired up, the ticket the daemon emits via
     // HostSession should carry the daemon's actual EndpointId in
     // host_addr.peer_id. We don't assert anything stronger about

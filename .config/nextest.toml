@@ -1,0 +1,58 @@
+# .config/nextest.toml
+#
+# Tiered test pyramid for the artel workspace.
+#
+#   Tier A — no iroh `Endpoint` bound.        Default profile.  Fast.
+#   Tier B — iroh hermetic (DnsPkarrServer +
+#            TestingUnreachableRelay).         Default profile.  Medium.
+#   Tier C — real n0.                          Only the `n0` /
+#            Test fn names suffix `*_n0`.      `ci` profiles.    Slow.
+#
+# Conventions:
+#   - Every test FUNCTION whose body binds real n0 (presets::N0,
+#     EndpointSetup::Production with iroh actually started) has its
+#     name suffixed `_n0`. nextest groups tests by name pattern,
+#     not file path, so this works inside a consolidated bin too.
+#   - The `tier-c-serial` test-group ensures Tier C runs serially
+#     so the captured tracing log of any failing iteration is a
+#     single coherent timeline (per docs/diagnosing-flaky-tests.md).
+#   - cargo test still works as a fallback: `cargo test --workspace
+#     --all-targets` (slow but unchanged) and `cargo test --workspace
+#     --doc` (nextest doesn't run doctests, so doctests stay here
+#     in either runner).
+
+[profile.default]
+# Developer ergonomics: `cargo nextest run` runs Tier A + B with
+# fail-fast. Tier C tests are filtered out (developers run them
+# manually with `--profile n0`).
+fail-fast = true
+slow-timeout = { period = "60s", terminate-after = 2 }
+default-filter = "not test(/_n0$/)"
+
+[profile.ci]
+# CI runs Tier A + B + C across two invocations: this profile
+# covers A + B with fail-fast so a failing fast-tier test doesn't
+# burn the slow C tier. The C tier is launched as a separate
+# `cargo nextest run --profile n0` invocation by the CI script.
+fail-fast = true
+slow-timeout = { period = "60s", terminate-after = 2 }
+default-filter = "not test(/_n0$/)"
+
+[profile.n0]
+# Tier C only. Serial within the tier (test-threads=1 + test-group
+# below). 300s slow-timeout because real-n0 needs propagation
+# windows. Used for:
+#   - the manual run-until-fail loop documented in
+#     docs/diagnosing-flaky-tests.md
+#   - the CI's tier-C invocation (after the default profile
+#     passes), via `cargo nextest run --profile n0`
+slow-timeout = { period = "300s", terminate-after = 1 }
+test-threads = 1
+default-filter = "test(/_n0$/)"
+
+[[profile.n0.overrides]]
+filter = "test(/_n0$/)"
+test-group = "tier-c-serial"
+
+[test-groups.tier-c-serial]
+max-threads = 1
