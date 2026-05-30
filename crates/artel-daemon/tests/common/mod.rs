@@ -164,15 +164,18 @@ async fn spawn_with_state(config: DaemonConfig, state: Option<State>) -> Running
 pub async fn spawn_pair() -> (RunningDaemon, RunningDaemon, Arc<DnsPkarrServer>) {
     let dns_pkarr = Arc::new(DnsPkarrServer::run().await.expect("DnsPkarrServer::run"));
 
-    let daemon_a = spawn_daemon(fresh_state(), testing_setup(&dns_pkarr)).await;
-    let daemon_b = spawn_daemon(fresh_state(), testing_setup(&dns_pkarr)).await;
+    // Box::pin the spawn futures so `tokio::join!` doesn't stack two
+    // copies of the (large) `Daemon::start` state machine into one
+    // future and trip `clippy::large_futures` at every caller.
+    let fut_a = Box::pin(spawn_daemon(fresh_state(), testing_setup(&dns_pkarr)));
+    let fut_b = Box::pin(spawn_daemon(fresh_state(), testing_setup(&dns_pkarr)));
+    let (daemon_a, daemon_b) = tokio::join!(fut_a, fut_b);
 
-    for daemon in [&daemon_a, &daemon_b] {
-        dns_pkarr
-            .on_endpoint(&daemon.iroh_addr.id, PKARR_READY_TIMEOUT)
-            .await
-            .expect("daemon endpoint pkarr-published");
-    }
+    let pkarr_a = dns_pkarr.on_endpoint(&daemon_a.iroh_addr.id, PKARR_READY_TIMEOUT);
+    let pkarr_b = dns_pkarr.on_endpoint(&daemon_b.iroh_addr.id, PKARR_READY_TIMEOUT);
+    let (ready_a, ready_b) = tokio::join!(pkarr_a, pkarr_b);
+    ready_a.expect("daemon endpoint pkarr-published");
+    ready_b.expect("daemon endpoint pkarr-published");
 
     (daemon_a, daemon_b, dns_pkarr)
 }

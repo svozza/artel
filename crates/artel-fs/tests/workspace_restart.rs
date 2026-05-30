@@ -13,10 +13,10 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, Once};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use artel_client::{Client, EventStream};
 use artel_daemon::shutdown::Shutdown;
@@ -28,14 +28,13 @@ use artel_protocol::{Event, MessageKind, PeerId, PeerInfo, Request, Response, Se
 use iroh::test_utils::DnsPkarrServer;
 use iroh_docs::DocTicket;
 use tempfile::TempDir;
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 
 use common::{
-    DaemonPaths, FILE_BUDGET, Pair, daemon_testing_setup, fresh_state, spawn_daemon_at,
-    spawn_daemon_with_setup, spawn_pair, testing_setup, wait_for_file,
+    DaemonPaths, Pair, daemon_testing_setup, fresh_state, spawn_daemon_at, spawn_daemon_with_setup,
+    spawn_pair, testing_setup, wait_for_file, wait_for_missing,
 };
 
-const POLL: Duration = Duration::from_millis(100);
 const TICKET_BUDGET: Duration = Duration::from_secs(15);
 
 /// Drain `events` until the workspace ticket lands; decode the
@@ -62,21 +61,6 @@ async fn capture_ticket(events: &mut EventStream, session: SessionId) -> DocTick
 
     let envelope = fs_ticket::decode(&payload).expect("envelope decode");
     DocTicket::from_str(&envelope.doc_ticket).expect("DocTicket parse")
-}
-
-async fn wait_for_missing(path: &Path) {
-    let deadline = Instant::now() + FILE_BUDGET;
-    loop {
-        if !path.exists() {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{} never disappeared",
-            path.display(),
-        );
-        sleep(POLL).await;
-    }
 }
 
 // =============================================================

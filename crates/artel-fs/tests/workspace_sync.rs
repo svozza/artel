@@ -127,17 +127,7 @@ async fn alice_delete_propagates_to_bob() {
         .await
         .unwrap();
 
-    let deadline = Instant::now() + WAIT_BUDGET;
-    loop {
-        if !tokio::fs::try_exists(&bob_path).await.unwrap_or(false) {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "bob still has doomed.txt after {WAIT_BUDGET:?}",
-        );
-        sleep(POLL_INTERVAL).await;
-    }
+    common::wait_for_missing(&bob_path).await;
 
     alice_ws.shutdown().await.expect("shutdown");
     bob_ws.shutdown().await.expect("shutdown");
@@ -646,24 +636,10 @@ async fn live_edit_propagates_host_to_joiner() {
     let payload = b"hello from a live edit";
     tokio::fs::write(&alice_path, payload).await.unwrap();
 
-    // Poll Bob's tempdir for the file. Generous deadline because
-    // we're going through:
-    //   notify debounce (300ms) -> doc set_bytes -> sync -> applier
-    // -> tokio::fs::write. ~5s upper bound is realistic.
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if let Ok(bytes) = tokio::fs::read(&bob_path).await
-            && bytes == payload
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "Bob never observed live edit at {}",
-            bob_path.display(),
-        );
-        sleep(Duration::from_millis(100)).await;
-    }
+    // Poll Bob's tempdir for the file. The shared FILE_BUDGET (15s)
+    // covers notify debounce (300ms) -> doc set_bytes -> sync ->
+    // applier -> tokio::fs::write.
+    common::wait_for_file(&bob_path, payload).await;
 
     alice_ws.shutdown().await.expect("shutdown");
     bob_ws.shutdown().await.expect("shutdown");

@@ -7,12 +7,10 @@
 //! `iroh_docs_smoke_pkarr`, `relay_unreachable`) per
 //! `docs/plans/2026-05-29-faster-cargo-test-plan.md` slice 2e.
 //!
-//! Naming: each section's helpers (`Node`, `phase`, `init_tracing`)
-//! has different fixture wiring under the hood, so the consolidated
-//! bin uses section-prefixed names (`N0Node` / `PkarrNode`,
-//! `n0_phase` / `pkarr_phase`, `init_n0_tracing` /
-//! `init_pkarr_tracing`) rather than try to share abstractions
-//! across them. The shapes are similar but not interchangeable.
+//! Naming: each section's `Node` has different fixture wiring under
+//! the hood, so the consolidated bin uses section-prefixed names
+//! (`N0Node` / `PkarrNode`) rather than try to share an abstraction.
+//! The phase wrappers and tracing init are shared across sections.
 
 #![cfg(feature = "test-utils")]
 #![allow(clippy::large_futures)]
@@ -292,35 +290,7 @@ async fn pkarr_phase<F, T>(name: &'static str, fut: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
-    eprintln!(">>> phase begin: {name} (budget {PKARR_PHASE_BUDGET:?})");
-    let res = timeout(PKARR_PHASE_BUDGET, fut)
-        .await
-        .unwrap_or_else(|_| panic!("phase hung past {PKARR_PHASE_BUDGET:?}: {name}"));
-    eprintln!("<<< phase end:   {name}");
-    res
-}
-
-fn init_pkarr_tracing() {
-    use std::sync::Once;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| {
-            concat!(
-                "info,",
-                "iroh=debug,",
-                "iroh::discovery=trace,",
-                "iroh_docs=debug,",
-                "iroh_gossip=debug,",
-                "iroh_blobs=debug",
-            )
-            .to_string()
-        });
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
-            .with_test_writer()
-            .with_target(true)
-            .try_init();
-    });
+    n0_phase_budgeted(name, PKARR_PHASE_BUDGET, fut).await
 }
 
 /// One full iroh node bound against `presets::Empty + Minimal` plus
@@ -392,7 +362,7 @@ impl PkarrNode {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn doc_ticket_round_trips_via_localhost_pkarr_dns() {
-    init_pkarr_tracing();
+    init_n0_tracing();
 
     let dns_pkarr = Arc::new(DnsPkarrServer::run().await.expect("DnsPkarrServer::run"));
 

@@ -20,7 +20,6 @@
 
 mod common;
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -36,7 +35,6 @@ use iroh::test_utils::DnsPkarrServer;
 use iroh_gossip::api::Event as GossipEvent;
 use iroh_gossip::proto::TopicId;
 use pretty_assertions::assert_eq;
-use tempfile::TempDir;
 use tokio::time::timeout;
 
 // =============================================================
@@ -53,31 +51,10 @@ use tokio::time::timeout;
 // daemons.
 // =============================================================
 
-const SMOKE_FALLBACK_PEER: PeerId = PeerId::from_bytes([0xee; 32]);
-
-/// Bin-local state-dir + iroh-runtime helpers for the smoke test.
-/// Don't use `common::*` here — the smoke test goes around the IPC
-/// boundary entirely and needs `IrohRuntime` directly, which the
-/// shared helper doesn't expose.
-struct SmokeState {
-    _root: TempDir,
-    socket: PathBuf,
-    pid: PathBuf,
-    sessions: PathBuf,
-    iroh_key: PathBuf,
-}
-
-fn smoke_fresh_state() -> SmokeState {
-    let root = TempDir::new().unwrap();
-    SmokeState {
-        socket: root.path().join("daemon.sock"),
-        pid: root.path().join("daemon.pid"),
-        sessions: root.path().join("sessions"),
-        iroh_key: root.path().join("iroh.key"),
-        _root: root,
-    }
-}
-
+/// Bin-local iroh-runtime harness for the smoke test. Reuses
+/// `common::State` for the on-disk paths but goes around the IPC
+/// boundary entirely (the smoke test needs `IrohRuntime` directly,
+/// which `common::RunningDaemon` doesn't expose).
 struct SmokeDaemon {
     runtime: artel_daemon::IrohRuntime,
     shutdown: Arc<Shutdown>,
@@ -85,12 +62,12 @@ struct SmokeDaemon {
 }
 
 impl SmokeDaemon {
-    async fn spawn(state: &SmokeState, dns_pkarr: &Arc<DnsPkarrServer>) -> Self {
+    async fn spawn(state: &common::State, dns_pkarr: &Arc<DnsPkarrServer>) -> Self {
         let daemon = Daemon::start(DaemonConfig {
             socket_path: state.socket.clone(),
             pid_path: state.pid.clone(),
             sessions_dir: state.sessions.clone(),
-            daemon_peer_id: SMOKE_FALLBACK_PEER,
+            daemon_peer_id: common::FALLBACK_PEER,
             iroh_key_path: Some(state.iroh_key.clone()),
             endpoint_setup: EndpointSetup::Testing {
                 dns_pkarr: Arc::clone(dns_pkarr),
@@ -122,8 +99,8 @@ impl SmokeDaemon {
 #[tokio::test]
 async fn two_daemons_exchange_a_payload_over_gossip() {
     let dns_pkarr = Arc::new(DnsPkarrServer::run().await.expect("dns_pkarr"));
-    let state_a = smoke_fresh_state();
-    let state_b = smoke_fresh_state();
+    let state_a = common::fresh_state();
+    let state_b = common::fresh_state();
 
     let daemon_a = SmokeDaemon::spawn(&state_a, &dns_pkarr).await;
     let daemon_b = SmokeDaemon::spawn(&state_b, &dns_pkarr).await;

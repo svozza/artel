@@ -292,13 +292,25 @@ pub struct Pair {
 pub async fn spawn_pair() -> Pair {
     let dns_pkarr = Arc::new(DnsPkarrServer::run().await.expect("DnsPkarrServer::run"));
 
-    let daemon_a = spawn_daemon_with_setup(fresh_state(), daemon_testing_setup(&dns_pkarr)).await;
-    let daemon_b = spawn_daemon_with_setup(fresh_state(), daemon_testing_setup(&dns_pkarr)).await;
+    // Box::pin the spawn futures so `tokio::join!` doesn't stack two
+    // copies of the (large) `Daemon::start` state machine into one
+    // future and trip `clippy::large_futures` at every caller.
+    let fut_a = Box::pin(spawn_daemon_with_setup(
+        fresh_state(),
+        daemon_testing_setup(&dns_pkarr),
+    ));
+    let fut_b = Box::pin(spawn_daemon_with_setup(
+        fresh_state(),
+        daemon_testing_setup(&dns_pkarr),
+    ));
+    let (daemon_a, daemon_b) = tokio::join!(fut_a, fut_b);
 
-    for daemon in [&daemon_a, &daemon_b] {
-        let addr = daemon.iroh_addr.as_ref().expect("daemon iroh addr");
-        wait_for_endpoint(&dns_pkarr, &addr.id).await;
-    }
+    let id_a = daemon_a.iroh_addr.as_ref().expect("daemon iroh addr").id;
+    let id_b = daemon_b.iroh_addr.as_ref().expect("daemon iroh addr").id;
+    tokio::join!(
+        wait_for_endpoint(&dns_pkarr, &id_a),
+        wait_for_endpoint(&dns_pkarr, &id_b),
+    );
 
     Pair {
         daemon_a,
