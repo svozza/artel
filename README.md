@@ -28,6 +28,25 @@ Local-only IPC, persistence, daemon, and client are working today. iroh integrat
 
 Other workspace types (CRDT docs, KV stores, etc.) can be implemented as sibling crates following the same convention.
 
+## Development
+
+### Tests
+
+`artel` uses [`cargo-nextest`](https://nexte.st) for the integration test pyramid:
+
+- **Tier A + B** (unit + cross-peer over a localhost `DnsPkarrServer` / `TestingUnreachableRelay`): `make test` or `cargo nextest run --workspace`. Fast, deterministic, runs on every PR.
+- **Tier C** (real n0 — `pkarr.iroh.computer` + production relay): `make test-n0` or `cargo nextest run --workspace --profile n0`. Slower, serial within the tier (so a failing iteration's tracing log is a single coherent timeline). Test fn names suffixed `_n0`; the default profile filters them out via `not test(/_n0$/)`.
+
+Install nextest with:
+
+```
+cargo install cargo-nextest --locked
+```
+
+If you don't want to install nextest, `make test-fallback` runs `cargo test --workspace --all-targets` instead. Slower; no inter-binary parallelism. Doctests run under `cargo test` in either runner (nextest doesn't support doctests).
+
+For diagnosing flaky tests, see [`docs/diagnosing-flaky-tests.md`](docs/diagnosing-flaky-tests.md).
+
 ## License
 
 Dual-licensed under either of:

@@ -47,7 +47,11 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
       - run: cargo build --workspace --all-targets --all-features
-      - run: cargo test --workspace --all-targets
-      - run: cargo test --workspace --all-targets --all-features
+      - run: cargo nextest run --workspace --profile ci
+      - run: cargo nextest run --workspace --profile ci --all-features
+      - run: cargo nextest run --workspace --profile n0 --run-ignored=all
       - run: cargo test --workspace --doc --all-features
