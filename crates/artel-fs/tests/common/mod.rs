@@ -189,6 +189,52 @@ pub async fn spawn_daemon_with_setup(
     }
 }
 
+/// Single-daemon, iroh-disabled harness. The daemon is configured
+/// with `iroh_key_path: None` so no `Endpoint` is bound — the
+/// workspace under test brings its own iroh node up internally and
+/// is the only iroh side that participates.
+///
+/// Used by tests that exercise client IPC paths or drive a single
+/// `Workspace` without a peer. For tests that need a daemon-side
+/// iroh runtime, use [`spawn_daemon_with_setup`] / [`spawn_pair`].
+pub struct LocalDaemon {
+    pub socket: PathBuf,
+    pub shutdown: Arc<Shutdown>,
+    pub join: tokio::task::JoinHandle<std::io::Result<()>>,
+    _tempdir: TempDir,
+}
+
+impl LocalDaemon {
+    pub async fn spawn() -> Self {
+        let tempdir = TempDir::new().unwrap();
+        let socket = tempdir.path().join("daemon.sock");
+        let daemon = Daemon::start(DaemonConfig {
+            socket_path: socket.clone(),
+            pid_path: tempdir.path().join("daemon.pid"),
+            sessions_dir: tempdir.path().join("sessions"),
+            daemon_peer_id: FALLBACK_PEER,
+            iroh_key_path: None,
+            endpoint_setup: DaemonEndpointSetup::Production,
+        })
+        .await
+        .expect("daemon start");
+        let shutdown = daemon.shutdown_handle();
+        let socket = daemon.socket_path().to_path_buf();
+        let join = tokio::spawn(daemon.run());
+        Self {
+            socket,
+            shutdown,
+            join,
+            _tempdir: tempdir,
+        }
+    }
+
+    pub async fn stop(self) {
+        self.shutdown.trigger();
+        let _ = timeout(Duration::from_secs(10), self.join).await;
+    }
+}
+
 /// Daemon state paths whose on-disk directory is owned by the caller.
 /// Use this when a test needs to stop a daemon and respawn another at
 /// the same paths (e.g. mid-session restart scenarios). Compare with

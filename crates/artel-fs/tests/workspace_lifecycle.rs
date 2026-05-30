@@ -17,8 +17,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use artel_client::Client;
-use artel_daemon::shutdown::Shutdown;
-use artel_daemon::{Daemon, DaemonConfig};
 use artel_fs::{
     AttachPolicy, KIND_V1, PolicyViolation, TICKET_ACTION, Workspace, WorkspaceAttachmentV1,
     WorkspaceConfig, WorkspaceError, WorkspaceRole, list_known_workspaces, path_to_key,
@@ -34,58 +32,11 @@ use iroh_docs::store::Query;
 use tempfile::TempDir;
 use tokio::time::{sleep, timeout};
 
-use common::{daemon_testing_setup, testing_setup};
+use common::{LocalDaemon, daemon_testing_setup, testing_setup};
 
 // =============================================================
 // Local helpers
 // =============================================================
-
-/// Single-daemon harness: iroh-disabled (`iroh_key_path: None` plus
-/// `EndpointSetup::Production`, which never actually binds an
-/// `Endpoint` because the daemon-side iroh runtime is feature-gated
-/// via `iroh_key_path`). Used by tests that only exercise client IPC
-/// or that drive a single `Workspace` without a peer — the workspace
-/// brings its own iroh node up internally and that's the only iroh
-/// side that participates.
-struct LocalDaemon {
-    _tempdir: TempDir,
-    socket: PathBuf,
-    shutdown: Arc<Shutdown>,
-    join: tokio::task::JoinHandle<std::io::Result<()>>,
-}
-
-impl LocalDaemon {
-    async fn spawn() -> Self {
-        let tempdir = tempfile::tempdir().unwrap();
-        let socket = tempdir.path().join("daemon.sock");
-        let pid = tempdir.path().join("daemon.pid");
-        let sessions = tempdir.path().join("sessions");
-        let daemon = Daemon::start(DaemonConfig {
-            socket_path: socket.clone(),
-            pid_path: pid,
-            sessions_dir: sessions,
-            daemon_peer_id: PeerId::from_bytes([0xee; 32]),
-            iroh_key_path: None,
-            endpoint_setup: artel_daemon::EndpointSetup::Production,
-        })
-        .await
-        .expect("daemon start");
-        let shutdown = daemon.shutdown_handle();
-        let socket = daemon.socket_path().to_path_buf();
-        let join = tokio::spawn(daemon.run());
-        Self {
-            _tempdir: tempdir,
-            socket,
-            shutdown,
-            join,
-        }
-    }
-
-    async fn stop(self) {
-        self.shutdown.trigger();
-        let _ = timeout(Duration::from_secs(10), self.join).await;
-    }
-}
 
 fn host_peer() -> PeerInfo {
     PeerInfo::new(PeerId::from_bytes([1; 32]), "host")

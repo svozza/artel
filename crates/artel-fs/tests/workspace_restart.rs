@@ -19,8 +19,6 @@ use std::sync::{Arc, Once};
 use std::time::Duration;
 
 use artel_client::{Client, EventStream};
-use artel_daemon::shutdown::Shutdown;
-use artel_daemon::{Daemon, DaemonConfig};
 use artel_fs::{
     AttachPolicy, TICKET_ACTION, Workspace, WorkspaceConfig, session_id_for, ticket as fs_ticket,
 };
@@ -31,8 +29,8 @@ use tempfile::TempDir;
 use tokio::time::timeout;
 
 use common::{
-    DaemonPaths, Pair, daemon_testing_setup, fresh_state, spawn_daemon_at, spawn_daemon_with_setup,
-    spawn_pair, testing_setup, wait_for_file, wait_for_missing,
+    DaemonPaths, LocalDaemon, Pair, daemon_testing_setup, fresh_state, spawn_daemon_at,
+    spawn_daemon_with_setup, spawn_pair, testing_setup, wait_for_file, wait_for_missing,
 };
 
 const TICKET_BUDGET: Duration = Duration::from_secs(15);
@@ -786,55 +784,12 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
 // unambiguous failure mode.
 // =============================================================
 
-/// Iroh-disabled single-daemon harness for the ticket-stability test.
-/// The resume-stability property is about per-workspace iroh state,
-/// not the daemon's iroh layer, so the daemon doesn't need to be
-/// iroh-enabled.
-struct TicketStableDaemon {
-    _tempdir: TempDir,
-    socket: PathBuf,
-    shutdown: Arc<Shutdown>,
-    join: tokio::task::JoinHandle<std::io::Result<()>>,
-}
-
-impl TicketStableDaemon {
-    async fn spawn() -> Self {
-        let tempdir = tempfile::tempdir().unwrap();
-        let socket = tempdir.path().join("daemon.sock");
-        let pid = tempdir.path().join("daemon.pid");
-        let daemon = Daemon::start(DaemonConfig {
-            socket_path: socket.clone(),
-            pid_path: pid,
-            sessions_dir: tempdir.path().join("sessions"),
-            daemon_peer_id: PeerId::from_bytes([0xee; 32]),
-            iroh_key_path: None,
-            endpoint_setup: artel_daemon::EndpointSetup::Production,
-        })
-        .await
-        .expect("daemon start");
-        let shutdown = daemon.shutdown_handle();
-        let join = tokio::spawn(daemon.run());
-        Self {
-            _tempdir: tempdir,
-            socket,
-            shutdown,
-            join,
-        }
-    }
-
-    async fn stop(self) {
-        self.shutdown.trigger();
-        timeout(Duration::from_secs(5), self.join)
-            .await
-            .expect("daemon did not exit within 5s")
-            .expect("daemon panicked")
-            .expect("daemon io");
-    }
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn re_hosting_same_dir_yields_structurally_identical_ticket() {
-    let harness = TicketStableDaemon::spawn().await;
+    // The resume-stability property is about per-workspace iroh
+    // state, not the daemon's iroh layer, so a `LocalDaemon`
+    // (iroh-disabled) is sufficient.
+    let harness = LocalDaemon::spawn().await;
 
     // Workspace dir outlives both phases. The state dir
     // (`<root>/.artel-fs/`) is what carries `iroh.key` + `doc-id`
@@ -864,7 +819,7 @@ async fn re_hosting_same_dir_yields_structurally_identical_ticket() {
 }
 
 /// Stand up a workspace, capture the published ticket, shut down.
-async fn host_once_and_capture_ticket(harness: &TicketStableDaemon, root: PathBuf) -> DocTicket {
+async fn host_once_and_capture_ticket(harness: &LocalDaemon, root: PathBuf) -> DocTicket {
     let alice = Client::connect(&harness.socket).await.unwrap();
     let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
 

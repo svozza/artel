@@ -15,13 +15,12 @@
 #![cfg(feature = "test-utils")]
 #![allow(clippy::large_futures)]
 
-use std::path::PathBuf;
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use artel_client::Client;
-use artel_daemon::shutdown::Shutdown;
-use artel_daemon::{Daemon, DaemonConfig};
 use artel_fs::{AttachPolicy, EndpointSetup, Workspace, WorkspaceConfig, WorkspaceError};
 use artel_protocol::{PeerId, PeerInfo};
 use bytes::Bytes;
@@ -37,7 +36,6 @@ use iroh_docs::engine::LiveEvent;
 use iroh_docs::protocol::Docs;
 use iroh_docs::store::Query;
 use iroh_gossip::net::Gossip;
-use tempfile::TempDir;
 use tokio::time::timeout;
 
 // =============================================================
@@ -484,53 +482,11 @@ async fn doc_ticket_round_trips_via_localhost_pkarr_dns() {
 /// on scheduling alone.
 const RELAY_HARNESS_BUDGET: Duration = Duration::from_secs(40);
 
-struct RelayDaemon {
-    _tempdir: TempDir,
-    socket: PathBuf,
-    shutdown: Arc<Shutdown>,
-    join: tokio::task::JoinHandle<std::io::Result<()>>,
-}
-
-impl RelayDaemon {
-    /// Daemon stays local-only (no `iroh_key_path`) — only the
-    /// workspace endpoint exercises the relay path.
-    async fn spawn() -> Self {
-        let tempdir = tempfile::tempdir().unwrap();
-        let socket = tempdir.path().join("daemon.sock");
-        let pid = tempdir.path().join("daemon.pid");
-        let daemon = Daemon::start(DaemonConfig {
-            socket_path: socket.clone(),
-            pid_path: pid,
-            sessions_dir: tempdir.path().join("sessions"),
-            daemon_peer_id: PeerId::from_bytes([0xee; 32]),
-            iroh_key_path: None,
-            endpoint_setup: artel_daemon::EndpointSetup::Production,
-        })
-        .await
-        .expect("daemon start");
-        let shutdown = daemon.shutdown_handle();
-        let join = tokio::spawn(daemon.run());
-        Self {
-            _tempdir: tempdir,
-            socket,
-            shutdown,
-            join,
-        }
-    }
-
-    async fn stop(self) {
-        self.shutdown.trigger();
-        timeout(Duration::from_secs(5), self.join)
-            .await
-            .expect("daemon did not exit within 5s")
-            .expect("daemon panicked")
-            .expect("daemon io");
-    }
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn host_with_unreachable_relay_returns_typed_error() {
-    let harness = RelayDaemon::spawn().await;
+    // Daemon stays local-only (no `iroh_key_path`) — only the
+    // workspace endpoint exercises the relay path.
+    let harness = common::LocalDaemon::spawn().await;
     let client = Client::connect(&harness.socket).await.unwrap();
 
     let ws_dir = tempfile::tempdir().unwrap();
