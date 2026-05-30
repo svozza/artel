@@ -7,10 +7,9 @@
 //! `host_restart_live_writes`, `host_restart_live_writes_n0`,
 //! `host_restart_ticket_stable`, `host_resume_session_id`) per
 //! `docs/plans/2026-05-29-faster-cargo-test-plan.md` slice 2d. The
-//! `*_real_n0` test fn keeps its `#[ignore]` and `_n0` suffix —
-//! the default nextest profile filters it out via
-//! `not test(/_n0$/)`. Slice 4 will remove the `#[ignore]` and the
-//! `n0` profile will run it.
+//! `*_real_n0` test fn keeps its `_n0` suffix — the default nextest
+//! profile filters it out via `not test(/_n0$/)`; the `n0` profile
+//! runs it.
 
 mod common;
 
@@ -592,15 +591,11 @@ async fn capture_ticket_n0(events: &mut EventStream, session: SessionId) -> DocT
 }
 
 // Real-n0 sibling for finding #5c (host-restart peer-addr cache).
-// The deterministic counterpart is
-// `crates/artel-daemon/tests/peer_addr_cache_pkarr.rs`. Keep this
-// `#[ignore]`d in CI per `docs/handoff-code-review-fixes.md`
-// § "Conventions a fresh agent should keep" — real-n0 tests are
-// flaky in CI under back-to-back load. Run manually with
-// `--ignored` per the recipe in `docs/diagnosing-flaky-tests.md`
-// before any change touching session-join / peer-addr paths.
+// The deterministic counterpart is the `peer_addr_cache_pkarr`
+// test fn in `crates/artel-daemon/tests/identity.rs`. Runs under
+// the `n0` nextest profile (filter `test(/_n0$/)`); the default
+// profile filters it out via `not test(/_n0$/)`.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "real-n0; run manually with --ignored before changes touching session-join / peer-addr paths"]
 #[allow(clippy::large_futures, clippy::too_many_lines)]
 async fn alice_post_restart_writes_reach_bob_real_n0() {
     init_n0_tracing();

@@ -228,9 +228,8 @@ async fn no_iroh_key_path_keeps_synthetic_peer_id() {
 // installs at startup) so the very first dial has the relay url +
 // direct addrs in hand and doesn't wait on pkarr.
 //
-// `#[ignore]`d in CI per docs/handoff-code-review-fixes.md
-// § "Conventions a fresh agent should keep" — real-n0 tests are
-// flaky in CI under back-to-back load.
+// Runs under the `n0` nextest profile (filter `test(/_n0$/)`); the
+// default profile filters it out via `not test(/_n0$/)`.
 // =============================================================
 
 /// Tighter than `gossip_bridge::JOIN_READY_TIMEOUT` (15s) but loose
@@ -238,7 +237,6 @@ async fn no_iroh_key_path_keeps_synthetic_peer_id() {
 const JOIN_BUDGET: Duration = Duration::from_secs(8);
 
 #[tokio::test]
-#[ignore = "real-n0; run manually with --ignored before changes touching session-join paths"]
 async fn join_succeeds_within_tight_budget_real_n0() {
     let alice_state = common::fresh_state();
     let bob_state = common::fresh_state();
