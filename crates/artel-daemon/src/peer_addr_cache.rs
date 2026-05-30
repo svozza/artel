@@ -15,7 +15,7 @@
 //! failing test was `host_restart_live_writes_n0` — alice's
 //! post-restart writes never reached bob because iroh-docs read
 //! id-only `EndpointAddr`s from its persistent doc store, skipped
-//! its internal memory_lookup seeding (`engine/live.rs:472`), and
+//! its internal `memory_lookup` seeding (`engine/live.rs:472`), and
 //! raced n0 pkarr/DNS to find bob. The race lost.
 //!
 //! See `docs/handoff-code-review-fixes.md` § "Findings discovered
@@ -61,7 +61,7 @@ use tracing::{debug, warn};
 const CACHE_MODE: u32 = 0o600;
 
 /// Maximum entries persisted per snapshot. Keeps the file size and
-/// MemoryLookup memory footprint bounded over a long-running daemon.
+/// `MemoryLookup` memory footprint bounded over a long-running daemon.
 /// 256 covers a several-hundred-peer mesh comfortably; entries beyond
 /// the cap are evicted MRU-style at write time.
 const MAX_ENTRIES: usize = 256;
@@ -100,16 +100,11 @@ pub(crate) struct PeerAddrCache {
 impl PeerAddrCache {
     /// Create a handle pointing at `path`. The file does not need to
     /// exist; [`load`](Self::load) returns an empty list if missing.
-    pub(crate) fn new(path: PathBuf) -> Self {
+    pub(crate) const fn new(path: PathBuf) -> Self {
         Self {
             path,
             max_entries: MAX_ENTRIES,
         }
-    }
-
-    /// Return the cache file path.
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
     }
 
     /// Load entries from disk. Never errors; logs and returns an
@@ -151,7 +146,7 @@ impl PeerAddrCache {
 
     /// Persist `entries` to disk. Never errors; logs on failure.
     /// Drops entries with no relay url AND no direct addrs (id-only
-    /// — they provide no value to MemoryLookup) and caps the file at
+    /// — they provide no value to `MemoryLookup`) and caps the file at
     /// `MAX_ENTRIES`, keeping the most-recently-seen.
     pub(crate) fn save(&self, entries: Vec<CacheEntry>) {
         let mut filtered: Vec<CacheEntry> = entries
@@ -159,7 +154,7 @@ impl PeerAddrCache {
             .filter(|e| !e.addr.relay_url.is_empty() || !e.addr.direct_addrs.is_empty())
             .collect();
         // Newest first; truncate keeps the head.
-        filtered.sort_by(|a, b| b.last_seen_unix_secs.cmp(&a.last_seen_unix_secs));
+        filtered.sort_by_key(|e| std::cmp::Reverse(e.last_seen_unix_secs));
         filtered.truncate(self.max_entries);
 
         let envelope = PeerAddrCacheFile::V1(PeerAddrCacheV1 { entries: filtered });
@@ -198,8 +193,7 @@ pub(crate) fn entry_from_iroh(addr: &EndpointAddr) -> CacheEntry {
     let direct_addrs: BTreeSet<SocketAddr> = addr.ip_addrs().copied().collect();
     let last_seen_unix_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     CacheEntry {
         addr: WireEndpointAddr {
             peer_id,
@@ -306,17 +300,13 @@ mod tests {
         let path = dir.path().join("peer_addrs.postcard");
         let cache = PeerAddrCache::new(path);
 
-        let want = vec![entry(0x01, 1000), entry(0x02, 2000), entry(0x03, 3000)];
+        let mut want = vec![entry(0x01, 1000), entry(0x02, 2000), entry(0x03, 3000)];
         cache.save(want.clone());
 
         let got = cache.load();
         // Save sorts by last_seen desc; order should be 03, 02, 01.
-        let expected_order: Vec<_> = {
-            let mut e = want.clone();
-            e.sort_by(|a, b| b.last_seen_unix_secs.cmp(&a.last_seen_unix_secs));
-            e
-        };
-        assert_eq!(got, expected_order);
+        want.sort_by_key(|c| std::cmp::Reverse(c.last_seen_unix_secs));
+        assert_eq!(got, want);
     }
 
     #[test]
@@ -339,8 +329,12 @@ mod tests {
         let got = cache.load();
         assert_eq!(got.len(), 3);
         let kept: BTreeSet<PeerId> = got.iter().map(|e| e.addr.peer_id).collect();
-        let expected: BTreeSet<PeerId> = [0x03, 0x04, 0x05].into_iter().map(valid_peer_id).collect();
-        assert_eq!(kept, expected, "should retain the 3 highest last_seen entries");
+        let expected: BTreeSet<PeerId> =
+            [0x03, 0x04, 0x05].into_iter().map(valid_peer_id).collect();
+        assert_eq!(
+            kept, expected,
+            "should retain the 3 highest last_seen entries"
+        );
     }
 
     #[test]

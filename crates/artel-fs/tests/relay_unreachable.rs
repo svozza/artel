@@ -85,8 +85,8 @@ async fn host_with_unreachable_relay_returns_typed_error() {
     let ws_dir = tempfile::tempdir().unwrap();
     let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
 
-    let config = WorkspaceConfig::default()
-        .with_endpoint_setup(EndpointSetup::TestingUnreachableRelay);
+    let config =
+        WorkspaceConfig::default().with_endpoint_setup(EndpointSetup::TestingUnreachableRelay);
 
     // `Workspace::host_with` must return Err within the harness
     // budget. Pre-fix this hangs in `endpoint.online()` and the
@@ -121,9 +121,7 @@ async fn host_with_unreachable_relay_returns_typed_error() {
             "expected WorkspaceError::RelayUnreachable, but host_with succeeded — \
              that's impossible against a TEST-NET-1 relay"
         ),
-        Err(other) => panic!(
-            "expected WorkspaceError::RelayUnreachable, got {other:?}"
-        ),
+        Err(other) => panic!("expected WorkspaceError::RelayUnreachable, got {other:?}"),
     }
 
     drop(client);

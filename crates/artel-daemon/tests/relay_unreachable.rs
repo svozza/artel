@@ -88,9 +88,7 @@ async fn daemon_start_with_unreachable_relay_returns_typed_error() {
                  the daemon never awaits endpoint.online() (#6 asymmetry)"
             );
         }
-        Err(other) => panic!(
-            "expected StartError::RelayUnreachable, got {other:?}"
-        ),
+        Err(other) => panic!("expected StartError::RelayUnreachable, got {other:?}"),
     }
 
     // Hold the temp dir for the duration of the test; nothing to

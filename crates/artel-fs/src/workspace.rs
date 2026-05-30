@@ -989,13 +989,13 @@ impl Workspace {
     /// already taken) return `Ok(())`. The Drop bomb stays armed when
     /// this method returns `Err`, so a violator who logged-and-ignored
     /// a failed shutdown still sees the loud message on Drop.
+    // Holding the lock across the await is deliberate: it serialises
+    // shutdown so a second caller can't observe completion before the
+    // first call's router has actually closed. See struct docs.
+    #[allow(clippy::significant_drop_tightening)]
     pub async fn shutdown(&self) -> Result<(), WorkspaceError> {
         debug!(target: "artel_fs::workspace", "shutdown: cancelling token");
         self.shutdown_token.cancel();
-        // Hold the lock across the await. The contention window is
-        // bounded by iroh's router shutdown (seconds at worst); all
-        // we need is that B can't return claiming completion before
-        // A's router has actually closed. See struct docs.
         let mut slot = self.node.lock().await;
         let Some(node) = slot.take() else {
             debug!(target: "artel_fs::workspace", "shutdown: node already taken");

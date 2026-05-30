@@ -47,4 +47,3 @@ pub use ticket::{TicketEnvelopeError, WorkspaceTicketEnvelope};
 pub use workspace::{
     AttachPolicy, Direction, TICKET_ACTION, Workspace, WorkspaceConfig, WorkspaceEvent,
 };
-

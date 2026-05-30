@@ -131,9 +131,9 @@ async fn join_succeeds_within_tight_budget_real_n0() {
         Response::JoinSession { session, .. } => {
             assert_eq!(session, session_id, "session id mismatch");
         }
-        Response::Error { error } => panic!(
-            "bob's JoinSession returned error after {elapsed:?}: {error:?}",
-        ),
+        Response::Error { error } => {
+            panic!("bob's JoinSession returned error after {elapsed:?}: {error:?}")
+        }
         other => panic!("expected JoinSession, got {other:?}"),
     }
 

@@ -41,15 +41,13 @@ use std::sync::{Arc, Once};
 use std::time::Duration;
 
 use artel_client::Client;
-use artel_protocol::{
-    Event, MessageKind, PeerId, PeerInfo, Request, Response, SendPayload,
-};
+use artel_protocol::{Event, MessageKind, PeerId, PeerInfo, Request, Response, SendPayload};
 use iroh::test_utils::DnsPkarrServer;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
 /// Per-phase budget — see `docs/diagnosing-flaky-tests.md` § 1.
-/// 30s covers two-daemon spin-up + DnsPkarrServer pkarr publish on
+/// 30s covers two-daemon spin-up + `DnsPkarrServer` pkarr publish on
 /// CI without leaving slack for genuine hangs.
 const PHASE_BUDGET: Duration = Duration::from_secs(30);
 
@@ -104,6 +102,7 @@ fn init_tracing() {
 /// explicit so snapshot-not-firing vs load-not-firing are
 /// distinguishable failure modes.
 #[tokio::test]
+#[allow(clippy::too_many_lines, clippy::large_futures)]
 async fn addr_hint_survives_daemon_restart_via_on_disk_cache() {
     init_tracing();
 
@@ -120,9 +119,12 @@ async fn addr_hint_survives_daemon_restart_via_on_disk_cache() {
 
     // ------- Phase 1 — alice + bob run; bob joins alice's session -------
     let dns_phase1 = Arc::new(
-        phase("phase1: spin up first DnsPkarrServer", DnsPkarrServer::run())
-            .await
-            .expect("DnsPkarrServer::run phase1"),
+        phase(
+            "phase1: spin up first DnsPkarrServer",
+            DnsPkarrServer::run(),
+        )
+        .await
+        .expect("DnsPkarrServer::run phase1"),
     );
 
     let alice_phase1 = phase(
@@ -227,7 +229,7 @@ async fn addr_hint_survives_daemon_restart_via_on_disk_cache() {
                 Some(Event::Message { message, .. }) if message.payload == b"hello-from-bob" => {
                     break;
                 }
-                Some(_) => continue,
+                Some(_) => {}
                 None => panic!("alice's event stream closed before bob's message arrived"),
             }
         }
@@ -291,7 +293,11 @@ async fn addr_hint_survives_daemon_restart_via_on_disk_cache() {
              shutdown hook didn't run in phase 1, or the load-on- \
              startup hook didn't run in phase 2.",
             cache_path.display(),
-            if cache_path.exists() { "exists" } else { "MISSING" },
+            if cache_path.exists() {
+                "exists"
+            } else {
+                "MISSING"
+            },
         )
     });
 
@@ -311,4 +317,3 @@ async fn addr_hint_survives_daemon_restart_via_on_disk_cache() {
     drop(dns_phase2);
     drop(alice_root);
 }
-

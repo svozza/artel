@@ -60,7 +60,7 @@ where
     res
 }
 
-/// One-shot tracing init for this test process. Wide RUST_LOG
+/// One-shot tracing init for this test process. Wide `RUST_LOG`
 /// defaults so a captured failing log surfaces every layer that
 /// could plausibly cause a sync hang. Honours `RUST_LOG`; narrow via
 /// env var when isolating a specific subsystem.
@@ -98,6 +98,7 @@ fn init_tracing() {
 // before any change touching session-join / peer-addr paths.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "real-n0; run manually with --ignored before changes touching session-join / peer-addr paths"]
+#[allow(clippy::large_futures)]
 async fn alice_post_restart_writes_reach_bob_real_n0() {
     init_tracing();
 

@@ -18,13 +18,13 @@
 
 mod common;
 
-use common::{spawn_pair, testing_setup, wait_for_file, Pair};
+use common::{Pair, spawn_pair, testing_setup, wait_for_file};
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use artel_client::Client;
-use artel_fs::{path_to_key, AttachPolicy, Workspace, WorkspaceConfig};
+use artel_fs::{AttachPolicy, Workspace, WorkspaceConfig, path_to_key};
 use artel_protocol::{PeerId, PeerInfo, Request, Response};
 use bytes::Bytes;
 use tokio::time::sleep;
@@ -37,6 +37,7 @@ use tokio::time::sleep;
 const TOMBSTONE_SETTLE: Duration = Duration::from_millis(200);
 
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
 async fn applier_filter_check_gates_tombstone_for_hardcoded_skip() {
     let Pair {
         daemon_a,

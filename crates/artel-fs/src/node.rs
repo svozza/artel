@@ -204,4 +204,3 @@ impl WorkspaceNode {
             .map_err(|err| WorkspaceError::Iroh(format!("router shutdown: {err}")))
     }
 }
-

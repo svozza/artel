@@ -108,8 +108,7 @@ pub(crate) struct GossipBridge {
     /// public iterator over `MemoryLookup` entries, so this
     /// shadow is the daemon's only enumerable source. Drives
     /// finding #5c's host-restart peer-addr cache.
-    tracked_peer_ids:
-        Arc<std::sync::Mutex<std::collections::BTreeSet<iroh::EndpointId>>>,
+    tracked_peer_ids: Arc<std::sync::Mutex<std::collections::BTreeSet<iroh::EndpointId>>>,
 }
 
 #[derive(Debug)]
@@ -830,8 +829,8 @@ fn wire_addr_to_iroh(addr: &WireEndpointAddr) -> Result<EndpointAddr, String> {
         .map_err(|e| format!("peer id: {e}"))?;
     let mut iroh_addr = EndpointAddr::new(endpoint_id);
     if !addr.relay_url.is_empty() {
-        let url = iroh::RelayUrl::from_str(&addr.relay_url)
-            .map_err(|e| format!("relay_url: {e}"))?;
+        let url =
+            iroh::RelayUrl::from_str(&addr.relay_url).map_err(|e| format!("relay_url: {e}"))?;
         iroh_addr = iroh_addr.with_relay_url(url);
     }
     for direct in &addr.direct_addrs {

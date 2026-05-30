@@ -747,16 +747,19 @@ async fn resolve_iroh_runtime(
     // pkarr/DNS to find peers (handoff finding #5c). Loading is
     // best-effort: a missing or corrupt cache yields an empty seed,
     // identical to pre-fix behaviour.
-    let tracked_peer_ids = Arc::new(std::sync::Mutex::new(
-        std::collections::BTreeSet::<iroh::EndpointId>::new(),
-    ));
+    let tracked_peer_ids = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::<
+        iroh::EndpointId,
+    >::new()));
     let peer_addr_cache = Arc::new(crate::peer_addr_cache::PeerAddrCache::new(
         peer_addr_cache_path(path),
     ));
     for entry in peer_addr_cache.load() {
         match crate::peer_addr_cache::iroh_addr_from_entry(&entry) {
             Ok(iroh_addr) => {
-                tracked_peer_ids.lock().expect("poisoned").insert(iroh_addr.id);
+                tracked_peer_ids
+                    .lock()
+                    .expect("poisoned")
+                    .insert(iroh_addr.id);
                 addr_hint.add_endpoint_info(iroh_addr);
             }
             Err(err) => {
@@ -806,9 +809,10 @@ async fn resolve_iroh_runtime(
 /// matches the rest of the daemon's per-state-dir files.
 #[cfg(feature = "iroh")]
 fn peer_addr_cache_path(iroh_key_path: &std::path::Path) -> PathBuf {
-    iroh_key_path
-        .parent()
-        .map_or_else(|| PathBuf::from("peer_addrs.postcard"), |p| p.join("peer_addrs.postcard"))
+    iroh_key_path.parent().map_or_else(
+        || PathBuf::from("peer_addrs.postcard"),
+        |p| p.join("peer_addrs.postcard"),
+    )
 }
 
 /// Walk every tracked `EndpointId`, ask iroh's endpoint for its
@@ -846,7 +850,8 @@ async fn snapshot_peer_addrs(
         // `RemoteInfo::into_addrs` shows this exact pattern.
         let iroh_addr = iroh::EndpointAddr::from_parts(
             info.id(),
-            info.into_addrs().map(|addr| addr.into_addr()),
+            info.into_addrs()
+                .map(iroh::endpoint::TransportAddrInfo::into_addr),
         );
         entries.push(crate::peer_addr_cache::entry_from_iroh(&iroh_addr));
     }
