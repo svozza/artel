@@ -78,12 +78,14 @@ labelling anything an n0 infra flake.
 This doc is referenced again from:
 - The `feedback_no_handwaving_flaky_tests.md` memory entry
   (loads automatically — see `MEMORY.md`).
-- `docs/roadmap.md` § "Future" → "Faster `cargo test --workspace`"
-  (the test-tiers / nextest entry — commit `d9d9e0e`). The
-  diagnostic-legibility framing for serialising real-n0 tests
-  belongs there, not in the older "n0 rate-limit flakiness"
-  attribution that `docs/diagnosing-flaky-tests.md` § "What NOT to
-  do" explicitly debunks.
+- `docs/plans/2026-05-29-faster-cargo-test-plan.md` (test-infra
+  landed at commit `6d22e61` — cargo-nextest + by-subsystem
+  consolidation + tiered pyramid). The diagnostic-legibility
+  framing for serialising real-n0 tests is now wired in via the
+  `n0` profile in `.config/nextest.toml`, not in the older "n0
+  rate-limit flakiness" attribution that
+  `docs/diagnosing-flaky-tests.md` § "What NOT to do" explicitly
+  debunks.
 - The "Conventions a fresh agent should keep" subsection at
   the bottom of this status block.
 
@@ -161,13 +163,11 @@ landed alongside the fix.
   `wait_for_workspace` to gate cross-peer tests on workspace
   endpoints' pkarr publish. Hardens `live_edit`,
   `delete_propagates`, `round_trip`, the read_only_*,
-  `host_restart_live_writes`, etc. **Pairs naturally with the
-  test-tiers/nextest work** in `docs/roadmap.md` § "Future" →
-  "Faster `cargo test --workspace`" (commit `d9d9e0e`) — both are
-  test-infrastructure changes that touch `tests/common/mod.rs` and
-  the cross-peer test pyramid. If you do this finding and the
-  test-tiers cleanup at roughly the same time, they can share a
-  `tests/common/mod.rs` rewrite instead of two passes over it.
+  `host_restart_live_writes`, etc. Test-infra (cargo-nextest +
+  by-subsystem consolidation) landed at commit `6d22e61` per
+  `docs/plans/2026-05-29-faster-cargo-test-plan.md`, so the
+  `tests/common/mod.rs` shape is now stable; this finding's
+  cross-peer-gate rewrite lands on top.
 - **#9 — `drop_bomb_child` Testing-fixture.** Adds
   `EndpointSetup::TestingExternal { nameserver, pkarr_url }`
   variant + child-process env plumbing.
