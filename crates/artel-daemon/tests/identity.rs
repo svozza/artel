@@ -29,12 +29,10 @@
 
 mod common;
 
-use std::path::PathBuf;
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use artel_client::Client;
-use artel_daemon::shutdown::Shutdown;
 use artel_daemon::{Daemon, DaemonConfig, EndpointSetup, StartError};
 use artel_protocol::{
     Event, MessageKind, PeerId, PeerInfo, Request, Response, SendPayload, ticket,
@@ -52,81 +50,28 @@ use tokio::time::timeout;
 // the synthetic peer id and these assertions don't apply.
 // =============================================================
 
-/// Synthetic id used as the `daemon_peer_id` fallback. With an iroh
-/// key supplied, the daemon must derive its real id from the key and
-/// ignore this value, so we pick something obviously fake.
-const FALLBACK_PEER_FOR_IDENTITY: PeerId = PeerId::from_bytes([0xee; 32]);
-
-struct IdentityStateDir {
-    _root: TempDir,
-    socket: PathBuf,
-    pid: PathBuf,
-    sessions: PathBuf,
-    iroh_key: PathBuf,
-}
-
-fn identity_fresh_state_dir() -> IdentityStateDir {
-    let root = TempDir::new().unwrap();
-    IdentityStateDir {
-        socket: root.path().join("daemon.sock"),
-        pid: root.path().join("daemon.pid"),
-        sessions: root.path().join("sessions"),
-        iroh_key: root.path().join("iroh.key"),
-        _root: root,
-    }
-}
-
-struct IdentityRunningDaemon {
-    shutdown: Arc<Shutdown>,
-    join: tokio::task::JoinHandle<std::io::Result<()>>,
-}
-
-async fn identity_spawn_at(state: &IdentityStateDir) -> IdentityRunningDaemon {
-    let daemon = Daemon::start(DaemonConfig {
-        socket_path: state.socket.clone(),
-        pid_path: state.pid.clone(),
-        sessions_dir: state.sessions.clone(),
-        daemon_peer_id: FALLBACK_PEER_FOR_IDENTITY,
-        iroh_key_path: Some(state.iroh_key.clone()),
-        endpoint_setup: EndpointSetup::Production,
-    })
-    .await
-    .expect("daemon start");
-    let shutdown = daemon.shutdown_handle();
-    let join = tokio::spawn(daemon.run());
-    IdentityRunningDaemon { shutdown, join }
-}
-
-impl IdentityRunningDaemon {
-    async fn stop(self) {
-        self.shutdown.trigger();
-        timeout(Duration::from_secs(10), self.join)
-            .await
-            .expect("daemon did not exit within 10s")
-            .expect("daemon panicked")
-            .expect("daemon io");
-    }
-}
-
 #[tokio::test]
 async fn endpoint_id_is_stable_across_daemon_restarts_n0() {
-    let state = identity_fresh_state_dir();
+    // Caller-owned root so iroh.key persists across the stop/respawn.
+    let root = TempDir::new().unwrap();
+    let paths = common::RestartState::under(root.path());
 
     // First boot generates and persists the key.
-    let daemon = identity_spawn_at(&state).await;
-    let client = Client::connect(&state.socket).await.unwrap();
+    let daemon = common::spawn_daemon_at(&paths, EndpointSetup::Production).await;
+    let client = Client::connect(&paths.socket).await.unwrap();
     let first_id = client.daemon_peer_id();
     assert_ne!(
-        first_id, FALLBACK_PEER_FOR_IDENTITY,
+        first_id,
+        common::FALLBACK_PEER,
         "iroh-derived id must not equal the synthetic fallback",
     );
-    assert!(state.iroh_key.exists(), "iroh.key should be persisted");
+    assert!(paths.iroh_key.exists(), "iroh.key should be persisted");
     drop(client);
     daemon.stop().await;
 
     // Second boot reuses the persisted key.
-    let daemon = identity_spawn_at(&state).await;
-    let client = Client::connect(&state.socket).await.unwrap();
+    let daemon = common::spawn_daemon_at(&paths, EndpointSetup::Production).await;
+    let client = Client::connect(&paths.socket).await.unwrap();
     let second_id = client.daemon_peer_id();
     assert_eq!(
         first_id, second_id,
@@ -144,9 +89,8 @@ async fn host_ticket_carries_a_real_endpoint_addr_n0() {
     // direct addrs / relay url because those are environment-
     // dependent — but the addr must be self-consistent and match
     // the live peer id.
-    let state = identity_fresh_state_dir();
-    let daemon = identity_spawn_at(&state).await;
-    let client = Client::connect(&state.socket).await.unwrap();
+    let daemon = common::spawn_daemon(common::fresh_state(), EndpointSetup::Production).await;
+    let client = Client::connect(&daemon.socket).await.unwrap();
     let daemon_id = client.daemon_peer_id();
 
     let resp = client
@@ -175,9 +119,10 @@ async fn host_ticket_carries_a_real_endpoint_addr_n0() {
 async fn iroh_key_file_is_chmod_0600() {
     use std::os::unix::fs::MetadataExt;
 
-    let state = identity_fresh_state_dir();
-    let daemon = identity_spawn_at(&state).await;
-    let mode = std::fs::metadata(&state.iroh_key).unwrap().mode() & 0o777;
+    let state = common::fresh_state();
+    let iroh_key = state.iroh_key.clone();
+    let daemon = common::spawn_daemon(state, EndpointSetup::Production).await;
+    let mode = std::fs::metadata(&iroh_key).unwrap().mode() & 0o777;
     assert_eq!(mode, 0o600, "iroh.key must be owner-only");
     daemon.stop().await;
 }
@@ -186,13 +131,14 @@ async fn iroh_key_file_is_chmod_0600() {
 async fn no_iroh_key_path_keeps_synthetic_peer_id() {
     // Sanity: when the caller doesn't supply iroh_key_path, the
     // daemon stays local-only and the wire peer id matches the
-    // synthetic fallback.
+    // synthetic fallback. Bypasses the common helper because that
+    // helper hard-wires `iroh_key_path: Some(...)`.
     let root = TempDir::new().unwrap();
     let daemon = Daemon::start(DaemonConfig {
         socket_path: root.path().join("daemon.sock"),
         pid_path: root.path().join("daemon.pid"),
         sessions_dir: root.path().join("sessions"),
-        daemon_peer_id: FALLBACK_PEER_FOR_IDENTITY,
+        daemon_peer_id: common::FALLBACK_PEER,
         iroh_key_path: None,
         endpoint_setup: EndpointSetup::Production,
     })
@@ -203,7 +149,7 @@ async fn no_iroh_key_path_keeps_synthetic_peer_id() {
     let join = tokio::spawn(daemon.run());
 
     let client = Client::connect(&socket).await.unwrap();
-    assert_eq!(client.daemon_peer_id(), FALLBACK_PEER_FOR_IDENTITY);
+    assert_eq!(client.daemon_peer_id(), common::FALLBACK_PEER);
     drop(client);
     shutdown.trigger();
     timeout(Duration::from_secs(5), join)
@@ -572,33 +518,14 @@ async fn addr_hint_survives_daemon_restart_via_on_disk_cache() {
 
 const RELAY_HARNESS_BUDGET: Duration = Duration::from_secs(40);
 
-struct RelayState {
-    _root: TempDir,
-    socket: PathBuf,
-    pid: PathBuf,
-    sessions: PathBuf,
-    iroh_key: PathBuf,
-}
-
-fn relay_fresh_state() -> RelayState {
-    let root = TempDir::new().unwrap();
-    RelayState {
-        socket: root.path().join("daemon.sock"),
-        pid: root.path().join("daemon.pid"),
-        sessions: root.path().join("sessions"),
-        iroh_key: root.path().join("iroh.key"),
-        _root: root,
-    }
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn daemon_start_with_unreachable_relay_returns_typed_error() {
-    let state = relay_fresh_state();
+    let state = common::fresh_state();
     let config = DaemonConfig {
         socket_path: state.socket.clone(),
         pid_path: state.pid.clone(),
         sessions_dir: state.sessions.clone(),
-        daemon_peer_id: PeerId::from_bytes([0xee; 32]),
+        daemon_peer_id: common::FALLBACK_PEER,
         // iroh_key_path = Some triggers the iroh runtime, which
         // is the codepath under test (#6).
         iroh_key_path: Some(state.iroh_key.clone()),
