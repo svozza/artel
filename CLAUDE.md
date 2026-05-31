@@ -13,12 +13,14 @@ This workspace uses `cargo nextest` as the canonical test runner. **Do not invok
 
 For one-off targeted runs, prefer `cargo nextest run --package <crate> --test <bin>` over `cargo test`.
 
-## Lints / fmt / docs
+## Lints / fmt / docs / coverage
 
 - `make fmt` — `cargo fmt --all --check`.
 - `make clippy` — both feature modes (default and `--all-features`); `-D warnings`.
 - `make doc` — rustdoc both feature modes; catches broken intra-doc links.
-- `make ci-local` — fmt + clippy + doc + tests + n0.
+- `make coverage` — text summary via `cargo-llvm-cov` + nextest, both feature modes (Tier A + B; Tier C skipped — see Makefile comment). Requires `cargo install cargo-llvm-cov` once.
+- `make coverage-html` — same data, HTML report at `target/llvm-cov/html/index.html`.
+- `make ci-local` — fmt + clippy + doc + tests + n0 (coverage is opt-in).
 
 ## Plans / brainstorms
 

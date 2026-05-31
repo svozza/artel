@@ -10,7 +10,7 @@
 # filters them out via `not test(/_n0$/)`. See
 # docs/diagnosing-flaky-tests.md for the run-until-fail recipe.
 
-.PHONY: test test-n0 test-fallback fmt clippy doc ci-local
+.PHONY: test test-n0 test-fallback fmt clippy doc coverage coverage-html ci-local
 
 # Default test target: Tier A + B (no real n0). Fast.
 test:
@@ -43,6 +43,24 @@ clippy:
 doc:
 	cargo doc --workspace --no-deps
 	cargo doc --workspace --no-deps --all-features
+
+# Coverage via cargo-llvm-cov. Requires `cargo install
+# cargo-llvm-cov` once (instrumented binaries need llvm-tools and
+# cargo-llvm-cov drives them).
+#
+# `make coverage` prints a per-file summary + workspace total.
+# `make coverage-html` writes HTML reports under `target/llvm-cov/html/`.
+# Both run Tier A + B (default profile, same filter as `make test`).
+# Tier C (`_n0` tests) intentionally skipped: real-n0 traffic doesn't
+# trace anything coverage cares about that the hermetic suite misses,
+# and we don't want an unreachable relay flake to mask coverage drift.
+coverage:
+	cargo llvm-cov nextest --workspace --summary-only
+	cargo llvm-cov nextest --workspace --summary-only --all-features
+
+coverage-html:
+	cargo llvm-cov nextest --workspace --html
+	@echo "HTML report: target/llvm-cov/html/index.html"
 
 # What CI runs locally — full pyramid.
 ci-local: fmt clippy doc test test-n0
