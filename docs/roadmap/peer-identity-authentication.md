@@ -1,5 +1,23 @@
 # Peer-identity authentication
 
+**Status update (2026-05-30):** L1 (peer-id collapse) shipped as
+auth Slice A — `PROTOCOL_VERSION` 4. `artel-protocol::PeerId` is
+now defined as the iroh `EndpointId` bytes; host-side
+`SendRequest` / `JoinAnnouncement` handlers reject frames whose
+body `peer.id` doesn't match the gossip-authenticated
+`delivered_from`; joiner-side outbound paths stamp the daemon's
+authenticated id; the synthetic-id construction surface
+(`--peer-id` flag, `derive_default_peer_id`, `FALLBACK_PEER`) is
+gone. The open-design-questions section below — picking between
+**collapse**, **bind**, and **trusted-IPC-only** — is superseded
+by the v1 auth-story brainstorm at
+`docs/brainstorms/2026-05-30-auth-story-brainstorm.md` (which
+picked **collapse**) and the implementation plan at
+`docs/plans/2026-05-30-auth-l1-peer-id-collapse-plan.md`. The
+failure-mode catalog and threat-model rationale below remain the
+load-bearing motivation for L1 and the starting-point reference
+for L2 (capability events) and L3 (per-message signing).
+
 **Status:** future work, not scoped. Belongs under ADR-001 § "Auth
 and capability model" (line 203) which already defers
 read-only/write-restricted tickets, signed messages, and ticket

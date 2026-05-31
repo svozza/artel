@@ -14,7 +14,7 @@ along the way.
 
 | Crate | State |
 |---|---|
-| `artel-protocol` | Wire types + Unix-socket transport. Done. |
+| `artel-protocol` | Wire types + Unix-socket transport. Done. `PROTOCOL_VERSION` is now `4` (auth L1 — peer-id collapse, 2026-05-30). |
 | `artel-daemon` | Persistent in-memory daemon + `artel-daemon` binary. Done. |
 | `artel-client` | Stateless multiplexed client + `artel` CLI binary + `connect_or_spawn`. Done. |
 | `artel-fs` | Phase 3a (MVP) + 3b-1 (disk-backed persistence) + 3b-3 (crash recovery) shipped. Author identity and configurable filter remain. |
@@ -615,16 +615,20 @@ Listed for completeness, no detailed plan yet:
   them). The future work here is at the *capability* layer
   (what does possessing a ticket let you do?) not the path-rule
   layer (which paths in a doc can be written?).
-- **Peer-identity authentication.** Application-level `PeerInfo.id`
-  is unauthenticated today — any IPC client picks 32 bytes and the
-  daemon ships them inside `JoinAnnouncement` / `SendRequest` /
-  `Message` bodies. A legitimate joiner can spoof authorship and
-  ghost-membership claims; only network-layer identity
-  (`iroh::EndpointId`, authenticated via QUIC) is trustworthy.
-  Prerequisite for meaningful capability enforcement (the ticket-
-  level entry above). See
-  [`docs/roadmap/peer-identity-authentication.md`](roadmap/peer-identity-authentication.md)
-  for failure-mode catalog and the protocol-change design space.
+- **~~Peer-identity authentication.~~** L1 DONE 2026-05-30
+  (`PROTOCOL_VERSION` 4). `artel-protocol::PeerId` is now defined as
+  the iroh `EndpointId` bytes; host-side `SendRequest` and
+  `JoinAnnouncement` arms reject body / `delivered_from` mismatches,
+  joiner-side outbound paths stamp the daemon's authenticated id,
+  and the synthetic-id construction site (`--peer-id` flag,
+  `derive_default_peer_id`, `FALLBACK_PEER`) is gone. See
+  `docs/brainstorms/2026-05-30-auth-story-brainstorm.md` for the
+  full v1 auth story (L1 collapse + L2 capability events + L3
+  per-message signing); the brainstorm supersedes the
+  open-design-questions section of
+  [`docs/roadmap/peer-identity-authentication.md`](roadmap/peer-identity-authentication.md).
+  L2 (capability events) and L3 (per-message signing) remain open
+  as Slices B and C of the auth story.
 - **N-1 protocol-version compatibility.** Today version mismatch is
   fatal. Some scheme that lets a daemon serve clients one version
   behind would smooth upgrades.
