@@ -69,9 +69,15 @@ impl From<Uuid> for SessionId {
 
 /// Opaque 32-byte identifier for a peer.
 ///
-/// Sized to fit an iroh node id (an Ed25519 public key) but the protocol
-/// crate stays free of any iroh dependency. Equality and ordering are byte-
-/// wise. Display is lowercase hex.
+/// 32 bytes that ARE an `iroh::EndpointId` (an Ed25519 public key). The
+/// protocol crate stays free of any iroh dependency, but daemon-side
+/// enforcement requires this invariant — the host drops gossip frames
+/// whose body `peer.id` doesn't match the gossip-authenticated sender.
+/// `PeerId::from_bytes` accepts any 32 bytes for use in unit-test
+/// fixtures that don't cross a real gossip mesh; once the bytes hit the
+/// network they're checked against `delivered_from`.
+///
+/// Equality and ordering are byte-wise. Display is lowercase hex.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct PeerId(#[serde(with = "serde_bytes_array")] [u8; 32]);

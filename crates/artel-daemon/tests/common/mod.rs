@@ -84,6 +84,11 @@ pub struct RunningDaemon {
     /// and identical to the instance the daemon's resolver chain
     /// holds, so direct calls here are visible to iroh's lookups.
     pub addr_hint: iroh::address_lookup::memory::MemoryLookup,
+    /// Cloned out of the daemon's [`IrohRuntime`] before `run()`
+    /// consumes it. Lets tests subscribe to a session's gossip topic
+    /// and broadcast hand-crafted frames (e.g. spoofed `peer.id`s
+    /// for the auth-L1 regression suite).
+    pub gossip: iroh_gossip::net::Gossip,
     pub shutdown: Arc<Shutdown>,
     pub join: tokio::task::JoinHandle<std::io::Result<()>>,
     /// Optional caller-owned state dir (kept alive for the daemon's
@@ -142,6 +147,7 @@ async fn spawn_with_state(config: DaemonConfig, state: Option<State>) -> Running
     let iroh_runtime = daemon.iroh().expect("iroh runtime");
     let iroh_addr = iroh_runtime.endpoint.addr();
     let addr_hint = iroh_runtime.addr_hint.clone();
+    let gossip = iroh_runtime.gossip.clone();
     let shutdown = daemon.shutdown_handle();
     let socket = daemon.socket_path().to_path_buf();
     let join = tokio::spawn(daemon.run());
@@ -149,6 +155,7 @@ async fn spawn_with_state(config: DaemonConfig, state: Option<State>) -> Running
         socket,
         iroh_addr,
         addr_hint,
+        gossip,
         shutdown,
         join,
         _state: state,

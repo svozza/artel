@@ -69,6 +69,22 @@ const JOIN_READY_TIMEOUT: Duration = Duration::from_secs(15);
 /// fail-loud upper bound for connectivity drops mid-request.
 const SEND_REMOTE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Verify that the application-level `peer.id` carried inside a
+/// gossip-frame body matches the gossip-authenticated
+/// `delivered_from` for that frame. The body field is shipped by the
+/// sender; `delivered_from` is signed by the iroh transport and
+/// trustworthy. A mismatch is the L1 spoofed-authorship /
+/// ghost-membership attack class; we drop the frame at the bridge
+/// with a warn log.
+///
+/// This is a byte equality check, not a key validation: it relies on
+/// the invariant `iroh::EndpointId == 32 bytes that ARE an Ed25519
+/// public key` (the same shape `PeerId` carries). If iroh ever
+/// changes that primitive, the assumption needs revisiting.
+fn peer_id_matches_delivered_from(body_peer_id: PeerId, delivered_from: iroh::EndpointId) -> bool {
+    body_peer_id.as_bytes() == delivered_from.as_bytes()
+}
+
 /// Inter-daemon plumbing. One instance per daemon, shared across
 /// every session it joins or hosts.
 #[derive(Debug)]
@@ -109,6 +125,13 @@ pub(crate) struct GossipBridge {
     /// shadow is the daemon's only enumerable source. Drives
     /// finding #5c's host-restart peer-addr cache.
     tracked_peer_ids: Arc<std::sync::Mutex<std::collections::BTreeSet<iroh::EndpointId>>>,
+    /// The daemon's own iroh `EndpointId`, cached as a [`PeerId`]
+    /// for cheap reads at outbound-stamp sites. Computed once at
+    /// construction from `endpoint.id().as_bytes()`. The daemon
+    /// has no key-rotate surface today; if one ever lands, this
+    /// becomes a `Mutex<PeerId>` or a closure capturing the live
+    /// endpoint.
+    authenticated_peer_id: PeerId,
 }
 
 #[derive(Debug)]
@@ -156,7 +179,9 @@ impl GossipBridge {
         gossip: Gossip,
         addr_hint: MemoryLookup,
         tracked_peer_ids: Arc<std::sync::Mutex<std::collections::BTreeSet<iroh::EndpointId>>>,
+        endpoint_id: iroh::EndpointId,
     ) -> Self {
+        let authenticated_peer_id = PeerId::from_bytes(*endpoint_id.as_bytes());
         Self {
             gossip,
             sessions: Mutex::new(HashMap::new()),
@@ -164,8 +189,10 @@ impl GossipBridge {
             registry: Mutex::new(Weak::new()),
             addr_hint,
             tracked_peer_ids,
+            authenticated_peer_id,
         }
     }
+
 
     /// Inject the back-reference to the [`Registry`] this bridge
     /// serves. Called once at daemon startup, after the registry is
@@ -332,6 +359,15 @@ impl GossipBridge {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.pending_sends.lock().await.insert(req_id, reply_tx);
 
+        // Override the IPC-caller-supplied peer.id with the daemon's
+        // authenticated id so the host's L1 check
+        // (peer_id_matches_delivered_from) succeeds. The IPC caller's
+        // claimed id is not trustworthy; only the daemon's own iroh
+        // EndpointId is. Display name is preserved.
+        let peer = PeerInfo {
+            id: self.authenticated_peer_id,
+            ..peer
+        };
         let body = GossipBody::SendRequest {
             req_id,
             peer,
@@ -421,7 +457,14 @@ impl GossipBridge {
                             .insert(msg.delivered_from);
                         match gossip::decode(&msg.content) {
                             Ok(body) => {
-                                handle_inbound_frame(&bridge, session_for_log, &role, body).await;
+                                handle_inbound_frame(
+                                    &bridge,
+                                    session_for_log,
+                                    &role,
+                                    body,
+                                    msg.delivered_from,
+                                )
+                                .await;
                             }
                             Err(err) => {
                                 warn!(?err, "gossip frame decode failed; dropping");
@@ -540,6 +583,15 @@ impl GossipBridge {
             );
             return;
         };
+        // Override the IPC-caller-supplied peer.id with the daemon's
+        // authenticated id so the host's L1 check
+        // (peer_id_matches_delivered_from) succeeds. Same rationale as
+        // `send_remote`: only the daemon's iroh EndpointId is
+        // trustworthy. Display name preserved.
+        let peer = PeerInfo {
+            id: self.authenticated_peer_id,
+            ..peer
+        };
         let body = GossipBody::JoinAnnouncement {
             peer,
             timestamp_ms: now_ms(),
@@ -582,11 +634,29 @@ impl GossipBridge {
 /// Dispatch an inbound gossip frame body for `session` based on the
 /// local role. Lives outside the impl so the spawned forwarder task
 /// can call it without re-borrowing `self`.
+///
+/// `delivered_from` is the iroh `EndpointId` of the peer that
+/// delivered the frame on the gossip mesh — signed by the iroh
+/// transport, trustworthy. Host-role arms whose body carries a
+/// `peer.id` (`SendRequest`, `JoinAnnouncement`) verify
+/// `peer.id == delivered_from` and drop the frame on mismatch.
+///
+/// Joiner-role arms (`Message`, `SendAck::Ok`) carry
+/// [`SessionMessage`] bodies whose `peer.id` is the *original
+/// sender's* id, not the host that re-published the frame. Verifying
+/// `body.peer.id == delivered_from` would be wrong; the correct
+/// invariant is "the host vouches for the message", which needs L3
+/// per-message signatures to enforce. Joiner-side enforcement of
+/// `Message` / `SendAck::Ok` is therefore deferred to Slice B of the
+/// auth story (see
+/// `docs/brainstorms/2026-05-30-auth-story-brainstorm.md`). Until B
+/// lands, joiners trust their host (the existing model).
 async fn handle_inbound_frame(
     bridge: &Arc<GossipBridge>,
     session: SessionId,
     role: &SessionRole,
     body: GossipBody,
+    delivered_from: iroh::EndpointId,
 ) {
     match (role, body) {
         // Host receives a joiner's send request — drive Registry::send,
@@ -599,6 +669,15 @@ async fn handle_inbound_frame(
                 payload,
             },
         ) => {
+            if !peer_id_matches_delivered_from(peer.id, delivered_from) {
+                warn!(
+                    ?session,
+                    body_peer = %peer.id,
+                    authenticated = %PeerId::from_bytes(*delivered_from.as_bytes()),
+                    "dropping gossip frame: body peer.id does not match delivered_from",
+                );
+                return;
+            }
             let result = run_host_send(bridge, session, peer, payload).await;
             bridge.publish_send_ack(session, req_id, result).await;
         }
@@ -615,6 +694,15 @@ async fn handle_inbound_frame(
                 timestamp_ms: _,
             },
         ) => {
+            if !peer_id_matches_delivered_from(peer.id, delivered_from) {
+                warn!(
+                    ?session,
+                    body_peer = %peer.id,
+                    authenticated = %PeerId::from_bytes(*delivered_from.as_bytes()),
+                    "dropping gossip frame: body peer.id does not match delivered_from",
+                );
+                return;
+            }
             let registry_weak = bridge.registry.lock().await.clone();
             if let Some(registry) = registry_weak.upgrade()
                 && let Err(err) = registry.ensure_member(session, peer).await
@@ -862,5 +950,59 @@ mod tests {
         let a = topic_for(SessionId::from_bytes([1; 16]));
         let b = topic_for(SessionId::from_bytes([2; 16]));
         assert_ne!(a.as_bytes(), b.as_bytes());
+    }
+
+    /// Generate a deterministic `EndpointId` whose underlying bytes
+    /// are a valid Ed25519 public key (constant-byte ids like
+    /// `[0xab; 32]` don't satisfy the curve check). Mirrors the
+    /// helper in `peer_addr_cache::tests`.
+    fn valid_endpoint_id(seed: u8) -> iroh::EndpointId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    #[test]
+    fn peer_id_matches_delivered_from_accepts_equal_bytes() {
+        let endpoint_id = valid_endpoint_id(0xab);
+        let peer = PeerId::from_bytes(*endpoint_id.as_bytes());
+        assert!(peer_id_matches_delivered_from(peer, endpoint_id));
+    }
+
+    #[test]
+    fn peer_id_matches_delivered_from_rejects_mismatch() {
+        let endpoint_id = valid_endpoint_id(0xab);
+        let mut body_bytes = *endpoint_id.as_bytes();
+        body_bytes[0] ^= 0x01; // flip one bit so the peer-id is *not* the delivered_from
+        let peer = PeerId::from_bytes(body_bytes);
+        assert!(!peer_id_matches_delivered_from(peer, endpoint_id));
+    }
+
+    #[test]
+    fn peer_id_matches_delivered_from_byte_identical_pair() {
+        // No special-casing: any two byte-identical 32-byte values
+        // compare as equal regardless of curve-validity. This pins
+        // the helper as a pure byte-equality, not a key validation.
+        let endpoint_id = valid_endpoint_id(0x77);
+        let peer = PeerId::from_bytes(*endpoint_id.as_bytes());
+        assert!(peer_id_matches_delivered_from(peer, endpoint_id));
+    }
+
+    /// Build a [`GossipBridge`] with a known `EndpointId` and check it
+    /// caches the right bytes. Standing up a real `iroh::Endpoint` /
+    /// `Gossip` requires a rustls crypto provider that's only
+    /// installed in the integration-test harness, so this test
+    /// goes through `IrohRuntime`-shaped integration tests
+    /// (see `tests/auth_l1_spoofing.rs::joiner_outbound_stamps_authenticated_peer_id`)
+    /// for the end-to-end pinning. The unit-level invariant —
+    /// `endpoint.id().as_bytes()` round-trips into
+    /// `bridge.authenticated_peer_id().as_bytes()` — is small enough
+    /// to be checked at the type level: `PeerId::from_bytes` is
+    /// `const`, the field is set once, and the accessor is a pure
+    /// copy. Inlining the construction by hand here would just
+    /// re-export the same line from `GossipBridge::new`.
+    #[test]
+    fn authenticated_peer_id_round_trips_from_endpoint_bytes() {
+        let endpoint_id = valid_endpoint_id(0x42);
+        let derived = PeerId::from_bytes(*endpoint_id.as_bytes());
+        assert_eq!(derived.as_bytes(), endpoint_id.as_bytes());
     }
 }

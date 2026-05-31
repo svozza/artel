@@ -314,8 +314,14 @@ async fn joiner_announces_membership_without_sending() {
     // Bob on daemon B joins via the real ticket. He never sends — we
     // want to verify Alice sees him purely from the JoinAnnouncement
     // frame the bridge broadcasts when Bob's gossip mesh comes up.
+    //
+    // Auth L1: Bob's outbound `peer.id` is stamped to daemon B's
+    // authenticated `EndpointId` by the bridge regardless of what the
+    // IPC client claims. Source the real id from `daemon_b.iroh_addr`
+    // so the `PeerJoined` assertion below matches what's on the wire.
     let bob_client = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
+    let bob_real_id = PeerId::from_bytes(*daemon_b.iroh_addr.id.as_bytes());
+    let bob = PeerInfo::new(bob_real_id, "bob");
     let join_resp = bob_client
         .request(Request::JoinSession {
             peer: bob.clone(),
@@ -403,9 +409,13 @@ async fn joiner_send_round_trips_through_host() {
         .unwrap();
     let mut alice_events = alice_client.take_events().await.expect("alice events");
 
-    // Bob on daemon B joins via the real ticket.
+    // Bob on daemon B joins via the real ticket. Auth L1: Bob's
+    // outbound `peer.id` is stamped to daemon B's authenticated id at
+    // the bridge — the IPC client's claim is ignored on the wire. Use
+    // the real id so the assertions on `peer == bob` below match.
     let bob_client = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
+    let bob_real_id = PeerId::from_bytes(*daemon_b.iroh_addr.id.as_bytes());
+    let bob = PeerInfo::new(bob_real_id, "bob");
     let join_resp = bob_client
         .request(Request::JoinSession {
             peer: bob.clone(),

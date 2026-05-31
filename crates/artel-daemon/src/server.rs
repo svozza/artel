@@ -258,6 +258,7 @@ impl Daemon {
                 rt.gossip.clone(),
                 rt.addr_hint.clone(),
                 Arc::clone(&rt.tracked_peer_ids),
+                rt.endpoint.id(),
             ))
         });
 

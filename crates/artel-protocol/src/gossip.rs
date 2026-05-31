@@ -66,9 +66,9 @@ pub enum GossipBody {
         /// in the matching [`GossipBody::SendAck`].
         req_id: Uuid,
         /// The originating peer (the joiner client's identity).
-        /// We trust this in v1 — signing is Phase 4 territory. The
-        /// host writes the resulting [`SessionMessage`] with this
-        /// peer in the `peer` field.
+        /// The daemon enforces that `peer.id` matches the
+        /// gossip-authenticated `delivered_from` of the carrying
+        /// frame; mismatched frames are dropped at the bridge.
         peer: PeerInfo,
         /// What the joiner asked to append.
         payload: SendPayload,
@@ -95,7 +95,10 @@ pub enum GossipBody {
     /// proactively rather than lazily on the joiner's first
     /// `SendRequest`.
     JoinAnnouncement {
-        /// The joining peer's identity.
+        /// The joining peer's identity. The daemon enforces that
+        /// `peer.id` matches the gossip-authenticated
+        /// `delivered_from` of the carrying frame; mismatched
+        /// frames are dropped at the bridge.
         peer: PeerInfo,
         /// Joiner-local wall-clock millis at the moment they
         /// finished subscribing. Carried so the host's

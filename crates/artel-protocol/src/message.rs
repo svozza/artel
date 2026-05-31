@@ -41,10 +41,15 @@ pub const MESSAGE_FORMAT: MessageFormat = MessageFormat::new(1);
 /// Identity of the peer that authored a message.
 ///
 /// Includes a human-readable display name distinct from the cryptographic
-/// [`PeerId`]. Display names are advisory; trust comes from the peer id.
+/// [`PeerId`]. Display names are advisory and never authenticated. Trust
+/// comes from the peer id, which is itself authenticated by the gossip
+/// transport.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PeerInfo {
-    /// Cryptographic identity. Stable across sessions.
+    /// Cryptographic identity. MUST equal the iroh `EndpointId` that
+    /// delivered the carrying gossip frame; the host drops mismatched
+    /// frames. See ADR-001 § Auth and capability model and
+    /// `docs/brainstorms/2026-05-30-auth-story-brainstorm.md`.
     pub id: PeerId,
     /// Display name. Advisory only — not authenticated.
     pub display_name: String,
