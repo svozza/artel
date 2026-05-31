@@ -10,7 +10,7 @@
 # filters them out via `not test(/_n0$/)`. See
 # docs/diagnosing-flaky-tests.md for the run-until-fail recipe.
 
-.PHONY: test test-n0 test-fallback fmt clippy ci-local
+.PHONY: test test-n0 test-fallback fmt clippy doc ci-local
 
 # Default test target: Tier A + B (no real n0). Fast.
 test:
@@ -37,5 +37,12 @@ clippy:
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+# Build rustdoc for the workspace. Mirrors the clippy two-mode shape
+# (default + all-features) so a feature-gated link or item failure
+# is caught in either build.
+doc:
+	cargo doc --workspace --no-deps
+	cargo doc --workspace --no-deps --all-features
+
 # What CI runs locally — full pyramid.
-ci-local: fmt clippy test test-n0
+ci-local: fmt clippy doc test test-n0
