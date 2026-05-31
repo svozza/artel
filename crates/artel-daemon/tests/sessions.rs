@@ -10,18 +10,20 @@
 //! `docs/plans/2026-05-29-faster-cargo-test-plan.md` slice 3a. Each
 //! original file's docstring is retained verbatim in section banners.
 //!
-//! All Tier A: no iroh `Endpoint` is bound. The shared daemon
-//! `tests/common/mod.rs` is iroh-gated (`#[cfg(feature = "iroh")]`)
-//! so the helpers used here are deliberately bin-local.
+//! Post-A2: the daemon's `PeerId` is always its iroh `EndpointId`, so
+//! these tests use [`common::spawn_local_daemon`] (Testing setup +
+//! shared `DnsPkarrServer`) for the IPC-only end-to-end / host-resume
+//! / persistence cases.
+
+#![cfg(feature = "iroh")]
+
+mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use artel_client::{Client, ClientError, EventStream, SpawnError, SpawnOptions};
-use artel_daemon::shutdown::Shutdown;
-use artel_daemon::{Daemon, DaemonConfig};
 use artel_protocol::ticket::{self, SessionTicket, WireEndpointAddr};
 use artel_protocol::{
     Event, JoinTicket, MessageKind, PeerId, PeerInfo, ProtocolError, Request, Response,
@@ -33,79 +35,54 @@ use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use tokio::time::{sleep, timeout};
 
-const DAEMON_PEER: PeerId = PeerId::from_bytes([0xee; 32]);
-
-// =============================================================
-// Local daemon helpers
-//
-// Two flavours used by this bin:
-//
-// - `LocalDaemon` (Daemon::start at fresh paths) — used by the
-//   end-to-end / host-resume / persistence tests. Mirrors the shape
-//   each original file's `DaemonHarness` had.
-// - The auto-spawn tests build their own throwaway daemons via
-//   `Client::connect_or_spawn` and use `sigterm_pidfile` to take
-//   them down — no Daemon::start needed there.
-// =============================================================
-
-struct StateDir {
-    _root: TempDir,
-    socket: PathBuf,
-    pid: PathBuf,
-    sessions: PathBuf,
-}
-
-fn fresh_state_dir() -> StateDir {
-    let root = tempfile::tempdir().unwrap();
-    let socket = root.path().join("daemon.sock");
-    let pid = root.path().join("daemon.pid");
-    let sessions = root.path().join("sessions");
-    StateDir {
-        _root: root,
-        socket,
-        pid,
-        sessions,
-    }
-}
-
-struct LocalDaemon {
-    shutdown: Arc<Shutdown>,
-    join: tokio::task::JoinHandle<std::io::Result<()>>,
-}
-
-impl LocalDaemon {
-    /// Spawn an iroh-disabled daemon at `state`'s paths.
-    async fn spawn_at(state: &StateDir) -> Self {
-        let daemon = Daemon::start(DaemonConfig {
-            socket_path: state.socket.clone(),
-            pid_path: state.pid.clone(),
-            sessions_dir: state.sessions.clone(),
-            daemon_peer_id: DAEMON_PEER,
-            iroh_key_path: None,
-            endpoint_setup: artel_daemon::EndpointSetup::Production,
-        })
-        .await
-        .expect("daemon start");
-        let shutdown = daemon.shutdown_handle();
-        let join = tokio::spawn(daemon.run());
-        Self { shutdown, join }
-    }
-
-    async fn stop(self) {
-        self.shutdown.trigger();
-        timeout(Duration::from_secs(5), self.join)
-            .await
-            .expect("daemon did not exit within 5s")
-            .expect("daemon panicked")
-            .expect("daemon io");
-    }
-}
-
 async fn next_event(events: &mut EventStream) -> Event {
     timeout(Duration::from_secs(2), events.recv())
         .await
         .expect("timed out waiting for event")
         .expect("event channel closed")
+}
+
+/// Bin-local thin wrapper over [`common::State`]. Carries the
+/// iroh.key path the iroh runtime needs.
+fn fresh_state_dir() -> common::State {
+    common::fresh_state()
+}
+
+/// Bin-local thin wrapper over [`common::RunningDaemon`] for the
+/// "spawn an IPC-only daemon at these paths" use case. Uses the
+/// shared in-process [`iroh::test_utils::DnsPkarrServer`] (one per
+/// test bin) so we don't pay the server startup cost per test.
+struct LocalDaemon {
+    inner: common::RunningDaemon,
+}
+
+impl LocalDaemon {
+    /// Spawn an iroh-enabled daemon at `state`'s paths. Borrows the
+    /// caller's directory so a follow-up restart at the same paths
+    /// reads the same iroh.key (and persisted sessions, peer-addr
+    /// cache, etc.) from disk.
+    async fn spawn_at(state: &common::State) -> Self {
+        let cloned = common::State {
+            socket: state.socket.clone(),
+            pid: state.pid.clone(),
+            sessions: state.sessions.clone(),
+            iroh_key: state.iroh_key.clone(),
+            // Don't re-take ownership of the caller's TempDir; a
+            // throwaway here keeps the type happy. The caller's
+            // `State` keeps the real dir alive across this call.
+            root: TempDir::new().unwrap(),
+        };
+        let inner = common::spawn_local_daemon(cloned).await;
+        Self { inner }
+    }
+
+    fn daemon_peer_id(&self) -> PeerId {
+        PeerId::from_bytes(*self.inner.iroh_addr.id.as_bytes())
+    }
+
+    async fn stop(self) {
+        self.inner.stop().await;
+    }
 }
 
 /// Host a session as `peer` and subscribe to its full log,
@@ -798,13 +775,17 @@ async fn session_and_log_survive_daemon_restart() {
 
     // Re-join Alice (her per-connection state was wiped) and subscribe
     // from before the first message; she should see all three replayed.
+    // Post-A2 the daemon's PeerId is its iroh `EndpointId`, so the
+    // hand-crafted ticket has to point at daemon2's live id (same as
+    // daemon1's, because they share an iroh.key on disk).
+    let daemon_id = daemon2.daemon_peer_id();
     let _ = recovered
         .request(Request::JoinSession {
             peer: alice_peer.clone(),
             ticket: ticket::encode(&SessionTicket {
                 session_id,
-                host_peer_id: DAEMON_PEER,
-                host_addr: WireEndpointAddr::id_only(DAEMON_PEER),
+                host_peer_id: daemon_id,
+                host_addr: WireEndpointAddr::id_only(daemon_id),
             })
             .into(),
         })

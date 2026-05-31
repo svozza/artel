@@ -3,72 +3,44 @@
 //! Exercises the daemon's persistence story for opaque per-session
 //! attachments: register/list/forget round-trips, `kind`-filtering,
 //! cascade on host-leave, and survival across a daemon restart.
+//!
+//! Post-A2: every daemon binds an iroh `Endpoint`, so this bin
+//! reuses [`common::spawn_local_daemon`] (Testing setup + a shared
+//! in-process [`iroh::test_utils::DnsPkarrServer`]).
 
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+#![cfg(feature = "iroh")]
+
+mod common;
 
 use artel_client::{Client, ClientError};
-use artel_daemon::shutdown::Shutdown;
-use artel_daemon::{Daemon, DaemonConfig};
 use artel_protocol::{Attachment, PeerId, PeerInfo, ProtocolError, Request, Response};
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
-use tokio::time::timeout;
 
-const DAEMON_PEER: PeerId = PeerId::from_bytes([0xee; 32]);
 const KIND_V1: &str = "artel-fs/workspace/v1";
 
-struct StateDir {
-    _root: TempDir,
-    socket: PathBuf,
-    pid: PathBuf,
-    sessions: PathBuf,
-}
+/// Bin-local thin wrapper that mirrors the pre-A2 `StateDir` field
+/// names. The `socket`/`pid`/`sessions` paths come from
+/// [`common::State`]; `iroh.key` is added so the iroh runtime has
+/// a place to persist its key across `RunningDaemon::stop()` /
+/// respawn pairs.
+type StateDir = common::State;
 
 fn fresh_state_dir() -> StateDir {
-    let root = tempfile::tempdir().unwrap();
-    let socket = root.path().join("daemon.sock");
-    let pid = root.path().join("daemon.pid");
-    let sessions = root.path().join("sessions");
-    StateDir {
-        _root: root,
-        socket,
-        pid,
-        sessions,
-    }
+    common::fresh_state()
 }
 
-struct RunningDaemon {
-    shutdown: Arc<Shutdown>,
-    join: tokio::task::JoinHandle<std::io::Result<()>>,
-}
+type RunningDaemon = common::RunningDaemon;
 
 async fn spawn_at(state: &StateDir) -> RunningDaemon {
-    let daemon = Daemon::start(DaemonConfig {
-        socket_path: state.socket.clone(),
-        pid_path: state.pid.clone(),
-        sessions_dir: state.sessions.clone(),
-        daemon_peer_id: DAEMON_PEER,
-        iroh_key_path: None,
-        endpoint_setup: artel_daemon::EndpointSetup::Production,
-    })
-    .await
-    .expect("daemon start");
-    let shutdown = daemon.shutdown_handle();
-    let join = tokio::spawn(daemon.run());
-    RunningDaemon { shutdown, join }
-}
-
-impl RunningDaemon {
-    async fn stop(self) {
-        self.shutdown.trigger();
-        timeout(Duration::from_secs(5), self.join)
-            .await
-            .expect("daemon did not exit within 5s")
-            .expect("daemon panicked")
-            .expect("daemon io");
-    }
+    let cloned = common::State {
+        socket: state.socket.clone(),
+        pid: state.pid.clone(),
+        sessions: state.sessions.clone(),
+        iroh_key: state.iroh_key.clone(),
+        root: TempDir::new().unwrap(),
+    };
+    common::spawn_local_daemon(cloned).await
 }
 
 async fn host_session(client: &Client) -> artel_protocol::SessionId {

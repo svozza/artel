@@ -37,6 +37,18 @@ use crate::shutdown::{Shutdown, ShutdownToken};
 #[cfg(feature = "iroh")]
 const HOME_RELAY_BUDGET: Duration = Duration::from_secs(30);
 
+/// Non-routable, non-authenticated id used when the `iroh` feature
+/// is disabled at compile time. Equal to `[0u8; 32]`. Outbound
+/// gossip is impossible in this mode, so the bytes serve only as a
+/// placeholder in the local IPC handshake's
+/// [`artel_protocol::Response::Hello::daemon_peer_id`]. A future
+/// embedder use case (e.g. unit tests that talk only to a local
+/// registry) sees a stable, obviously-synthetic value rather than
+/// per-process drift.
+#[cfg(not(feature = "iroh"))]
+pub const SYNTHETIC_LOCAL_PEER_ID: artel_protocol::PeerId =
+    artel_protocol::PeerId::from_bytes([0; 32]);
+
 /// Configuration for [`Daemon::start`].
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
@@ -48,16 +60,15 @@ pub struct DaemonConfig {
     /// Directory holding per-session subdirectories. Loaded at startup
     /// so sessions outlive the daemon process; created if missing.
     pub sessions_dir: PathBuf,
-    /// Fallback peer id, used when no iroh key path is supplied
-    /// (or when the `iroh` feature is disabled at compile time).
-    /// Tests and headless embeds set this directly to avoid spinning
-    /// up an iroh `Endpoint`.
-    pub daemon_peer_id: artel_protocol::PeerId,
-    /// Path to the persisted iroh secret key. When `Some` and the
-    /// `iroh` feature is enabled, the daemon loads (or generates) the
-    /// key, binds an `Endpoint`, and uses the resulting `EndpointId`
-    /// in place of [`Self::daemon_peer_id`]. When `None`, the daemon
-    /// stays local-only and advertises the synthetic peer id.
+    /// Path to the persisted iroh secret key. When the `iroh` feature
+    /// is enabled this is the only knob — the daemon loads (or
+    /// generates) the key and uses the resulting `EndpointId` as its
+    /// [`artel_protocol::PeerId`]. When `None` and `iroh` is on,
+    /// `Daemon::start` returns [`StartError::Iroh`] (a daemon with no
+    /// network identity is a configuration bug). When `iroh` is off,
+    /// the field is ignored and the daemon advertises
+    /// `SYNTHETIC_LOCAL_PEER_ID` (an all-zero, non-routable id) in
+    /// `Hello`.
     pub iroh_key_path: Option<PathBuf>,
     /// Pick the iroh endpoint's discovery layer when the `iroh`
     /// feature is on and an [`Self::iroh_key_path`] is supplied.
@@ -214,24 +225,18 @@ impl Daemon {
                 source,
             })?;
 
-        // Resolve the daemon's network identity. Two paths:
-        //
-        // - `iroh` feature on AND an iroh_key_path supplied: load (or
-        //   generate-and-persist) the secret, bind an Endpoint, spawn
-        //   a Gossip handle, and start a protocol Router accepting
-        //   the gossip ALPN. EndpointId becomes the daemon peer id.
-        // - Otherwise: use the caller-supplied peer id and don't
-        //   stand up any iroh runtime. Keeps tests fast and lets
-        //   embeds opt out of the network stack entirely.
+        // Resolve the daemon's network identity. With the `iroh`
+        // feature on, [`resolve_iroh_runtime`] loads (or generates)
+        // the persisted secret key, binds an Endpoint, and uses the
+        // resulting EndpointId as the daemon's PeerId — no
+        // alternative path. Without the feature, the daemon
+        // advertises [`SYNTHETIC_LOCAL_PEER_ID`] (an all-zero,
+        // non-routable id) and stays local-only.
         #[cfg(feature = "iroh")]
-        let (daemon_peer_id, iroh) = resolve_iroh_runtime(
-            config.iroh_key_path.as_deref(),
-            config.daemon_peer_id,
-            &config.endpoint_setup,
-        )
-        .await?;
+        let (daemon_peer_id, iroh) =
+            resolve_iroh_runtime(config.iroh_key_path.as_deref(), &config.endpoint_setup).await?;
         #[cfg(not(feature = "iroh"))]
-        let daemon_peer_id = config.daemon_peer_id;
+        let daemon_peer_id = SYNTHETIC_LOCAL_PEER_ID;
 
         // Snapshot the daemon's network addr so the registry can
         // stamp it into outbound tickets. Without iroh (or before
@@ -704,17 +709,17 @@ async fn dispatch_attachment(registry: &Registry, request: Request) -> Response 
 /// and start a protocol `Router` accepting the gossip ALPN. Returns
 /// the resulting `EndpointId` (cast to [`PeerId`]) plus the bundle.
 ///
-/// When no key path is supplied, returns the caller-supplied fallback
-/// peer id and `None` — the daemon stays local-only.
+/// `key_path` is required: a daemon with the `iroh` feature on but
+/// no key path is a configuration bug (no network identity, no way
+/// to host or join sessions). [`StartError::Iroh`] surfaces it as a
+/// fail-fast.
 #[cfg(feature = "iroh")]
 async fn resolve_iroh_runtime(
     key_path: Option<&std::path::Path>,
-    fallback_peer_id: artel_protocol::PeerId,
     setup: &EndpointSetup,
 ) -> Result<(artel_protocol::PeerId, Option<IrohRuntime>), StartError> {
-    let Some(path) = key_path else {
-        return Ok((fallback_peer_id, None));
-    };
+    let path = key_path
+        .ok_or_else(|| StartError::Iroh("iroh feature is on but no iroh_key_path given".into()))?;
     let secret =
         crate::iroh_key::load_or_create(path).map_err(|e| StartError::Iroh(e.to_string()))?;
     // Start from `presets::Empty` so the `EndpointSetup::apply` chain
@@ -983,272 +988,30 @@ fn handle_hello(client_version: ProtocolVersion) -> Result<(), ProtocolError> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use artel_protocol::transport::client::connect;
-    use artel_protocol::{PeerId, PeerInfo, RequestId};
-    use pretty_assertions::assert_eq;
-    use tempfile::tempdir;
-    use tokio::time::timeout;
-
-    use super::*;
-
-    fn unused_socket() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
-        let dir = tempdir().unwrap();
-        let sock = dir.path().join("daemon.sock");
-        let pid = dir.path().join("daemon.pid");
-        let sessions = dir.path().join("sessions");
-        (dir, sock, pid, sessions)
-    }
-
-    fn config(sock: PathBuf, pid: PathBuf, sessions_dir: PathBuf) -> DaemonConfig {
-        DaemonConfig {
-            socket_path: sock,
-            pid_path: pid,
-            sessions_dir,
-            daemon_peer_id: PeerId::from_bytes([0xee; 32]),
-            iroh_key_path: None,
-            #[cfg(feature = "iroh")]
-            endpoint_setup: EndpointSetup::default(),
-            #[cfg(not(feature = "iroh"))]
-            endpoint_setup: (),
-        }
-    }
-
-    #[tokio::test]
-    async fn start_then_immediate_shutdown_is_clean() {
-        let (_dir, sock, pid, sessions) = unused_socket();
-        let daemon = Daemon::start(config(sock.clone(), pid.clone(), sessions.clone()))
-            .await
-            .unwrap();
-        daemon.trigger_shutdown();
-        let run = tokio::spawn(daemon.run());
-        timeout(Duration::from_secs(2), run)
-            .await
-            .expect("daemon did not exit")
-            .unwrap()
-            .unwrap();
-
-        // PID file removed, socket file removed.
-        assert!(!pid.exists(), "pid file should be removed on shutdown");
-        assert!(!sock.exists(), "socket file should be removed on shutdown");
-    }
-
-    #[tokio::test]
-    async fn hello_succeeds_against_running_daemon() {
-        let (_dir, sock, pid, sessions) = unused_socket();
-        let daemon = Daemon::start(config(sock.clone(), pid, sessions.clone()))
-            .await
-            .unwrap();
-        let shutdown_handle = Arc::clone(&daemon.shutdown);
-        let run = tokio::spawn(daemon.run());
-
-        // Connect and send Hello.
-        let mut framed = connect(&sock).await.unwrap();
-        framed
-            .send(WireMessage::Request {
-                id: RequestId::new(1),
-                request: Request::Hello {
-                    client_version: PROTOCOL_VERSION,
-                },
-            })
-            .await
-            .unwrap();
-        let resp = timeout(Duration::from_secs(2), framed.next())
-            .await
-            .expect("response")
-            .expect("frame")
-            .unwrap();
-        match resp {
-            WireMessage::Response {
-                id,
-                response: Response::Hello { daemon_peer_id, .. },
-            } => {
-                assert_eq!(id, RequestId::new(1));
-                assert_eq!(daemon_peer_id, PeerId::from_bytes([0xee; 32]));
-            }
-            other => panic!("expected Hello response, got {other:?}"),
-        }
-
-        drop(framed);
-        shutdown_handle.trigger();
-        timeout(Duration::from_secs(2), run)
-            .await
-            .expect("daemon did not exit")
-            .unwrap()
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn version_mismatch_returns_error_then_closes() {
-        let (_dir, sock, pid, sessions) = unused_socket();
-        let daemon = Daemon::start(config(sock.clone(), pid, sessions.clone()))
-            .await
-            .unwrap();
-        let shutdown_handle = Arc::clone(&daemon.shutdown);
-        let run = tokio::spawn(daemon.run());
-
-        let mut framed = connect(&sock).await.unwrap();
-        framed
-            .send(WireMessage::Request {
-                id: RequestId::new(1),
-                request: Request::Hello {
-                    client_version: ProtocolVersion::new(99),
-                },
-            })
-            .await
-            .unwrap();
-
-        let resp = timeout(Duration::from_secs(2), framed.next())
-            .await
-            .expect("response")
-            .expect("frame")
-            .unwrap();
-        match resp {
-            WireMessage::Response {
-                response:
-                    Response::Error {
-                        error: ProtocolError::VersionMismatch(_),
-                    },
-                ..
-            } => {}
-            other => panic!("expected version-mismatch error, got {other:?}"),
-        }
-
-        // Daemon should close the connection after the rejection.
-        // Either clean EOF (None) or a transport error counts as
-        // "closed"; only a delivered frame or a timeout indicates the
-        // daemon is still alive on this connection.
-        let after = timeout(Duration::from_secs(2), framed.next())
-            .await
-            .expect("connection did not close");
-        match after {
-            None | Some(Err(_)) => {}
-            Some(Ok(other)) => panic!("expected EOF, got frame {other:?}"),
-        }
-
-        shutdown_handle.trigger();
-        timeout(Duration::from_secs(2), run)
-            .await
-            .expect("daemon did not exit")
-            .unwrap()
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn host_then_list_round_trip() {
-        let (_dir, sock, pid, sessions) = unused_socket();
-        let daemon = Daemon::start(config(sock.clone(), pid, sessions.clone()))
-            .await
-            .unwrap();
-        let shutdown_handle = Arc::clone(&daemon.shutdown);
-        let run = tokio::spawn(daemon.run());
-
-        let mut framed = connect(&sock).await.unwrap();
-        // Hello.
-        framed
-            .send(WireMessage::Request {
-                id: RequestId::new(1),
-                request: Request::Hello {
-                    client_version: PROTOCOL_VERSION,
-                },
-            })
-            .await
-            .unwrap();
-        let _hello = framed.next().await.unwrap().unwrap();
-
-        // HostSession.
-        framed
-            .send(WireMessage::Request {
-                id: RequestId::new(2),
-                request: Request::HostSession {
-                    peer: PeerInfo::new(PeerId::from_bytes([1; 32]), "alice"),
-                    session: None,
-                },
-            })
-            .await
-            .unwrap();
-        let host_resp = framed.next().await.unwrap().unwrap();
-        let session_id = match host_resp {
-            WireMessage::Response {
-                response: Response::HostSession { session, .. },
-                ..
-            } => session,
-            other => panic!("expected HostSession response, got {other:?}"),
-        };
-
-        // ListSessions.
-        framed
-            .send(WireMessage::Request {
-                id: RequestId::new(3),
-                request: Request::ListSessions,
-            })
-            .await
-            .unwrap();
-        let list_resp = framed.next().await.unwrap().unwrap();
-        match list_resp {
-            WireMessage::Response {
-                response: Response::ListSessions { sessions },
-                ..
-            } => {
-                assert_eq!(sessions.len(), 1);
-                assert_eq!(sessions[0].id, session_id);
-            }
-            other => panic!("expected ListSessions response, got {other:?}"),
-        }
-
-        drop(framed);
-        shutdown_handle.trigger();
-        timeout(Duration::from_secs(2), run)
-            .await
-            .expect("daemon did not exit")
-            .unwrap()
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn stale_socket_file_is_replaced_on_start() {
-        // A crashed predecessor can leave the socket file behind. Once
-        // we have the PID lock, the daemon should overwrite it rather
-        // than fail with AddrInUse.
-        let (_dir, sock, pid, sessions) = unused_socket();
-        std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
-        std::fs::write(&sock, b"junk").unwrap();
-        assert!(sock.exists());
-
-        let daemon = Daemon::start(config(sock.clone(), pid, sessions))
-            .await
-            .unwrap();
-        assert!(sock.exists(), "fresh socket should now exist");
-        // Should be a real listening socket: a client can connect.
-        let _ = artel_protocol::transport::client::connect(&sock)
-            .await
-            .unwrap();
-        daemon.trigger_shutdown();
-        let run = tokio::spawn(daemon.run());
-        timeout(Duration::from_secs(2), run)
-            .await
-            .expect("daemon did not exit")
-            .unwrap()
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn second_daemon_on_same_pid_path_errors() {
-        let (_dir, sock, pid, sessions) = unused_socket();
-        let _first = Daemon::start(config(sock.clone(), pid.clone(), sessions.clone()))
-            .await
-            .unwrap();
-        // Use a different socket path so we hit the PID check, not bind.
-        let other_sock = sock.with_extension("other");
-        let err = Daemon::start(config(other_sock, pid, sessions))
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, StartError::Pid(PidError::AlreadyRunning { .. })),
-            "{err:?}"
-        );
-    }
-}
+// server.rs::tests pre-A2 stood up daemons via `iroh_key_path: None`
+// + a synthetic peer id, sidestepping the iroh runtime entirely.
+// Post-A2 that path no longer exists under the iroh feature: every
+// daemon binds a real `Endpoint`. The integration suite
+// (`tests/auth_l1_spoofing.rs`, `tests/identity.rs`,
+// `tests/sessions.rs`, `tests/gossip.rs`, `artel-fs/tests/`)
+// covers every assertion this module previously held against a
+// real iroh runtime, so the in-module tests are removed rather
+// than mocked. The previously-tested invariants and their new
+// homes:
+//
+// - `start_then_immediate_shutdown_is_clean`: covered by the
+//   `RunningDaemon::stop` round-trip in every integration test.
+// - `hello_succeeds_against_running_daemon`: every test that
+//   constructs a `Client` exercises the Hello round-trip; auth-L1
+//   tests pin the Hello-returned `daemon_peer_id` against the
+//   daemon's iroh `EndpointId`.
+// - `version_mismatch_returns_error_then_closes`: protocol-level
+//   coverage in `artel-protocol::version::tests`.
+// - `host_then_list_round_trip`: covered by
+//   `artel-daemon::sessions::two_clients_chat_end_to_end` and the
+//   `Workspace`-driven tests in artel-fs.
+// - `stale_socket_file_is_replaced_on_start`: covered by
+//   `artel-daemon::sessions::stale_socket_file_is_recovered`.
+// - `second_daemon_on_same_pid_path_errors`: covered by
+//   `artel-daemon::sessions::live_pid_no_socket_waits_for_socket_then_times_out`
+//   and the PID-file unit tests in `pidfile::tests`.

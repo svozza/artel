@@ -29,12 +29,12 @@ use std::time::{Duration, Instant};
 use artel_daemon::shutdown::Shutdown;
 use artel_daemon::{Daemon, DaemonConfig, EndpointSetup as DaemonEndpointSetup};
 use artel_fs::EndpointSetup as FsEndpointSetup;
-use artel_protocol::PeerId;
 use futures_util::StreamExt;
 use iroh::test_utils::DnsPkarrServer;
 use iroh_docs::api::Doc;
 use iroh_docs::store::Query;
 use tempfile::TempDir;
+use tokio::sync::OnceCell;
 use tokio::time::{sleep, timeout};
 
 /// Default poll interval used by [`wait_for_file`] / [`wait_for_missing`].
@@ -94,7 +94,25 @@ pub async fn doc_has_key(doc: &Doc, key: &[u8]) -> bool {
     stream.next().await.is_some()
 }
 
-pub const FALLBACK_PEER: PeerId = PeerId::from_bytes([0xee; 32]);
+/// Per-test-bin shared `DnsPkarrServer`. Reused by helpers that
+/// stand up a single daemon for IPC-only tests (no peer-to-peer
+/// gossip in the bin) so the ~200ms server startup cost is paid
+/// once per test process. Bins that need a full per-test pair use
+/// [`spawn_pair`], which mints its own server.
+static SHARED_DNS_PKARR: OnceCell<Arc<DnsPkarrServer>> = OnceCell::const_new();
+
+async fn shared_dns_pkarr() -> Arc<DnsPkarrServer> {
+    SHARED_DNS_PKARR
+        .get_or_init(|| async {
+            Arc::new(
+                DnsPkarrServer::run()
+                    .await
+                    .expect("DnsPkarrServer::run for shared local-daemon fixture"),
+            )
+        })
+        .await
+        .clone()
+}
 
 pub struct DaemonState {
     pub root: TempDir,
@@ -170,7 +188,6 @@ pub async fn spawn_daemon_with_setup(
         socket_path: state.socket.clone(),
         pid_path: state.pid.clone(),
         sessions_dir: state.sessions.clone(),
-        daemon_peer_id: FALLBACK_PEER,
         iroh_key_path: Some(state.iroh_key.clone()),
         endpoint_setup: setup,
     })
@@ -205,16 +222,23 @@ pub struct LocalDaemon {
 }
 
 impl LocalDaemon {
+    /// Spawn an iroh-enabled daemon under a fresh tempdir. Uses
+    /// [`DaemonEndpointSetup::Testing`] against the bin-shared
+    /// [`DnsPkarrServer`] so daemon startup is fast and hermetic
+    /// (no n0 traffic, no relay handshake). Pre-A2 this function
+    /// stood up an iroh-disabled daemon via `iroh_key_path: None`;
+    /// post-A2 there is no synthetic-id path under the iroh
+    /// feature, so every daemon binds an iroh `Endpoint`.
     pub async fn spawn() -> Self {
         let tempdir = TempDir::new().unwrap();
         let socket = tempdir.path().join("daemon.sock");
+        let dns_pkarr = shared_dns_pkarr().await;
         let daemon = Daemon::start(DaemonConfig {
             socket_path: socket.clone(),
             pid_path: tempdir.path().join("daemon.pid"),
             sessions_dir: tempdir.path().join("sessions"),
-            daemon_peer_id: FALLBACK_PEER,
-            iroh_key_path: None,
-            endpoint_setup: DaemonEndpointSetup::Production,
+            iroh_key_path: Some(tempdir.path().join("iroh.key")),
+            endpoint_setup: daemon_testing_setup(&dns_pkarr),
         })
         .await
         .expect("daemon start");
@@ -293,7 +317,6 @@ pub async fn spawn_daemon_at(paths: &DaemonPaths, setup: DaemonEndpointSetup) ->
         socket_path: paths.socket.clone(),
         pid_path: paths.pid.clone(),
         sessions_dir: paths.sessions.clone(),
-        daemon_peer_id: FALLBACK_PEER,
         iroh_key_path: Some(paths.iroh_key.clone()),
         endpoint_setup: setup,
     })

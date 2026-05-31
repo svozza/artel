@@ -8,7 +8,6 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use artel_daemon::{Daemon, DaemonConfig};
-use artel_protocol::PeerId;
 use artel_protocol::transport::path::{default_pid_path, default_socket_path};
 use clap::Parser;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -25,11 +24,6 @@ struct Args {
     /// `<dir>/daemon.sock` and PID to `<dir>/daemon.pid`.
     #[arg(long)]
     state_dir: Option<PathBuf>,
-
-    /// 32-byte peer id as 64 hex chars. For local-only testing without
-    /// iroh; defaults to a deterministic pseudo id derived from PID.
-    #[arg(long)]
-    peer_id: Option<String>,
 
     /// Log filter. Falls back to `ARTEL_LOG`, then `RUST_LOG`, then
     /// `info`.
@@ -107,20 +101,18 @@ fn build_config(args: &Args) -> Result<DaemonConfig, String> {
         (socket, pid, sessions, state_dir)
     };
 
-    // When the user pins --peer-id we honour it and skip iroh
-    // entirely. That keeps the synthetic-id path useful for tests
-    // and embeds. Otherwise: load (or generate) a real iroh key.
-    let (daemon_peer_id, iroh_key_path) = match &args.peer_id {
-        Some(hex) => (parse_peer_id_hex(hex)?, None),
-        None => (derive_default_peer_id(), Some(state_dir.join("iroh.key"))),
-    };
+    // The daemon's PeerId is its iroh EndpointId — full stop. The
+    // key file under the state dir is loaded (or created on first
+    // run); without the iroh feature, the daemon advertises a
+    // documented all-zero `SYNTHETIC_LOCAL_PEER_ID` and can't
+    // route anything.
+    let iroh_key_path = state_dir.join("iroh.key");
 
     Ok(DaemonConfig {
         socket_path,
         pid_path,
         sessions_dir,
-        daemon_peer_id,
-        iroh_key_path,
+        iroh_key_path: Some(iroh_key_path),
         #[cfg(feature = "iroh")]
         endpoint_setup: artel_daemon::EndpointSetup::default(),
         #[cfg(not(feature = "iroh"))]
@@ -140,38 +132,4 @@ fn init_tracing(filter: Option<&str>) -> Result<(), String> {
         .with_env_filter(env)
         .try_init()
         .map_err(|e| format!("init tracing: {e}"))
-}
-
-fn parse_peer_id_hex(hex: &str) -> Result<PeerId, String> {
-    if hex.len() != 64 {
-        return Err(format!("peer id must be 64 hex chars, got {}", hex.len()));
-    }
-    let mut out = [0u8; 32];
-    for (i, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
-        let hi = decode_nibble(chunk[0]).ok_or_else(|| format!("invalid hex: {hex:?}"))?;
-        let lo = decode_nibble(chunk[1]).ok_or_else(|| format!("invalid hex: {hex:?}"))?;
-        out[i] = (hi << 4) | lo;
-    }
-    Ok(PeerId::from_bytes(out))
-}
-
-const fn decode_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-/// Pseudo peer id used when `--peer-id` isn't supplied. PID-derived so
-/// two local instances don't collide; sentinel byte 0xfe in the last
-/// slot makes the synthetic source obvious.
-fn derive_default_peer_id() -> PeerId {
-    let pid = std::process::id();
-    let mut bytes = [0u8; 32];
-    let pid_bytes = pid.to_le_bytes();
-    bytes[..pid_bytes.len()].copy_from_slice(&pid_bytes);
-    bytes[31] = 0xfe;
-    PeerId::from_bytes(bytes)
 }

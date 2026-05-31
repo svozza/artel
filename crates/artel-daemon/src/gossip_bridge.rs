@@ -193,7 +193,6 @@ impl GossipBridge {
         }
     }
 
-
     /// Inject the back-reference to the [`Registry`] this bridge
     /// serves. Called once at daemon startup, after the registry is
     /// wrapped in an [`Arc`]. Held as a [`Weak`] so the bridge

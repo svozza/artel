@@ -24,16 +24,33 @@ use std::time::Duration;
 
 use artel_daemon::shutdown::Shutdown;
 use artel_daemon::{Daemon, DaemonConfig, EndpointSetup};
-use artel_protocol::PeerId;
 use iroh::test_utils::DnsPkarrServer;
 use tempfile::TempDir;
+use tokio::sync::OnceCell;
 use tokio::time::timeout;
-
-pub const FALLBACK_PEER: PeerId = PeerId::from_bytes([0xee; 32]);
 
 /// How long to wait for a freshly-bound endpoint to publish its
 /// pkarr record to the localhost server.
 pub const PKARR_READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Per-test-bin shared `DnsPkarrServer`. Bins that only need to
+/// stand up an iroh-enabled daemon for IPC tests (no peer-to-peer
+/// gossip) reuse this so they don't pay the ~200ms server startup
+/// cost per test. Each test process gets its own server.
+static SHARED_DNS_PKARR: OnceCell<Arc<DnsPkarrServer>> = OnceCell::const_new();
+
+async fn shared_dns_pkarr() -> Arc<DnsPkarrServer> {
+    SHARED_DNS_PKARR
+        .get_or_init(|| async {
+            Arc::new(
+                DnsPkarrServer::run()
+                    .await
+                    .expect("DnsPkarrServer::run for shared local-daemon fixture"),
+            )
+        })
+        .await
+        .clone()
+}
 
 pub struct State {
     pub root: TempDir,
@@ -120,7 +137,6 @@ pub async fn spawn_daemon(state: State, setup: EndpointSetup) -> RunningDaemon {
         socket_path: state.socket.clone(),
         pid_path: state.pid.clone(),
         sessions_dir: state.sessions.clone(),
-        daemon_peer_id: FALLBACK_PEER,
         iroh_key_path: Some(state.iroh_key.clone()),
         endpoint_setup: setup,
     };
@@ -135,11 +151,22 @@ pub async fn spawn_daemon_at(paths: &RestartState, setup: EndpointSetup) -> Runn
         socket_path: paths.socket.clone(),
         pid_path: paths.pid.clone(),
         sessions_dir: paths.sessions.clone(),
-        daemon_peer_id: FALLBACK_PEER,
         iroh_key_path: Some(paths.iroh_key.clone()),
         endpoint_setup: setup,
     };
     spawn_with_state(config, None).await
+}
+
+/// Bring a single iroh-enabled daemon up against the shared
+/// in-process [`DnsPkarrServer`]. For tests that don't need a
+/// second daemon to gossip with — they just want an iroh-enabled
+/// daemon to drive IPC commands against — this is the right
+/// helper. Pre-A2 the same surface was provided via the now-retired
+/// synthetic-peer-id path; post-A2, every daemon binds an iroh
+/// `Endpoint`.
+pub async fn spawn_local_daemon(state: State) -> RunningDaemon {
+    let dns_pkarr = shared_dns_pkarr().await;
+    spawn_daemon(state, testing_setup(&dns_pkarr)).await
 }
 
 async fn spawn_with_state(config: DaemonConfig, state: Option<State>) -> RunningDaemon {

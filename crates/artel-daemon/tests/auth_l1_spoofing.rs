@@ -137,8 +137,7 @@ async fn host_drops_send_request_with_spoofed_peer_id() {
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if let Ok(Some(Ok(GossipEvent::Received(msg)))) =
-            timeout(remaining, receiver.next()).await
+        if let Ok(Some(Ok(GossipEvent::Received(msg)))) = timeout(remaining, receiver.next()).await
         {
             let decoded = gossip::decode(&msg.content).expect("decode round-trip");
             assert!(

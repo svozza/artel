@@ -45,9 +45,6 @@ use tokio::time::timeout;
 // =============================================================
 // `EndpointId` is stable across daemon restarts when the iroh secret
 // key file persists.
-//
-// Gated on the `iroh` feature. Without it, the daemon falls back to
-// the synthetic peer id and these assertions don't apply.
 // =============================================================
 
 #[tokio::test]
@@ -60,11 +57,6 @@ async fn endpoint_id_is_stable_across_daemon_restarts_n0() {
     let daemon = common::spawn_daemon_at(&paths, EndpointSetup::Production).await;
     let client = Client::connect(&paths.socket).await.unwrap();
     let first_id = client.daemon_peer_id();
-    assert_ne!(
-        first_id,
-        common::FALLBACK_PEER,
-        "iroh-derived id must not equal the synthetic fallback",
-    );
     assert!(paths.iroh_key.exists(), "iroh.key should be persisted");
     drop(client);
     daemon.stop().await;
@@ -128,35 +120,25 @@ async fn iroh_key_file_is_chmod_0600() {
 }
 
 #[tokio::test]
-async fn no_iroh_key_path_keeps_synthetic_peer_id() {
-    // Sanity: when the caller doesn't supply iroh_key_path, the
-    // daemon stays local-only and the wire peer id matches the
-    // synthetic fallback. Bypasses the common helper because that
-    // helper hard-wires `iroh_key_path: Some(...)`.
+async fn missing_iroh_key_path_under_iroh_feature_errors() {
+    // Post-A2: a daemon with the `iroh` feature on but no
+    // `iroh_key_path` is a configuration bug — there is no
+    // synthetic-peer-id fallback. `Daemon::start` must fail fast
+    // with a typed `StartError::Iroh`.
     let root = TempDir::new().unwrap();
-    let daemon = Daemon::start(DaemonConfig {
+    let err = Daemon::start(DaemonConfig {
         socket_path: root.path().join("daemon.sock"),
         pid_path: root.path().join("daemon.pid"),
         sessions_dir: root.path().join("sessions"),
-        daemon_peer_id: common::FALLBACK_PEER,
         iroh_key_path: None,
         endpoint_setup: EndpointSetup::Production,
     })
     .await
-    .expect("daemon start");
-    let socket = daemon.socket_path().to_path_buf();
-    let shutdown = daemon.shutdown_handle();
-    let join = tokio::spawn(daemon.run());
-
-    let client = Client::connect(&socket).await.unwrap();
-    assert_eq!(client.daemon_peer_id(), common::FALLBACK_PEER);
-    drop(client);
-    shutdown.trigger();
-    timeout(Duration::from_secs(5), join)
-        .await
-        .expect("daemon did not exit")
-        .expect("daemon panicked")
-        .expect("daemon io");
+    .expect_err("daemon start should reject missing iroh_key_path under the iroh feature");
+    assert!(
+        matches!(err, StartError::Iroh(_)),
+        "expected StartError::Iroh, got {err:?}",
+    );
 }
 
 // =============================================================
@@ -525,7 +507,6 @@ async fn daemon_start_with_unreachable_relay_returns_typed_error() {
         socket_path: state.socket.clone(),
         pid_path: state.pid.clone(),
         sessions_dir: state.sessions.clone(),
-        daemon_peer_id: common::FALLBACK_PEER,
         // iroh_key_path = Some triggers the iroh runtime, which
         // is the codepath under test (#6).
         iroh_key_path: Some(state.iroh_key.clone()),

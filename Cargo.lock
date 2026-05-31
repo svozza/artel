@@ -159,6 +159,7 @@ dependencies = [
  "artel-protocol",
  "clap",
  "futures-util",
+ "iroh",
  "nix",
  "pretty_assertions",
  "serde",

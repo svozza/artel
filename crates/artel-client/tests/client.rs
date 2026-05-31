@@ -11,20 +11,40 @@ use std::time::Duration;
 
 use artel_client::{Client, ClientError};
 use artel_daemon::shutdown::Shutdown;
-use artel_daemon::{Daemon, DaemonConfig};
+use artel_daemon::{Daemon, DaemonConfig, EndpointSetup};
 use artel_protocol::{
     Event, MessageKind, PROTOCOL_VERSION, PeerId, PeerInfo, ProtocolError, Request, Response,
     SendPayload,
 };
+use iroh::test_utils::DnsPkarrServer;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
+use tokio::sync::OnceCell;
 use tokio::time::timeout;
 
-const DAEMON_PEER: PeerId = PeerId::from_bytes([0xee; 32]);
+/// Per-process shared `DnsPkarrServer`. Auth-L1 (`PROTOCOL_VERSION` 4)
+/// removed the synthetic-peer-id path, so every daemon binds an
+/// iroh `Endpoint`. Reuse one localhost server across tests in this
+/// bin so we don't pay the ~200ms server startup cost per test.
+static SHARED_DNS_PKARR: OnceCell<Arc<DnsPkarrServer>> = OnceCell::const_new();
+
+async fn shared_dns_pkarr() -> Arc<DnsPkarrServer> {
+    SHARED_DNS_PKARR
+        .get_or_init(|| async {
+            Arc::new(
+                DnsPkarrServer::run()
+                    .await
+                    .expect("DnsPkarrServer::run for shared local-daemon fixture"),
+            )
+        })
+        .await
+        .clone()
+}
 
 struct DaemonHarness {
     _tempdir: TempDir,
     socket: PathBuf,
+    daemon_peer_id: PeerId,
     shutdown: Arc<Shutdown>,
     join: tokio::task::JoinHandle<std::io::Result<()>>,
 }
@@ -34,23 +54,30 @@ impl DaemonHarness {
         let tempdir = tempfile::tempdir().unwrap();
         let socket = tempdir.path().join("daemon.sock");
         let pid = tempdir.path().join("daemon.pid");
+        let dns_pkarr = shared_dns_pkarr().await;
         let daemon = Daemon::start(DaemonConfig {
             socket_path: socket.clone(),
             pid_path: pid,
             sessions_dir: tempdir.path().join("sessions"),
-            daemon_peer_id: DAEMON_PEER,
-            iroh_key_path: None,
-            // Default; ignored because `iroh_key_path: None` keeps
-            // the daemon local-only — no endpoint stood up.
-            endpoint_setup: artel_daemon::EndpointSetup::default(),
+            iroh_key_path: Some(tempdir.path().join("iroh.key")),
+            endpoint_setup: EndpointSetup::Testing { dns_pkarr },
         })
         .await
         .expect("daemon start");
+        let daemon_peer_id = PeerId::from_bytes(
+            *daemon
+                .iroh()
+                .expect("iroh runtime")
+                .endpoint
+                .id()
+                .as_bytes(),
+        );
         let shutdown = daemon.shutdown_handle();
         let join = tokio::spawn(daemon.run());
         Self {
             _tempdir: tempdir,
             socket,
+            daemon_peer_id,
             shutdown,
             join,
         }
@@ -78,7 +105,7 @@ fn bob() -> PeerInfo {
 async fn connect_does_handshake_and_records_daemon_info() {
     let h = DaemonHarness::spawn().await;
     let client = Client::connect(&h.socket).await.unwrap();
-    assert_eq!(client.daemon_peer_id(), DAEMON_PEER);
+    assert_eq!(client.daemon_peer_id(), h.daemon_peer_id);
     assert_eq!(client.daemon_version(), PROTOCOL_VERSION);
     drop(client);
     h.shutdown().await;

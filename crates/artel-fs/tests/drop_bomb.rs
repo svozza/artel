@@ -17,58 +17,31 @@
 //! regardless of whether a tracing subscriber is installed in the
 //! embedding binary.
 
+mod common;
+
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
-use std::time::Duration;
-
-use artel_daemon::shutdown::Shutdown;
-use artel_daemon::{Daemon, DaemonConfig};
-use artel_protocol::PeerId;
-use tempfile::TempDir;
-use tokio::time::timeout;
 
 const MARKER: &str = "[artel-fs] Workspace dropped without calling shutdown()";
 
+/// Bin-local thin wrapper over [`common::LocalDaemon`]. Pre-A2 the
+/// harness ran the daemon with the iroh runtime disabled; post-A2
+/// every daemon binds an `Endpoint`, so this hands off to the
+/// shared in-process [`iroh::test_utils::DnsPkarrServer`] fixture.
 struct DaemonHarness {
-    _tempdir: TempDir,
+    inner: common::LocalDaemon,
     socket: PathBuf,
-    shutdown: Arc<Shutdown>,
-    join: tokio::task::JoinHandle<std::io::Result<()>>,
 }
 
 impl DaemonHarness {
     async fn spawn() -> Self {
-        let tempdir = tempfile::tempdir().unwrap();
-        let socket = tempdir.path().join("daemon.sock");
-        let pid = tempdir.path().join("daemon.pid");
-        let daemon = Daemon::start(DaemonConfig {
-            socket_path: socket.clone(),
-            pid_path: pid,
-            sessions_dir: tempdir.path().join("sessions"),
-            daemon_peer_id: PeerId::from_bytes([0xee; 32]),
-            iroh_key_path: None,
-            endpoint_setup: artel_daemon::EndpointSetup::Production,
-        })
-        .await
-        .expect("daemon start");
-        let shutdown = daemon.shutdown_handle();
-        let join = tokio::spawn(daemon.run());
-        Self {
-            _tempdir: tempdir,
-            socket,
-            shutdown,
-            join,
-        }
+        let inner = common::LocalDaemon::spawn().await;
+        let socket = inner.socket.clone();
+        Self { inner, socket }
     }
 
     async fn stop(self) {
-        self.shutdown.trigger();
-        timeout(Duration::from_secs(5), self.join)
-            .await
-            .expect("daemon did not exit within 5s")
-            .expect("daemon panicked")
-            .expect("daemon io");
+        self.inner.stop().await;
     }
 }
 

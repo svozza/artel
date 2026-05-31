@@ -67,7 +67,6 @@ impl SmokeDaemon {
             socket_path: state.socket.clone(),
             pid_path: state.pid.clone(),
             sessions_dir: state.sessions.clone(),
-            daemon_peer_id: common::FALLBACK_PEER,
             iroh_key_path: Some(state.iroh_key.clone()),
             endpoint_setup: EndpointSetup::Testing {
                 dns_pkarr: Arc::clone(dns_pkarr),
