@@ -1,5 +1,78 @@
 # Auth Slice A — L1 peer-id collapse — implementation plan
 
+> **Status (2026-05-31): SHIPPED.** All three sub-slices landed:
+>
+> - **A1** — daemon enforcement + doc updates (commit `06917c0`,
+>   `daemon: enforce peer.id == delivered_from on host gossip arms…`).
+> - **A2** — synthetic-peer-id retirement (commit `223a9b8`,
+>   `daemon: drop synthetic peer-id path…`).
+> - **A3** — documentation (commit `fde396d`,
+>   `docs: mark auth L1 roadmap item done; ADR-001 update for PROTOCOL_VERSION 4`).
+>
+> ADR-001 § Open questions § Auth and capability model is annotated
+> "(L1 resolved 2026-05-30)"; `docs/roadmap.md` § Future strikes the
+> "Peer-identity authentication" item; `docs/roadmap/peer-identity-authentication.md`
+> carries a status header pointing at the brainstorm + plan as the
+> source of truth.
+>
+> ## Deviations from this plan
+>
+> 1. **A1 unit test renamed.** Plan called for
+>    `bridge_new_stores_authenticated_peer_id` to construct a bridge
+>    against a real `iroh::Endpoint`. In practice that requires a
+>    rustls crypto provider that's only installed by the integration-
+>    test harness (the lib-test path hits "Missing or incompatible
+>    rustls crypto provider configured"). Replaced with
+>    `authenticated_peer_id_round_trips_from_endpoint_bytes`, a pure
+>    byte-equality test on the field-set path, and lean on the e2e
+>    `joiner_outbound_stamps_authenticated_peer_id` (which DOES bind
+>    a real endpoint via `common::spawn_pair`) to pin the live
+>    invariant.
+>
+> 2. **A2 test-fixture migration was wider than the plan accounted
+>    for.** The plan's "Risks" section anticipated a handful of
+>    *client-side* `PeerInfo` callsites needing the live-daemon
+>    `Hello` round-trip pattern. In practice every Tier-A test that
+>    spun a daemon via `iroh_key_path: None` + `daemon_peer_id:
+>    FALLBACK_PEER` had to migrate too — there's no synthetic-id
+>    fallback under the iroh feature post-A2. Concretely:
+>    - `artel-daemon::tests::common` and `artel-fs::tests::common`
+>      gained a `spawn_local_daemon` helper backed by a bin-shared
+>      `DnsPkarrServer` (via `tokio::sync::OnceCell`) so test bins
+>      that previously used the synthetic path now stand up a real
+>      Testing-mode iroh runtime cheaply.
+>    - `artel-daemon/tests/sessions.rs`, `artel-daemon/tests/attachments.rs`,
+>      `artel-fs/tests/drop_bomb.rs`, and `artel-client/tests/client.rs`
+>      all migrated their bin-local `LocalDaemon` / `DaemonHarness`
+>      types to use the shared helper.
+>    - `artel-daemon::sessions::session_and_log_survive_daemon_restart`
+>      stopped hand-crafting a ticket with the synthetic constant
+>      and now uses the daemon's live `peer_id`.
+>    - The whole `server.rs::tests` module was removed: every
+>      assertion it held is duplicated by the integration suite
+>      against a real iroh runtime, and standing up Testing-mode
+>      iroh inside the lib `cfg(test)` graph would require pulling
+>      `DnsPkarrServer` (a `dev-dependency`) into the lib-test
+>      compile graph.
+>    - `identity::no_iroh_key_path_keeps_synthetic_peer_id` (which
+>      tested behaviour we're removing) was replaced with
+>      `missing_iroh_key_path_under_iroh_feature_errors` (a
+>      typed-error test for the new fail-fast).
+>
+> 3. **Repo-prep commit.** A `repo: add CLAUDE.md (nextest) and
+>    Makefile doc target` commit (`8b244ad`) landed *before* A1.
+>    `CLAUDE.md` codifies "use `cargo nextest`, not `cargo test`,
+>    for workspace runs"; the new `make doc` target builds rustdoc
+>    in both feature modes. Not part of the plan but small enough
+>    to land alongside.
+>
+> A fresh agent reading from here for context: don't re-execute the
+> sub-slices below. Treat the rest of this document as the
+> after-the-fact design rationale; the *current* code is what
+> actually shipped.
+
+---
+
 Source brainstorm: `docs/brainstorms/2026-05-30-auth-story-brainstorm.md`. The
 brainstorm picks **Option A (collapse)**: `artel-protocol::PeerId` becomes
 the iroh `EndpointId` bytes, and every host-side acceptance path verifies
