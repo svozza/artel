@@ -195,16 +195,11 @@ pub async fn spawn_daemon_at(paths: &RestartState, setup: EndpointSetup) -> Runn
 /// helper. Pre-A2 the same surface was provided via the now-retired
 /// synthetic-peer-id path; post-A2, every daemon binds an iroh
 /// `Endpoint`.
-pub async fn spawn_local_daemon(state: State) -> RunningDaemon {
-    let dns_pkarr = shared_dns_pkarr().await;
-    spawn_daemon(state, testing_setup(&dns_pkarr)).await
-}
-
-/// Same as [`spawn_local_daemon`] but for caller-owned paths
-/// ([`RestartState`]). Used by bins that own a [`TempDir`]
-/// directly so the daemon's on-disk state outlives the spawn —
-/// e.g. restart-style tests, attachment tests that keep the
-/// session dir live across `RunningDaemon::stop()`.
+///
+/// Used by bins that own a [`TempDir`] directly so the daemon's
+/// on-disk state outlives the spawn — e.g. restart-style tests,
+/// attachment tests that keep the session dir live across
+/// `RunningDaemon::stop()`.
 pub async fn spawn_local_daemon_at(paths: &RestartState) -> RunningDaemon {
     let dns_pkarr = shared_dns_pkarr().await;
     spawn_daemon_at(paths, testing_setup(&dns_pkarr)).await

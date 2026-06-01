@@ -5,7 +5,7 @@
 //! cascade on host-leave, and survival across a daemon restart.
 //!
 //! Post-A2: every daemon binds an iroh `Endpoint`, so this bin
-//! reuses [`common::spawn_local_daemon`] (Testing setup + a shared
+//! reuses [`common::spawn_local_daemon_at`] (Testing setup + a shared
 //! in-process [`iroh::test_utils::DnsPkarrServer`]).
 
 #![cfg(feature = "iroh")]

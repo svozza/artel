@@ -11,7 +11,7 @@
 //! original file's docstring is retained verbatim in section banners.
 //!
 //! Post-A2: the daemon's `PeerId` is always its iroh `EndpointId`, so
-//! these tests use [`common::spawn_local_daemon`] (Testing setup +
+//! these tests use [`common::spawn_local_daemon_at`] (Testing setup +
 //! shared `DnsPkarrServer`) for the IPC-only end-to-end / host-resume
 //! / persistence cases.
 
