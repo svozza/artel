@@ -19,28 +19,14 @@ use tempfile::TempDir;
 
 const KIND_V1: &str = "artel-fs/workspace/v1";
 
-/// Bin-local thin wrapper that mirrors the pre-A2 `StateDir` field
-/// names. The `socket`/`pid`/`sessions` paths come from
-/// [`common::State`]; `iroh.key` is added so the iroh runtime has
-/// a place to persist its key across `RunningDaemon::stop()` /
-/// respawn pairs.
-type StateDir = common::State;
-
-fn fresh_state_dir() -> StateDir {
-    common::fresh_state()
-}
-
-type RunningDaemon = common::RunningDaemon;
-
-async fn spawn_at(state: &StateDir) -> RunningDaemon {
-    let cloned = common::State {
-        socket: state.socket.clone(),
-        pid: state.pid.clone(),
-        sessions: state.sessions.clone(),
-        iroh_key: state.iroh_key.clone(),
-        root: TempDir::new().unwrap(),
-    };
-    common::spawn_local_daemon(cloned).await
+/// Allocate a fresh temp dir + the [`common::RestartState`] paths
+/// underneath it. The caller owns the [`TempDir`] so the daemon's
+/// on-disk state survives a `RunningDaemon::stop()` round-trip
+/// (used by the persistence-across-restart cases).
+fn fresh_state_dir() -> (TempDir, common::RestartState) {
+    let root = TempDir::new().unwrap();
+    let paths = common::RestartState::under(root.path());
+    (root, paths)
 }
 
 async fn host_session(client: &Client) -> artel_protocol::SessionId {
@@ -73,8 +59,8 @@ async fn list(client: &Client, kind: Option<&str>) -> Vec<Attachment> {
 
 #[tokio::test]
 async fn register_then_list_round_trips_via_ipc() {
-    let state = fresh_state_dir();
-    let daemon = spawn_at(&state).await;
+    let (_root, state) = fresh_state_dir();
+    let daemon = common::spawn_local_daemon_at(&state).await;
     let client = Client::connect(&state.socket).await.unwrap();
     let session = host_session(&client).await;
 
@@ -100,8 +86,8 @@ async fn register_then_list_round_trips_via_ipc() {
 
 #[tokio::test]
 async fn list_attachments_filters_by_kind_via_ipc() {
-    let state = fresh_state_dir();
-    let daemon = spawn_at(&state).await;
+    let (_root, state) = fresh_state_dir();
+    let daemon = common::spawn_local_daemon_at(&state).await;
     let client = Client::connect(&state.socket).await.unwrap();
     let session = host_session(&client).await;
 
@@ -130,8 +116,8 @@ async fn list_attachments_filters_by_kind_via_ipc() {
 
 #[tokio::test]
 async fn register_attachment_unknown_session_surfaces_unknown_session_error() {
-    let state = fresh_state_dir();
-    let daemon = spawn_at(&state).await;
+    let (_root, state) = fresh_state_dir();
+    let daemon = common::spawn_local_daemon_at(&state).await;
     let client = Client::connect(&state.socket).await.unwrap();
 
     let bogus = artel_protocol::SessionId::new_random();
@@ -154,8 +140,8 @@ async fn register_attachment_unknown_session_surfaces_unknown_session_error() {
 
 #[tokio::test]
 async fn forget_attachment_is_idempotent_via_ipc() {
-    let state = fresh_state_dir();
-    let daemon = spawn_at(&state).await;
+    let (_root, state) = fresh_state_dir();
+    let daemon = common::spawn_local_daemon_at(&state).await;
     let client = Client::connect(&state.socket).await.unwrap();
     let session = host_session(&client).await;
 
@@ -186,8 +172,8 @@ async fn forget_attachment_is_idempotent_via_ipc() {
 
 #[tokio::test]
 async fn attachments_cascade_when_host_leaves_via_ipc() {
-    let state = fresh_state_dir();
-    let daemon = spawn_at(&state).await;
+    let (_root, state) = fresh_state_dir();
+    let daemon = common::spawn_local_daemon_at(&state).await;
     let client = Client::connect(&state.socket).await.unwrap();
     let session = host_session(&client).await;
 
@@ -214,10 +200,10 @@ async fn attachments_cascade_when_host_leaves_via_ipc() {
 
 #[tokio::test]
 async fn attachments_persist_across_daemon_restart() {
-    let state = fresh_state_dir();
+    let (_root, state) = fresh_state_dir();
 
     // ---- First daemon: host + register ----
-    let daemon1 = spawn_at(&state).await;
+    let daemon1 = common::spawn_local_daemon_at(&state).await;
     let client1 = Client::connect(&state.socket).await.unwrap();
     let session = host_session(&client1).await;
     client1
@@ -232,7 +218,7 @@ async fn attachments_persist_across_daemon_restart() {
     daemon1.stop().await;
 
     // ---- Second daemon: same state dir ----
-    let daemon2 = spawn_at(&state).await;
+    let daemon2 = common::spawn_local_daemon_at(&state).await;
     let client2 = Client::connect(&state.socket).await.unwrap();
 
     let entries = list(&client2, Some(KIND_V1)).await;

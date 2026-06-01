@@ -24,6 +24,7 @@ use std::time::Duration;
 
 use artel_daemon::shutdown::Shutdown;
 use artel_daemon::{Daemon, DaemonConfig, EndpointSetup};
+use artel_protocol::PeerId;
 use iroh::test_utils::DnsPkarrServer;
 use tempfile::TempDir;
 use tokio::sync::OnceCell;
@@ -32,6 +33,14 @@ use tokio::time::timeout;
 /// How long to wait for a freshly-bound endpoint to publish its
 /// pkarr record to the localhost server.
 pub const PKARR_READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Derive a curve-valid [`PeerId`] from a single seed byte. Plain
+/// `[seed; 32]` byte arrays don't satisfy iroh's Ed25519 curve
+/// check, so tests that need a "novel but valid" peer-id (e.g. the
+/// ghost peer in a spoofing test) go through this helper.
+pub fn valid_peer_id(seed: u8) -> PeerId {
+    PeerId::from_bytes(*iroh::SecretKey::from_bytes(&[seed; 32]).public().as_bytes())
+}
 
 /// Per-test-bin shared `DnsPkarrServer`. Bins that only need to
 /// stand up an iroh-enabled daemon for IPC tests (no peer-to-peer
@@ -115,6 +124,12 @@ pub struct RunningDaemon {
 }
 
 impl RunningDaemon {
+    /// The daemon's authenticated [`PeerId`] — its iroh
+    /// `EndpointId` bytes wrapped as the protocol-side type.
+    pub fn peer_id(&self) -> PeerId {
+        PeerId::from_bytes(*self.iroh_addr.id.as_bytes())
+    }
+
     pub async fn stop(self) {
         self.shutdown.trigger();
         timeout(Duration::from_secs(10), self.join)
@@ -167,6 +182,16 @@ pub async fn spawn_daemon_at(paths: &RestartState, setup: EndpointSetup) -> Runn
 pub async fn spawn_local_daemon(state: State) -> RunningDaemon {
     let dns_pkarr = shared_dns_pkarr().await;
     spawn_daemon(state, testing_setup(&dns_pkarr)).await
+}
+
+/// Same as [`spawn_local_daemon`] but for caller-owned paths
+/// ([`RestartState`]). Used by bins that own a [`TempDir`]
+/// directly so the daemon's on-disk state outlives the spawn —
+/// e.g. restart-style tests, attachment tests that keep the
+/// session dir live across `RunningDaemon::stop()`.
+pub async fn spawn_local_daemon_at(paths: &RestartState) -> RunningDaemon {
+    let dns_pkarr = shared_dns_pkarr().await;
+    spawn_daemon_at(paths, testing_setup(&dns_pkarr)).await
 }
 
 async fn spawn_with_state(config: DaemonConfig, state: Option<State>) -> RunningDaemon {

@@ -319,7 +319,7 @@ async fn joiner_announces_membership_without_sending() {
     // IPC client claims. Source the real id from `daemon_b.iroh_addr`
     // so the `PeerJoined` assertion below matches what's on the wire.
     let bob_client = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob_real_id = PeerId::from_bytes(*daemon_b.iroh_addr.id.as_bytes());
+    let bob_real_id = daemon_b.peer_id();
     let bob = PeerInfo::new(bob_real_id, "bob");
     let join_resp = bob_client
         .request(Request::JoinSession {
@@ -413,7 +413,7 @@ async fn joiner_send_round_trips_through_host() {
     // the bridge — the IPC client's claim is ignored on the wire. Use
     // the real id so the assertions on `peer == bob` below match.
     let bob_client = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob_real_id = PeerId::from_bytes(*daemon_b.iroh_addr.id.as_bytes());
+    let bob_real_id = daemon_b.peer_id();
     let bob = PeerInfo::new(bob_real_id, "bob");
     let join_resp = bob_client
         .request(Request::JoinSession {

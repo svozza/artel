@@ -19,9 +19,7 @@ use std::time::{Duration, Instant};
 use artel_client::Client;
 use artel_protocol::gossip::{self, GossipBody};
 use artel_protocol::rpc::SendPayload;
-use artel_protocol::{
-    Event, MessageKind, PeerId, PeerInfo, Request, Response, SessionId, SessionMessage,
-};
+use artel_protocol::{Event, MessageKind, PeerInfo, Request, Response, SessionId, SessionMessage};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use iroh_gossip::api::Event as GossipEvent;
@@ -40,13 +38,6 @@ fn topic_for(session: SessionId) -> TopicId {
     TopicId::from_bytes(bytes)
 }
 
-/// `[xx; 32]` is not a valid Ed25519 public key, so we derive a
-/// curve-valid id from a 32-byte secret seed.
-fn valid_peer_id(seed: u8) -> PeerId {
-    let secret = iroh::SecretKey::from_bytes(&[seed; 32]);
-    PeerId::from_bytes(*secret.public().as_bytes())
-}
-
 // =============================================================
 // Host drops a spoofed `SendRequest` whose body `peer.id` doesn't
 // match the gossip-authenticated `delivered_from`.
@@ -59,7 +50,7 @@ async fn host_drops_send_request_with_spoofed_peer_id() {
     // Alice on daemon A hosts and subscribes so we can observe (or
     // fail to observe) inbound traffic.
     let alice_client = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice_id = PeerId::from_bytes(*daemon_a.iroh_addr.id.as_bytes());
+    let alice_id = daemon_a.peer_id();
     let alice = PeerInfo::new(alice_id, "alice");
     let host_resp = alice_client
         .request(Request::HostSession {
@@ -85,7 +76,7 @@ async fn host_drops_send_request_with_spoofed_peer_id() {
     // the two daemons is wired up. We then sneak a spoofed frame in
     // alongside the real bridge traffic.
     let bob_client = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob_id = PeerId::from_bytes(*daemon_b.iroh_addr.id.as_bytes());
+    let bob_id = daemon_b.peer_id();
     let bob = PeerInfo::new(bob_id, "bob");
     let join_resp = bob_client
         .request(Request::JoinSession {
@@ -131,37 +122,40 @@ async fn host_drops_send_request_with_spoofed_peer_id() {
         .await
         .expect("broadcast spoofed SendRequest");
 
-    // Drain gossip frames for 2s. We must not see a SendAck (the
-    // host doesn't ack a dropped frame) AND alice's IPC stream must
-    // not see a Message for the spoofed payload.
+    // For 2s in parallel: (a) the gossip topic must not see a
+    // SendAck (the host doesn't ack a dropped frame), and (b)
+    // alice's IPC stream must not surface a Message for the
+    // spoofed payload.
     let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if let Ok(Some(Ok(GossipEvent::Received(msg)))) = timeout(remaining, receiver.next()).await
-        {
-            let decoded = gossip::decode(&msg.content).expect("decode round-trip");
-            assert!(
-                !matches!(decoded, GossipBody::SendAck { .. }),
-                "host produced a SendAck for the spoofed SendRequest",
-            );
+    let drain_gossip = async {
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if let Ok(Some(Ok(GossipEvent::Received(msg)))) =
+                timeout(remaining, receiver.next()).await
+            {
+                let decoded = gossip::decode(&msg.content).expect("decode round-trip");
+                assert!(
+                    !matches!(decoded, GossipBody::SendAck { .. }),
+                    "host produced a SendAck for the spoofed SendRequest",
+                );
+            }
         }
-    }
-
-    // Within the same window, alice's IPC stream must not surface the
-    // spoofed message. Use a short additional drain.
-    let alice_deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < alice_deadline {
-        let remaining = alice_deadline.saturating_duration_since(Instant::now());
-        let Ok(Some(event)) = timeout(remaining, alice_events.recv()).await else {
-            break;
-        };
-        if let Event::Message { message, .. } = event {
-            assert_ne!(
-                message.payload, spoofed_payload,
-                "host accepted the spoofed SendRequest and fanned it out",
-            );
+    };
+    let drain_alice = async {
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Ok(Some(event)) = timeout(remaining, alice_events.recv()).await else {
+                break;
+            };
+            if let Event::Message { message, .. } = event {
+                assert_ne!(
+                    message.payload, spoofed_payload,
+                    "host accepted the spoofed SendRequest and fanned it out",
+                );
+            }
         }
-    }
+    };
+    tokio::join!(drain_gossip, drain_alice);
 
     drop(receiver);
     drop(sender);
@@ -182,7 +176,7 @@ async fn host_drops_join_announcement_with_spoofed_peer_id() {
     let (daemon_a, daemon_b, _dns_pkarr) = common::spawn_pair().await;
 
     let alice_client = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice_id = PeerId::from_bytes(*daemon_a.iroh_addr.id.as_bytes());
+    let alice_id = daemon_a.peer_id();
     let alice = PeerInfo::new(alice_id, "alice");
     let host_resp = alice_client
         .request(Request::HostSession {
@@ -221,7 +215,7 @@ async fn host_drops_join_announcement_with_spoofed_peer_id() {
 
     // Forge a JoinAnnouncement claiming to be a never-seen peer
     // (curve-valid id derived from seed 0xde).
-    let ghost_peer_id = valid_peer_id(0xde);
+    let ghost_peer_id = common::valid_peer_id(0xde);
     let ghost = PeerInfo::new(ghost_peer_id, "ghost");
     let body = GossipBody::JoinAnnouncement {
         peer: ghost.clone(),
@@ -276,7 +270,7 @@ async fn host_accepts_send_request_with_matching_peer_id() {
     let (daemon_a, daemon_b, _dns_pkarr) = common::spawn_pair().await;
 
     let alice_client = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice_id = PeerId::from_bytes(*daemon_a.iroh_addr.id.as_bytes());
+    let alice_id = daemon_a.peer_id();
     let alice = PeerInfo::new(alice_id, "alice");
     let host_resp = alice_client
         .request(Request::HostSession {
@@ -299,7 +293,7 @@ async fn host_accepts_send_request_with_matching_peer_id() {
     let mut alice_events = alice_client.take_events().await.expect("alice events");
 
     let bob_client = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob_id = PeerId::from_bytes(*daemon_b.iroh_addr.id.as_bytes());
+    let bob_id = daemon_b.peer_id();
     let bob = PeerInfo::new(bob_id, "bob");
     bob_client
         .request(Request::JoinSession {
@@ -343,7 +337,7 @@ async fn joiner_outbound_stamps_authenticated_peer_id() {
     let (daemon_a, daemon_b, _dns_pkarr) = common::spawn_pair().await;
 
     let alice_client = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice_id = PeerId::from_bytes(*daemon_a.iroh_addr.id.as_bytes());
+    let alice_id = daemon_a.peer_id();
     let alice = PeerInfo::new(alice_id, "alice");
     let host_resp = alice_client
         .request(Request::HostSession {
@@ -367,8 +361,8 @@ async fn joiner_outbound_stamps_authenticated_peer_id() {
 
     // Bob's IPC supplies a wrong peer.id. The daemon must NOT propagate
     // it; the bridge stamps the daemon's authenticated id instead.
-    let wrong_id = valid_peer_id(0xee);
-    let bob_real_id = PeerId::from_bytes(*daemon_b.iroh_addr.id.as_bytes());
+    let wrong_id = common::valid_peer_id(0xee);
+    let bob_real_id = daemon_b.peer_id();
     assert_ne!(wrong_id, bob_real_id, "test premise: ids must differ");
     let bob_lying = PeerInfo::new(wrong_id, "bob");
     let bob_client = Client::connect(&daemon_b.socket).await.unwrap();

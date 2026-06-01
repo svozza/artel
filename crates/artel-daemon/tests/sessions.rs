@@ -42,47 +42,14 @@ async fn next_event(events: &mut EventStream) -> Event {
         .expect("event channel closed")
 }
 
-/// Bin-local thin wrapper over [`common::State`]. Carries the
-/// iroh.key path the iroh runtime needs.
-fn fresh_state_dir() -> common::State {
-    common::fresh_state()
-}
-
-/// Bin-local thin wrapper over [`common::RunningDaemon`] for the
-/// "spawn an IPC-only daemon at these paths" use case. Uses the
-/// shared in-process [`iroh::test_utils::DnsPkarrServer`] (one per
-/// test bin) so we don't pay the server startup cost per test.
-struct LocalDaemon {
-    inner: common::RunningDaemon,
-}
-
-impl LocalDaemon {
-    /// Spawn an iroh-enabled daemon at `state`'s paths. Borrows the
-    /// caller's directory so a follow-up restart at the same paths
-    /// reads the same iroh.key (and persisted sessions, peer-addr
-    /// cache, etc.) from disk.
-    async fn spawn_at(state: &common::State) -> Self {
-        let cloned = common::State {
-            socket: state.socket.clone(),
-            pid: state.pid.clone(),
-            sessions: state.sessions.clone(),
-            iroh_key: state.iroh_key.clone(),
-            // Don't re-take ownership of the caller's TempDir; a
-            // throwaway here keeps the type happy. The caller's
-            // `State` keeps the real dir alive across this call.
-            root: TempDir::new().unwrap(),
-        };
-        let inner = common::spawn_local_daemon(cloned).await;
-        Self { inner }
-    }
-
-    fn daemon_peer_id(&self) -> PeerId {
-        PeerId::from_bytes(*self.inner.iroh_addr.id.as_bytes())
-    }
-
-    async fn stop(self) {
-        self.inner.stop().await;
-    }
+/// Allocate a fresh temp dir + the [`common::RestartState`] paths
+/// underneath it. The caller owns the [`TempDir`] so the daemon's
+/// on-disk state survives a `RunningDaemon::stop()` round-trip
+/// (used by the persistence-across-restart cases).
+fn fresh_state_dir() -> (TempDir, common::RestartState) {
+    let root = TempDir::new().unwrap();
+    let paths = common::RestartState::under(root.path());
+    (root, paths)
 }
 
 /// Host a session as `peer` and subscribe to its full log,
@@ -353,8 +320,8 @@ async fn live_pid_no_socket_waits_for_socket_then_times_out() {
 
 #[tokio::test]
 async fn two_clients_chat_end_to_end() {
-    let state = fresh_state_dir();
-    let daemon = LocalDaemon::spawn_at(&state).await;
+    let (_root, state) = fresh_state_dir();
+    let daemon = common::spawn_local_daemon_at(&state).await;
 
     let alice_client = Client::connect(&state.socket).await.unwrap();
     let bob_client = Client::connect(&state.socket).await.unwrap();
@@ -458,8 +425,8 @@ async fn two_clients_chat_end_to_end() {
 
 #[tokio::test]
 async fn subscribe_replays_history() {
-    let state = fresh_state_dir();
-    let daemon = LocalDaemon::spawn_at(&state).await;
+    let (_root, state) = fresh_state_dir();
+    let daemon = common::spawn_local_daemon_at(&state).await;
 
     let alice_client = Client::connect(&state.socket).await.unwrap();
     let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
@@ -540,11 +507,11 @@ async fn subscribe_replays_history() {
 /// the pre-restart messages.
 #[tokio::test]
 async fn host_with_some_id_resumes_persisted_session() {
-    let state = fresh_state_dir();
+    let (_root, state) = fresh_state_dir();
     let alice = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
 
     // ---- Daemon 1: host a fresh session, send three messages ----
-    let daemon1 = LocalDaemon::spawn_at(&state).await;
+    let daemon1 = common::spawn_local_daemon_at(&state).await;
     let client1 = Client::connect(&state.socket).await.unwrap();
 
     let session_id = match client1
@@ -578,7 +545,7 @@ async fn host_with_some_id_resumes_persisted_session() {
     daemon1.stop().await;
 
     // ---- Daemon 2: resume by supplying the same SessionId ----
-    let daemon2 = LocalDaemon::spawn_at(&state).await;
+    let daemon2 = common::spawn_local_daemon_at(&state).await;
     let client2 = Client::connect(&state.socket).await.unwrap();
 
     let resumed = match client2
@@ -630,11 +597,11 @@ async fn host_with_some_id_resumes_persisted_session() {
 /// is unchanged.
 #[tokio::test]
 async fn host_with_some_id_rejects_when_host_differs() {
-    let state = fresh_state_dir();
+    let (_root, state) = fresh_state_dir();
     let alice = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     let bob = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
 
-    let daemon = LocalDaemon::spawn_at(&state).await;
+    let daemon = common::spawn_local_daemon_at(&state).await;
     let client = Client::connect(&state.socket).await.unwrap();
 
     // Alice hosts.
@@ -684,11 +651,11 @@ async fn host_with_some_id_rejects_when_host_differs() {
 /// layer to confirm the protocol field plumbs through.
 #[tokio::test]
 async fn host_with_some_id_creates_at_that_id_first_time() {
-    let state = fresh_state_dir();
+    let (_root, state) = fresh_state_dir();
     let alice = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     let chosen = SessionId::from_bytes([0xbe; 16]);
 
-    let daemon = LocalDaemon::spawn_at(&state).await;
+    let daemon = common::spawn_local_daemon_at(&state).await;
     let client = Client::connect(&state.socket).await.unwrap();
 
     let returned = match client
@@ -717,10 +684,10 @@ async fn host_with_some_id_creates_at_that_id_first_time() {
 
 #[tokio::test]
 async fn session_and_log_survive_daemon_restart() {
-    let state = fresh_state_dir();
+    let (_root, state) = fresh_state_dir();
 
     // ---- First daemon: host + send three messages ----
-    let daemon1 = LocalDaemon::spawn_at(&state).await;
+    let daemon1 = common::spawn_local_daemon_at(&state).await;
     let alice_client = Client::connect(&state.socket).await.unwrap();
     let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
 
@@ -759,7 +726,7 @@ async fn session_and_log_survive_daemon_restart() {
     daemon1.stop().await;
 
     // ---- Second daemon: state directory unchanged ----
-    let daemon2 = LocalDaemon::spawn_at(&state).await;
+    let daemon2 = common::spawn_local_daemon_at(&state).await;
     let recovered = Client::connect(&state.socket).await.unwrap();
 
     // ListSessions should see the original session.
@@ -778,7 +745,7 @@ async fn session_and_log_survive_daemon_restart() {
     // Post-A2 the daemon's PeerId is its iroh `EndpointId`, so the
     // hand-crafted ticket has to point at daemon2's live id (same as
     // daemon1's, because they share an iroh.key on disk).
-    let daemon_id = daemon2.daemon_peer_id();
+    let daemon_id = daemon2.peer_id();
     let _ = recovered
         .request(Request::JoinSession {
             peer: alice_peer.clone(),
@@ -823,8 +790,8 @@ async fn session_and_log_survive_daemon_restart() {
 
 #[tokio::test]
 async fn host_leave_removes_session_dir() {
-    let state = fresh_state_dir();
-    let daemon = LocalDaemon::spawn_at(&state).await;
+    let (_root, state) = fresh_state_dir();
+    let daemon = common::spawn_local_daemon_at(&state).await;
     let client = Client::connect(&state.socket).await.unwrap();
     let alice = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
 

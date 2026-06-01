@@ -37,15 +37,15 @@ use crate::shutdown::{Shutdown, ShutdownToken};
 #[cfg(feature = "iroh")]
 const HOME_RELAY_BUDGET: Duration = Duration::from_secs(30);
 
-/// Non-routable, non-authenticated id used when the `iroh` feature
-/// is disabled at compile time. Equal to `[0u8; 32]`. Outbound
-/// gossip is impossible in this mode, so the bytes serve only as a
-/// placeholder in the local IPC handshake's
-/// [`artel_protocol::Response::Hello::daemon_peer_id`]. A future
-/// embedder use case (e.g. unit tests that talk only to a local
-/// registry) sees a stable, obviously-synthetic value rather than
-/// per-process drift.
-#[cfg(not(feature = "iroh"))]
+/// Non-routable, non-authenticated id advertised in `Hello` when the
+/// `iroh` feature is disabled at compile time.
+///
+/// Equal to `[0u8; 32]`; outbound gossip is impossible in that mode,
+/// so the bytes serve only as a stable, obviously-synthetic
+/// placeholder (better than per-process drift for embedders that
+/// talk only to a local registry). Defined unconditionally so
+/// intra-doc links resolve in either feature mode; only read in the
+/// no-iroh `Daemon::start` path.
 pub const SYNTHETIC_LOCAL_PEER_ID: artel_protocol::PeerId =
     artel_protocol::PeerId::from_bytes([0; 32]);
 
@@ -67,7 +67,7 @@ pub struct DaemonConfig {
     /// `Daemon::start` returns [`StartError::Iroh`] (a daemon with no
     /// network identity is a configuration bug). When `iroh` is off,
     /// the field is ignored and the daemon advertises
-    /// `SYNTHETIC_LOCAL_PEER_ID` (an all-zero, non-routable id) in
+    /// [`SYNTHETIC_LOCAL_PEER_ID`] (an all-zero, non-routable id) in
     /// `Hello`.
     pub iroh_key_path: Option<PathBuf>,
     /// Pick the iroh endpoint's discovery layer when the `iroh`
@@ -225,13 +225,8 @@ impl Daemon {
                 source,
             })?;
 
-        // Resolve the daemon's network identity. With the `iroh`
-        // feature on, [`resolve_iroh_runtime`] loads (or generates)
-        // the persisted secret key, binds an Endpoint, and uses the
-        // resulting EndpointId as the daemon's PeerId — no
-        // alternative path. Without the feature, the daemon
-        // advertises [`SYNTHETIC_LOCAL_PEER_ID`] (an all-zero,
-        // non-routable id) and stays local-only.
+        // Iroh on: load key, bind endpoint, EndpointId -> PeerId.
+        // Off: synthetic id, no runtime.
         #[cfg(feature = "iroh")]
         let (daemon_peer_id, iroh) =
             resolve_iroh_runtime(config.iroh_key_path.as_deref(), &config.endpoint_setup).await?;
@@ -988,30 +983,8 @@ fn handle_hello(client_version: ProtocolVersion) -> Result<(), ProtocolError> {
     Ok(())
 }
 
-// server.rs::tests pre-A2 stood up daemons via `iroh_key_path: None`
-// + a synthetic peer id, sidestepping the iroh runtime entirely.
-// Post-A2 that path no longer exists under the iroh feature: every
-// daemon binds a real `Endpoint`. The integration suite
-// (`tests/auth_l1_spoofing.rs`, `tests/identity.rs`,
-// `tests/sessions.rs`, `tests/gossip.rs`, `artel-fs/tests/`)
-// covers every assertion this module previously held against a
-// real iroh runtime, so the in-module tests are removed rather
-// than mocked. The previously-tested invariants and their new
-// homes:
-//
-// - `start_then_immediate_shutdown_is_clean`: covered by the
-//   `RunningDaemon::stop` round-trip in every integration test.
-// - `hello_succeeds_against_running_daemon`: every test that
-//   constructs a `Client` exercises the Hello round-trip; auth-L1
-//   tests pin the Hello-returned `daemon_peer_id` against the
-//   daemon's iroh `EndpointId`.
-// - `version_mismatch_returns_error_then_closes`: protocol-level
-//   coverage in `artel-protocol::version::tests`.
-// - `host_then_list_round_trip`: covered by
-//   `artel-daemon::sessions::two_clients_chat_end_to_end` and the
-//   `Workspace`-driven tests in artel-fs.
-// - `stale_socket_file_is_replaced_on_start`: covered by
-//   `artel-daemon::sessions::stale_socket_file_is_recovered`.
-// - `second_daemon_on_same_pid_path_errors`: covered by
-//   `artel-daemon::sessions::live_pid_no_socket_waits_for_socket_then_times_out`
-//   and the PID-file unit tests in `pidfile::tests`.
+// In-module tests removed in auth-L1/A2 — they relied on
+// `iroh_key_path: None` + synthetic peer id, a path that no longer
+// exists under the iroh feature. Coverage now lives in the
+// integration suite (`tests/{sessions,attachments,identity,gossip,auth_l1_spoofing}.rs`,
+// `artel-fs/tests/`).
