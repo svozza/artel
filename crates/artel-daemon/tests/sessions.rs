@@ -886,3 +886,30 @@ async fn hello_version_mismatch_returns_error_then_closes() {
 
     daemon.stop().await;
 }
+
+// =============================================================
+// Shutdown cleanup: a clean `RunningDaemon::stop()` must remove
+// the daemon's on-disk socket and PID files. Guards against a
+// drop-guard regression that lets the join future complete while
+// leaving stale paths behind — a lookalike daemon at the same
+// state dir on the next start would then stumble over them.
+// =============================================================
+
+#[tokio::test]
+async fn shutdown_removes_socket_and_pid_files() {
+    let (_root, state) = fresh_state_dir();
+    let daemon = common::spawn_local_daemon_at(&state).await;
+    assert!(state.socket.exists(), "socket should exist while daemon runs");
+    assert!(state.pid.exists(), "pid file should exist while daemon runs");
+
+    daemon.stop().await;
+
+    assert!(
+        !state.socket.exists(),
+        "socket should be removed on shutdown",
+    );
+    assert!(
+        !state.pid.exists(),
+        "pid file should be removed on shutdown",
+    );
+}
