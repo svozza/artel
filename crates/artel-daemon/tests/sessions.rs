@@ -882,7 +882,10 @@ async fn hello_version_mismatch_returns_error_then_closes() {
     let next = timeout(Duration::from_secs(2), framed.next())
         .await
         .expect("EOF timeout");
-    assert!(next.is_none(), "expected EOF after version mismatch, got {next:?}");
+    assert!(
+        next.is_none(),
+        "expected EOF after version mismatch, got {next:?}"
+    );
 
     daemon.stop().await;
 }
@@ -899,8 +902,14 @@ async fn hello_version_mismatch_returns_error_then_closes() {
 async fn shutdown_removes_socket_and_pid_files() {
     let (_root, state) = fresh_state_dir();
     let daemon = common::spawn_local_daemon_at(&state).await;
-    assert!(state.socket.exists(), "socket should exist while daemon runs");
-    assert!(state.pid.exists(), "pid file should exist while daemon runs");
+    assert!(
+        state.socket.exists(),
+        "socket should exist while daemon runs"
+    );
+    assert!(
+        state.pid.exists(),
+        "pid file should exist while daemon runs"
+    );
 
     daemon.stop().await;
 

@@ -119,8 +119,7 @@ pub struct RunningDaemon {
     /// consumes it. Lets tests assert what's been recorded for the
     /// shutdown-snapshot path — e.g. that a peer that ever-only sent
     /// spoofed frames is NOT captured.
-    pub tracked_peer_ids:
-        Arc<std::sync::Mutex<std::collections::BTreeSet<iroh::EndpointId>>>,
+    pub tracked_peer_ids: Arc<std::sync::Mutex<std::collections::BTreeSet<iroh::EndpointId>>>,
     pub shutdown: Arc<Shutdown>,
     pub join: tokio::task::JoinHandle<std::io::Result<()>>,
     /// Optional caller-owned state dir (kept alive for the daemon's
@@ -140,10 +139,7 @@ impl RunningDaemon {
     /// `BTreeSet` so the caller can assert membership without holding
     /// the daemon's internal lock.
     pub fn tracked_peer_ids_snapshot(&self) -> std::collections::BTreeSet<iroh::EndpointId> {
-        self.tracked_peer_ids
-            .lock()
-            .expect("poisoned")
-            .clone()
+        self.tracked_peer_ids.lock().expect("poisoned").clone()
     }
 
     pub async fn stop(self) {

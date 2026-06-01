@@ -177,8 +177,7 @@ pub struct IrohRuntime {
     /// must be paired with a `tracked_peer_ids.insert(addr.id)` so
     /// the snapshot path can find the peer at shutdown. The
     /// gossip-bridge upholds the pairing in `join_session`.
-    pub tracked_peer_ids:
-        Arc<std::sync::Mutex<std::collections::BTreeSet<iroh::EndpointId>>>,
+    pub tracked_peer_ids: Arc<std::sync::Mutex<std::collections::BTreeSet<iroh::EndpointId>>>,
     /// On-disk peer-addr cache. Populated at startup (entries
     /// seeded into [`Self::addr_hint`]) and overwritten at graceful
     /// shutdown with a fresh snapshot of [`Self::tracked_peer_ids`].
