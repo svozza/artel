@@ -193,7 +193,7 @@ pub async fn spawn_daemon_with_setup(
     })
     .await
     .expect("daemon start");
-    let iroh_addr = daemon.iroh().map(|rt| rt.endpoint.addr());
+    let iroh_addr = Some(daemon.iroh().endpoint.addr());
     let shutdown = daemon.shutdown_handle();
     let socket = daemon.socket_path().to_path_buf();
     let join = tokio::spawn(daemon.run());
@@ -326,7 +326,7 @@ pub async fn spawn_daemon_at(paths: &DaemonPaths, setup: DaemonEndpointSetup) ->
     })
     .await
     .expect("daemon start");
-    let iroh_addr = daemon.iroh().map(|rt| rt.endpoint.addr());
+    let iroh_addr = Some(daemon.iroh().endpoint.addr());
     let shutdown = daemon.shutdown_handle();
     let socket = daemon.socket_path().to_path_buf();
     let join = tokio::spawn(daemon.run());

@@ -193,12 +193,13 @@ pub struct Daemon {
     listener: Listener,
     pid: PidFile,
     shutdown: Arc<Shutdown>,
-    /// iroh state when the feature is on and an
-    /// [`DaemonConfig::iroh_key_path`] was supplied. We hold it for
-    /// the daemon's lifetime; teardown happens in [`Self::run`] before
-    /// returning.
+    /// iroh state. Required when the feature is on; populated by
+    /// [`resolve_iroh_runtime`] in [`Self::start`], which fails fast
+    /// if no [`DaemonConfig::iroh_key_path`] was supplied. We hold it
+    /// for the daemon's lifetime; teardown happens in [`Self::run`]
+    /// before returning.
     #[cfg(feature = "iroh")]
-    iroh: Option<IrohRuntime>,
+    iroh: IrohRuntime,
 }
 
 impl Daemon {
@@ -234,15 +235,9 @@ impl Daemon {
         let daemon_peer_id = SYNTHETIC_LOCAL_PEER_ID;
 
         // Snapshot the daemon's network addr so the registry can
-        // stamp it into outbound tickets. Without iroh (or before
-        // the endpoint has discovered any addrs), we fall back to
-        // an id-only addr — joiners will need an address-lookup
-        // service of their own to dial us.
+        // stamp it into outbound tickets.
         #[cfg(feature = "iroh")]
-        let daemon_addr = iroh.as_ref().map_or_else(
-            || artel_protocol::WireEndpointAddr::id_only(daemon_peer_id),
-            |rt| iroh_endpoint_to_wire(&rt.endpoint.addr()),
-        );
+        let daemon_addr = iroh_endpoint_to_wire(&iroh.endpoint.addr());
         #[cfg(not(feature = "iroh"))]
         let daemon_addr = artel_protocol::WireEndpointAddr::id_only(daemon_peer_id);
 
@@ -253,14 +248,12 @@ impl Daemon {
         // lives in `endpoint.address_lookup()` so adds via the
         // bridge are visible to iroh's resolver chain immediately.
         #[cfg(feature = "iroh")]
-        let bridge = iroh.as_ref().map(|rt| {
-            Arc::new(crate::gossip_bridge::GossipBridge::new(
-                rt.gossip.clone(),
-                rt.addr_hint.clone(),
-                Arc::clone(&rt.tracked_peer_ids),
-                rt.endpoint.id(),
-            ))
-        });
+        let bridge = Arc::new(crate::gossip_bridge::GossipBridge::new(
+            iroh.gossip.clone(),
+            iroh.addr_hint.clone(),
+            Arc::clone(&iroh.tracked_peer_ids),
+            iroh.endpoint.id(),
+        ));
 
         let store: crate::store::DynStore = Arc::new(
             crate::store::FsLogStore::open(&config.sessions_dir)
@@ -272,7 +265,7 @@ impl Daemon {
                 daemon_addr,
                 store,
                 #[cfg(feature = "iroh")]
-                bridge.clone(),
+                Some(Arc::clone(&bridge)),
             )
             .await
             .map_err(StartError::LoadSessions)?,
@@ -283,9 +276,7 @@ impl Daemon {
         // cycle. Without this the host-side forwarder has no way to
         // call back into `Registry::send` for inbound SendRequests.
         #[cfg(feature = "iroh")]
-        if let Some(bridge) = &bridge {
-            bridge.attach_registry(Arc::downgrade(&registry)).await;
-        }
+        bridge.attach_registry(Arc::downgrade(&registry)).await;
 
         let shutdown = Arc::new(Shutdown::new());
         shutdown
@@ -312,8 +303,9 @@ impl Daemon {
         })
     }
 
-    /// iroh runtime if the daemon stood one up. `None` when the
-    /// feature is off or no `iroh_key_path` was supplied.
+    /// iroh runtime backing the daemon. Always present under the
+    /// `iroh` feature: [`Self::start`] fails fast if no
+    /// [`DaemonConfig::iroh_key_path`] was supplied.
     ///
     /// Exposed so embedders and integration tests can talk to the
     /// daemon's `Endpoint` and `Gossip` directly. Phase 2c-2 will
@@ -321,8 +313,8 @@ impl Daemon {
     /// `Registry`.
     #[cfg(feature = "iroh")]
     #[must_use]
-    pub const fn iroh(&self) -> Option<&IrohRuntime> {
-        self.iroh.as_ref()
+    pub const fn iroh(&self) -> &IrohRuntime {
+        &self.iroh
     }
 
     /// Path of the bound IPC socket.
@@ -421,14 +413,14 @@ impl Daemon {
         // that closes the endpoint and `remote_info` returns `None`
         // afterwards.
         #[cfg(feature = "iroh")]
-        if let Some(IrohRuntime {
-            router,
-            endpoint,
-            tracked_peer_ids,
-            peer_addr_cache,
-            ..
-        }) = iroh
         {
+            let IrohRuntime {
+                router,
+                endpoint,
+                tracked_peer_ids,
+                peer_addr_cache,
+                ..
+            } = iroh;
             snapshot_peer_addrs(&endpoint, &tracked_peer_ids, &peer_addr_cache).await;
             if let Err(err) = router.shutdown().await {
                 warn!(error = %err, "iroh router shutdown failed");
@@ -712,7 +704,7 @@ async fn dispatch_attachment(registry: &Registry, request: Request) -> Response 
 async fn resolve_iroh_runtime(
     key_path: Option<&std::path::Path>,
     setup: &EndpointSetup,
-) -> Result<(artel_protocol::PeerId, Option<IrohRuntime>), StartError> {
+) -> Result<(artel_protocol::PeerId, IrohRuntime), StartError> {
     let path = key_path
         .ok_or_else(|| StartError::Iroh("iroh feature is on but no iroh_key_path given".into()))?;
     let secret =
@@ -794,14 +786,14 @@ async fn resolve_iroh_runtime(
 
     Ok((
         peer_id,
-        Some(IrohRuntime {
+        IrohRuntime {
             endpoint,
             gossip,
             router,
             addr_hint,
             tracked_peer_ids,
             peer_addr_cache,
-        }),
+        },
     ))
 }
 

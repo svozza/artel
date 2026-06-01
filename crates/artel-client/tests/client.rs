@@ -64,14 +64,7 @@ impl DaemonHarness {
         })
         .await
         .expect("daemon start");
-        let daemon_peer_id = PeerId::from_bytes(
-            *daemon
-                .iroh()
-                .expect("iroh runtime")
-                .endpoint
-                .id()
-                .as_bytes(),
-        );
+        let daemon_peer_id = PeerId::from_bytes(*daemon.iroh().endpoint.id().as_bytes());
         let shutdown = daemon.shutdown_handle();
         let join = tokio::spawn(daemon.run());
         Self {

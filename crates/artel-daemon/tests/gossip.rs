@@ -75,7 +75,7 @@ impl SmokeDaemon {
         .await
         .expect("daemon start");
 
-        let runtime = daemon.iroh().expect("iroh runtime").clone();
+        let runtime = daemon.iroh().clone();
         let shutdown = daemon.shutdown_handle();
         let join = tokio::spawn(daemon.run());
         Self {

@@ -207,7 +207,7 @@ pub async fn spawn_local_daemon_at(paths: &RestartState) -> RunningDaemon {
 
 async fn spawn_with_state(config: DaemonConfig, state: Option<State>) -> RunningDaemon {
     let daemon = Daemon::start(config).await.expect("daemon start");
-    let iroh_runtime = daemon.iroh().expect("iroh runtime");
+    let iroh_runtime = daemon.iroh();
     let iroh_addr = iroh_runtime.endpoint.addr();
     let addr_hint = iroh_runtime.addr_hint.clone();
     let gossip = iroh_runtime.gossip.clone();
