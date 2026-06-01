@@ -387,8 +387,12 @@ mod tests {
 
     #[test]
     fn spawn_options_builder_sets_fields() {
+        // Use a real flag the daemon CLI accepts so anyone copying
+        // this snippet into a live `Client::connect_or_spawn` call
+        // doesn't trip a clap rejection. Daemon CLI flags as of HEAD:
+        // --socket, --state-dir, --log.
         let opts = SpawnOptions::new("/tmp/sock", "/tmp/pid", "/usr/local/bin/artel-daemon")
-            .with_args(["--peer-id", "deadbeef"])
+            .with_args(["--log", "debug"])
             .with_spawn_timeout(Duration::from_secs(10));
         assert_eq!(opts.socket_path, PathBuf::from("/tmp/sock"));
         assert_eq!(opts.pid_path, PathBuf::from("/tmp/pid"));
@@ -396,7 +400,7 @@ mod tests {
             opts.daemon_binary,
             PathBuf::from("/usr/local/bin/artel-daemon"),
         );
-        assert_eq!(opts.extra_args, vec!["--peer-id", "deadbeef"]);
+        assert_eq!(opts.extra_args, vec!["--log", "debug"]);
         assert_eq!(opts.spawn_timeout, Duration::from_secs(10));
     }
 }
