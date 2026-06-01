@@ -58,6 +58,15 @@ async fn endpoint_id_is_stable_across_daemon_restarts_n0() {
     let client = Client::connect(&paths.socket).await.unwrap();
     let first_id = client.daemon_peer_id();
     assert!(paths.iroh_key.exists(), "iroh.key should be persisted");
+    // Floor check: an iroh upgrade or logic bug returning all-zeros
+    // would otherwise pass the stability check
+    // (`first_id == second_id == [0; 32]`). `SYNTHETIC_LOCAL_PEER_ID`
+    // lives in the same module as `[0; 32]`, so guard against drift.
+    assert_ne!(
+        first_id.as_bytes(),
+        &[0u8; 32],
+        "iroh-derived EndpointId must not be all-zeros (degenerate / uninit)",
+    );
     drop(client);
     daemon.stop().await;
 
