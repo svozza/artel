@@ -44,6 +44,7 @@ fn topic_for(session: SessionId) -> TopicId {
 // =============================================================
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn host_drops_send_request_with_spoofed_peer_id() {
     let (daemon_a, daemon_b, _dns_pkarr) = common::spawn_pair().await;
 
@@ -130,28 +131,34 @@ async fn host_drops_send_request_with_spoofed_peer_id() {
     let drain_gossip = async {
         while Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            if let Ok(Some(Ok(GossipEvent::Received(msg)))) =
-                timeout(remaining, receiver.next()).await
-            {
-                let decoded = gossip::decode(&msg.content).expect("decode round-trip");
-                assert!(
-                    !matches!(decoded, GossipBody::SendAck { .. }),
-                    "host produced a SendAck for the spoofed SendRequest",
-                );
+            match timeout(remaining, receiver.next()).await {
+                Ok(Some(Ok(GossipEvent::Received(msg)))) => {
+                    let decoded = gossip::decode(&msg.content).expect("decode round-trip");
+                    assert!(
+                        !matches!(decoded, GossipBody::SendAck { .. }),
+                        "host produced a SendAck for the spoofed SendRequest",
+                    );
+                }
+                Ok(None) => break,
+                Ok(Some(Ok(_))) | Err(_) => {}
+                Ok(Some(Err(err))) => panic!("gossip receiver errored mid-test: {err}"),
             }
         }
     };
     let drain_alice = async {
         while Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let Ok(Some(event)) = timeout(remaining, alice_events.recv()).await else {
-                break;
-            };
-            if let Event::Message { message, .. } = event {
-                assert_ne!(
-                    message.payload, spoofed_payload,
-                    "host accepted the spoofed SendRequest and fanned it out",
-                );
+            match timeout(remaining, alice_events.recv()).await {
+                Ok(Some(event)) => {
+                    if let Event::Message { message, .. } = event {
+                        assert_ne!(
+                            message.payload, spoofed_payload,
+                            "host accepted the spoofed SendRequest and fanned it out",
+                        );
+                    }
+                }
+                Ok(None) => panic!("alice IPC events channel closed mid-test"),
+                Err(_) => {}
             }
         }
     };
