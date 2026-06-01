@@ -25,10 +25,12 @@ use std::time::{Duration, Instant};
 
 use artel_client::{Client, ClientError, EventStream, SpawnError, SpawnOptions};
 use artel_protocol::ticket::{self, SessionTicket, WireEndpointAddr};
+use artel_protocol::transport::client::connect as transport_connect;
 use artel_protocol::{
-    Event, JoinTicket, MessageKind, PeerId, PeerInfo, ProtocolError, Request, Response,
-    SendPayload, Seq, SessionId,
+    Event, JoinTicket, MessageKind, PeerId, PeerInfo, ProtocolError, ProtocolVersion, Request,
+    RequestId, Response, SendPayload, Seq, SessionId, WireMessage,
 };
+use futures_util::{SinkExt, StreamExt};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use pretty_assertions::assert_eq;
@@ -822,5 +824,65 @@ async fn host_leave_removes_session_dir() {
     );
 
     drop(client);
+    daemon.stop().await;
+}
+
+// =============================================================
+// Hello version mismatch: a client whose `client_version` doesn't
+// match the daemon's `PROTOCOL_VERSION` gets a typed
+// `ProtocolError::VersionMismatch` reply, then EOF on the next
+// read. Bypasses [`Client`] so we drive raw frames over the
+// socket — the pre-A2 in-module test that covered this was
+// deleted along with the synthetic-peer-id path.
+// =============================================================
+
+#[tokio::test]
+async fn hello_version_mismatch_returns_error_then_closes() {
+    let (_root, state) = fresh_state_dir();
+    let daemon = common::spawn_local_daemon_at(&state).await;
+
+    let mut framed = transport_connect(&state.socket).await.expect("connect");
+
+    // The daemon's `PROTOCOL_VERSION` is 4 at time of writing; pick a
+    // value the daemon is guaranteed not to recognise.
+    let bogus = ProtocolVersion::new(99);
+    framed
+        .send(WireMessage::Request {
+            id: RequestId::new(1),
+            request: Request::Hello {
+                client_version: bogus,
+            },
+        })
+        .await
+        .expect("send Hello");
+
+    let frame = timeout(Duration::from_secs(2), framed.next())
+        .await
+        .expect("response timeout")
+        .expect("stream closed before response")
+        .expect("decode response");
+    match frame {
+        WireMessage::Response { id, response } => {
+            assert_eq!(id, RequestId::new(1));
+            match response {
+                Response::Error {
+                    error: ProtocolError::VersionMismatch(mismatch),
+                } => {
+                    assert_eq!(mismatch.client, bogus);
+                    assert_eq!(mismatch.daemon, artel_protocol::PROTOCOL_VERSION);
+                }
+                other => panic!("expected VersionMismatch error, got {other:?}"),
+            }
+        }
+        other => panic!("expected Response, got {other:?}"),
+    }
+
+    // Daemon must close the connection after the rejection — no
+    // further frames, just EOF.
+    let next = timeout(Duration::from_secs(2), framed.next())
+        .await
+        .expect("EOF timeout");
+    assert!(next.is_none(), "expected EOF after version mismatch, got {next:?}");
+
     daemon.stop().await;
 }
