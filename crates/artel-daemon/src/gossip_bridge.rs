@@ -454,19 +454,17 @@ impl GossipBridge {
             while let Some(item) = receiver.next().await {
                 match item {
                     Ok(IrohGossipEvent::Received(msg)) => {
-                        // Every frame carries the iroh `EndpointId` of
-                        // the peer that delivered it on the gossip
-                        // mesh — the right id for the daemon's
-                        // shutdown-snapshot path (finding #5c). The
-                        // application-level `PeerId` carried inside
-                        // frame bodies is NOT a valid iroh public
-                        // key in general (joiners stamp arbitrary
-                        // 32-byte ids onto outbound `PeerInfo`).
-                        bridge
-                            .tracked_peer_ids
-                            .lock()
-                            .expect("poisoned")
-                            .insert(msg.delivered_from);
+                        // The application-level `PeerId` carried inside
+                        // frame bodies is NOT a valid iroh public key
+                        // in general (joiners stamp arbitrary 32-byte
+                        // ids onto outbound `PeerInfo`); only
+                        // `msg.delivered_from` (the iroh `EndpointId`
+                        // of the mesh neighbor) is signed by the iroh
+                        // transport. `handle_inbound_frame` records
+                        // it into `tracked_peer_ids` only after the
+                        // host-arm spoof check passes, so a peer that
+                        // only ever sends spoofed bodies isn't
+                        // captured for the shutdown-snapshot path.
                         match gossip::decode(&msg.content) {
                             Ok(body) => {
                                 handle_inbound_frame(
@@ -653,6 +651,13 @@ impl GossipBridge {
 /// `peer.id` (`SendRequest`, `JoinAnnouncement`) verify
 /// `peer.id == delivered_from` and drop the frame on mismatch.
 ///
+/// `delivered_from` is recorded into [`GossipBridge::tracked_peer_ids`]
+/// only on arms that accept the frame as legitimate (after the spoof
+/// check passes on host arms). A peer that ever-only sends spoofed
+/// frames is never captured for the shutdown-snapshot path, so its
+/// addr never lands in the persisted peer-addr cache — the daemon
+/// won't seed it back into `addr_hint` at the next startup.
+///
 /// Joiner-role arms (`Message`, `SendAck::Ok`) carry
 /// [`SessionMessage`] bodies whose `peer.id` is the *original
 /// sender's* id, not the host that re-published the frame. Verifying
@@ -684,6 +689,7 @@ async fn handle_inbound_frame(
             if drop_if_spoofed(session, peer.id, delivered_from) {
                 return;
             }
+            track_authenticated_peer(bridge, delivered_from);
             let result = run_host_send(bridge, session, peer, payload).await;
             bridge.publish_send_ack(session, req_id, result).await;
         }
@@ -703,6 +709,7 @@ async fn handle_inbound_frame(
             if drop_if_spoofed(session, peer.id, delivered_from) {
                 return;
             }
+            track_authenticated_peer(bridge, delivered_from);
             let registry_weak = bridge.registry.lock().await.clone();
             if let Some(registry) = registry_weak.upgrade()
                 && let Err(err) = registry.ensure_member(session, peer).await
@@ -716,6 +723,7 @@ async fn handle_inbound_frame(
         // entry. Idempotent on the registry side, so a stray
         // duplicate frame is harmless.
         (SessionRole::Joiner { .. }, GossipBody::SessionClosed) => {
+            track_authenticated_peer(bridge, delivered_from);
             let registry_weak = bridge.registry.lock().await.clone();
             if let Some(registry) = registry_weak.upgrade()
                 && let Err(err) = registry.host_closed_session(session).await
@@ -729,6 +737,7 @@ async fn handle_inbound_frame(
         // replay traffic too and dedup-skip it; that's wasteful
         // but correct (see `GossipBody::Replay` doc-comment).
         (SessionRole::Host, GossipBody::Replay { since }) => {
+            track_authenticated_peer(bridge, delivered_from);
             run_host_replay(bridge, session, since).await;
         }
         // Host ignores its own Message+SendAck broadcasts (Registry
@@ -750,10 +759,14 @@ async fn handle_inbound_frame(
 
         // Joiner receives the host's broadcast — push into the local
         // mirror's events_tx + log.
-        (SessionRole::Joiner { on_message }, GossipBody::Message(m)) => on_message(m),
+        (SessionRole::Joiner { on_message }, GossipBody::Message(m)) => {
+            track_authenticated_peer(bridge, delivered_from);
+            on_message(m);
+        }
         // Joiner receives the host's reply to one of our outbound
         // sends — resolve the matching pending oneshot.
         (SessionRole::Joiner { .. }, GossipBody::SendAck { req_id, result }) => {
+            track_authenticated_peer(bridge, delivered_from);
             let pending = bridge.pending_sends.lock().await.remove(&req_id);
             if let Some(tx) = pending {
                 let _ = tx.send(result);
@@ -762,6 +775,19 @@ async fn handle_inbound_frame(
             }
         }
     }
+}
+
+/// Record `delivered_from` into the bridge's `tracked_peer_ids` set.
+/// Called from each `handle_inbound_frame` arm that accepts the frame
+/// as legitimate; never called on a spoof-dropped frame, so a peer
+/// that only ever sends spoofed bodies isn't captured for the
+/// shutdown-snapshot path.
+fn track_authenticated_peer(bridge: &GossipBridge, delivered_from: iroh::EndpointId) {
+    bridge
+        .tracked_peer_ids
+        .lock()
+        .expect("poisoned")
+        .insert(delivered_from);
 }
 
 /// Run the host-side `Registry::send` corresponding to an inbound

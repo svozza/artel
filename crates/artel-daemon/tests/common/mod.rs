@@ -115,6 +115,12 @@ pub struct RunningDaemon {
     /// and broadcast hand-crafted frames (e.g. spoofed `peer.id`s
     /// for the auth-L1 regression suite).
     pub gossip: iroh_gossip::net::Gossip,
+    /// Cloned out of the daemon's [`IrohRuntime`] before `run()`
+    /// consumes it. Lets tests assert what's been recorded for the
+    /// shutdown-snapshot path — e.g. that a peer that ever-only sent
+    /// spoofed frames is NOT captured.
+    pub tracked_peer_ids:
+        Arc<std::sync::Mutex<std::collections::BTreeSet<iroh::EndpointId>>>,
     pub shutdown: Arc<Shutdown>,
     pub join: tokio::task::JoinHandle<std::io::Result<()>>,
     /// Optional caller-owned state dir (kept alive for the daemon's
@@ -128,6 +134,16 @@ impl RunningDaemon {
     /// `EndpointId` bytes wrapped as the protocol-side type.
     pub fn peer_id(&self) -> PeerId {
         PeerId::from_bytes(*self.iroh_addr.id.as_bytes())
+    }
+
+    /// Snapshot the bridge's `tracked_peer_ids` set. Returns a fresh
+    /// `BTreeSet` so the caller can assert membership without holding
+    /// the daemon's internal lock.
+    pub fn tracked_peer_ids_snapshot(&self) -> std::collections::BTreeSet<iroh::EndpointId> {
+        self.tracked_peer_ids
+            .lock()
+            .expect("poisoned")
+            .clone()
     }
 
     pub async fn stop(self) {
@@ -200,6 +216,7 @@ async fn spawn_with_state(config: DaemonConfig, state: Option<State>) -> Running
     let iroh_addr = iroh_runtime.endpoint.addr();
     let addr_hint = iroh_runtime.addr_hint.clone();
     let gossip = iroh_runtime.gossip.clone();
+    let tracked_peer_ids = Arc::clone(&iroh_runtime.tracked_peer_ids);
     let shutdown = daemon.shutdown_handle();
     let socket = daemon.socket_path().to_path_buf();
     let join = tokio::spawn(daemon.run());
@@ -208,6 +225,7 @@ async fn spawn_with_state(config: DaemonConfig, state: Option<State>) -> Running
         iroh_addr,
         addr_hint,
         gossip,
+        tracked_peer_ids,
         shutdown,
         join,
         _state: state,

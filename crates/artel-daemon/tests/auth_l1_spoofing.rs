@@ -252,6 +252,16 @@ async fn host_drops_join_announcement_with_spoofed_peer_id() {
     };
     assert_eq!(summary.peer_count, 1, "host alone");
 
+    // The host (daemon_a) must not have captured B's `EndpointId` in
+    // `tracked_peer_ids`. B never sent a legitimate frame — the
+    // spoofed JoinAnnouncement was the only thing on the wire from
+    // them — so the shutdown-snapshot path must not persist B's addr.
+    let tracked = daemon_a.tracked_peer_ids_snapshot();
+    assert!(
+        !tracked.contains(&daemon_b.iroh_addr.id),
+        "host cached spoofed-only sender's EndpointId: {tracked:?}",
+    );
+
     drop(receiver);
     drop(sender);
     drop(alice_client);
