@@ -255,7 +255,11 @@ impl LocalDaemon {
 
     pub async fn stop(self) {
         self.shutdown.trigger();
-        let _ = timeout(Duration::from_secs(10), self.join).await;
+        timeout(Duration::from_secs(10), self.join)
+            .await
+            .expect("daemon did not exit within 10s")
+            .expect("daemon panicked")
+            .expect("daemon io");
     }
 }
 
