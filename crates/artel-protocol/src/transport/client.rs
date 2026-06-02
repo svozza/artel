@@ -29,7 +29,6 @@ mod tests {
 
     use super::*;
     use crate::ids::PeerId;
-    use crate::message::PeerInfo;
     use crate::rpc::{Request, RequestId, Response, WireMessage};
     use crate::transport::server::Listener;
     use crate::version::PROTOCOL_VERSION;
@@ -122,7 +121,7 @@ mod tests {
                 WireMessage::Request {
                     id: RequestId::new(2),
                     request: Request::HostSession {
-                        peer: PeerInfo::new(PeerId::from_bytes([1; 32]), "alice"),
+                        display_name: "alice".into(),
                         session: None,
                     },
                 },

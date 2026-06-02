@@ -551,26 +551,14 @@ async fn dispatch(
         Request::Hello { .. } => Response::Error {
             error: ProtocolError::Internal("Hello sent twice on one connection".into()),
         },
-        Request::HostSession { peer, session } => {
-            match registry.host(peer.clone(), session).await {
-                Ok((session, ticket)) => {
-                    memberships.insert(session, peer);
-                    Response::HostSession { session, ticket }
-                }
-                Err(err) => Response::Error {
-                    error: session_error_to_protocol(&err),
-                },
-            }
-        }
-        Request::JoinSession { peer, ticket } => match registry.join(&ticket, peer.clone()).await {
-            Ok((session, head)) => {
-                memberships.insert(session, peer);
-                Response::JoinSession { session, head }
-            }
-            Err(err) => Response::Error {
-                error: session_error_to_protocol(&err),
-            },
-        },
+        Request::HostSession {
+            display_name,
+            session,
+        } => dispatch_host(registry, display_name, session, memberships).await,
+        Request::JoinSession {
+            display_name,
+            ticket,
+        } => dispatch_join(registry, display_name, ticket, memberships).await,
         Request::ListSessions => Response::ListSessions {
             sessions: registry.list().await,
         },
@@ -634,6 +622,54 @@ async fn dispatch(
         req @ (Request::RegisterAttachment { .. }
         | Request::ListAttachments { .. }
         | Request::ForgetAttachment { .. }) => dispatch_attachment(registry, req).await,
+    }
+}
+
+/// Stamp the daemon's authenticated `PeerId` and route to
+/// `Registry::host`. Pulled out of `dispatch` so the parent stays
+/// under clippy's `too_many_lines` cap (auth L1 fix #3,
+/// `PROTOCOL_VERSION` 5).
+async fn dispatch_host(
+    registry: &Registry,
+    display_name: String,
+    session: Option<SessionId>,
+    memberships: &mut HashMap<SessionId, PeerInfo>,
+) -> Response {
+    let peer = PeerInfo {
+        id: registry.daemon_peer_id(),
+        display_name,
+    };
+    match registry.host(peer.clone(), session).await {
+        Ok((session, ticket)) => {
+            memberships.insert(session, peer);
+            Response::HostSession { session, ticket }
+        }
+        Err(err) => Response::Error {
+            error: session_error_to_protocol(&err),
+        },
+    }
+}
+
+/// Stamp the daemon's authenticated `PeerId` and route to
+/// `Registry::join`. Counterpart to `dispatch_host`.
+async fn dispatch_join(
+    registry: &Registry,
+    display_name: String,
+    ticket: artel_protocol::JoinTicket,
+    memberships: &mut HashMap<SessionId, PeerInfo>,
+) -> Response {
+    let peer = PeerInfo {
+        id: registry.daemon_peer_id(),
+        display_name,
+    };
+    match registry.join(&ticket, peer.clone()).await {
+        Ok((session, head)) => {
+            memberships.insert(session, peer);
+            Response::JoinSession { session, head }
+        }
+        Err(err) => Response::Error {
+            error: session_error_to_protocol(&err),
+        },
     }
 }
 
@@ -944,7 +980,6 @@ fn session_error_to_protocol(err: &SessionError) -> ProtocolError {
     match err {
         SessionError::UnknownSession(s) => ProtocolError::UnknownSession(*s),
         SessionError::NotMember(_) => ProtocolError::Internal("not a member".into()),
-        SessionError::AlreadyJoined(s) => ProtocolError::AlreadyJoined(*s),
         SessionError::InvalidTicket => ProtocolError::InvalidTicket,
         SessionError::Storage(io_err) => ProtocolError::Internal(format!("storage: {io_err}")),
         SessionError::InvalidAddr(msg) => ProtocolError::Internal(format!("invalid addr: {msg}")),

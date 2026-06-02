@@ -870,7 +870,6 @@ fn session_error_to_wire(err: &SessionError) -> ProtocolError {
     match err {
         SessionError::UnknownSession(s) => ProtocolError::UnknownSession(*s),
         SessionError::NotMember(_) => ProtocolError::Internal("not a member".into()),
-        SessionError::AlreadyJoined(s) => ProtocolError::AlreadyJoined(*s),
         SessionError::InvalidTicket => ProtocolError::InvalidTicket,
         SessionError::Storage(io_err) => ProtocolError::Internal(format!("storage: {io_err}")),
         // The bridge currently doesn't surface InvalidAddr to the

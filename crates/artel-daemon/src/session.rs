@@ -47,10 +47,6 @@ pub enum SessionError {
     #[error("not a member of session: {0}")]
     NotMember(SessionId),
 
-    /// The peer is already a member of the session.
-    #[error("already joined session: {0}")]
-    AlreadyJoined(SessionId),
-
     /// Join ticket malformed or revoked.
     #[error("invalid join ticket")]
     InvalidTicket,
@@ -102,7 +98,6 @@ impl PartialEq for SessionError {
         match (self, other) {
             (Self::UnknownSession(a), Self::UnknownSession(b))
             | (Self::NotMember(a), Self::NotMember(b))
-            | (Self::AlreadyJoined(a), Self::AlreadyJoined(b))
             | (Self::SessionConflict(a), Self::SessionConflict(b)) => a == b,
             (Self::Storage(a), Self::Storage(b)) => a.kind() == b.kind(),
             (Self::InvalidAddr(a), Self::InvalidAddr(b))
@@ -424,29 +419,38 @@ impl Registry {
         // join with the same peer doesn't race past the membership
         // check. This is the simplest correct shape; the store is fast
         // and uncontended in practice.
-        let mut s = session.lock().await;
-        if s.members.contains(&peer.id) {
-            return Err(SessionError::AlreadyJoined(session_id));
+        let head;
+        {
+            let mut s = session.lock().await;
+            head = if s.head == Seq::ZERO {
+                None
+            } else {
+                Some(s.head)
+            };
+            if s.members.contains(&peer.id) {
+                // Self-rejoin: caller's authenticated id is already
+                // a member. Daemon-side membership is per-
+                // authenticated-identity (persistent across consumer
+                // remounts); a re-host or re-join from the same
+                // daemon is a no-op. No second PeerJoined fires.
+                // See `docs/plans/2026-06-01-auth-l1-fix3-plan.md`.
+                return Ok((session_id, head));
+            }
+            self.store
+                .add_member(session_id, &peer)
+                .await
+                .map_err(SessionError::Storage)?;
+            s.members.insert(peer.id);
+
+            // Notify other peers of the join. broadcast::send
+            // returns Err when there are no receivers; that's fine,
+            // we treat it as a "nobody listening" no-op.
+            let _ = s.events_tx.send(Event::PeerJoined {
+                session: session_id,
+                peer,
+            });
         }
-        self.store
-            .add_member(session_id, &peer)
-            .await
-            .map_err(SessionError::Storage)?;
-        s.members.insert(peer.id);
 
-        // Notify other peers of the join. broadcast::send returns Err
-        // when there are no receivers; that's fine, we treat it as a
-        // "nobody listening" no-op.
-        let _ = s.events_tx.send(Event::PeerJoined {
-            session: session_id,
-            peer,
-        });
-
-        let head = if s.head == Seq::ZERO {
-            None
-        } else {
-            Some(s.head)
-        };
         Ok((session_id, head))
     }
 
@@ -1343,12 +1347,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn join_twice_errors() {
+    async fn join_twice_is_idempotent() {
         let r = registry();
-        let (_id, ticket) = r.host(peer(1, "alice"), None).await.unwrap();
-        r.join(&ticket, peer(2, "bob")).await.unwrap();
-        let err = r.join(&ticket, peer(2, "bob")).await.unwrap_err();
-        assert!(matches!(err, SessionError::AlreadyJoined(_)), "{err:?}");
+        let (id, ticket) = r.host(peer(1, "alice"), None).await.unwrap();
+        let (got_first, head_first) = r.join(&ticket, peer(2, "bob")).await.unwrap();
+        // Second call must NOT error — it's a no-op for the same
+        // authenticated id (auth L1 fix #3, idempotent self-rejoin).
+        let (got_second, head_second) = r.join(&ticket, peer(2, "bob")).await.unwrap();
+        assert_eq!(got_first, id);
+        assert_eq!(got_second, id);
+        assert_eq!(head_first, head_second);
+
+        // Bob remains a single member of the session — the
+        // idempotent path neither duplicates the entry nor races
+        // through the store.
+        let bob_id = peer(2, "bob").id;
+        let session_arc = {
+            let sessions = r.sessions.read().await;
+            sessions.get(&id).expect("session exists").clone()
+        };
+        let (members, bob_count) = {
+            let session = session_arc.lock().await;
+            let count = session.members.iter().filter(|m| **m == bob_id).count();
+            (session.members.clone(), count)
+        };
+        assert_eq!(bob_count, 1, "members: {members:?}");
+    }
+
+    #[tokio::test]
+    async fn host_then_self_join_via_same_id_is_idempotent() {
+        // Alice is the daemon's own peer (matches `registry()`'s
+        // [0xff; 32]), so re-joining via her own ticket is the
+        // self-rejoin case.
+        let daemon_peer = PeerId::from_bytes([0xff; 32]);
+        let r = registry();
+        let alice = PeerInfo::new(daemon_peer, "alice");
+        let (id, ticket) = r.host(alice.clone(), None).await.unwrap();
+        // Same authenticated id rejoining via the host's own ticket.
+        let (got, head) = r.join(&ticket, alice.clone()).await.unwrap();
+        assert_eq!(got, id);
+        assert_eq!(head, None, "no messages yet, head should be None");
+
+        // Membership unchanged: alice is still a single member.
+        let session_arc = {
+            let sessions = r.sessions.read().await;
+            sessions.get(&id).expect("session exists").clone()
+        };
+        let (members, alice_count) = {
+            let session = session_arc.lock().await;
+            let count = session
+                .members
+                .iter()
+                .filter(|m| **m == daemon_peer)
+                .count();
+            (session.members.clone(), count)
+        };
+        assert_eq!(alice_count, 1, "members: {members:?}");
     }
 
     // ---- send / sequencing ----

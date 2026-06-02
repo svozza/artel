@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// Bump on any wire-incompatible change. Additive changes that are
 /// backwards-compatible at the serde level (e.g. new optional fields) do not
 /// require a bump.
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(4);
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(5);
 
 /// A monotonically-increasing protocol version.
 #[derive(
@@ -76,9 +76,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn current_protocol_version_is_four() {
-        assert_eq!(PROTOCOL_VERSION, ProtocolVersion::new(4));
-        assert_eq!(PROTOCOL_VERSION.get(), 4);
+    fn current_protocol_version_is_five() {
+        assert_eq!(PROTOCOL_VERSION, ProtocolVersion::new(5));
+        assert_eq!(PROTOCOL_VERSION.get(), 5);
     }
 
     #[test]

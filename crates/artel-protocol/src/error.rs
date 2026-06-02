@@ -32,10 +32,6 @@ pub enum ProtocolError {
     #[error("invalid join ticket")]
     InvalidTicket,
 
-    /// The client is already a member of the session.
-    #[error("already joined session: {0}")]
-    AlreadyJoined(SessionId),
-
     /// The daemon refuses the request because it has not finished starting
     /// up. Clients should retry after a short delay.
     #[error("daemon is not ready yet")]
@@ -70,7 +66,6 @@ impl ProtocolError {
             Self::UnknownSession(_) => "unknown_session",
             Self::NotSubscribed(_) => "not_subscribed",
             Self::InvalidTicket => "invalid_ticket",
-            Self::AlreadyJoined(_) => "already_joined",
             Self::NotReady => "not_ready",
             Self::NotHost => "not_host",
             Self::SessionConflict(_) => "session_conflict",
@@ -110,10 +105,6 @@ mod tests {
             "not_subscribed"
         );
         assert_eq!(ProtocolError::InvalidTicket.slug(), "invalid_ticket");
-        assert_eq!(
-            ProtocolError::AlreadyJoined(sample_session()).slug(),
-            "already_joined"
-        );
         assert_eq!(ProtocolError::NotReady.slug(), "not_ready");
         assert_eq!(ProtocolError::NotHost.slug(), "not_host");
         assert_eq!(
@@ -130,7 +121,6 @@ mod tests {
             ProtocolError::UnknownSession(s),
             ProtocolError::NotSubscribed(s),
             ProtocolError::InvalidTicket,
-            ProtocolError::AlreadyJoined(s),
             ProtocolError::NotReady,
             ProtocolError::NotHost,
             ProtocolError::SessionConflict(s),
@@ -189,7 +179,6 @@ mod tests {
             any::<[u8; 16]>().prop_map(|b| ProtocolError::UnknownSession(SessionId::from_bytes(b))),
             any::<[u8; 16]>().prop_map(|b| ProtocolError::NotSubscribed(SessionId::from_bytes(b))),
             Just(ProtocolError::InvalidTicket),
-            any::<[u8; 16]>().prop_map(|b| ProtocolError::AlreadyJoined(SessionId::from_bytes(b))),
             Just(ProtocolError::NotReady),
             Just(ProtocolError::NotHost),
             any::<[u8; 16]>()

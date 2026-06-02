@@ -129,16 +129,25 @@ pub enum Request {
     /// host or is a remote-mirror session is rejected with
     /// [`ProtocolError::SessionConflict`].
     HostSession {
-        /// Display info for this peer (the host).
-        peer: PeerInfo,
+        /// Display name to advertise as this peer's label. Display
+        /// names are advisory and never authenticated. The
+        /// authenticated [`PeerId`] is the daemon's own iroh
+        /// `EndpointId`; the IPC caller cannot influence it. See
+        /// `docs/brainstorms/2026-06-01-auth-l1-fix3-shape.md` and
+        /// `docs/plans/2026-06-01-auth-l1-fix3-plan.md`.
+        display_name: String,
         /// Caller-supplied session id, or `None` to mint a fresh one.
         session: Option<SessionId>,
     },
 
     /// Join an existing session via its ticket.
     JoinSession {
-        /// Display info for this peer (the joiner).
-        peer: PeerInfo,
+        /// Display name to advertise as this peer's label. Display
+        /// names are advisory and never authenticated. The
+        /// authenticated [`PeerId`] is the daemon's own iroh
+        /// `EndpointId`; the IPC caller cannot influence it. See
+        /// `docs/brainstorms/2026-06-01-auth-l1-fix3-shape.md`.
+        display_name: String,
         /// Ticket obtained out-of-band from the host.
         ticket: JoinTicket,
     },
@@ -475,7 +484,7 @@ mod tests {
     #[test]
     fn host_session_request_round_trip() {
         let req = Request::HostSession {
-            peer: sample_peer(),
+            display_name: "alice".into(),
             session: None,
         };
         let bytes = postcard::to_allocvec(&req).unwrap();
@@ -486,7 +495,7 @@ mod tests {
     #[test]
     fn host_session_request_round_trip_with_session_id() {
         let req = Request::HostSession {
-            peer: sample_peer(),
+            display_name: "alice".into(),
             session: Some(SessionId::from_bytes([7; 16])),
         };
         let bytes = postcard::to_allocvec(&req).unwrap();
@@ -502,7 +511,7 @@ mod tests {
     #[test]
     fn join_session_request_round_trip() {
         let req = Request::JoinSession {
-            peer: sample_peer(),
+            display_name: "bob".into(),
             ticket: JoinTicket::from("ticket-blob"),
         };
         let bytes = postcard::to_allocvec(&req).unwrap();
@@ -837,9 +846,8 @@ mod tests {
             })
     }
 
-    fn arb_peer() -> impl Strategy<Value = PeerInfo> {
-        (any::<[u8; 32]>(), "[\\PC]{0,32}")
-            .prop_map(|(id, name)| PeerInfo::new(PeerId::from_bytes(id), name))
+    fn arb_display_name() -> impl Strategy<Value = String> {
+        "[\\PC]{0,32}".prop_map(String::from)
     }
 
     fn arb_request() -> impl Strategy<Value = Request> {
@@ -847,15 +855,17 @@ mod tests {
             any::<u32>().prop_map(|v| Request::Hello {
                 client_version: ProtocolVersion::new(v),
             }),
-            (arb_peer(), proptest::option::of(any::<[u8; 16]>())).prop_map(|(peer, s)| {
+            (arb_display_name(), proptest::option::of(any::<[u8; 16]>())).prop_map(|(name, s)| {
                 Request::HostSession {
-                    peer,
+                    display_name: name,
                     session: s.map(SessionId::from_bytes),
                 }
             }),
-            (arb_peer(), "[\\PC]{0,128}").prop_map(|(peer, ticket)| Request::JoinSession {
-                peer,
-                ticket: JoinTicket::from(ticket),
+            (arb_display_name(), "[\\PC]{0,128}").prop_map(|(name, ticket)| {
+                Request::JoinSession {
+                    display_name: name,
+                    ticket: JoinTicket::from(ticket),
+                }
             }),
             Just(Request::ListSessions),
             (any::<[u8; 16]>(), proptest::option::of(any::<u64>())).prop_map(|(s, since)| {
