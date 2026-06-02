@@ -185,6 +185,7 @@ mod tests {
             MessageKind::Chat,
             "x",
             vec![],
+            artel_protocol::message::SIGNATURE_UNSIGNED,
         )
     }
 

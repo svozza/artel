@@ -417,7 +417,14 @@ struct Meta {
 }
 
 impl Meta {
-    const CURRENT_VERSION: u32 = 1;
+    /// On-disk schema version for `meta.json`.
+    ///
+    /// Bumped to `2` on 2026-06-02 (Auth Slice B1) when
+    /// `MESSAGE_FORMAT` went 1 → 2 and the on-disk log frames started
+    /// embedding signatures. A v1 directory is unreadable by a v2
+    /// daemon: pre-Slice-B logs have no signature byte run, so even
+    /// unverified replay would mis-decode.
+    const CURRENT_VERSION: u32 = 2;
 
     fn from_record(r: &SessionRecord) -> Self {
         Self {
@@ -853,6 +860,7 @@ mod tests {
             MessageKind::Chat,
             "x",
             vec![0xab; 8],
+            artel_protocol::message::SIGNATURE_UNSIGNED,
         )
     }
 

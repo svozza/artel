@@ -67,6 +67,7 @@ mod tests {
                         MessageKind::Chat,
                         "chat.message",
                         b"hello".to_vec(),
+                        crate::message::SIGNATURE_UNSIGNED,
                     ),
                 },
             },

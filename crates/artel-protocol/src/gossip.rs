@@ -46,7 +46,7 @@ use uuid::Uuid;
 use crate::error::ProtocolError;
 use crate::ids::Seq;
 use crate::message::{PeerInfo, SessionMessage};
-use crate::rpc::SendPayload;
+use crate::rpc::SignedSendPayload;
 
 /// One frame on a session's gossip topic. Externally tagged so
 /// postcard can serialise it (see workspace memo on postcard +
@@ -61,6 +61,14 @@ pub enum GossipBody {
     /// Joiner-published request asking the host to append a
     /// message on its behalf. Correlated with a matching
     /// [`GossipBody::SendAck`] via `req_id`.
+    ///
+    /// The `payload` is a [`SignedSendPayload`] — the joiner's
+    /// daemon stamped `timestamp_ms` and signed the canonical
+    /// bytes before publishing (Slice B2; in B1 the signature
+    /// is `SIGNATURE_UNSIGNED` and verification is off). The
+    /// host preserves both verbatim into the broadcast
+    /// [`SessionMessage`] so receivers can verify against the
+    /// joiner's `peer.id` without a second sign-and-verify pass.
     SendRequest {
         /// Joiner-assigned correlation id. Round-tripped verbatim
         /// in the matching [`GossipBody::SendAck`].
@@ -70,8 +78,9 @@ pub enum GossipBody {
         /// gossip-authenticated `delivered_from` of the carrying
         /// frame; mismatched frames are dropped at the bridge.
         peer: PeerInfo,
-        /// What the joiner asked to append.
-        payload: SendPayload,
+        /// What the joiner asked to append, plus the joiner's
+        /// timestamp + signature.
+        payload: SignedSendPayload,
     },
 
     /// Host-published reply to a [`GossipBody::SendRequest`].
@@ -169,14 +178,17 @@ mod tests {
             MessageKind::Chat,
             "chat.message",
             b"hi".to_vec(),
+            crate::message::SIGNATURE_UNSIGNED,
         )
     }
 
-    fn sample_payload() -> SendPayload {
-        SendPayload {
+    fn sample_payload() -> SignedSendPayload {
+        SignedSendPayload {
+            timestamp_ms: 1_700_000_000_000,
             kind: MessageKind::Chat,
             action: "chat.message".into(),
             payload: b"hi from joiner".to_vec(),
+            signature: crate::message::SIGNATURE_UNSIGNED,
         }
     }
 

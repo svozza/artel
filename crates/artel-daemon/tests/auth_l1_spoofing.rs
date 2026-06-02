@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use artel_client::Client;
 use artel_protocol::gossip::{self, GossipBody};
-use artel_protocol::rpc::SendPayload;
+use artel_protocol::rpc::{SendPayload, SignedSendPayload};
 use artel_protocol::{Event, MessageKind, PeerInfo, Request, Response, SessionId, SessionMessage};
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -110,10 +110,12 @@ async fn host_drops_send_request_with_spoofed_peer_id() {
     let body = GossipBody::SendRequest {
         req_id: Uuid::new_v4(),
         peer: alice.clone(),
-        payload: SendPayload {
+        payload: SignedSendPayload {
+            timestamp_ms: 0,
             kind: MessageKind::Chat,
             action: "chat.message".into(),
             payload: spoofed_payload.clone(),
+            signature: artel_protocol::SIGNATURE_UNSIGNED,
         },
     };
     sender

@@ -29,6 +29,8 @@ pub mod gossip;
 pub mod ids;
 pub mod message;
 pub mod rpc;
+#[cfg(feature = "signing")]
+pub mod signing;
 pub mod ticket;
 #[cfg(feature = "tokio")]
 pub mod transport;
@@ -36,10 +38,13 @@ pub mod version;
 
 pub use error::ProtocolError;
 pub use ids::{PeerId, Seq, SessionId};
-pub use message::{MESSAGE_FORMAT, MessageFormat, MessageKind, PeerInfo, SessionMessage};
+pub use message::{
+    MESSAGE_FORMAT, MessageFormat, MessageKind, PeerInfo, SIGNATURE_UNSIGNED, SessionMessage,
+    SigBytes,
+};
 pub use rpc::{
     Attachment, Event, JoinTicket, Request, RequestId, Response, SendPayload, SessionSummary,
-    WireMessage,
+    SignedSendPayload, WireMessage,
 };
 pub use ticket::{SessionTicket, TICKET_PREFIX, TICKET_VERSION, TicketError, WireEndpointAddr};
 pub use version::{PROTOCOL_VERSION, ProtocolVersion, VersionMismatch};

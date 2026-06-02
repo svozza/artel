@@ -42,7 +42,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use artel_protocol::gossip::{self, GossipBody};
-use artel_protocol::rpc::SendPayload;
+use artel_protocol::rpc::{SendPayload, SignedSendPayload};
 use artel_protocol::ticket::WireEndpointAddr;
 use artel_protocol::{PeerId, PeerInfo, ProtocolError, Seq, SessionId, SessionMessage};
 use bytes::Bytes;
@@ -380,10 +380,28 @@ impl GossipBridge {
             id: self.authenticated_peer_id,
             ..peer
         };
+        // B1: wrap the IPC-side `SendPayload` into a wire-side
+        // `SignedSendPayload` with the sentinel signature. B2 will
+        // replace `SIGNATURE_UNSIGNED` with `sign_body` over the
+        // canonical bytes; verification is off until then.
+        let SendPayload {
+            kind,
+            action,
+            payload,
+        } = payload;
+        let signed_payload = SignedSendPayload {
+            timestamp_ms: now_ms(),
+            kind,
+            action,
+            payload,
+            // TODO(slice-b2): replace with `sign_body` against
+            // `self.signing_key` (not yet on the bridge — wired in B2).
+            signature: artel_protocol::message::SIGNATURE_UNSIGNED,
+        };
         let body = GossipBody::SendRequest {
             req_id,
             peer,
-            payload,
+            payload: signed_payload,
         };
         let bytes = Bytes::from(gossip::encode(&body));
         if let Err(err) = sender.broadcast(bytes).await {
@@ -793,11 +811,19 @@ fn track_authenticated_peer(bridge: &GossipBridge, delivered_from: iroh::Endpoin
 /// Run the host-side `Registry::send` corresponding to an inbound
 /// `SendRequest`. Translates [`SessionError`] into the wire form
 /// the joiner expects to see in `SendAck.result`.
+///
+/// `payload` is a [`SignedSendPayload`] — the joiner's daemon stamped
+/// `timestamp_ms` and signed (B2) before publishing. In B1 the
+/// signature is the sentinel and verification is off; the host
+/// preserves `timestamp_ms` and `signature` verbatim into the
+/// resulting [`SessionMessage`] so receivers see the same bytes the
+/// joiner signed. Slice B2 will additionally pre-verify here at the
+/// bridge boundary.
 async fn run_host_send(
     bridge: &Arc<GossipBridge>,
     session: SessionId,
     peer: PeerInfo,
-    payload: SendPayload,
+    payload: SignedSendPayload,
 ) -> Result<SessionMessage, ProtocolError> {
     let registry_weak = bridge.registry.lock().await.clone();
     let Some(registry) = registry_weak.upgrade() else {
@@ -812,13 +838,19 @@ async fn run_host_send(
     if let Err(err) = registry.ensure_member(session, peer.clone()).await {
         return Err(session_error_to_wire(&err));
     }
-    let SendPayload {
+    let SignedSendPayload {
+        timestamp_ms,
         kind,
         action,
         payload,
+        // Discarded in B1 — Registry::send still stamps
+        // SIGNATURE_UNSIGNED. B2 will thread `signature` through
+        // `Authoring::Remote` so the bytes the joiner signed end up
+        // in the broadcast `SessionMessage` verbatim.
+        signature: _,
     } = payload;
     match registry
-        .send(session, peer, kind, action, payload, now_ms())
+        .send(session, peer, kind, action, payload, timestamp_ms)
         .await
     {
         Ok(message) => Ok(message),

@@ -36,7 +36,27 @@ impl MessageFormat {
 }
 
 /// Current message format version.
-pub const MESSAGE_FORMAT: MessageFormat = MessageFormat::new(1);
+///
+/// Bumped to `2` on 2026-06-02 when [`SessionMessage::signature`] became
+/// part of the wire envelope (Auth Slice B). Pre-2 daemons can't decode v2
+/// frames; the version-2 verifier is the floor.
+pub const MESSAGE_FORMAT: MessageFormat = MessageFormat::new(2);
+
+/// 64-byte ed25519 signature carried inline on every [`SessionMessage`].
+///
+/// Wire-form is fixed-length so postcard encodes it as a flat byte run.
+/// The `signing` feature enables `crate::signing` helpers that produce and
+/// verify these bytes; consumers without the feature still see the field
+/// (and can ferry the bytes around) but cannot interpret them.
+pub type SigBytes = [u8; 64];
+
+/// All-zero signature used as the in-memory sentinel for "not yet signed".
+///
+/// Test fixtures and any pre-Slice-B2 code paths populate this and
+/// `crate::signing::verify_message` rejects it with
+/// `VerifyError::SentinelUnsigned` — that turns "we forgot to call
+/// `sign_body`" into a loud test failure once verification is on.
+pub const SIGNATURE_UNSIGNED: SigBytes = [0u8; 64];
 
 /// Identity of the peer that authored a message.
 ///
@@ -84,11 +104,19 @@ pub enum MessageKind {
 /// One ordered message in a session log.
 ///
 /// Field order and types match ADR-001 § "Versioned message envelope".
+/// `signature` is appended after `payload` and is **not** part of the
+/// signed scope — it carries the signature itself; the canonical bytes
+/// the signature covers are built from the preceding fields (minus
+/// `seq`) plus the carrying `SessionId`. See `crate::signing` and
+/// `docs/brainstorms/2026-05-30-auth-story-brainstorm.md` § L3.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionMessage {
     /// Message format version. See [`MessageFormat`] / [`MESSAGE_FORMAT`].
     pub version: MessageFormat,
     /// Host-assigned sequence number. Strictly monotonic within a session.
+    ///
+    /// **Excluded from the signed scope** so the joiner can sign before
+    /// the host stamps the seq. See `crate::signing::canonical_bytes`.
     pub seq: Seq,
     /// Authoring time, in milliseconds since the Unix epoch.
     pub timestamp_ms: u64,
@@ -103,10 +131,25 @@ pub struct SessionMessage {
     /// chooses its own serialization.
     #[serde(with = "payload_serde")]
     pub payload: Vec<u8>,
+    /// 64-byte ed25519 signature over `crate::signing::canonical_bytes`
+    /// of (`session_id`, `version`, `timestamp_ms`, `peer`, `kind`,
+    /// `action`, `payload`). [`SIGNATURE_UNSIGNED`] is the in-memory
+    /// sentinel for "not yet signed"; receivers reject the sentinel
+    /// once verification is on (Slice B2). Wire-form is a flat
+    /// 64-byte run via `serde_bytes`.
+    #[serde(with = "signature_serde")]
+    pub signature: SigBytes,
 }
 
 impl SessionMessage {
     /// Construct a `SessionMessage` with the current [`MESSAGE_FORMAT`].
+    ///
+    /// Callers that don't yet have a signing key (test fixtures and
+    /// the pre-Slice-B2 `Registry::send` code path) pass
+    /// [`SIGNATURE_UNSIGNED`]; verification rejects the sentinel as
+    /// soon as Slice B2 turns it on, which is the lit fuse that
+    /// catches "we forgot to wire signing in" loudly rather than
+    /// silently.
     #[must_use]
     pub fn new(
         seq: Seq,
@@ -115,6 +158,7 @@ impl SessionMessage {
         kind: MessageKind,
         action: impl Into<String>,
         payload: Vec<u8>,
+        signature: SigBytes,
     ) -> Self {
         Self {
             version: MESSAGE_FORMAT,
@@ -124,6 +168,7 @@ impl SessionMessage {
             kind,
             action: action.into(),
             payload,
+            signature,
         }
     }
 }
@@ -154,6 +199,102 @@ mod payload_serde {
     }
 }
 
+/// Encoding for the 64-byte signature.
+///
+/// Postcard sees a flat byte run (length-prefixed by `serde_bytes`);
+/// JSON sees a 128-character lowercase-hex string. Hex is the same shape
+/// as `PeerId` so a manual log/fixture inspection reads consistently.
+///
+/// Crate-visible so [`crate::rpc::SignedSendPayload`] can reuse the
+/// same encoding for its own signature field.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) mod signature_serde {
+    use serde::de::{self, Deserializer, SeqAccess, Visitor};
+    use serde::{Serialize, Serializer};
+
+    use super::SigBytes;
+
+    const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
+
+    pub(crate) fn serialize<S: Serializer>(bytes: &SigBytes, s: S) -> Result<S::Ok, S::Error> {
+        if s.is_human_readable() {
+            let mut out = String::with_capacity(128);
+            for b in bytes {
+                out.push(HEX_LOWER[(b >> 4) as usize] as char);
+                out.push(HEX_LOWER[(b & 0x0f) as usize] as char);
+            }
+            out.serialize(s)
+        } else {
+            serde_bytes::Bytes::new(bytes.as_slice()).serialize(s)
+        }
+    }
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<SigBytes, D::Error> {
+        struct SigVisitor;
+
+        impl<'de> Visitor<'de> for SigVisitor {
+            type Value = SigBytes;
+
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str("128 hex chars or 64 bytes")
+            }
+
+            fn visit_str<E: de::Error>(self, s: &str) -> Result<Self::Value, E> {
+                if s.len() != 128 {
+                    return Err(E::invalid_length(s.len(), &self));
+                }
+                let mut out = [0u8; 64];
+                for (i, chunk) in s.as_bytes().chunks_exact(2).enumerate() {
+                    let hi = decode_nibble(chunk[0]).ok_or_else(|| E::custom("invalid hex"))?;
+                    let lo = decode_nibble(chunk[1]).ok_or_else(|| E::custom("invalid hex"))?;
+                    out[i] = (hi << 4) | lo;
+                }
+                Ok(out)
+            }
+
+            fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+                v.try_into().map_err(|_| E::invalid_length(v.len(), &self))
+            }
+
+            fn visit_borrowed_bytes<E: de::Error>(self, v: &'de [u8]) -> Result<Self::Value, E> {
+                self.visit_bytes(v)
+            }
+
+            fn visit_byte_buf<E: de::Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
+                self.visit_bytes(&v)
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut out = [0u8; 64];
+                for (i, slot) in out.iter_mut().enumerate() {
+                    *slot = seq
+                        .next_element()?
+                        .ok_or_else(|| de::Error::invalid_length(i, &self))?;
+                }
+                if seq.next_element::<u8>()?.is_some() {
+                    return Err(de::Error::invalid_length(65, &self));
+                }
+                Ok(out)
+            }
+        }
+
+        if d.is_human_readable() {
+            d.deserialize_str(SigVisitor)
+        } else {
+            d.deserialize_bytes(SigVisitor)
+        }
+    }
+
+    const fn decode_nibble(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -173,15 +314,16 @@ mod tests {
             MessageKind::Chat,
             "chat.message",
             b"hello".to_vec(),
+            SIGNATURE_UNSIGNED,
         )
     }
 
     // ---- MessageFormat ----
 
     #[test]
-    fn message_format_constant_is_one() {
-        assert_eq!(MESSAGE_FORMAT, MessageFormat::new(1));
-        assert_eq!(MESSAGE_FORMAT.get(), 1);
+    fn message_format_constant_is_two() {
+        assert_eq!(MESSAGE_FORMAT, MessageFormat::new(2));
+        assert_eq!(MESSAGE_FORMAT.get(), 2);
     }
 
     #[test]
@@ -242,6 +384,7 @@ mod tests {
             MessageKind::System,
             "system.heartbeat",
             Vec::new(),
+            SIGNATURE_UNSIGNED,
         );
         let bytes = postcard::to_allocvec(&m).unwrap();
         let back: SessionMessage = postcard::from_bytes(&bytes).unwrap();
@@ -258,6 +401,7 @@ mod tests {
             MessageKind::Tool,
             "tool.exec",
             vec![0xab; 64 * 1024],
+            [0xcd; 64],
         );
         let bytes = postcard::to_allocvec(&m).unwrap();
         let back: SessionMessage = postcard::from_bytes(&bytes).unwrap();
@@ -276,16 +420,72 @@ mod tests {
             MessageKind::Chat,
             "x",
             vec![0xff; 16],
+            SIGNATURE_UNSIGNED,
         );
         let bytes = postcard::to_allocvec(&m).unwrap();
         // u8 + varint(1) + varint(0) + 32 bytes peer + 0-len name + variant
-        // tag + 1-char action + 16 bytes payload, plus framing varints.
-        // Generous upper bound; will fail loudly if encoding regresses.
+        // tag + 1-char action + 16 bytes payload + 64-byte signature run,
+        // plus framing varints. Generous upper bound; will fail loudly if
+        // encoding regresses.
         assert!(
-            bytes.len() < 80,
+            bytes.len() < 160,
             "postcard size grew unexpectedly: {} bytes",
             bytes.len()
         );
+    }
+
+    #[test]
+    fn session_message_signature_field_round_trips_postcard() {
+        // Pin the signature field's wire shape: a 64-byte run.
+        let mut sig = [0u8; 64];
+        for (i, b) in sig.iter_mut().enumerate() {
+            *b = u8::try_from(i).unwrap();
+        }
+        let m = SessionMessage::new(
+            Seq::new(1),
+            42,
+            sample_peer(),
+            MessageKind::Chat,
+            "chat.message",
+            b"hi".to_vec(),
+            sig,
+        );
+        let bytes = postcard::to_allocvec(&m).unwrap();
+        let back: SessionMessage = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back.signature, sig);
+    }
+
+    #[test]
+    fn session_message_signature_field_round_trips_json_as_hex() {
+        // JSON renders the signature as a 128-char lowercase-hex string,
+        // matching `PeerId`'s shape.
+        let sig = [0xabu8; 64];
+        let m = SessionMessage::new(
+            Seq::new(1),
+            42,
+            sample_peer(),
+            MessageKind::Chat,
+            "chat.message",
+            b"hi".to_vec(),
+            sig,
+        );
+        let json = serde_json::to_string(&m).unwrap();
+        let expected = format!("\"signature\":\"{}\"", "ab".repeat(64));
+        assert!(
+            json.contains(&expected),
+            "json missing hex signature: {json}"
+        );
+        let back: SessionMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.signature, sig);
+    }
+
+    #[test]
+    fn signature_unsigned_is_all_zero() {
+        // The sentinel must stay 64 zero bytes — a fixture regression
+        // detector. `crate::signing::verify_message` rejects this exact
+        // value as `VerifyError::SentinelUnsigned` once verification is
+        // on.
+        assert_eq!(SIGNATURE_UNSIGNED, [0u8; 64]);
     }
 
     // ---- PeerInfo ----
@@ -339,6 +539,7 @@ mod tests {
             kind_idx in 0u8..3,
             action in "[\\PC]{0,64}",
             payload in proptest::collection::vec(any::<u8>(), 0..512),
+            signature in any::<[u8; 64]>(),
         ) {
             let kind = match kind_idx {
                 0 => MessageKind::Chat,
@@ -353,6 +554,7 @@ mod tests {
                 kind,
                 action,
                 payload,
+                signature,
             };
             let bytes = postcard::to_allocvec(&m).unwrap();
             let back: SessionMessage = postcard::from_bytes(&bytes).unwrap();
@@ -368,6 +570,7 @@ mod tests {
             kind_idx in 0u8..3,
             action in "[\\PC]{0,64}",
             payload in proptest::collection::vec(any::<u8>(), 0..256),
+            signature in any::<[u8; 64]>(),
         ) {
             let kind = match kind_idx {
                 0 => MessageKind::Chat,
@@ -381,6 +584,7 @@ mod tests {
                 kind,
                 action,
                 payload,
+                signature,
             );
             let json = serde_json::to_string(&m).unwrap();
             let back: SessionMessage = serde_json::from_str(&json).unwrap();

@@ -22,7 +22,7 @@ iroh = ["dep:iroh", "dep:iroh-gossip", "dep:rand", "dep:bytes"]
 test-utils = ["iroh", "iroh?/test-utils"]
 
 [dependencies]
-artel-protocol = { workspace = true, features = ["tokio"] }
+artel-protocol = { workspace = true, features = ["signing", "tokio"] }
 async-trait = { workspace = true }
 bytes = { workspace = true, optional = true }
 clap = { workspace = true }

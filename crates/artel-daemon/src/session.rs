@@ -211,6 +211,16 @@ pub struct Registry {
     /// supplied; `None` for local-only embeds and unit tests.
     #[cfg(feature = "iroh")]
     bridge: Option<Arc<crate::gossip_bridge::GossipBridge>>,
+    /// Daemon's iroh secret key, used to sign every locally-authored
+    /// `SessionMessage` (Auth Slice B). `None` for unit tests that
+    /// build a registry without an iroh runtime in scope; production
+    /// code paths populate this from
+    /// [`crate::server::IrohRuntime::signing_key`]. In B1 nothing
+    /// reads this field yet (`Registry::send` still ships the
+    /// `SIGNATURE_UNSIGNED` sentinel); B2 turns signing on.
+    #[cfg(feature = "iroh")]
+    #[allow(dead_code)] // wired in B1; consumed in B2.
+    signing_key: Option<Arc<iroh::SecretKey>>,
 }
 
 impl Registry {
@@ -229,6 +239,8 @@ impl Registry {
             store,
             #[cfg(feature = "iroh")]
             bridge: None,
+            #[cfg(feature = "iroh")]
+            signing_key: None,
         }
     }
 
@@ -239,6 +251,7 @@ impl Registry {
         daemon_addr: WireEndpointAddr,
         store: DynStore,
         #[cfg(feature = "iroh")] bridge: Option<Arc<crate::gossip_bridge::GossipBridge>>,
+        #[cfg(feature = "iroh")] signing_key: Option<Arc<iroh::SecretKey>>,
     ) -> std::io::Result<Self> {
         let records = store.load_all().await?;
         let mut sessions = HashMap::with_capacity(records.len());
@@ -253,6 +266,8 @@ impl Registry {
             store,
             #[cfg(feature = "iroh")]
             bridge,
+            #[cfg(feature = "iroh")]
+            signing_key,
         })
     }
 
@@ -929,7 +944,19 @@ impl Registry {
         // We compute the prospective seq without committing it. If the
         // store write succeeds we commit; if not, we leave head alone.
         let prospective = s.head.next().expect("seq overflow");
-        let message = SessionMessage::new(prospective, timestamp_ms, peer, kind, action, payload);
+        // TODO(slice-b2): replace SIGNATURE_UNSIGNED with sign_body using
+        // the registry's signing key. Today we ship the sentinel; B2
+        // turns verification on, at which point any unsigned path goes
+        // red catastrophically — that's deliberate.
+        let message = SessionMessage::new(
+            prospective,
+            timestamp_ms,
+            peer,
+            kind,
+            action,
+            payload,
+            artel_protocol::message::SIGNATURE_UNSIGNED,
+        );
         if let Err(err) = self.store.append(session, &message).await {
             return Err(SessionError::Storage(err));
         }
@@ -1165,6 +1192,7 @@ mod tests {
             MessageKind::Chat,
             String::from("hello"),
             b"world".to_vec(),
+            artel_protocol::message::SIGNATURE_UNSIGNED,
         )];
         let record = SessionRecord {
             id: session_id,
@@ -1179,6 +1207,8 @@ mod tests {
             daemon_peer,
             WireEndpointAddr::id_only(daemon_peer),
             store,
+            #[cfg(feature = "iroh")]
+            None,
             #[cfg(feature = "iroh")]
             None,
         )
@@ -1230,6 +1260,8 @@ mod tests {
             store,
             #[cfg(feature = "iroh")]
             None,
+            #[cfg(feature = "iroh")]
+            None,
         )
         .await
         .unwrap();
@@ -1266,6 +1298,8 @@ mod tests {
             daemon_peer,
             WireEndpointAddr::id_only(daemon_peer),
             store,
+            #[cfg(feature = "iroh")]
+            None,
             #[cfg(feature = "iroh")]
             None,
         )
@@ -1688,6 +1722,8 @@ mod tests {
             store,
             #[cfg(feature = "iroh")]
             None,
+            #[cfg(feature = "iroh")]
+            None,
         )
         .await
         .unwrap();
@@ -1738,6 +1774,7 @@ mod tests {
             daemon_peer,
             WireEndpointAddr::id_only(daemon_peer),
             store.clone(),
+            None,
             None,
         )
         .await
@@ -1927,6 +1964,7 @@ mod tests {
             WireEndpointAddr::id_only(daemon_peer),
             store.clone(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1965,6 +2003,7 @@ mod tests {
             daemon_peer,
             WireEndpointAddr::id_only(daemon_peer),
             store.clone(),
+            None,
             None,
         )
         .await

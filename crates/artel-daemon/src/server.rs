@@ -182,6 +182,26 @@ pub struct IrohRuntime {
     /// seeded into [`Self::addr_hint`]) and overwritten at graceful
     /// shutdown with a fresh snapshot of [`Self::tracked_peer_ids`].
     pub(crate) peer_addr_cache: Arc<crate::peer_addr_cache::PeerAddrCache>,
+    /// Cloned `iroh::SecretKey` retained alongside the Endpoint so
+    /// the daemon can sign session messages (Auth Slice B). Held as
+    /// `Arc` so the registry + gossip bridge each hold a cheap
+    /// refcounted handle and the bytes never have to be re-loaded
+    /// from disk. iroh's `SecretKey` is a thin wrapper around
+    /// `[u8; 32]` and is `Clone` for free; `Arc` is here only to
+    /// flatten the lifetime to "as long as the daemon is up".
+    pub(crate) signing_key: Arc<iroh::SecretKey>,
+}
+
+#[cfg(feature = "iroh")]
+impl IrohRuntime {
+    /// Borrow the daemon's signing key. Used by [`Registry::send`]
+    /// and the gossip bridge to produce per-message ed25519
+    /// signatures (Auth Slice B). The same bytes are inside
+    /// `endpoint.secret_key()`; we mirror them here so the registry
+    /// doesn't have to depend on the iroh `Endpoint` type.
+    pub(crate) fn signing_key(&self) -> Arc<iroh::SecretKey> {
+        self.signing_key.clone()
+    }
 }
 
 /// A running daemon. Hold the value to keep the daemon alive; drop it
@@ -265,6 +285,8 @@ impl Daemon {
                 store,
                 #[cfg(feature = "iroh")]
                 Some(Arc::clone(&bridge)),
+                #[cfg(feature = "iroh")]
+                Some(iroh.signing_key()),
             )
             .await
             .map_err(StartError::LoadSessions)?,
@@ -744,6 +766,12 @@ async fn resolve_iroh_runtime(
         .ok_or_else(|| StartError::Iroh("iroh feature is on but no iroh_key_path given".into()))?;
     let secret =
         crate::iroh_key::load_or_create(path).map_err(|e| StartError::Iroh(e.to_string()))?;
+    // `iroh::SecretKey` is a 32-byte wrapper that is `Clone`; we keep
+    // a copy on `IrohRuntime` so the registry / gossip bridge can
+    // sign session messages (Auth Slice B) without the
+    // `Endpoint::secret_key` round-trip. The Endpoint takes the other
+    // copy by value via `secret_key()`.
+    let signing_key = Arc::new(secret.clone());
     // Start from `presets::Empty` so the `EndpointSetup::apply` chain
     // has full control over which discovery preset gets layered in.
     let endpoint = setup
@@ -828,6 +856,7 @@ async fn resolve_iroh_runtime(
             addr_hint,
             tracked_peer_ids,
             peer_addr_cache,
+            signing_key,
         },
     ))
 }
@@ -1009,8 +1038,53 @@ fn handle_hello(client_version: ProtocolVersion) -> Result<(), ProtocolError> {
     Ok(())
 }
 
-// In-module tests removed in auth-L1/A2 — they relied on
+// Most in-module tests were removed in auth-L1/A2 — they relied on
 // `iroh_key_path: None` + synthetic peer id, a path that no longer
 // exists under the iroh feature. Coverage now lives in the
 // integration suite (`tests/{sessions,attachments,identity,gossip,auth_l1_spoofing}.rs`,
 // `artel-fs/tests/`).
+
+#[cfg(all(test, feature = "iroh", feature = "test-utils"))]
+mod tests {
+    use std::sync::Arc;
+
+    use iroh::test_utils::DnsPkarrServer;
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    /// Pin the load-bearing invariant for Auth Slice B: the bytes
+    /// retained on `IrohRuntime` for signing match the bytes the
+    /// `Endpoint` is using as its identity. If these ever drift,
+    /// daemons would sign with one key and authenticate as another —
+    /// every receiver would reject the body as `BadSig` and the
+    /// failure would only surface in flaky end-to-end traffic.
+    #[tokio::test]
+    async fn iroh_runtime_signing_key_matches_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("iroh.key");
+        // Hermetic relay/pkarr so we don't reach n0; the test is
+        // about the *key bytes*, not network traffic.
+        let dns_pkarr = Arc::new(DnsPkarrServer::run().await.expect("dns_pkarr server"));
+        let setup = EndpointSetup::Testing {
+            dns_pkarr: Arc::clone(&dns_pkarr),
+        };
+        let (_peer_id, runtime) = resolve_iroh_runtime(Some(&key_path), &setup)
+            .await
+            .expect("runtime");
+
+        // The Arc on IrohRuntime holds the same 32 bytes as the
+        // Endpoint's secret_key — both are clones of the bytes loaded
+        // from disk.
+        let on_runtime = runtime.signing_key().to_bytes();
+        let on_endpoint = runtime.endpoint.secret_key().to_bytes();
+        assert_eq!(on_runtime, on_endpoint);
+        // And both equal what was written to disk; load_or_create is
+        // identity for an existing key file.
+        let on_disk = crate::iroh_key::load_or_create(&key_path).unwrap();
+        assert_eq!(on_runtime, on_disk.to_bytes());
+
+        // Tear down to avoid leaking the iroh router's accept loop.
+        runtime.router.shutdown().await.expect("router shutdown");
+    }
+}

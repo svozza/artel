@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ProtocolError;
 use crate::ids::{PeerId, Seq, SessionId};
-use crate::message::{PeerInfo, SessionMessage};
+use crate::message::{PeerInfo, SessionMessage, SigBytes};
 use crate::version::ProtocolVersion;
 
 /// Correlates a [`Request`] with its [`Response`].
@@ -243,6 +243,43 @@ pub struct SendPayload {
     pub payload: Vec<u8>,
 }
 
+/// Joiner-authored, signed body shipped on the gossip wire as the
+/// payload of [`crate::gossip::GossipBody::SendRequest`].
+///
+/// The IPC `Request::Send` body is [`SendPayload`] (no key on the IPC
+/// caller); the joiner's daemon stamps `timestamp_ms` and signs to
+/// produce a `SignedSendPayload`, which then rides on
+/// `GossipBody::SendRequest`. The host preserves `timestamp_ms` and
+/// `signature` verbatim into the broadcast [`SessionMessage`];
+/// receivers verify against the joiner's `peer.id` (which is the
+/// `peer` field on the carrying frame).
+///
+/// Slice B1 introduces the type with [`crate::message::SIGNATURE_UNSIGNED`]
+/// as its sentinel value; Slice B2 turns signing on at the bridge.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedSendPayload {
+    /// Authoring time, stamped by the joiner's daemon at the moment
+    /// the body is signed. Preserved verbatim by the host through the
+    /// round-trip; included in the signed scope so a malicious host
+    /// cannot rewrite it.
+    pub timestamp_ms: u64,
+    /// Top-level category.
+    pub kind: crate::message::MessageKind,
+    /// Application-defined verb.
+    pub action: String,
+    /// Opaque application bytes.
+    #[serde(with = "send_payload_bytes")]
+    pub payload: Vec<u8>,
+    /// 64-byte ed25519 signature over
+    /// `crate::signing::canonical_bytes(session_id, MESSAGE_FORMAT,
+    /// timestamp_ms, peer, kind, action, payload)`. The session id is
+    /// not on this struct because the carrier (the gossip topic)
+    /// already names the session; the host re-binds it when
+    /// rebuilding the [`SessionMessage`].
+    #[serde(with = "crate::message::signature_serde")]
+    pub signature: SigBytes,
+}
+
 mod send_payload_bytes {
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -444,6 +481,7 @@ mod tests {
             MessageKind::Chat,
             "chat.message",
             b"hi".to_vec(),
+            crate::message::SIGNATURE_UNSIGNED,
         )
     }
 
@@ -604,6 +642,41 @@ mod tests {
         let bytes = postcard::to_allocvec(&req).unwrap();
         let back: Request = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(req, back);
+    }
+
+    // ---- SignedSendPayload ----
+
+    #[test]
+    fn signed_send_payload_postcard_round_trip() {
+        let p = SignedSendPayload {
+            timestamp_ms: 1_700_000_000_000,
+            kind: MessageKind::Tool,
+            action: "tool.exec".into(),
+            payload: b"args".to_vec(),
+            signature: [0xcd; 64],
+        };
+        let bytes = postcard::to_allocvec(&p).unwrap();
+        let back: SignedSendPayload = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(p, back);
+    }
+
+    #[test]
+    fn signed_send_payload_json_round_trip_carries_hex_signature() {
+        let p = SignedSendPayload {
+            timestamp_ms: 42,
+            kind: MessageKind::Chat,
+            action: "chat.message".into(),
+            payload: b"hi".to_vec(),
+            signature: [0xab; 64],
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        // 128-char lowercase hex on the wire — same shape as PeerId.
+        assert!(
+            json.contains(&format!("\"signature\":\"{}\"", "ab".repeat(64))),
+            "json missing hex signature: {json}"
+        );
+        let back: SignedSendPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, back);
     }
 
     // ---- Response round-trips ----
