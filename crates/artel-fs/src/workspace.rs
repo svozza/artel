@@ -23,8 +23,7 @@ use std::time::Duration;
 
 use artel_client::{Client, ClientError};
 use artel_protocol::{
-    Event, JoinTicket, MessageKind, PeerInfo, ProtocolError, Request, Response, SendPayload,
-    SessionId,
+    Event, JoinTicket, MessageKind, ProtocolError, Request, Response, SendPayload, SessionId,
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -385,10 +384,12 @@ impl Workspace {
     ///    derive a stable [`SessionId`] from its `NamespaceId` via
     ///    [`crate::session_id_for`].
     /// 3. Register with the daemon by issuing
-    ///    `Request::HostSession { peer, session: Some(derived_id) }`.
+    ///    `Request::HostSession { display_name, session: Some(derived_id) }`.
     ///    First-time hosts mint the session at the derived id;
     ///    subsequent restarts resume the existing record verbatim
-    ///    (members, log, head preserved).
+    ///    (members, log, head preserved). The daemon stamps its own
+    ///    authenticated `PeerId` server-side; the IPC caller cannot
+    ///    influence it (auth L1, `PROTOCOL_VERSION` 5).
     /// 4. Walk `root`, publish every non-skipped file into the doc.
     /// 5. Share the doc as a `DocTicket` and broadcast it over the
     ///    artel session as a [`MessageKind::System`] message with
@@ -400,11 +401,18 @@ impl Workspace {
     /// [`Self::session_id`].
     pub async fn host(
         client: &Client,
-        peer: PeerInfo,
+        display_name: impl Into<String>,
         root: PathBuf,
         policy: AttachPolicy,
     ) -> Result<(Self, mpsc::Receiver<WorkspaceEvent>), WorkspaceError> {
-        Self::host_with(client, peer, root, policy, WorkspaceConfig::default()).await
+        Self::host_with(
+            client,
+            display_name,
+            root,
+            policy,
+            WorkspaceConfig::default(),
+        )
+        .await
     }
 
     /// [`Self::host`], but with an explicit [`WorkspaceConfig`] so
@@ -427,11 +435,12 @@ impl Workspace {
     /// remote-mirror session — see [`ProtocolError::SessionConflict`].
     pub async fn host_with(
         client: &Client,
-        peer: PeerInfo,
+        display_name: impl Into<String>,
         root: PathBuf,
         policy: AttachPolicy,
         config: WorkspaceConfig,
     ) -> Result<(Self, mpsc::Receiver<WorkspaceEvent>), WorkspaceError> {
+        let display_name = display_name.into();
         // Materialise the workspace dir *before* canonicalising so the
         // canonical form is stable across first and subsequent attaches
         // (canonicalize errors on a non-existent path; the previous
@@ -469,7 +478,7 @@ impl Workspace {
         let mut rb = WorkspaceRollback::default();
         match Self::host_with_inner(
             client,
-            peer,
+            display_name,
             root,
             state_dir,
             rules,
@@ -493,7 +502,7 @@ impl Workspace {
     #[allow(clippy::too_many_arguments)]
     async fn host_with_inner(
         client: &Client,
-        peer: PeerInfo,
+        display_name: String,
         root: PathBuf,
         state_dir: PathBuf,
         rules: PathRules,
@@ -536,7 +545,7 @@ impl Workspace {
         // means a different peer already owns this id locally — the
         // user is pointing two daemons at the same state dir or
         // started two workspaces from one daemon.
-        let join_ticket = register_host(client, peer, session_id).await?;
+        let join_ticket = register_host(client, display_name, session_id).await?;
         // Arm the LeaveSession rollback the moment we own this
         // session in the daemon.
         rb.leave_on_rollback = Some(session_id);
@@ -1239,19 +1248,22 @@ impl WorkspaceRollback {
     }
 }
 
-/// Issue `Request::HostSession { peer, session: Some(session_id) }`
+/// Issue `Request::HostSession { display_name, session: Some(session_id) }`
 /// against the daemon and return the [`JoinTicket`] from the reply.
 /// Maps the daemon's resume-conflict variant to
 /// [`WorkspaceError::SessionConflict`] so callers can distinguish
 /// "wrong peer at this state dir" from generic IPC failures.
+///
+/// The daemon stamps its authenticated `PeerId` server-side; the
+/// `display_name` we pass here only labels this peer in events.
 async fn register_host(
     client: &Client,
-    peer: PeerInfo,
+    display_name: String,
     session_id: SessionId,
 ) -> Result<JoinTicket, WorkspaceError> {
     match client
         .request(Request::HostSession {
-            peer,
+            display_name,
             session: Some(session_id),
         })
         .await
