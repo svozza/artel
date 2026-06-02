@@ -13,8 +13,7 @@ use artel_client::{Client, ClientError};
 use artel_daemon::shutdown::Shutdown;
 use artel_daemon::{Daemon, DaemonConfig, EndpointSetup};
 use artel_protocol::{
-    Event, MessageKind, PROTOCOL_VERSION, PeerId, PeerInfo, ProtocolError, Request, Response,
-    SendPayload,
+    Event, MessageKind, PROTOCOL_VERSION, PeerId, ProtocolError, Request, Response, SendPayload,
 };
 use iroh::test_utils::DnsPkarrServer;
 use pretty_assertions::assert_eq;
@@ -86,14 +85,6 @@ impl DaemonHarness {
     }
 }
 
-fn alice() -> PeerInfo {
-    PeerInfo::new(PeerId::from_bytes([1; 32]), "alice")
-}
-
-fn bob() -> PeerInfo {
-    PeerInfo::new(PeerId::from_bytes([2; 32]), "bob")
-}
-
 #[tokio::test]
 async fn connect_does_handshake_and_records_daemon_info() {
     let h = DaemonHarness::spawn().await;
@@ -137,7 +128,7 @@ async fn host_then_list_sees_the_session() {
 
     let resp = client
         .request(Request::HostSession {
-            peer: alice(),
+            display_name: "alice".into(),
             session: None,
         })
         .await
@@ -170,7 +161,7 @@ async fn concurrent_requests_correlate_independently() {
     // Prime: host a session so the daemon has something to look at.
     let resp = client
         .request(Request::HostSession {
-            peer: alice(),
+            display_name: "alice".into(),
             session: None,
         })
         .await
@@ -211,7 +202,7 @@ async fn protocol_error_surfaces_as_client_error_protocol() {
 
     let err = client
         .request(Request::JoinSession {
-            peer: bob(),
+            display_name: "bob".into(),
             ticket: "iroh-fake:abc".into(),
         })
         .await
@@ -227,14 +218,18 @@ async fn protocol_error_surfaces_as_client_error_protocol() {
 
 #[tokio::test]
 async fn events_stream_delivers_message_events() {
-    let h = DaemonHarness::spawn().await;
-    let alice_client = Client::connect(&h.socket).await.unwrap();
-    let bob_client = Client::connect(&h.socket).await.unwrap();
+    // Auth L1 fix #3: each "client" is a separate daemon. Two
+    // DaemonHarness instances share the localhost DnsPkarr server so
+    // they discover each other without per-test n0 startup cost.
+    let h_a = DaemonHarness::spawn().await;
+    let h_b = DaemonHarness::spawn().await;
+    let alice_client = Client::connect(&h_a.socket).await.unwrap();
+    let bob_client = Client::connect(&h_b.socket).await.unwrap();
 
     // Alice hosts and subscribes.
     let resp = alice_client
         .request(Request::HostSession {
-            peer: alice(),
+            display_name: "alice".into(),
             session: None,
         })
         .await
@@ -255,7 +250,7 @@ async fn events_stream_delivers_message_events() {
     // Bob joins and sends.
     let _ = bob_client
         .request(Request::JoinSession {
-            peer: bob(),
+            display_name: "bob".into(),
             ticket,
         })
         .await
@@ -272,24 +267,33 @@ async fn events_stream_delivers_message_events() {
         .await
         .unwrap();
 
-    // Alice should observe PeerJoined then Message.
-    let event = timeout(Duration::from_secs(2), alice_events.recv())
-        .await
-        .expect("event timeout")
-        .expect("event channel closed");
-    assert!(matches!(event, Event::PeerJoined { .. }), "{event:?}");
-    let event = timeout(Duration::from_secs(2), alice_events.recv())
-        .await
-        .expect("event timeout")
-        .expect("event channel closed");
-    match event {
-        Event::Message { message, .. } => assert_eq!(message.payload, b"hi"),
-        other => panic!("expected Message, got {other:?}"),
+    // Alice should observe PeerJoined and Message. Across daemons,
+    // gossip-mesh setup may interleave events, so drain to each
+    // expected one within a generous ceiling.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut saw_join = false;
+    let mut saw_message = false;
+    while !(saw_join && saw_message) {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "alice never observed PeerJoined+Message (saw_join={saw_join}, saw_message={saw_message})",
+        );
+        match timeout(remaining, alice_events.recv()).await {
+            Ok(Some(Event::PeerJoined { .. })) => saw_join = true,
+            Ok(Some(Event::Message { message, .. })) => {
+                assert_eq!(message.payload, b"hi");
+                saw_message = true;
+            }
+            Ok(Some(_)) | Err(_) => {}
+            Ok(None) => panic!("alice events channel closed"),
+        }
     }
 
     drop(alice_client);
     drop(bob_client);
-    h.shutdown().await;
+    h_a.shutdown().await;
+    h_b.shutdown().await;
 }
 
 #[tokio::test]

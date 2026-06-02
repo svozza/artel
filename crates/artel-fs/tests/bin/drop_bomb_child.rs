@@ -19,7 +19,6 @@ use std::process::ExitCode;
 
 use artel_client::Client;
 use artel_fs::{AttachPolicy, Workspace, WorkspaceConfig};
-use artel_protocol::{PeerId, PeerInfo};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
@@ -93,12 +92,11 @@ fn main() -> ExitCode {
 
 async fn run(args: Args) {
     let alice = Client::connect(&args.socket).await.expect("client connect");
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
 
     let cfg = WorkspaceConfig::default().with_state_dir(args.state_dir.clone());
     let (workspace, _events) = Workspace::host_with(
         &alice,
-        alice_peer,
+        "alice",
         args.root.clone(),
         AttachPolicy::AllowExisting,
         cfg,

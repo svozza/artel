@@ -34,9 +34,7 @@ use std::time::{Duration, Instant};
 
 use artel_client::Client;
 use artel_daemon::{Daemon, DaemonConfig, EndpointSetup, StartError};
-use artel_protocol::{
-    Event, MessageKind, PeerId, PeerInfo, Request, Response, SendPayload, ticket,
-};
+use artel_protocol::{Event, MessageKind, Request, Response, SendPayload, ticket};
 use iroh::test_utils::DnsPkarrServer;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
@@ -96,7 +94,7 @@ async fn host_ticket_carries_a_real_endpoint_addr_n0() {
 
     let resp = client
         .request(Request::HostSession {
-            peer: PeerInfo::new(PeerId::from_bytes([1; 32]), "alice"),
+            display_name: "alice".into(),
             session: None,
         })
         .await
@@ -186,10 +184,9 @@ async fn join_succeeds_within_tight_budget_real_n0() {
 
     // Alice hosts immediately.
     let alice_client = Client::connect(&alice.socket).await.unwrap();
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     let host_resp = alice_client
         .request(Request::HostSession {
-            peer: alice_peer,
+            display_name: "alice".into(),
             session: None,
         })
         .await
@@ -205,13 +202,12 @@ async fn join_succeeds_within_tight_budget_real_n0() {
     // dial races alice's pkarr publish-loop on the n0 network.
     let bob = common::spawn_daemon(bob_state, EndpointSetup::Production).await;
     let bob_client = Client::connect(&bob.socket).await.unwrap();
-    let bob_peer = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
 
     let started = Instant::now();
     let join_outcome = timeout(
         JOIN_BUDGET,
         bob_client.request(Request::JoinSession {
-            peer: bob_peer,
+            display_name: "bob".into(),
             ticket,
         }),
     )
@@ -352,11 +348,10 @@ async fn addr_hint_survives_daemon_restart_via_on_disk_cache() {
 
     // Alice hosts.
     let alice_client = Client::connect(&alice_phase1.socket).await.unwrap();
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     let host_resp = peer_cache_phase(
         "phase1: alice hosts",
         alice_client.request(Request::HostSession {
-            peer: alice_peer,
+            display_name: "alice".into(),
             session: None,
         }),
     )
@@ -372,11 +367,10 @@ async fn addr_hint_survives_daemon_restart_via_on_disk_cache() {
     // populates alice's `endpoint.remote_info(bob_id)` with bob's
     // actual relay+direct addrs.
     let bob_client = Client::connect(&bob_phase1.socket).await.unwrap();
-    let bob_peer = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
     let _join_resp = peer_cache_phase(
         "phase1: bob joins alice's session",
         bob_client.request(Request::JoinSession {
-            peer: bob_peer,
+            display_name: "bob".into(),
             ticket,
         }),
     )

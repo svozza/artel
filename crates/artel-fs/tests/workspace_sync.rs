@@ -20,7 +20,7 @@ use artel_fs::{
     AttachPolicy, Workspace, WorkspaceConfig, WorkspaceError, WorkspaceEvent, key_to_path,
     path_to_key,
 };
-use artel_protocol::{PeerId, PeerInfo, Request, Response, SessionId};
+use artel_protocol::{Request, Response, SessionId};
 use futures_util::StreamExt;
 use futures_util::future::FutureExt;
 use iroh::test_utils::DnsPkarrServer;
@@ -55,7 +55,6 @@ async fn alice_delete_propagates_to_bob() {
     // Alice hosts; her workspace starts with one seed file so the
     // file is present on Bob's side after `Workspace::join`.
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
 
     let alice_dir = tempfile::tempdir().unwrap();
     tokio::fs::write(alice_dir.path().join("doomed.txt"), b"to be deleted")
@@ -64,7 +63,7 @@ async fn alice_delete_propagates_to_bob() {
 
     let (alice_ws, _) = Workspace::host_with(
         &alice,
-        alice_peer,
+        "alice",
         alice_dir.path().to_path_buf(),
         AttachPolicy::AllowExisting,
         WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
@@ -82,10 +81,9 @@ async fn alice_delete_propagates_to_bob() {
     // Bob joins. After bulk_export his dir should already contain
     // `doomed.txt` (sanity-checked before we delete).
     let bob = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob_peer = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
     let resp = bob
         .request(Request::JoinSession {
-            peer: bob_peer,
+            display_name: "bob".into(),
             ticket,
         })
         .await
@@ -184,12 +182,11 @@ async fn spawn_host_workspace_for_empty_test() -> (
         common::spawn_daemon_with_setup(common::fresh_state(), daemon_testing_setup(&dns_pkarr))
             .await;
     let client = Client::connect(&daemon.socket).await.unwrap();
-    let peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "host");
     let dir = tempfile::tempdir().unwrap();
     let cfg = WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr));
     let (ws, events) = Workspace::host_with(
         &client,
-        peer,
+        "host",
         dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
         cfg,
@@ -320,7 +317,6 @@ async fn joiner_bulk_imports_host_files() {
 
     // Alice on daemon A hosts the artel session.
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     // Alice's workspace dir has two seed files.
     let alice_dir = tempfile::tempdir().unwrap();
     tokio::fs::write(alice_dir.path().join("a.txt"), b"alpha")
@@ -334,7 +330,7 @@ async fn joiner_bulk_imports_host_files() {
     // into the doc and broadcasts the ticket on the session.
     let (alice_ws, _alice_ws_events) = Workspace::host_with(
         &alice,
-        alice_peer,
+        "alice",
         alice_dir.path().to_path_buf(),
         AttachPolicy::AllowExisting,
         WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
@@ -349,10 +345,9 @@ async fn joiner_bulk_imports_host_files() {
 
     // Bob on daemon B joins the artel session.
     let bob = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob_peer = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
     let resp = bob
         .request(Request::JoinSession {
-            peer: bob_peer,
+            display_name: "bob".into(),
             ticket,
         })
         .await
@@ -429,10 +424,9 @@ async fn host_session_without_workspace() -> JoinerSetup {
     } = spawn_pair().await;
 
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     let (session, ticket) = match alice
         .request(Request::HostSession {
-            peer: alice_peer,
+            display_name: "alice".into(),
             session: None,
         })
         .await
@@ -446,10 +440,9 @@ async fn host_session_without_workspace() -> JoinerSetup {
     drop(alice);
 
     let bob = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob_peer = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
     let resp = bob
         .request(Request::JoinSession {
-            peer: bob_peer,
+            display_name: "bob".into(),
             ticket,
         })
         .await
@@ -586,12 +579,11 @@ async fn live_edit_propagates_host_to_joiner() {
 
     // Alice hosts.
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
 
     let alice_dir = tempfile::tempdir().unwrap();
     let (alice_ws, _) = Workspace::host_with(
         &alice,
-        alice_peer,
+        "alice",
         alice_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
         WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
@@ -608,10 +600,9 @@ async fn live_edit_propagates_host_to_joiner() {
 
     // Bob joins.
     let bob = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob_peer = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
     let resp = bob
         .request(Request::JoinSession {
-            peer: bob_peer,
+            display_name: "bob".into(),
             ticket,
         })
         .await
@@ -691,11 +682,10 @@ async fn round_trip_once(run: usize) {
 
     // Alice on daemon A hosts the artel session + workspace.
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     let alice_dir = tempfile::tempdir().unwrap();
     let (alice_ws, _) = Workspace::host_with(
         &alice,
-        alice_peer,
+        "alice",
         alice_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
         WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
@@ -712,10 +702,9 @@ async fn round_trip_once(run: usize) {
 
     // Bob on daemon B joins, then mounts a workspace.
     let bob = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob_peer = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
     let resp = bob
         .request(Request::JoinSession {
-            peer: bob_peer,
+            display_name: "bob".into(),
             ticket,
         })
         .await

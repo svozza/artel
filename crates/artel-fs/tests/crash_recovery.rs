@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 
 use artel_client::Client;
 use artel_fs::{AttachPolicy, Workspace, WorkspaceConfig, WorkspaceEvent};
-use artel_protocol::{JoinTicket, PeerId, PeerInfo, Request, Response};
+use artel_protocol::{JoinTicket, Request, Response};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -172,13 +172,15 @@ async fn run_until_workspace_up(child: &mut ChildHandle) -> JoinTicket {
 
 /// Bring up Bob's workspace as a joiner. The same `bob_root` and
 /// `bob_wstate` are reused across child restarts so we test the
-/// returning-joiner path too.
+/// returning-joiner path too. Auth L1 fix #3: under the collapsed
+/// peer-id model, the daemon stamps its own authenticated id, so
+/// this helper no longer takes a `peer_id` parameter — Bob's id is
+/// always `daemon_b.peer_id()` regardless of which call this is.
 async fn join_as_bob(
     socket: &Path,
     bob_root: &Path,
     bob_wstate: &Path,
     artel_ticket: JoinTicket,
-    peer_id: [u8; 32],
 ) -> (
     Client,
     Arc<Workspace>,
@@ -186,10 +188,9 @@ async fn join_as_bob(
     tokio::task::JoinHandle<()>,
 ) {
     let bob = Client::connect(socket).await.unwrap();
-    let bob_peer = PeerInfo::new(PeerId::from_bytes(peer_id), "bob");
     let session = match bob
         .request(Request::JoinSession {
-            peer: bob_peer,
+            display_name: "bob".into(),
             ticket: artel_ticket,
         })
         .await
@@ -283,14 +284,8 @@ async fn steady_state_sigkill_preserves_state() {
         .wait_for(|s| matches!(s, Status::Ready), "READY")
         .await;
 
-    let (bob, bob_ws, _bob_events, bob_handle) = join_as_bob(
-        &daemon_b.socket,
-        bob_root.path(),
-        bob_wstate.path(),
-        ticket,
-        [2; 32],
-    )
-    .await;
+    let (bob, bob_ws, _bob_events, bob_handle) =
+        join_as_bob(&daemon_b.socket, bob_root.path(), bob_wstate.path(), ticket).await;
     wait_for_file(&bob_root.path().join("seed.txt"), b"steady-seed").await;
 
     child.sigkill().await;
@@ -323,7 +318,6 @@ async fn steady_state_sigkill_preserves_state() {
         bob_root.path(),
         bob_wstate.path(),
         ticket2,
-        [3; 32],
     )
     .await;
 
@@ -424,7 +418,6 @@ async fn mid_scan_sigkill_recovers_via_reconcile() {
         bob_root.path(),
         bob_wstate.path(),
         ticket2,
-        [4; 32],
     )
     .await;
 
@@ -532,7 +525,6 @@ async fn mid_write_sigkill_resyncs_on_restart() {
         bob_root.path(),
         bob_wstate.path(),
         ticket2,
-        [5; 32],
     )
     .await;
 

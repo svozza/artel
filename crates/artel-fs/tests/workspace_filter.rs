@@ -25,7 +25,7 @@ use artel_fs::{
     AttachPolicy, Direction, Mode, PathRule, PathRules, TICKET_ACTION, Workspace, WorkspaceConfig,
     WorkspaceEvent, path_to_key,
 };
-use artel_protocol::{MessageKind, PeerId, PeerInfo, Request, Response, SendPayload};
+use artel_protocol::{MessageKind, Request, Response, SendPayload};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use iroh_docs::store::Query;
@@ -55,7 +55,6 @@ async fn default_rules_give_unchanged_round_trip() {
     } = spawn_pair().await;
 
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
 
     let alice_dir = tempfile::tempdir().unwrap();
     // Pre-existing file exercises `scan_and_publish_existing` on the
@@ -66,7 +65,7 @@ async fn default_rules_give_unchanged_round_trip() {
 
     let (alice_ws, _) = Workspace::host_with(
         &alice,
-        alice_peer,
+        "alice",
         alice_dir.path().to_path_buf(),
         AttachPolicy::AllowExisting,
         WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
@@ -82,10 +81,9 @@ async fn default_rules_give_unchanged_round_trip() {
     let alice_handle = Arc::clone(&alice_ws).run().await;
 
     let bob = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob_peer = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
     let resp = bob
         .request(Request::JoinSession {
-            peer: bob_peer,
+            display_name: "bob".into(),
             ticket,
         })
         .await
@@ -228,11 +226,10 @@ async fn run_first_match_wins(rules: PathRules, expectation: Expectation) {
     } = spawn_pair().await;
 
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     let alice_dir = tempfile::tempdir().unwrap();
     let (alice_ws, _) = Workspace::host_with(
         &alice,
-        alice_peer,
+        "alice",
         alice_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
         WorkspaceConfig::default()
@@ -250,10 +247,9 @@ async fn run_first_match_wins(rules: PathRules, expectation: Expectation) {
     let alice_handle = Arc::clone(&alice_ws).run().await;
 
     let bob = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob_peer = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
     let resp = bob
         .request(Request::JoinSession {
-            peer: bob_peer,
+            display_name: "bob".into(),
             ticket,
         })
         .await
@@ -347,7 +343,6 @@ async fn applier_drops_incoming_read_only_insert() {
     } = spawn_pair().await;
 
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     let rules = PathRules {
         default: Mode::ReadWrite,
         rules: vec![PathRule {
@@ -359,7 +354,7 @@ async fn applier_drops_incoming_read_only_insert() {
     let alice_dir = tempfile::tempdir().unwrap();
     let (alice_ws, _alice_events) = Workspace::host_with(
         &alice,
-        alice_peer,
+        "alice",
         alice_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
         WorkspaceConfig::default()
@@ -377,10 +372,9 @@ async fn applier_drops_incoming_read_only_insert() {
     let alice_handle = Arc::clone(&alice_ws).run().await;
 
     let bob = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob_peer = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
     let resp = bob
         .request(Request::JoinSession {
-            peer: bob_peer,
+            display_name: "bob".into(),
             ticket,
         })
         .await
@@ -518,7 +512,6 @@ async fn watcher_blocks_outgoing_read_only_write() {
     } = spawn_pair().await;
 
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     let rules = PathRules {
         default: Mode::ReadWrite,
         rules: vec![PathRule {
@@ -530,7 +523,7 @@ async fn watcher_blocks_outgoing_read_only_write() {
     let alice_dir = tempfile::tempdir().unwrap();
     let (alice_ws, mut alice_events) = Workspace::host_with(
         &alice,
-        alice_peer,
+        "alice",
         alice_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
         WorkspaceConfig::default()
@@ -548,10 +541,9 @@ async fn watcher_blocks_outgoing_read_only_write() {
     let alice_handle = Arc::clone(&alice_ws).run().await;
 
     let bob = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob_peer = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
     let resp = bob
         .request(Request::JoinSession {
-            peer: bob_peer,
+            display_name: "bob".into(),
             ticket,
         })
         .await
@@ -646,7 +638,6 @@ async fn scan_blocks_outgoing_read_only_preexisting_file() {
     } = spawn_pair().await;
 
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     // Pre-seed Alice's dir BEFORE the workspace is constructed, so
     // the secret goes through `scan_and_publish_existing` rather
     // than the live watcher path.
@@ -671,7 +662,7 @@ async fn scan_blocks_outgoing_read_only_preexisting_file() {
 
     let (alice_ws, _alice_events) = Workspace::host_with(
         &alice,
-        alice_peer,
+        "alice",
         alice_dir.path().to_path_buf(),
         AttachPolicy::AllowExisting,
         WorkspaceConfig::default()
@@ -689,10 +680,9 @@ async fn scan_blocks_outgoing_read_only_preexisting_file() {
     let alice_handle = Arc::clone(&alice_ws).run().await;
 
     let bob = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob_peer = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
     let resp = bob
         .request(Request::JoinSession {
-            peer: bob_peer,
+            display_name: "bob".into(),
             ticket,
         })
         .await
@@ -759,7 +749,6 @@ async fn post_join_live_write_to_read_only_zone_is_blocked() {
     } = spawn_pair().await;
 
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     let rules = PathRules {
         default: Mode::ReadWrite,
         rules: vec![PathRule {
@@ -771,7 +760,7 @@ async fn post_join_live_write_to_read_only_zone_is_blocked() {
     let alice_dir = tempfile::tempdir().unwrap();
     let (alice_ws, _) = Workspace::host_with(
         &alice,
-        alice_peer,
+        "alice",
         alice_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
         WorkspaceConfig::default()
@@ -789,10 +778,9 @@ async fn post_join_live_write_to_read_only_zone_is_blocked() {
     let alice_handle = Arc::clone(&alice_ws).run().await;
 
     let bob = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob_peer = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
     let resp = bob
         .request(Request::JoinSession {
-            peer: bob_peer,
+            display_name: "bob".into(),
             ticket,
         })
         .await
@@ -862,7 +850,6 @@ async fn on_removed_does_not_tombstone_read_only_path() {
     } = spawn_pair().await;
 
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     let rules = PathRules {
         default: Mode::ReadWrite,
         rules: vec![PathRule {
@@ -874,7 +861,7 @@ async fn on_removed_does_not_tombstone_read_only_path() {
     let alice_dir = tempfile::tempdir().unwrap();
     let (alice_ws, _) = Workspace::host_with(
         &alice,
-        alice_peer,
+        "alice",
         alice_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
         WorkspaceConfig::default()
@@ -892,10 +879,9 @@ async fn on_removed_does_not_tombstone_read_only_path() {
     let alice_handle = Arc::clone(&alice_ws).run().await;
 
     let bob = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob_peer = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
     let resp = bob
         .request(Request::JoinSession {
-            peer: bob_peer,
+            display_name: "bob".into(),
             ticket,
         })
         .await
@@ -1004,10 +990,9 @@ async fn joiner_rejects_old_shape_doc_ticket_payload() {
     // workspace. Instead she broadcasts a raw `DocTicket`-shaped
     // payload via `Request::Send` to mimic a legacy host.
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     let (session, artel_ticket) = match alice
         .request(Request::HostSession {
-            peer: alice_peer.clone(),
+            display_name: "alice".into(),
             session: None,
         })
         .await
@@ -1043,10 +1028,9 @@ async fn joiner_rejects_old_shape_doc_ticket_payload() {
     // Bob joins the artel session, then calls `Workspace::join_with`.
     // The replayed `workspace.ticket` payload fails envelope decode.
     let bob = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob_peer = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
     let resp = bob
         .request(Request::JoinSession {
-            peer: bob_peer,
+            display_name: "bob".into(),
             ticket: artel_ticket,
         })
         .await
@@ -1114,7 +1098,6 @@ async fn rules_round_trip_via_envelope() {
     } = spawn_pair().await;
 
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
 
     let configured_rules = PathRules {
         default: Mode::ReadOnly,
@@ -1133,7 +1116,7 @@ async fn rules_round_trip_via_envelope() {
     let alice_dir = tempfile::tempdir().unwrap();
     let (alice_ws, _alice_ws_events) = Workspace::host_with(
         &alice,
-        alice_peer,
+        "alice",
         alice_dir.path().to_path_buf(),
         AttachPolicy::AllowExisting,
         WorkspaceConfig::default()
@@ -1163,10 +1146,9 @@ async fn rules_round_trip_via_envelope() {
     };
 
     let bob = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob_peer = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
     let resp = bob
         .request(Request::JoinSession {
-            peer: bob_peer,
+            display_name: "bob".into(),
             ticket: artel_ticket,
         })
         .await
@@ -1239,12 +1221,11 @@ async fn applier_filter_check_gates_tombstone_for_hardcoded_skip() {
     } = spawn_pair().await;
 
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
 
     let alice_dir = tempfile::tempdir().unwrap();
     let (alice_ws, _alice_events) = Workspace::host_with(
         &alice,
-        alice_peer,
+        "alice",
         alice_dir.path().to_path_buf(),
         AttachPolicy::AllowExisting,
         WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
@@ -1260,10 +1241,9 @@ async fn applier_filter_check_gates_tombstone_for_hardcoded_skip() {
     let alice_handle = Arc::clone(&alice_ws).run().await;
 
     let bob = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob_peer = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
     let resp = bob
         .request(Request::JoinSession {
-            peer: bob_peer,
+            display_name: "bob".into(),
             ticket,
         })
         .await
@@ -1367,12 +1347,11 @@ async fn bulk_export_filter_check_gates_tombstone_for_hardcoded_skip() {
     } = spawn_pair().await;
 
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
 
     let alice_dir = tempfile::tempdir().unwrap();
     let (alice_ws, _alice_events) = Workspace::host_with(
         &alice,
-        alice_peer,
+        "alice",
         alice_dir.path().to_path_buf(),
         AttachPolicy::AllowExisting,
         WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
@@ -1423,10 +1402,9 @@ async fn bulk_export_filter_check_gates_tombstone_for_hardcoded_skip() {
         .unwrap();
 
     let bob = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob_peer = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
     let resp = bob
         .request(Request::JoinSession {
-            peer: bob_peer,
+            display_name: "bob".into(),
             ticket,
         })
         .await

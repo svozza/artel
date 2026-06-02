@@ -22,7 +22,6 @@ use std::time::Duration;
 
 use artel_client::Client;
 use artel_fs::{AttachPolicy, EndpointSetup, Workspace, WorkspaceConfig, WorkspaceError};
-use artel_protocol::{PeerId, PeerInfo};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use iroh::address_lookup::{AddrFilter, DnsAddressLookup, PkarrPublisher};
@@ -490,7 +489,6 @@ async fn host_with_unreachable_relay_returns_typed_error() {
     let client = Client::connect(&harness.socket).await.unwrap();
 
     let ws_dir = tempfile::tempdir().unwrap();
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
 
     let config =
         WorkspaceConfig::default().with_endpoint_setup(EndpointSetup::TestingUnreachableRelay);
@@ -502,7 +500,7 @@ async fn host_with_unreachable_relay_returns_typed_error() {
         RELAY_HARNESS_BUDGET,
         Workspace::host_with(
             &client,
-            alice_peer,
+            "alice",
             ws_dir.path().to_path_buf(),
             AttachPolicy::AllowExisting,
             config,

@@ -13,7 +13,7 @@
 mod common;
 
 use artel_client::{Client, ClientError};
-use artel_protocol::{Attachment, PeerId, PeerInfo, ProtocolError, Request, Response};
+use artel_protocol::{Attachment, ProtocolError, Request, Response};
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
@@ -30,10 +30,9 @@ fn fresh_state_dir() -> (TempDir, common::RestartState) {
 }
 
 async fn host_session(client: &Client) -> artel_protocol::SessionId {
-    let alice = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     match client
         .request(Request::HostSession {
-            peer: alice,
+            display_name: "alice".into(),
             session: None,
         })
         .await

@@ -55,7 +55,7 @@ async fn host_drops_send_request_with_spoofed_peer_id() {
     let alice = PeerInfo::new(alice_id, "alice");
     let host_resp = alice_client
         .request(Request::HostSession {
-            peer: alice.clone(),
+            display_name: "alice".into(),
             session: None,
         })
         .await
@@ -77,11 +77,9 @@ async fn host_drops_send_request_with_spoofed_peer_id() {
     // the two daemons is wired up. We then sneak a spoofed frame in
     // alongside the real bridge traffic.
     let bob_client = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob_id = daemon_b.peer_id();
-    let bob = PeerInfo::new(bob_id, "bob");
     let join_resp = bob_client
         .request(Request::JoinSession {
-            peer: bob.clone(),
+            display_name: "bob".into(),
             ticket,
         })
         .await
@@ -183,11 +181,9 @@ async fn host_drops_join_announcement_with_spoofed_peer_id() {
     let (daemon_a, daemon_b, _dns_pkarr) = common::spawn_pair().await;
 
     let alice_client = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice_id = daemon_a.peer_id();
-    let alice = PeerInfo::new(alice_id, "alice");
     let host_resp = alice_client
         .request(Request::HostSession {
-            peer: alice.clone(),
+            display_name: "alice".into(),
             session: None,
         })
         .await
@@ -287,11 +283,9 @@ async fn host_accepts_send_request_with_matching_peer_id() {
     let (daemon_a, daemon_b, _dns_pkarr) = common::spawn_pair().await;
 
     let alice_client = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice_id = daemon_a.peer_id();
-    let alice = PeerInfo::new(alice_id, "alice");
     let host_resp = alice_client
         .request(Request::HostSession {
-            peer: alice.clone(),
+            display_name: "alice".into(),
             session: None,
         })
         .await
@@ -311,10 +305,9 @@ async fn host_accepts_send_request_with_matching_peer_id() {
 
     let bob_client = Client::connect(&daemon_b.socket).await.unwrap();
     let bob_id = daemon_b.peer_id();
-    let bob = PeerInfo::new(bob_id, "bob");
     bob_client
         .request(Request::JoinSession {
-            peer: bob.clone(),
+            display_name: "bob".into(),
             ticket,
         })
         .await
@@ -354,11 +347,9 @@ async fn joiner_outbound_stamps_authenticated_peer_id() {
     let (daemon_a, daemon_b, _dns_pkarr) = common::spawn_pair().await;
 
     let alice_client = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice_id = daemon_a.peer_id();
-    let alice = PeerInfo::new(alice_id, "alice");
     let host_resp = alice_client
         .request(Request::HostSession {
-            peer: alice.clone(),
+            display_name: "alice".into(),
             session: None,
         })
         .await
@@ -376,16 +367,16 @@ async fn joiner_outbound_stamps_authenticated_peer_id() {
         .unwrap();
     let mut alice_events = alice_client.take_events().await.expect("alice events");
 
-    // Bob's IPC supplies a wrong peer.id. The daemon must NOT propagate
-    // it; the bridge stamps the daemon's authenticated id instead.
-    let wrong_id = common::valid_peer_id(0xee);
+    // Auth L1 fix #3 (PROTOCOL_VERSION 5): the IPC has no `peer.id`
+    // field anymore — the daemon stamps its authenticated id
+    // server-side. This test pins the property at the wire level: Bob's
+    // observed `peer.id` always equals daemon B's authenticated id,
+    // regardless of any display_name we pass.
     let bob_real_id = daemon_b.peer_id();
-    assert_ne!(wrong_id, bob_real_id, "test premise: ids must differ");
-    let bob_lying = PeerInfo::new(wrong_id, "bob");
     let bob_client = Client::connect(&daemon_b.socket).await.unwrap();
     bob_client
         .request(Request::JoinSession {
-            peer: bob_lying.clone(),
+            display_name: "bob".into(),
             ticket,
         })
         .await
@@ -405,13 +396,12 @@ async fn joiner_outbound_stamps_authenticated_peer_id() {
     let observed: SessionMessage =
         common::expect_message_with_payload(&mut alice_events, b"signed by my-real-id", "alice")
             .await;
+    // The IPC has no `peer.id` field post-fix-#3, so there's no way
+    // for an embedder to lie. Pin the load-bearing property:
+    // `observed.peer.id` ALWAYS equals daemon B's authenticated id.
     assert_eq!(
         observed.peer.id, bob_real_id,
-        "the bridge must override the IPC caller's claimed id with the authenticated one",
-    );
-    assert_ne!(
-        observed.peer.id, wrong_id,
-        "alice must never see the IPC caller's claimed id on the wire",
+        "the daemon must stamp its authenticated id, not whatever the IPC client supplied",
     );
 
     drop(alice_client);

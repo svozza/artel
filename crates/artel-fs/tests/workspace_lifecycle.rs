@@ -22,9 +22,7 @@ use artel_fs::{
     WorkspaceConfig, WorkspaceError, WorkspaceRole, list_known_workspaces, path_to_key,
     ticket as fs_ticket,
 };
-use artel_protocol::{
-    Attachment, Event, MessageKind, PeerId, PeerInfo, Request, Response, SessionId,
-};
+use artel_protocol::{Attachment, Event, MessageKind, Request, Response, SessionId};
 use futures_util::StreamExt;
 use iroh::test_utils::DnsPkarrServer;
 use iroh_docs::DocTicket;
@@ -38,8 +36,12 @@ use common::{LocalDaemon, daemon_testing_setup, testing_setup};
 // Local helpers
 // =============================================================
 
-fn host_peer() -> PeerInfo {
-    PeerInfo::new(PeerId::from_bytes([1; 32]), "host")
+/// Display name used for the host across these tests. Auth L1 fix
+/// #3: the daemon stamps its own authenticated `PeerId` on
+/// `Workspace::host`/`host_with` callsites, so the test fixture only
+/// needs to supply a label.
+const fn host_peer() -> &'static str {
+    "host"
 }
 
 /// Canonicalise a test path the same best-effort way the workspace
@@ -214,11 +216,10 @@ async fn join_require_empty_rejects_non_empty_dir_without_creating_state() {
     // against. The joiner's policy rejection should fire *before* we
     // get anywhere near the host's iroh node.
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     let alice_dir = TempDir::new().unwrap();
     let (alice_ws, _) = Workspace::host_with(
         &alice,
-        alice_peer,
+        "alice",
         alice_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
         WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
@@ -235,10 +236,9 @@ async fn join_require_empty_rejects_non_empty_dir_without_creating_state() {
     // Bob joins the artel session and tries to mount a workspace
     // into a non-empty dir.
     let bob = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob_peer = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
     let resp = bob
         .request(Request::JoinSession {
-            peer: bob_peer,
+            display_name: "bob".into(),
             ticket: artel_ticket,
         })
         .await
@@ -388,7 +388,6 @@ async fn host_lands_ticket_on_session() {
     let harness = LocalDaemon::spawn().await;
 
     let alice = Client::connect(&harness.socket).await.unwrap();
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
 
     // Stand the workspace up. The temp dir gets a single seed file
     // so we exercise the scan-and-publish path too. The workspace
@@ -402,7 +401,7 @@ async fn host_lands_ticket_on_session() {
 
     let (workspace, _ws_events) = Workspace::host(
         &alice,
-        alice_peer,
+        "alice",
         ws_dir.path().to_path_buf(),
         AttachPolicy::AllowExisting,
     )
@@ -491,7 +490,7 @@ async fn watcher_attached_when_run_resolves() {
     let ws_dir = TempDir::new().unwrap();
     let (ws, _ws_events) = Workspace::host(
         &client,
-        PeerInfo::new(PeerId::from_bytes([1; 32]), "alice"),
+        "alice",
         ws_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
     )
@@ -542,7 +541,7 @@ async fn applier_subscribed_when_run_resolves() {
     let ws_dir = TempDir::new().unwrap();
     let (ws, _ws_events) = Workspace::host(
         &client,
-        PeerInfo::new(PeerId::from_bytes([1; 32]), "alice"),
+        "alice",
         ws_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
     )
@@ -600,7 +599,6 @@ async fn host_workspace_registers_attachment_via_ipc() {
     let dns_pkarr = Arc::new(DnsPkarrServer::run().await.unwrap());
 
     let alice = Client::connect(&harness.socket).await.unwrap();
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
 
     let ws_root = TempDir::new().unwrap();
     let ws_state = TempDir::new().unwrap();
@@ -616,7 +614,7 @@ async fn host_workspace_registers_attachment_via_ipc() {
 
     let (workspace, _events) = Workspace::host_with(
         &alice,
-        alice_peer,
+        "alice",
         ws_root.path().to_path_buf(),
         AttachPolicy::AllowExisting,
         cfg,
@@ -658,11 +656,10 @@ async fn join_workspace_registers_attachment_via_ipc() {
     } = common::spawn_pair().await;
 
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     let alice_root = TempDir::new().unwrap();
     let (alice_ws, _alice_events) = Workspace::host_with(
         &alice,
-        alice_peer,
+        "alice",
         alice_root.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
         WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
@@ -676,10 +673,9 @@ async fn join_workspace_registers_attachment_via_ipc() {
         .clone();
 
     let bob = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob_peer = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
     let resp = bob
         .request(Request::JoinSession {
-            peer: bob_peer,
+            display_name: "bob".into(),
             ticket,
         })
         .await
@@ -726,7 +722,6 @@ async fn list_known_workspaces_helper_returns_typed_view() {
     let dns_pkarr = Arc::new(DnsPkarrServer::run().await.unwrap());
 
     let alice = Client::connect(&harness.socket).await.unwrap();
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([3; 32]), "alice");
     let ws_root = TempDir::new().unwrap();
     // Localhost `DnsPkarrServer` → workspace iroh node uses testing
     // preset, skips n0 discovery. See
@@ -734,7 +729,7 @@ async fn list_known_workspaces_helper_returns_typed_view() {
     let cfg = WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr));
     let (workspace, _events) = Workspace::host_with(
         &alice,
-        alice_peer,
+        "alice",
         ws_root.path().to_path_buf(),
         AttachPolicy::AllowExisting,
         cfg,
@@ -778,7 +773,6 @@ async fn attachment_persists_across_daemon_restart() {
     let alice_root = TempDir::new().unwrap();
     let alice_wstate = TempDir::new().unwrap();
     let alice_daemon_state = common::fresh_state();
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
 
     // Phase 1: host once, capture session id and attachment.
     let daemon_a1 =
@@ -790,7 +784,7 @@ async fn attachment_persists_across_daemon_restart() {
         .with_endpoint_setup(testing_setup(&dns_pkarr));
     let (alice_ws_1, _alice_events_1) = Workspace::host_with(
         &alice_a1,
-        alice_peer.clone(),
+        "alice",
         alice_root.path().to_path_buf(),
         AttachPolicy::AllowExisting,
         cfg_1,
@@ -866,7 +860,7 @@ async fn attachment_persists_across_daemon_restart() {
         .with_endpoint_setup(testing_setup(&dns_pkarr));
     let (alice_ws_2, _alice_events_2) = Workspace::host_with(
         &alice_a2,
-        alice_peer,
+        "alice",
         alice_root.path().to_path_buf(),
         AttachPolicy::AllowExisting,
         cfg_2,
@@ -894,7 +888,6 @@ async fn attachment_removed_on_host_leave_session() {
     let dns_pkarr = Arc::new(DnsPkarrServer::run().await.unwrap());
 
     let alice = Client::connect(&harness.socket).await.unwrap();
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     let ws_root = TempDir::new().unwrap();
     // Localhost `DnsPkarrServer` → workspace iroh node uses testing
     // preset, skips n0 discovery. See
@@ -902,7 +895,7 @@ async fn attachment_removed_on_host_leave_session() {
     let cfg = WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr));
     let (workspace, _events) = Workspace::host_with(
         &alice,
-        alice_peer,
+        "alice",
         ws_root.path().to_path_buf(),
         AttachPolicy::AllowExisting,
         cfg,
@@ -950,11 +943,10 @@ async fn attachment_removed_on_joiner_leave_session() {
     } = common::spawn_pair().await;
 
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     let alice_root = TempDir::new().unwrap();
     let (alice_ws, _alice_events) = Workspace::host_with(
         &alice,
-        alice_peer,
+        "alice",
         alice_root.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
         WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
@@ -968,10 +960,9 @@ async fn attachment_removed_on_joiner_leave_session() {
         .clone();
 
     let bob = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob_peer = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
     let resp = bob
         .request(Request::JoinSession {
-            peer: bob_peer,
+            display_name: "bob".into(),
             ticket,
         })
         .await
@@ -1059,12 +1050,11 @@ async fn second_shutdown_call_is_a_noop_and_returns_ok() {
     } = common::spawn_pair().await;
 
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     let alice_root = TempDir::new().unwrap();
     let cfg = WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr));
     let (ws, _events) = Workspace::host_with(
         &alice,
-        alice_peer,
+        "alice",
         alice_root.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
         cfg,
@@ -1104,12 +1094,11 @@ async fn shutdown_propagates_router_failure_and_keeps_node_consumable() {
     } = common::spawn_pair().await;
 
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     let alice_root = TempDir::new().unwrap();
     let cfg = WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr));
     let (ws, _events) = Workspace::host_with(
         &alice,
-        alice_peer,
+        "alice",
         alice_root.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
         cfg,
@@ -1176,12 +1165,11 @@ async fn concurrent_shutdowns_both_return_ok_within_budget() {
     } = common::spawn_pair().await;
 
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     let alice_root = TempDir::new().unwrap();
     let cfg = WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr));
     let (ws, _events) = Workspace::host_with(
         &alice,
-        alice_peer,
+        "alice",
         alice_root.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
         cfg,

@@ -42,7 +42,6 @@ use std::time::Duration;
 
 use artel_client::Client;
 use artel_fs::{AttachPolicy, Workspace, WorkspaceConfig};
-use artel_protocol::{PeerId, PeerInfo};
 
 #[derive(Debug)]
 struct Args {
@@ -134,12 +133,11 @@ fn main() -> ExitCode {
 }
 
 async fn run(args: Args) -> Result<(), String> {
-    // Stable peer id derived from the peer name so the same child
-    // re-spawned later keeps the same identity. Anything stable
-    // works here — we just blake3-hash the name.
-    let peer_id_bytes: [u8; 32] = blake3::hash(args.peer_name.as_bytes()).into();
-    let peer = PeerInfo::new(PeerId::from_bytes(peer_id_bytes), args.peer_name.clone());
-
+    // Auth L1 fix #3 (PROTOCOL_VERSION 5): the daemon stamps its
+    // own authenticated PeerId, so the child only needs to supply
+    // the display name. Stability across child restarts is
+    // guaranteed by the persisted iroh.key under the daemon's
+    // state dir, not by the child's process identity.
     let client = Client::connect(&args.socket)
         .await
         .map_err(|e| format!("connect daemon: {e}"))?;
@@ -147,7 +145,7 @@ async fn run(args: Args) -> Result<(), String> {
     let cfg = WorkspaceConfig::default().with_state_dir(args.state_dir.clone());
     let (ws, mut events) = Workspace::host_with(
         &client,
-        peer,
+        args.peer_name.clone(),
         args.root.clone(),
         AttachPolicy::AllowExisting,
         cfg,

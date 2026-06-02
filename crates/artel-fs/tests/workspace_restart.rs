@@ -22,7 +22,7 @@ use artel_client::{Client, EventStream};
 use artel_fs::{
     AttachPolicy, TICKET_ACTION, Workspace, WorkspaceConfig, session_id_for, ticket as fs_ticket,
 };
-use artel_protocol::{Event, MessageKind, PeerId, PeerInfo, Request, Response, SessionId};
+use artel_protocol::{Event, MessageKind, Request, Response, SessionId};
 use iroh::test_utils::DnsPkarrServer;
 use iroh_docs::DocTicket;
 use tempfile::TempDir;
@@ -89,9 +89,6 @@ async fn workspace_state_survives_graceful_restart() {
     let bob_root = tempfile::tempdir().unwrap();
     let bob_wstate = tempfile::tempdir().unwrap();
 
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
-    let bob_peer = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
-
     // -----------------------------------------------------------
     // Phase 1: first lifetime of the workspaces.
     // -----------------------------------------------------------
@@ -112,7 +109,7 @@ async fn workspace_state_survives_graceful_restart() {
             .with_endpoint_setup(testing_setup(&dns_pkarr));
         let (alice_ws, _alice_ws_events) = Workspace::host_with(
             &alice,
-            alice_peer.clone(),
+            "alice",
             alice_root.path().to_path_buf(),
             AttachPolicy::AllowExisting,
             alice_cfg,
@@ -146,7 +143,7 @@ async fn workspace_state_survives_graceful_restart() {
         let bob = Client::connect(&daemon_b.socket).await.unwrap();
         let resp = bob
             .request(Request::JoinSession {
-                peer: bob_peer.clone(),
+                display_name: "bob".into(),
                 ticket: artel_ticket,
             })
             .await
@@ -228,7 +225,7 @@ async fn workspace_state_survives_graceful_restart() {
         .with_endpoint_setup(testing_setup(&dns_pkarr));
     let (alice_ws, _alice_ws_events) = Workspace::host_with(
         &alice,
-        alice_peer,
+        "alice",
         alice_root.path().to_path_buf(),
         AttachPolicy::AllowExisting,
         alice_cfg,
@@ -272,7 +269,7 @@ async fn workspace_state_survives_graceful_restart() {
     let bob = Client::connect(&daemon_b.socket).await.unwrap();
     let resp = bob
         .request(Request::JoinSession {
-            peer: bob_peer,
+            display_name: "bob".into(),
             ticket: artel_ticket,
         })
         .await
@@ -345,9 +342,6 @@ async fn alice_post_restart_writes_reach_bob() {
     let bob_root = TempDir::new().unwrap();
     let bob_wstate = TempDir::new().unwrap();
 
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
-    let bob_peer = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
-
     // Phase 1: bring up the shared `DnsPkarrServer` directly, then
     // spawn alice's daemon at caller-owned paths so the same on-disk
     // state (including iroh secret) survives the mid-test restart.
@@ -364,7 +358,7 @@ async fn alice_post_restart_writes_reach_bob() {
         .with_endpoint_setup(testing_setup(&dns_pkarr));
     let (alice_ws, _alice_ws_events) = Workspace::host_with(
         &alice,
-        alice_peer.clone(),
+        "alice",
         alice_root.path().to_path_buf(),
         AttachPolicy::AllowExisting,
         alice_cfg,
@@ -393,7 +387,7 @@ async fn alice_post_restart_writes_reach_bob() {
     let bob = Client::connect(&bob_daemon.socket).await.unwrap();
     let resp = bob
         .request(Request::JoinSession {
-            peer: bob_peer.clone(),
+            display_name: "bob".into(),
             ticket: artel_ticket,
         })
         .await
@@ -446,7 +440,7 @@ async fn alice_post_restart_writes_reach_bob() {
         .with_endpoint_setup(testing_setup(&dns_pkarr));
     let (alice_ws, _alice_ws_events) = Workspace::host_with(
         &alice,
-        alice_peer,
+        "alice",
         alice_root.path().to_path_buf(),
         AttachPolicy::AllowExisting,
         alice_cfg,
@@ -589,9 +583,6 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
     let bob_root = TempDir::new().unwrap();
     let bob_wstate = TempDir::new().unwrap();
 
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
-    let bob_peer = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
-
     // Real n0 discovery — both daemons get `Production` for the
     // address-lookup chain, so they go through pkarr + DNS like
     // production.
@@ -615,7 +606,7 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
         "alice Workspace::host_with (phase 1)",
         Workspace::host_with(
             &alice,
-            alice_peer.clone(),
+            "alice",
             alice_root.path().to_path_buf(),
             AttachPolicy::AllowExisting,
             alice_cfg,
@@ -650,7 +641,7 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
     let resp = phase(
         "bob JoinSession over IPC (gossip subscribe + JOIN_READY)",
         bob.request(Request::JoinSession {
-            peer: bob_peer.clone(),
+            display_name: "bob".into(),
             ticket: artel_ticket,
         }),
     )
@@ -718,7 +709,7 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
         "alice Workspace::host_with (phase 2 — post-restart)",
         Workspace::host_with(
             &alice,
-            alice_peer,
+            "alice",
             alice_root.path().to_path_buf(),
             AttachPolicy::AllowExisting,
             alice_cfg,
@@ -821,11 +812,10 @@ async fn re_hosting_same_dir_yields_structurally_identical_ticket() {
 /// Stand up a workspace, capture the published ticket, shut down.
 async fn host_once_and_capture_ticket(harness: &LocalDaemon, root: PathBuf) -> DocTicket {
     let alice = Client::connect(&harness.socket).await.unwrap();
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
 
     let (workspace, _ws_events) = Workspace::host_with(
         &alice,
-        alice_peer,
+        "alice",
         root,
         AttachPolicy::AllowExisting,
         WorkspaceConfig::default(),
@@ -889,9 +879,6 @@ async fn re_hosting_recovers_session_id_and_resumes_message_flow() {
     let bob_root = TempDir::new().unwrap();
     let bob_wstate = TempDir::new().unwrap();
 
-    let alice_peer = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
-    let bob_peer = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
-
     // ---------------------------------------------------------------
     // Phase 1: Alice on daemon A1, Bob on daemon B. Live sync works.
     // ---------------------------------------------------------------
@@ -906,7 +893,7 @@ async fn re_hosting_recovers_session_id_and_resumes_message_flow() {
         .with_endpoint_setup(testing_setup(&dns_pkarr));
     let (alice_ws_1, _alice_events_1) = Workspace::host_with(
         &alice_a1,
-        alice_peer.clone(),
+        "alice",
         alice_root.path().to_path_buf(),
         AttachPolicy::AllowExisting,
         alice_cfg,
@@ -933,7 +920,7 @@ async fn re_hosting_recovers_session_id_and_resumes_message_flow() {
     let bob = Client::connect(&daemon_b.socket).await.unwrap();
     let resp = bob
         .request(Request::JoinSession {
-            peer: bob_peer,
+            display_name: "bob".into(),
             ticket,
         })
         .await
@@ -993,7 +980,7 @@ async fn re_hosting_recovers_session_id_and_resumes_message_flow() {
         .with_endpoint_setup(testing_setup(&dns_pkarr));
     let (alice_ws_2, _alice_events_2) = Workspace::host_with(
         &alice_a2,
-        alice_peer,
+        "alice",
         alice_root.path().to_path_buf(),
         AttachPolicy::AllowExisting,
         alice_cfg_2,

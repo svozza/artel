@@ -26,9 +26,7 @@ use std::time::{Duration, Instant};
 use artel_client::{Client, ClientError, EventStream};
 use artel_daemon::shutdown::Shutdown;
 use artel_daemon::{Daemon, DaemonConfig, EndpointSetup};
-use artel_protocol::{
-    Event, MessageKind, PeerId, PeerInfo, ProtocolError, Request, Response, SendPayload,
-};
+use artel_protocol::{Event, MessageKind, PeerInfo, ProtocolError, Request, Response, SendPayload};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use iroh::test_utils::DnsPkarrServer;
@@ -197,10 +195,10 @@ async fn host_sends_message_joiner_observes_via_gossip() {
 
     // Alice on daemon A hosts.
     let alice_client = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
+    let alice = PeerInfo::new(daemon_a.peer_id(), "alice");
     let host_resp = alice_client
         .request(Request::HostSession {
-            peer: alice.clone(),
+            display_name: "alice".into(),
             session: None,
         })
         .await
@@ -221,10 +219,9 @@ async fn host_sends_message_joiner_observes_via_gossip() {
 
     // Bob on daemon B joins via the real ticket.
     let bob_client = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
     let join_resp = bob_client
         .request(Request::JoinSession {
-            peer: bob.clone(),
+            display_name: "bob".into(),
             ticket,
         })
         .await
@@ -289,10 +286,9 @@ async fn joiner_announces_membership_without_sending() {
     // Alice on daemon A hosts and subscribes to her own session so we
     // can observe events for incoming peers.
     let alice_client = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     let host_resp = alice_client
         .request(Request::HostSession {
-            peer: alice.clone(),
+            display_name: "alice".into(),
             session: None,
         })
         .await
@@ -316,14 +312,13 @@ async fn joiner_announces_membership_without_sending() {
     //
     // Auth L1: Bob's outbound `peer.id` is stamped to daemon B's
     // authenticated `EndpointId` by the bridge regardless of what the
-    // IPC client claims. Source the real id from `daemon_b.iroh_addr`
+    // IPC client claims. Source the real id from `daemon_b.peer_id()`
     // so the `PeerJoined` assertion below matches what's on the wire.
     let bob_client = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob_real_id = daemon_b.peer_id();
-    let bob = PeerInfo::new(bob_real_id, "bob");
+    let bob = PeerInfo::new(daemon_b.peer_id(), "bob");
     let join_resp = bob_client
         .request(Request::JoinSession {
-            peer: bob.clone(),
+            display_name: "bob".into(),
             ticket,
         })
         .await
@@ -384,10 +379,9 @@ async fn joiner_send_round_trips_through_host() {
 
     // Alice on daemon A hosts.
     let alice_client = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     let host_resp = alice_client
         .request(Request::HostSession {
-            peer: alice.clone(),
+            display_name: "alice".into(),
             session: None,
         })
         .await
@@ -413,11 +407,10 @@ async fn joiner_send_round_trips_through_host() {
     // the bridge — the IPC client's claim is ignored on the wire. Use
     // the real id so the assertions on `peer == bob` below match.
     let bob_client = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob_real_id = daemon_b.peer_id();
-    let bob = PeerInfo::new(bob_real_id, "bob");
+    let bob = PeerInfo::new(daemon_b.peer_id(), "bob");
     let join_resp = bob_client
         .request(Request::JoinSession {
-            peer: bob.clone(),
+            display_name: "bob".into(),
             ticket,
         })
         .await
@@ -497,10 +490,9 @@ async fn joiner_send_after_host_closes_surfaces_unknown_session() {
     let (daemon_a, daemon_b, _dns_pkarr) = common::spawn_pair().await;
 
     let alice_client = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     let host_resp = alice_client
         .request(Request::HostSession {
-            peer: alice.clone(),
+            display_name: "alice".into(),
             session: None,
         })
         .await
@@ -514,10 +506,9 @@ async fn joiner_send_after_host_closes_surfaces_unknown_session() {
     // SessionClosed event before sending — otherwise we race the
     // close-broadcast.
     let bob_client = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
     bob_client
         .request(Request::JoinSession {
-            peer: bob.clone(),
+            display_name: "bob".into(),
             ticket,
         })
         .await
@@ -598,10 +589,9 @@ async fn host_close_propagates_session_closed_to_joiner() {
     let (daemon_a, daemon_b, _dns_pkarr) = common::spawn_pair().await;
 
     let alice_client = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     let host_resp = alice_client
         .request(Request::HostSession {
-            peer: alice.clone(),
+            display_name: "alice".into(),
             session: None,
         })
         .await
@@ -614,10 +604,9 @@ async fn host_close_propagates_session_closed_to_joiner() {
     // Bob on daemon B joins and subscribes so he has an event stream
     // we can read SessionClosed off of.
     let bob_client = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
     bob_client
         .request(Request::JoinSession {
-            peer: bob.clone(),
+            display_name: "bob".into(),
             ticket,
         })
         .await
@@ -685,10 +674,9 @@ async fn joiner_replays_messages_sent_before_join() {
     let (daemon_a, daemon_b, _dns_pkarr) = common::spawn_pair().await;
 
     let alice_client = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     let host_resp = alice_client
         .request(Request::HostSession {
-            peer: alice.clone(),
+            display_name: "alice".into(),
             session: None,
         })
         .await
@@ -714,10 +702,9 @@ async fn joiner_replays_messages_sent_before_join() {
     }
 
     let bob_client = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
     bob_client
         .request(Request::JoinSession {
-            peer: bob.clone(),
+            display_name: "bob".into(),
             ticket,
         })
         .await
@@ -806,10 +793,9 @@ async fn joiner_replays_system_message_after_daemon_restart() {
     let (daemon_a, mut daemon_b, dns_pkarr) = common::spawn_pair().await;
 
     let alice_client = Client::connect(&daemon_a.socket).await.unwrap();
-    let alice = PeerInfo::new(PeerId::from_bytes([1; 32]), "alice");
     let host_resp = alice_client
         .request(Request::HostSession {
-            peer: alice.clone(),
+            display_name: "alice".into(),
             session: None,
         })
         .await
@@ -821,10 +807,9 @@ async fn joiner_replays_system_message_after_daemon_restart() {
 
     // Bob joins (first run).
     let bob_client_1 = Client::connect(&daemon_b.socket).await.unwrap();
-    let bob = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
     let join_resp = bob_client_1
         .request(Request::JoinSession {
-            peer: bob.clone(),
+            display_name: "bob".into(),
             ticket: ticket.clone(),
         })
         .await
