@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use artel_protocol::message::{MESSAGE_FORMAT, SIGNATURE_UNSIGNED, SigBytes};
-use artel_protocol::signing::{self, VerifyError};
+use artel_protocol::signing::{self, verify_reason};
 use artel_protocol::ticket::{self, SessionTicket, WireEndpointAddr};
 use artel_protocol::{
     Event, JoinTicket, MessageKind, PeerId, PeerInfo, Seq, SessionId, SessionMessage,
@@ -250,12 +250,19 @@ pub struct Registry {
     #[cfg(feature = "iroh")]
     bridge: Option<Arc<crate::gossip_bridge::GossipBridge>>,
     /// Daemon's iroh secret key, used to sign every locally-authored
-    /// `SessionMessage` (Auth Slice B). `None` for unit tests that
-    /// build a registry without an iroh runtime in scope; production
-    /// code paths populate this from
-    /// [`crate::server::IrohRuntime::signing_key`]. The `Local` arm
-    /// of [`Authoring`] panics loudly if iroh is on but this field
-    /// is `None` — that's a wiring bug, not a runtime case.
+    /// `SessionMessage` (Auth Slice B). `None` only for unit tests
+    /// that build a registry via the test-only [`Registry::new`]
+    /// without an iroh runtime in scope; every production path
+    /// populates it from [`crate::server::IrohRuntime::signing_key`]
+    /// (see [`Registry::load`]'s call in `Daemon::start`).
+    ///
+    /// When the key is `None`, the `Local` arm of [`Authoring`] stamps
+    /// [`SIGNATURE_UNSIGNED`] rather than panicking: that sentinel is
+    /// the lit fuse. Any real receive/load path verifies and rejects
+    /// it ([`signing::VerifyError::SentinelUnsigned`]), so a wiring
+    /// bug that left the key unset surfaces as a loud, total verify
+    /// failure rather than silently shipping forgeable messages. It is
+    /// *not* silently treated as "signed".
     #[cfg(feature = "iroh")]
     signing_key: Option<Arc<iroh::SecretKey>>,
 }
@@ -648,6 +655,21 @@ impl Registry {
                 // ever matters we can replace with a per-session
                 // mpsc.
                 tokio::spawn(async move {
+                    let mut s = mirror.lock().await;
+                    // Dedup BEFORE verifying. iroh-gossip delivers a
+                    // frame at-least-once (mesh redundancy) and the
+                    // host re-broadcasts the whole log on `Replay`, so
+                    // duplicate seqs are routine. The signature check
+                    // is an ed25519 scalar-mult; running it on a frame
+                    // we already hold is wasted crypto. We still verify
+                    // every *new* frame below, before it touches disk
+                    // or the in-memory log.
+                    let pos = s.log.partition_point(|m| m.seq < msg.seq);
+                    if pos < s.log.len() && s.log[pos].seq == msg.seq {
+                        // Duplicate seq; drop quietly. Already on
+                        // disk from the first delivery.
+                        return;
+                    }
                     // Verify the body's signature against its claimed
                     // peer.id before any state mutation. A tampered
                     // `Message` (or one whose host vouched
@@ -669,17 +691,8 @@ impl Registry {
                     }
                     // Persist BEFORE mutating in-memory state so a
                     // crash mid-callback doesn't leave the mirror's
-                    // in-memory log ahead of disk. Idempotent on
-                    // duplicate seq via the partition_point check
-                    // below — but the store itself doesn't dedupe,
-                    // so we check first.
-                    let mut s = mirror.lock().await;
-                    let pos = s.log.partition_point(|m| m.seq < msg.seq);
-                    if pos < s.log.len() && s.log[pos].seq == msg.seq {
-                        // Duplicate seq; drop quietly. Already on
-                        // disk from the first delivery.
-                        return;
-                    }
+                    // in-memory log ahead of disk.
+                    //
                     // Persist while holding the lock so a concurrent
                     // remote-mirror cascade (`leave` of the joiner)
                     // can't race us. Failure: log, drop the message;
@@ -1224,17 +1237,10 @@ impl Registry {
         );
         match signing::verify_message(session, &candidate, &signature) {
             Ok(()) => Ok((timestamp_ms, signature)),
-            Err(err) => {
-                let reason = match err {
-                    VerifyError::SentinelUnsigned => "unsigned sentinel".to_string(),
-                    VerifyError::BadKey => "peer.id is not a valid ed25519 key".to_string(),
-                    VerifyError::BadSig => "signature does not verify".to_string(),
-                };
-                Err(SessionError::SignatureRejected {
-                    peer_id: peer.id,
-                    reason,
-                })
-            }
+            Err(err) => Err(SessionError::SignatureRejected {
+                peer_id: peer.id,
+                reason: verify_reason(&err).to_string(),
+            }),
         }
     }
 

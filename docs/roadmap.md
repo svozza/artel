@@ -14,7 +14,7 @@ along the way.
 
 | Crate | State |
 |---|---|
-| `artel-protocol` | Wire types + Unix-socket transport. Done. `PROTOCOL_VERSION` is now `4` (auth L1 — peer-id collapse, 2026-05-30). |
+| `artel-protocol` | Wire types + Unix-socket transport. Done. `PROTOCOL_VERSION` is now `5` (auth L1 fix #3 — daemon stamps authenticated id, 2026-06-01); `MESSAGE_FORMAT` `2` (auth L3 — per-message signing, 2026-06-02). |
 | `artel-daemon` | Persistent in-memory daemon + `artel-daemon` binary. Done. |
 | `artel-client` | Stateless multiplexed client + `artel` CLI binary + `connect_or_spawn`. Done. |
 | `artel-fs` | Phase 3a (MVP) + 3b-1 (disk-backed persistence) + 3b-3 (crash recovery) shipped. Author identity and configurable filter remain. |
@@ -627,8 +627,30 @@ Listed for completeness, no detailed plan yet:
   per-message signing); the brainstorm supersedes the
   open-design-questions section of
   [`docs/roadmap/peer-identity-authentication.md`](roadmap/peer-identity-authentication.md).
-  L2 (capability events) and L3 (per-message signing) remain open
-  as Slices B and C of the auth story.
+  **L3 (per-message signing) DONE 2026-06-02** (`PROTOCOL_VERSION` 5,
+  `MESSAGE_FORMAT` 2): every `SessionMessage` carries an ed25519
+  signature over domain-separated canonical bytes; host and joiner-
+  mirror receive paths verify (`verify_strict`, version floor) and
+  reject on failure. See
+  `docs/plans/2026-06-02-auth-slice-b-l3-signing-plan.md`.
+  L2 (capability events) remains open as Slice C.
+- **Control-frame & sequence authentication (auth Slice B.5).** A code
+  review of the L3 landing surfaced three issues that need a gossip-
+  wire change and so were carved out of B: (#1) message **replay** —
+  `seq` is outside the signed scope and the joiner dedups by seq, so a
+  validly-signed body can be re-appended under a fresh seq (folds into
+  accepted host-trust under today's star topology; a real attack under
+  symmetric P2P); (#2) **forged `SessionClosed`** — the unauthenticated
+  joiner arm lets any topic member evict every other joiner's mirror
+  (with on-disk attachment cascade); (#3) **forged `SendAck`** — the
+  unauthenticated ack arm lets a racing peer spoof a send result to the
+  joiner's IPC client. The clean fix is **host-signed control/ack
+  frames + host counter-signed sequencing**, verified against the
+  host pubkey from the join ticket (topology-independent — does not
+  depend on `delivered_from`, which iroh-gossip defines as the relay
+  hop, not the origin). Full attack analysis, option space, and open
+  questions in
+  `docs/brainstorms/2026-06-02-control-frame-auth-and-replay-brainstorm.md`.
 - **N-1 protocol-version compatibility.** Today version mismatch is
   fatal. Some scheme that lets a daemon serve clients one version
   behind would smooth upgrades.

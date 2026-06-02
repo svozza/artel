@@ -456,7 +456,11 @@ fn load_one(dir: &Path) -> io::Result<SessionRecord> {
             ),
         ));
     }
-    let log = read_log(&dir.join(LOG_FILE), id)?;
+    // Verify signatures on load only when this build signs on write.
+    // A no-iroh daemon writes `SIGNATURE_UNSIGNED`, so verifying would
+    // drop its own log; an iroh daemon signs every frame and must
+    // reject tampered / sentinel ones. See `read_log`.
+    let log = read_log(&dir.join(LOG_FILE), id, cfg!(feature = "iroh"))?;
     Ok(SessionRecord {
         id,
         host: meta.host,
@@ -648,20 +652,26 @@ fn append_log(path: &Path, message: &SessionMessage) -> io::Result<()> {
     Ok(())
 }
 
-/// Read every complete frame in `path`, verifying each frame's
-/// signature against `session_id` before returning it. A trailing
-/// partial frame (length prefix not fully present, length prefix
-/// says N bytes but fewer follow, or postcard parse fails) is logged
-/// and the file is truncated to the last good byte.
+/// Read every complete frame in `path`. A trailing partial frame
+/// (length prefix not fully present, length prefix says N bytes but
+/// fewer follow, or postcard parse fails) is logged and the file is
+/// truncated to the last good byte.
 ///
-/// Frames whose signature does not verify are dropped with a `warn`
-/// and **not** appended to the returned vec. The on-disk log is
-/// **not** truncated mid-file: the surrounding good frames stay,
-/// leaving a non-contiguous `seq` gap. That is intentional — the
-/// receiver has no truth for the missing seq, and a future
-/// `Replay { since: head }` can fill it. Truncating-on-bad-frame
-/// would amputate every valid frame after a single tampered one.
-fn read_log(path: &Path, session_id: SessionId) -> io::Result<Vec<SessionMessage>> {
+/// When `verify` is `true`, each frame's signature is checked against
+/// `session_id` and frames that fail are dropped with a `warn` and
+/// **not** appended. The on-disk log is **not** truncated mid-file:
+/// the surrounding good frames stay, leaving a non-contiguous `seq`
+/// gap. That is intentional — the receiver has no truth for the
+/// missing seq, and a future `Replay { since: head }` can fill it.
+/// Truncating-on-bad-frame would amputate every valid frame after a
+/// single tampered one.
+///
+/// `verify` mirrors whether the daemon *signs* on write: a no-iroh
+/// build emits `SIGNATURE_UNSIGNED` (no wire surface), so it loads
+/// with `verify == false` — otherwise it would drop its own log on
+/// every restart. See [`FsLogStore`]'s caller, which passes
+/// `cfg!(feature = "iroh")`.
+fn read_log(path: &Path, session_id: SessionId, verify: bool) -> io::Result<Vec<SessionMessage>> {
     let mut f = match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -727,16 +737,27 @@ fn read_log(path: &Path, session_id: SessionId) -> io::Result<Vec<SessionMessage
                 // do NOT truncate — a bad frame in the middle of a
                 // long log shouldn't sever every good frame after
                 // it.
-                if let Err(err) =
-                    artel_protocol::signing::verify_message(session_id, &msg, &msg.signature)
-                {
-                    warn!(
-                        file = %path.display(),
-                        seq = ?msg.seq,
-                        peer = %msg.peer.id,
-                        ?err,
-                        "dropping log frame: signature verify failed",
-                    );
+                //
+                // `verify` is `false` only for a no-iroh build, whose
+                // `Registry::author_local` emits `SIGNATURE_UNSIGNED`
+                // (no wire surface to sign for). Verifying there would
+                // drop every frame the daemon wrote, silently wiping
+                // the whole log on restart; the no-iroh log has a
+                // single local writer, so there's nothing to reject.
+                if verify {
+                    if let Err(err) =
+                        artel_protocol::signing::verify_message(session_id, &msg, &msg.signature)
+                    {
+                        warn!(
+                            file = %path.display(),
+                            seq = ?msg.seq,
+                            peer = %msg.peer.id,
+                            ?err,
+                            "dropping log frame: signature verify failed",
+                        );
+                    } else {
+                        out.push(msg);
+                    }
                 } else {
                     out.push(msg);
                 }
@@ -1103,10 +1124,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_log_drops_unsigned_sentinel() {
+    async fn read_log_drops_unsigned_sentinel_when_verifying() {
         // A frame with `SIGNATURE_UNSIGNED` (a pre-Slice-B daemon's
         // wire shape, or a buggy/malicious peer that ships the
-        // sentinel) is dropped on load.
+        // sentinel) is dropped when verification is on — the iroh
+        // build's behaviour. Drives `read_log` with `verify = true`
+        // directly so the assertion holds regardless of the test
+        // binary's own feature set (dev-deps pull `iroh` in even under
+        // `--no-default-features`).
         let dir = tempdir().unwrap();
         let store = FsLogStore::open(dir.path()).unwrap();
         store.create(&record(1)).await.unwrap();
@@ -1126,15 +1151,45 @@ mod tests {
         let log_path = dir.path().join(record(1).id.to_string()).join(LOG_FILE);
         append_log(&log_path, &unsigned).unwrap();
 
-        let loaded = FsLogStore::open(dir.path())
-            .unwrap()
-            .load_all()
-            .await
-            .unwrap();
-        assert_eq!(loaded.len(), 1);
+        let loaded = read_log(&log_path, record(1).id, true).unwrap();
         assert!(
-            loaded[0].log.is_empty(),
-            "unsigned-sentinel frame must be dropped",
+            loaded.is_empty(),
+            "unsigned-sentinel frame must be dropped when verifying",
+        );
+    }
+
+    #[tokio::test]
+    async fn read_log_keeps_unsigned_sentinel_when_not_verifying() {
+        // Regression for the no-iroh data-loss bug: a local-only
+        // daemon's `author_local` emits `SIGNATURE_UNSIGNED` (no wire
+        // surface to sign for), so its own on-disk frames carry the
+        // sentinel and it loads with `verify == false`. Verifying
+        // there would drop every frame the daemon wrote, silently
+        // wiping the entire log on restart; the no-iroh log has a
+        // single local writer, so there's no forged-frame threat to
+        // reject. The production wiring passes `cfg!(feature = "iroh")`
+        // for this flag; the test drives `verify = false` directly.
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+
+        let unsigned = SessionMessage::new(
+            Seq::new(1),
+            42,
+            peer_for_seed(1, "alice"),
+            MessageKind::Chat,
+            "x",
+            vec![0xab; 8],
+            artel_protocol::message::SIGNATURE_UNSIGNED,
+        );
+        let log_path = dir.path().join(record(1).id.to_string()).join(LOG_FILE);
+        append_log(&log_path, &unsigned).unwrap();
+
+        let loaded = read_log(&log_path, record(1).id, false).unwrap();
+        assert_eq!(
+            loaded,
+            vec![unsigned],
+            "no-iroh build must keep its own unsigned frames on reload",
         );
     }
 

@@ -833,12 +833,14 @@ fn track_authenticated_peer(bridge: &GossipBridge, delivered_from: iroh::Endpoin
 /// the joiner expects to see in `SendAck.result`.
 ///
 /// `payload` is a [`SignedSendPayload`] — the joiner's daemon stamped
-/// `timestamp_ms` and signed (B2) before publishing. In B1 the
-/// signature is the sentinel and verification is off; the host
-/// preserves `timestamp_ms` and `signature` verbatim into the
-/// resulting [`SessionMessage`] so receivers see the same bytes the
-/// joiner signed. Slice B2 will additionally pre-verify here at the
-/// bridge boundary.
+/// `timestamp_ms` and signed before publishing. The host preserves
+/// `timestamp_ms` and `signature` verbatim into the resulting
+/// [`SessionMessage`] so receivers see the same bytes the joiner
+/// signed. Signature verification happens authoritatively inside
+/// `Registry::send`'s `Remote` authoring arm (verify-before-append);
+/// this function only translates the resulting [`SessionError`] into
+/// the wire form the joiner expects in `SendAck.result` and logs the
+/// rejection with bridge-local context.
 async fn run_host_send(
     bridge: &Arc<GossipBridge>,
     session: SessionId,
@@ -865,36 +867,16 @@ async fn run_host_send(
         payload,
         signature,
     } = payload;
-    // Belt-and-suspenders pre-verify at the bridge boundary. The
-    // host's `Registry::send` re-verifies inside its `Remote`
-    // authoring arm; doing it here too keeps the bridge log line
-    // (which carries `delivered_from`) attached to the rejection
-    // for triage. On verify-fail synthesise the rejection so the
-    // joiner's `pending_sends` resolves cleanly via
-    // `ProtocolError::Signature` instead of timing out.
-    let candidate = SessionMessage::new(
-        artel_protocol::Seq::ZERO,
-        timestamp_ms,
-        peer.clone(),
-        kind,
-        action.clone(),
-        payload.clone(),
-        signature,
-    );
-    if let Err(err) = artel_protocol::signing::verify_message(session, &candidate, &signature) {
-        warn!(
-            ?session,
-            peer = %peer.id,
-            ?err,
-            "host bridge: dropping SendRequest with bad signature",
-        );
-        let reason = match err {
-            artel_protocol::signing::VerifyError::SentinelUnsigned => "unsigned sentinel",
-            artel_protocol::signing::VerifyError::BadKey => "peer.id is not a valid ed25519 key",
-            artel_protocol::signing::VerifyError::BadSig => "signature does not verify",
-        };
-        return Err(ProtocolError::Signature(format!("{}: {reason}", peer.id)));
-    }
+    // Signature verification is the registry's job: `Registry::send`'s
+    // `Remote` authoring arm verifies against the body's `peer.id`
+    // before assigning a seq or appending, returning
+    // `SessionError::SignatureRejected` on failure. We do NOT
+    // pre-verify here — a second `verify_message` would re-run the
+    // ed25519 scalar-mult and re-allocate the canonical bytes on the
+    // host's hot path for no added safety. Instead we attach the
+    // bridge-local context (`peer.id`, which `drop_if_spoofed` has
+    // already pinned to `delivered_from`) to the warn on the way out.
+    let peer_id = peer.id;
     match registry
         .send(
             session,
@@ -910,7 +892,17 @@ async fn run_host_send(
         .await
     {
         Ok(message) => Ok(message),
-        Err(err) => Err(session_error_to_wire(&err)),
+        Err(err) => {
+            if let SessionError::SignatureRejected { reason, .. } = &err {
+                warn!(
+                    ?session,
+                    peer = %peer_id,
+                    %reason,
+                    "host bridge: dropping SendRequest with bad signature",
+                );
+            }
+            Err(session_error_to_wire(&err))
+        }
     }
 }
 

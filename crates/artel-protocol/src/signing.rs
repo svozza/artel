@@ -44,12 +44,13 @@
 //! layout avoids both that and any future postcard-encoding tweak
 //! breaking existing signatures.
 
-use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, VerifyingKey};
 pub use ed25519_dalek::{SigningKey, VerifyingKey as EdVerifyingKey};
 
 use crate::ids::SessionId;
 use crate::message::{
-    MessageFormat, MessageKind, PeerInfo, SIGNATURE_UNSIGNED, SessionMessage, SigBytes,
+    MESSAGE_FORMAT, MessageFormat, MessageKind, PeerInfo, SIGNATURE_UNSIGNED, SessionMessage,
+    SigBytes,
 };
 
 /// Domain-prefix string baked into every canonical-bytes blob.
@@ -149,10 +150,20 @@ pub fn sign_body(
 /// - [`VerifyError::SentinelUnsigned`] if `signature` is the all-zero
 ///   sentinel ([`SIGNATURE_UNSIGNED`]). A freshly-constructed v2
 ///   message that never went through [`sign_body`] hits this.
+/// - [`VerifyError::VersionTooOld`] if `message.version` is below
+///   [`MESSAGE_FORMAT`] — the signed-era floor. This is the active
+///   downgrade defense: the doc-comment's "the signature flips" only
+///   holds against *tampering* a v2 frame, but an author who signs a
+///   self-consistent sub-floor frame would otherwise verify fine.
+///   Rejecting `version < MESSAGE_FORMAT` here makes the floor real
+///   rather than aspirational.
 /// - [`VerifyError::BadKey`] if `peer.id` is not a valid ed25519
 ///   public key (i.e. doesn't decode to a curve point).
 /// - [`VerifyError::BadSig`] if the signature does not verify under
-///   `peer.id`.
+///   `peer.id`. Uses ed25519 *strict* verification, which additionally
+///   rejects the malleable / small-order signature forms that the
+///   permissive `verify` would accept — so a captured signature can't
+///   be reshaped into a second distinct-but-valid 64-byte blob.
 pub fn verify_message(
     session_id: SessionId,
     message: &SessionMessage,
@@ -160,6 +171,12 @@ pub fn verify_message(
 ) -> Result<(), VerifyError> {
     if signature == &SIGNATURE_UNSIGNED {
         return Err(VerifyError::SentinelUnsigned);
+    }
+    if message.version < MESSAGE_FORMAT {
+        return Err(VerifyError::VersionTooOld {
+            version: message.version.get(),
+            floor: MESSAGE_FORMAT.get(),
+        });
     }
     let verifying =
         VerifyingKey::from_bytes(message.peer.id.as_bytes()).map_err(|_| VerifyError::BadKey)?;
@@ -173,8 +190,11 @@ pub fn verify_message(
         &message.action,
         &message.payload,
     );
+    // `verify_strict` (not the permissive `Verifier::verify`) so
+    // ed25519 signature malleability is rejected: only the canonical
+    // (R, S) form passes. See `VerifyError::BadSig`.
     verifying
-        .verify(&bytes, &sig)
+        .verify_strict(&bytes, &sig)
         .map_err(|_| VerifyError::BadSig)
 }
 
@@ -187,6 +207,17 @@ pub enum VerifyError {
     /// "we forgot to wire signing in".
     #[error("signature is the zero sentinel; message was never signed")]
     SentinelUnsigned,
+    /// `message.version` is below the signed-era floor
+    /// ([`MESSAGE_FORMAT`]). A downgrade to a pre-signing wire shape
+    /// is rejected before any crypto runs — the floor is enforced
+    /// here, not merely folded into the canonical bytes.
+    #[error("message version {version} is below the signed floor {floor}")]
+    VersionTooOld {
+        /// The version stamped on the rejected message.
+        version: u8,
+        /// The minimum accepted version ([`MESSAGE_FORMAT`]).
+        floor: u8,
+    },
     /// `peer.id` does not decode as an ed25519 public key. Drop and
     /// do not append.
     #[error("peer id is not a valid ed25519 public key")]
@@ -195,6 +226,23 @@ pub enum VerifyError {
     /// bytes.
     #[error("signature does not verify against peer id")]
     BadSig,
+}
+
+/// Short, allocation-free diagnostic for a [`VerifyError`].
+///
+/// Suitable for the `reason` half of a wire-facing
+/// [`crate::ProtocolError::Signature`]. Names the failure mode but
+/// never leaks signature bytes. Shared by both daemon-side rejection
+/// sites (host bridge and the registry's `Remote` authoring arm) so
+/// the joiner-facing wording is defined once.
+#[must_use]
+pub const fn verify_reason(err: &VerifyError) -> &'static str {
+    match err {
+        VerifyError::SentinelUnsigned => "unsigned sentinel",
+        VerifyError::VersionTooOld { .. } => "message version below signed floor",
+        VerifyError::BadKey => "peer.id is not a valid ed25519 key",
+        VerifyError::BadSig => "signature does not verify",
+    }
 }
 
 #[cfg(test)]
@@ -448,6 +496,100 @@ mod tests {
                 other => panic!("garbage peer id {cand:?} passed verification: {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn verify_rejects_version_below_floor() {
+        // A message claiming a sub-floor version is rejected before
+        // any crypto runs — even if its signature is self-consistent
+        // over that lower version. Pins the downgrade floor as a real
+        // check, not just a byte folded into the canonical bytes.
+        let key = key_a();
+        let peer = peer_for(&key);
+        let s = sample_session_id();
+        let (ts, kind, action, payload) = (42u64, MessageKind::Chat, "x", &b"hi"[..]);
+        // Sign over version 1 (one below the floor) so the signature
+        // is internally valid for the bytes — the floor check must
+        // still reject it.
+        let v1 = MessageFormat::new(1);
+        let sig = sign_body(&key, s, v1, ts, &peer, kind, action, payload);
+        let mut m = body_matching(peer, ts, kind, action, payload, sig);
+        m.version = v1;
+        assert_eq!(
+            verify_message(s, &m, &sig).unwrap_err(),
+            VerifyError::VersionTooOld {
+                version: 1,
+                floor: MESSAGE_FORMAT.get(),
+            },
+        );
+    }
+
+    #[test]
+    fn verify_rejects_malleated_signature() {
+        // ed25519 signatures are malleable under the permissive
+        // `verify`: given a valid (R, S), the variant (R, S + L)
+        // (L = group order) also satisfies the non-strict equation.
+        // `verify_strict` rejects the non-canonical S. Construct the
+        // malleated form and assert it no longer verifies.
+        //
+        // L for ed25519: 2^252 + 27742317777372353535851937790883648493,
+        // little-endian.
+        const L: [u8; 32] = [
+            0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9,
+            0xde, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x10,
+        ];
+        let key = key_a();
+        let peer = peer_for(&key);
+        let s = sample_session_id();
+        let (ts, kind, action, payload) = (42u64, MessageKind::Chat, "x", &b"hi"[..]);
+        let sig = sign_body(&key, s, MESSAGE_FORMAT, ts, &peer, kind, action, payload);
+        let m = body_matching(peer, ts, kind, action, payload, sig);
+        // Sanity: the canonical signature verifies.
+        verify_message(s, &m, &sig).unwrap();
+
+        // Add the group order L to the scalar S (bytes 32..64,
+        // little-endian) to produce a malleated-but-equivalent sig
+        // under non-strict verification.
+        let mut malleated = sig;
+        let mut carry = 0u16;
+        for i in 0..32 {
+            let sum = u16::from(sig[32 + i]) + u16::from(L[i]) + carry;
+            malleated[32 + i] = (sum & 0xff) as u8;
+            carry = sum >> 8;
+        }
+        // Only meaningful if S + L didn't overflow the 32nd byte (it
+        // doesn't for a canonical S, which has the high bits clear).
+        assert_eq!(carry, 0, "S + L overflowed; test fixture invalid");
+        assert_ne!(malleated, sig, "malleated sig must differ");
+        assert_eq!(
+            verify_message(s, &m, &malleated).unwrap_err(),
+            VerifyError::BadSig,
+            "verify_strict must reject the malleated signature",
+        );
+    }
+
+    #[test]
+    fn verify_reason_names_each_failure_mode() {
+        assert_eq!(
+            verify_reason(&VerifyError::SentinelUnsigned),
+            "unsigned sentinel"
+        );
+        assert_eq!(
+            verify_reason(&VerifyError::VersionTooOld {
+                version: 1,
+                floor: 2
+            }),
+            "message version below signed floor",
+        );
+        assert_eq!(
+            verify_reason(&VerifyError::BadKey),
+            "peer.id is not a valid ed25519 key",
+        );
+        assert_eq!(
+            verify_reason(&VerifyError::BadSig),
+            "signature does not verify"
+        );
     }
 
     #[test]
