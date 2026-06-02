@@ -145,6 +145,13 @@ pub(crate) struct GossipBridge {
     /// The daemon's own iroh `EndpointId`, cached as a [`PeerId`]
     /// for cheap reads at outbound-stamp sites.
     authenticated_peer_id: PeerId,
+    /// Daemon's iroh secret key, cloned from
+    /// [`crate::server::IrohRuntime::signing_key`] at construction.
+    /// Used by [`Self::send_remote`] to sign joiner-authored bodies
+    /// before publishing the [`GossipBody::SendRequest`]. Held as
+    /// `Arc<iroh::SecretKey>` so all spawned forwarders see the same
+    /// 32 bytes without a refcount-per-publish.
+    signing_key: Arc<iroh::SecretKey>,
 }
 
 #[derive(Debug)]
@@ -193,6 +200,7 @@ impl GossipBridge {
         addr_hint: MemoryLookup,
         tracked_peer_ids: Arc<std::sync::Mutex<std::collections::BTreeSet<iroh::EndpointId>>>,
         endpoint_id: iroh::EndpointId,
+        signing_key: Arc<iroh::SecretKey>,
     ) -> Self {
         let authenticated_peer_id = PeerId::from_bytes(*endpoint_id.as_bytes());
         Self {
@@ -203,6 +211,7 @@ impl GossipBridge {
             addr_hint,
             tracked_peer_ids,
             authenticated_peer_id,
+            signing_key,
         }
     }
 
@@ -380,23 +389,34 @@ impl GossipBridge {
             id: self.authenticated_peer_id,
             ..peer
         };
-        // B1: wrap the IPC-side `SendPayload` into a wire-side
-        // `SignedSendPayload` with the sentinel signature. B2 will
-        // replace `SIGNATURE_UNSIGNED` with `sign_body` over the
-        // canonical bytes; verification is off until then.
+        // Sign the body with this daemon's iroh secret key over the
+        // canonical bytes (`session`, `MESSAGE_FORMAT`,
+        // `timestamp_ms`, `peer`, `kind`, `action`, `payload`). The
+        // host preserves `timestamp_ms` and `signature` verbatim
+        // through the round-trip so the bytes the host re-broadcasts
+        // verify against this peer.id.
         let SendPayload {
             kind,
             action,
             payload,
         } = payload;
+        let timestamp_ms = now_ms();
+        let signature = artel_protocol::signing::sign_body(
+            self.signing_key.as_signing_key(),
+            session,
+            artel_protocol::message::MESSAGE_FORMAT,
+            timestamp_ms,
+            &peer,
+            kind,
+            &action,
+            &payload,
+        );
         let signed_payload = SignedSendPayload {
-            timestamp_ms: now_ms(),
+            timestamp_ms,
             kind,
             action,
             payload,
-            // TODO(slice-b2): replace with `sign_body` against
-            // `self.signing_key` (not yet on the bridge — wired in B2).
-            signature: artel_protocol::message::SIGNATURE_UNSIGNED,
+            signature,
         };
         let body = GossipBody::SendRequest {
             req_id,
@@ -843,14 +863,50 @@ async fn run_host_send(
         kind,
         action,
         payload,
-        // Discarded in B1 — Registry::send still stamps
-        // SIGNATURE_UNSIGNED. B2 will thread `signature` through
-        // `Authoring::Remote` so the bytes the joiner signed end up
-        // in the broadcast `SessionMessage` verbatim.
-        signature: _,
+        signature,
     } = payload;
+    // Belt-and-suspenders pre-verify at the bridge boundary. The
+    // host's `Registry::send` re-verifies inside its `Remote`
+    // authoring arm; doing it here too keeps the bridge log line
+    // (which carries `delivered_from`) attached to the rejection
+    // for triage. On verify-fail synthesise the rejection so the
+    // joiner's `pending_sends` resolves cleanly via
+    // `ProtocolError::Signature` instead of timing out.
+    let candidate = SessionMessage::new(
+        artel_protocol::Seq::ZERO,
+        timestamp_ms,
+        peer.clone(),
+        kind,
+        action.clone(),
+        payload.clone(),
+        signature,
+    );
+    if let Err(err) = artel_protocol::signing::verify_message(session, &candidate, &signature) {
+        warn!(
+            ?session,
+            peer = %peer.id,
+            ?err,
+            "host bridge: dropping SendRequest with bad signature",
+        );
+        let reason = match err {
+            artel_protocol::signing::VerifyError::SentinelUnsigned => "unsigned sentinel",
+            artel_protocol::signing::VerifyError::BadKey => "peer.id is not a valid ed25519 key",
+            artel_protocol::signing::VerifyError::BadSig => "signature does not verify",
+        };
+        return Err(ProtocolError::Signature(format!("{}: {reason}", peer.id)));
+    }
     match registry
-        .send(session, peer, kind, action, payload, timestamp_ms)
+        .send(
+            session,
+            peer,
+            kind,
+            action,
+            payload,
+            crate::session::Authoring::Remote {
+                timestamp_ms,
+                signature,
+            },
+        )
         .await
     {
         Ok(message) => Ok(message),
@@ -917,6 +973,13 @@ fn session_error_to_wire(err: &SessionError) -> ProtocolError {
         // receive HostRejected from `send_remote`. Surface
         // defensively so a future bug doesn't silently swallow it.
         SessionError::HostRejected(err) => err.clone(),
+        // Joiner-authored body whose signature didn't verify under
+        // its claimed peer.id. The joiner sees this as
+        // `ProtocolError::Signature` in the SendAck so they can
+        // distinguish a sig failure from a generic Internal.
+        SessionError::SignatureRejected { peer_id, reason } => {
+            ProtocolError::Signature(format!("{peer_id}: {reason}"))
+        }
     }
 }
 

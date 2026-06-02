@@ -17,6 +17,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use artel_protocol::message::{MESSAGE_FORMAT, SIGNATURE_UNSIGNED, SigBytes};
+use artel_protocol::signing::{self, VerifyError};
 use artel_protocol::ticket::{self, SessionTicket, WireEndpointAddr};
 use artel_protocol::{
     Event, JoinTicket, MessageKind, PeerId, PeerInfo, Seq, SessionId, SessionMessage,
@@ -35,6 +37,15 @@ use crate::store::{DynStore, SessionKind, SessionRecord, StoredAttachment};
 /// right shape — we do not want to back-pressure publishers because of
 /// one slow subscriber.
 const EVENT_CHANNEL_CAPACITY: usize = 256;
+
+/// Wall-clock millis since the Unix epoch. The `Local` arm of
+/// [`Authoring`] stamps this onto every body it signs.
+fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
 
 /// Errors the registry may return from RPC handlers.
 #[derive(Debug, Error)]
@@ -89,6 +100,23 @@ pub enum SessionError {
     /// a flattened `Internal` shrug.
     #[error("host rejected send: {0}")]
     HostRejected(#[source] artel_protocol::ProtocolError),
+
+    /// A remote-authored `SendRequest` reached `Registry::send` with
+    /// a signature that does not verify against the body. The host
+    /// (or any other receiver) must drop the message rather than
+    /// append; the joiner sees this as
+    /// [`artel_protocol::ProtocolError::Signature`] in their
+    /// `SendAck`. See `crate::session::Authoring::Remote` and Auth
+    /// Slice B2.
+    #[error("signature rejected for peer {peer_id}: {reason}")]
+    SignatureRejected {
+        /// The body's `peer.id` — i.e. who claimed authorship.
+        peer_id: PeerId,
+        /// Diagnostic reason. Names the failure mode (sentinel /
+        /// bad key / bad sig). Never includes the bytes of the
+        /// rejected signature.
+        reason: String,
+    },
 }
 
 // io::Error doesn't impl PartialEq, so we hand-roll one for the
@@ -103,6 +131,16 @@ impl PartialEq for SessionError {
             (Self::InvalidAddr(a), Self::InvalidAddr(b))
             | (Self::Internal(a), Self::Internal(b)) => a == b,
             (Self::HostRejected(a), Self::HostRejected(b)) => a == b,
+            (
+                Self::SignatureRejected {
+                    peer_id: a_peer,
+                    reason: a_reason,
+                },
+                Self::SignatureRejected {
+                    peer_id: b_peer,
+                    reason: b_reason,
+                },
+            ) => a_peer == b_peer && a_reason == b_reason,
             (Self::InvalidTicket, Self::InvalidTicket) | (Self::NotHost, Self::NotHost) => true,
             _ => false,
         }
@@ -215,12 +253,49 @@ pub struct Registry {
     /// `SessionMessage` (Auth Slice B). `None` for unit tests that
     /// build a registry without an iroh runtime in scope; production
     /// code paths populate this from
-    /// [`crate::server::IrohRuntime::signing_key`]. In B1 nothing
-    /// reads this field yet (`Registry::send` still ships the
-    /// `SIGNATURE_UNSIGNED` sentinel); B2 turns signing on.
+    /// [`crate::server::IrohRuntime::signing_key`]. The `Local` arm
+    /// of [`Authoring`] panics loudly if iroh is on but this field
+    /// is `None` — that's a wiring bug, not a runtime case.
     #[cfg(feature = "iroh")]
-    #[allow(dead_code)] // wired in B1; consumed in B2.
     signing_key: Option<Arc<iroh::SecretKey>>,
+}
+
+/// Where the body handed to [`Registry::send`] was authored.
+///
+/// Drives the sign-vs-verify decision: [`Authoring::Local`] stamps
+/// `timestamp_ms` and signs with the daemon's own
+/// [`Registry::signing_key`]; [`Authoring::Remote`] trusts the
+/// joiner's timestamp + signature and verifies against the body's
+/// `peer.id` before assigning seq + appending.
+///
+/// The two arms differ in one bit ("did someone else already author
+/// this body?"). A typed enum forecloses "I forgot which arm re-signs"
+/// bugs the plain-arguments shape allowed: it is impossible to call
+/// `Registry::send` without committing to one or the other.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Authoring {
+    /// This daemon authored the body. Production IPC `Send` callers
+    /// and the unit-test fan-out use this arm. Stamps
+    /// `timestamp_ms = now_ms()` and signs before append.
+    Local,
+    /// A remote joiner authored the body, signed it, and the host
+    /// is now appending it to its log. Preserves the joiner's
+    /// `timestamp_ms` + `signature` verbatim and **verifies** before
+    /// assigning seq + appending. Only [`crate::gossip_bridge`]'s
+    /// `run_host_send` constructs this variant.
+    #[cfg(feature = "iroh")]
+    Remote {
+        /// Authoring time, stamped by the joiner's daemon at the
+        /// moment the body was signed. Inside the signed scope
+        /// (canonical bytes) so a malicious host cannot rewrite it.
+        timestamp_ms: u64,
+        /// Joiner's ed25519 signature over
+        /// [`signing::canonical_bytes`]. Verified against the body's
+        /// `peer.id` before append; on failure
+        /// [`SessionError::SignatureRejected`] is returned and no
+        /// state mutates.
+        signature: SigBytes,
+    },
 }
 
 impl Registry {
@@ -241,6 +316,28 @@ impl Registry {
             bridge: None,
             #[cfg(feature = "iroh")]
             signing_key: None,
+        }
+    }
+
+    /// Test-only constructor that wires a signing key into the
+    /// registry. Production code uses [`Registry::load`] (which
+    /// receives the key from
+    /// [`crate::server::IrohRuntime::signing_key`]); tests that need
+    /// the `Local` arm of [`Authoring`] to actually sign go through
+    /// this.
+    #[cfg(all(test, feature = "iroh"))]
+    pub(crate) fn new_with_signing_key(
+        daemon_peer_id: PeerId,
+        store: DynStore,
+        signing_key: Arc<iroh::SecretKey>,
+    ) -> Self {
+        Self {
+            daemon_peer_id,
+            daemon_addr: WireEndpointAddr::id_only(daemon_peer_id),
+            sessions: RwLock::new(HashMap::new()),
+            store,
+            bridge: None,
+            signing_key: Some(signing_key),
         }
     }
 
@@ -551,6 +648,25 @@ impl Registry {
                 // ever matters we can replace with a per-session
                 // mpsc.
                 tokio::spawn(async move {
+                    // Verify the body's signature against its claimed
+                    // peer.id before any state mutation. A tampered
+                    // `Message` (or one whose host vouched
+                    // dishonestly) drops here with a warn and never
+                    // touches the mirror's log. seq is excluded from
+                    // the signed scope so the host's stamp doesn't
+                    // matter; we verify the joiner's authorship
+                    // directly.
+                    if let Err(err) = signing::verify_message(session_for_log, &msg, &msg.signature)
+                    {
+                        tracing::warn!(
+                            session = ?session_for_log,
+                            seq = ?msg.seq,
+                            peer = %msg.peer.id,
+                            ?err,
+                            "dropping inbound Message: signature verify failed",
+                        );
+                        return;
+                    }
                     // Persist BEFORE mutating in-memory state so a
                     // crash mid-callback doesn't leave the mirror's
                     // in-memory log ahead of disk. Idempotent on
@@ -862,14 +978,14 @@ impl Registry {
     ///
     /// [`GossipBody::SendRequest`]: artel_protocol::gossip::GossipBody::SendRequest
     /// [`GossipBody::SendAck`]: artel_protocol::gossip::GossipBody::SendAck
-    pub async fn send(
+    pub(crate) async fn send(
         &self,
         session: SessionId,
         peer: PeerInfo,
         kind: MessageKind,
         action: String,
         payload: Vec<u8>,
-        timestamp_ms: u64,
+        authoring: Authoring,
     ) -> Result<SessionMessage, SessionError> {
         let session_arc = {
             let guard = self.sessions.read().await;
@@ -893,9 +1009,16 @@ impl Registry {
         // for the host's `SendAck`. The host's local `Registry::send`
         // will produce the broadcast `Message` frame we'll see on
         // our own forwarder; the IPC reply uses the assigned
-        // `SessionMessage` from the ack.
+        // `SessionMessage` from the ack. Authoring on this arm is
+        // always `Local` — the joiner's daemon owns the body and
+        // signs it inside `bridge.send_remote`; reaching here with
+        // `Remote` is a wiring bug.
         #[cfg(feature = "iroh")]
         if kind_snapshot == SessionKind::Remote {
+            debug_assert!(
+                matches!(authoring, Authoring::Local),
+                "Authoring::Remote is only valid for the host arm",
+            );
             let bridge = self.bridge.as_ref().ok_or_else(|| {
                 SessionError::Internal("remote send requires gossip bridge".into())
             })?;
@@ -935,6 +1058,20 @@ impl Registry {
             // arm for completeness.
             return Err(SessionError::NotHost);
         }
+
+        // Local-host arm. Either we authored the body ourselves
+        // (`Authoring::Local`: stamp now_ms + sign with our key) or a
+        // joiner authored it and we're appending on their behalf
+        // (`Authoring::Remote`: verify their signature against the
+        // body's peer.id BEFORE assigning seq + appending). The two
+        // arms split here so the typing makes "did we sign vs did
+        // they sign" explicit.
+        let (timestamp_ms, signature) =
+            match self.resolve_authoring(authoring, &peer, kind, &action, &payload, session) {
+                Ok(pair) => pair,
+                Err(err) => return Err(err),
+            };
+
         let mut s = session_arc.lock().await;
         // Build the message under the session lock (so seq is stable),
         // then persist before bumping in-memory state and fanning out.
@@ -944,10 +1081,6 @@ impl Registry {
         // We compute the prospective seq without committing it. If the
         // store write succeeds we commit; if not, we leave head alone.
         let prospective = s.head.next().expect("seq overflow");
-        // TODO(slice-b2): replace SIGNATURE_UNSIGNED with sign_body using
-        // the registry's signing key. Today we ship the sentinel; B2
-        // turns verification on, at which point any unsigned path goes
-        // red catastrophically — that's deliberate.
         let message = SessionMessage::new(
             prospective,
             timestamp_ms,
@@ -955,7 +1088,7 @@ impl Registry {
             kind,
             action,
             payload,
-            artel_protocol::message::SIGNATURE_UNSIGNED,
+            signature,
         );
         if let Err(err) = self.store.append(session, &message).await {
             return Err(SessionError::Storage(err));
@@ -982,6 +1115,127 @@ impl Registry {
         }
 
         Ok(message)
+    }
+
+    /// Branchpoint between the [`Authoring::Local`] sign-now and
+    /// [`Authoring::Remote`] verify-now arms. Builds canonical bytes
+    /// once and either signs (Local) or verifies (Remote); returns
+    /// the `(timestamp_ms, signature)` pair the [`SessionMessage`]
+    /// will carry.
+    fn resolve_authoring(
+        &self,
+        authoring: Authoring,
+        peer: &PeerInfo,
+        kind: MessageKind,
+        action: &str,
+        payload: &[u8],
+        session: SessionId,
+    ) -> Result<(u64, SigBytes), SessionError> {
+        // Take by value because `Authoring::Remote` carries a 64-byte
+        // signature we move into the verify path; passing by reference
+        // would force a clone on every joiner-authored body.
+        match authoring {
+            Authoring::Local => Ok(self.author_local(peer, kind, action, payload, session)),
+            #[cfg(feature = "iroh")]
+            Authoring::Remote {
+                timestamp_ms,
+                signature,
+            } => Self::author_remote(
+                timestamp_ms,
+                signature,
+                peer,
+                kind,
+                action,
+                payload,
+                session,
+            ),
+        }
+    }
+
+    /// Local-arm authoring: stamp `now_ms()`, sign with the daemon's
+    /// own key. Under `cfg(not(feature = "iroh"))` the registry has
+    /// no signing key — there's no wire surface to defend, so we
+    /// emit the unsigned sentinel. Under `cfg(feature = "iroh")` a
+    /// `None` signing key is a wiring bug: production paths feed
+    /// [`crate::server::IrohRuntime::signing_key`] in, and only the
+    /// test-only `Registry::new` constructor leaves it `None`. We
+    /// keep that test path working by falling back to the sentinel,
+    /// which the verifier rejects loudly the moment any receive
+    /// path actually verifies.
+    fn author_local(
+        &self,
+        peer: &PeerInfo,
+        kind: MessageKind,
+        action: &str,
+        payload: &[u8],
+        session: SessionId,
+    ) -> (u64, SigBytes) {
+        let timestamp_ms = now_ms();
+        #[cfg(feature = "iroh")]
+        let signature = self.signing_key.as_ref().map_or(SIGNATURE_UNSIGNED, |key| {
+            signing::sign_body(
+                key.as_signing_key(),
+                session,
+                MESSAGE_FORMAT,
+                timestamp_ms,
+                peer,
+                kind,
+                action,
+                payload,
+            )
+        });
+        #[cfg(not(feature = "iroh"))]
+        let signature = {
+            // No iroh feature → no wire surface; signing has nothing
+            // to defend at this layer. L4 will close this gap when
+            // it lands.
+            let _ = (session, peer, kind, action, payload);
+            SIGNATURE_UNSIGNED
+        };
+        (timestamp_ms, signature)
+    }
+
+    /// Remote-arm authoring: trust the joiner's stamp + signature
+    /// but verify before append. Failure returns
+    /// [`SessionError::SignatureRejected`] so `run_host_send` can
+    /// translate it into a [`artel_protocol::ProtocolError::Signature`]
+    /// in the `SendAck` (rather than the joiner timing out).
+    #[cfg(feature = "iroh")]
+    fn author_remote(
+        timestamp_ms: u64,
+        signature: SigBytes,
+        peer: &PeerInfo,
+        kind: MessageKind,
+        action: &str,
+        payload: &[u8],
+        session: SessionId,
+    ) -> Result<(u64, SigBytes), SessionError> {
+        // Mock up a SessionMessage shape so we can reuse
+        // `verify_message` — seq is excluded from the canonical
+        // bytes so any value works.
+        let candidate = SessionMessage::new(
+            Seq::ZERO,
+            timestamp_ms,
+            peer.clone(),
+            kind,
+            action.to_string(),
+            payload.to_vec(),
+            signature,
+        );
+        match signing::verify_message(session, &candidate, &signature) {
+            Ok(()) => Ok((timestamp_ms, signature)),
+            Err(err) => {
+                let reason = match err {
+                    VerifyError::SentinelUnsigned => "unsigned sentinel".to_string(),
+                    VerifyError::BadKey => "peer.id is not a valid ed25519 key".to_string(),
+                    VerifyError::BadSig => "signature does not verify".to_string(),
+                };
+                Err(SessionError::SignatureRejected {
+                    peer_id: peer.id,
+                    reason,
+                })
+            }
+        }
     }
 
     /// Persist (or overwrite) a consumer-tagged attachment against
@@ -1448,15 +1702,36 @@ mod tests {
         let (id, _) = r.host(host.clone(), None).await.unwrap();
 
         let s1 = r
-            .send(id, host.clone(), MessageKind::Chat, "a".into(), vec![], 1)
+            .send(
+                id,
+                host.clone(),
+                MessageKind::Chat,
+                "a".into(),
+                vec![],
+                Authoring::Local,
+            )
             .await
             .unwrap();
         let s2 = r
-            .send(id, host.clone(), MessageKind::Chat, "b".into(), vec![], 2)
+            .send(
+                id,
+                host.clone(),
+                MessageKind::Chat,
+                "b".into(),
+                vec![],
+                Authoring::Local,
+            )
             .await
             .unwrap();
         let s3 = r
-            .send(id, host, MessageKind::Chat, "c".into(), vec![], 3)
+            .send(
+                id,
+                host,
+                MessageKind::Chat,
+                "c".into(),
+                vec![],
+                Authoring::Local,
+            )
             .await
             .unwrap();
 
@@ -1478,7 +1753,7 @@ mod tests {
                 MessageKind::Chat,
                 "x".into(),
                 vec![],
-                0,
+                Authoring::Local,
             )
             .await
             .unwrap_err();
@@ -1496,7 +1771,7 @@ mod tests {
                 MessageKind::Chat,
                 "x".into(),
                 vec![],
-                0,
+                Authoring::Local,
             )
             .await
             .unwrap_err();
@@ -1517,7 +1792,7 @@ mod tests {
                 MessageKind::Chat,
                 "hello".into(),
                 b"world".to_vec(),
-                42,
+                Authoring::Local,
             )
             .await
             .unwrap();
@@ -1538,6 +1813,172 @@ mod tests {
         }
     }
 
+    // ---- send / signing (Auth Slice B2) ----
+
+    /// Build a registry with a known iroh `SecretKey` so the
+    /// `Local` arm of [`Authoring`] actually signs. The matching
+    /// `PeerId` is the daemon's own iroh public key — we use it as
+    /// both the daemon peer id and the host of the test session so
+    /// membership and signing-identity line up.
+    #[cfg(feature = "iroh")]
+    fn registry_with_signing_seed(seed: u8) -> (Registry, PeerInfo, Arc<iroh::SecretKey>) {
+        let secret = Arc::new(iroh::SecretKey::from_bytes(&[seed; 32]));
+        let endpoint_id = secret.public();
+        let peer_id = PeerId::from_bytes(*endpoint_id.as_bytes());
+        let store: DynStore = Arc::new(crate::store::MemoryStore::new());
+        let r = Registry::new_with_signing_key(peer_id, store, Arc::clone(&secret));
+        (r, PeerInfo::new(peer_id, "alice"), secret)
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "iroh")]
+    async fn registry_send_local_signs_with_daemon_key() {
+        // Pin the load-bearing signing path: a `Local`-arm send
+        // must produce a `SessionMessage` whose signature verifies
+        // against the body's peer.id (= the daemon's own pubkey).
+        let (r, host, _secret) = registry_with_signing_seed(0x41);
+        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        let sent = r
+            .send(
+                id,
+                host.clone(),
+                MessageKind::Chat,
+                "hello".into(),
+                b"world".to_vec(),
+                Authoring::Local,
+            )
+            .await
+            .unwrap();
+        // The signature must NOT be the sentinel — the local arm
+        // signed with the registry's iroh key.
+        assert_ne!(
+            sent.signature,
+            artel_protocol::message::SIGNATURE_UNSIGNED,
+            "Local arm must replace the sentinel with a real signature",
+        );
+        // And it verifies against the body's peer.id over the
+        // canonical bytes.
+        signing::verify_message(id, &sent, &sent.signature)
+            .expect("locally-signed message must verify");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "iroh")]
+    async fn registry_send_remote_authoring_verifies_signature_first() {
+        // A `Remote`-arm body whose signature does NOT verify must
+        // be rejected with `SignatureRejected`, not appended.
+        let (r, host, _) = registry_with_signing_seed(0x41);
+        let (id, _) = r.host(host.clone(), None).await.unwrap();
+
+        // Build a body whose claimed peer is a real ed25519 key but
+        // sign with a different key — that's the "BadSig" failure
+        // mode.
+        let real = artel_protocol::signing::SigningKey::from_bytes(&[0xaa; 32]);
+        let other = artel_protocol::signing::SigningKey::from_bytes(&[0xbb; 32]);
+        let claimed_peer = PeerInfo::new(
+            PeerId::from_bytes(real.verifying_key().to_bytes()),
+            "joiner",
+        );
+        let timestamp_ms = 1_700_000_000_000u64;
+        let bad_sig = artel_protocol::signing::sign_body(
+            &other,
+            id,
+            artel_protocol::message::MESSAGE_FORMAT,
+            timestamp_ms,
+            &claimed_peer,
+            MessageKind::Chat,
+            "x",
+            b"hi",
+        );
+        // Admit the joiner first so the membership check passes —
+        // this test pins the verify-before-append property, not the
+        // membership path.
+        r.ensure_member(id, claimed_peer.clone()).await.unwrap();
+
+        let err = r
+            .send(
+                id,
+                claimed_peer.clone(),
+                MessageKind::Chat,
+                "x".into(),
+                b"hi".to_vec(),
+                Authoring::Remote {
+                    timestamp_ms,
+                    signature: bad_sig,
+                },
+            )
+            .await
+            .unwrap_err();
+        match err {
+            SessionError::SignatureRejected { peer_id, reason } => {
+                assert_eq!(peer_id, claimed_peer.id);
+                assert!(
+                    reason.contains("does not verify"),
+                    "unexpected reason: {reason}",
+                );
+            }
+            other => panic!("expected SignatureRejected, got {other:?}"),
+        }
+
+        // No state mutation: the host's log is empty, head is ZERO.
+        let sub = r.subscribe(id, None).await.unwrap();
+        assert!(sub.replay.is_empty(), "rejected body must not append");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "iroh")]
+    async fn registry_send_remote_authoring_preserves_timestamp_and_signature() {
+        // The host trusts the joiner's `timestamp_ms` + `signature`
+        // verbatim. Sign off-registry, drive the `Remote` arm, and
+        // assert the appended message carries exactly those bytes.
+        let (r, host, _) = registry_with_signing_seed(0x41);
+        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        // The joiner signs with their own key; the body's peer.id is
+        // their own pubkey.
+        let joiner_signing = artel_protocol::signing::SigningKey::from_bytes(&[0x77; 32]);
+        let joiner = PeerInfo::new(
+            PeerId::from_bytes(joiner_signing.verifying_key().to_bytes()),
+            "bob",
+        );
+        let timestamp_ms = 1_700_000_001_234u64;
+        let signature = artel_protocol::signing::sign_body(
+            &joiner_signing,
+            id,
+            artel_protocol::message::MESSAGE_FORMAT,
+            timestamp_ms,
+            &joiner,
+            MessageKind::Chat,
+            "joiner.send",
+            b"payload",
+        );
+        r.ensure_member(id, joiner.clone()).await.unwrap();
+        let appended = r
+            .send(
+                id,
+                joiner.clone(),
+                MessageKind::Chat,
+                "joiner.send".into(),
+                b"payload".to_vec(),
+                Authoring::Remote {
+                    timestamp_ms,
+                    signature,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            appended.timestamp_ms, timestamp_ms,
+            "timestamp must be preserved verbatim",
+        );
+        assert_eq!(
+            appended.signature, signature,
+            "signature must be preserved verbatim",
+        );
+        // And it still verifies on the receiver side over the same
+        // canonical bytes.
+        signing::verify_message(id, &appended, &appended.signature).unwrap();
+    }
+
     // ---- subscribe / replay ----
 
     #[tokio::test]
@@ -1547,15 +1988,36 @@ mod tests {
         let (id, _) = r.host(host.clone(), None).await.unwrap();
 
         let s1 = r
-            .send(id, host.clone(), MessageKind::Chat, "1".into(), vec![], 0)
+            .send(
+                id,
+                host.clone(),
+                MessageKind::Chat,
+                "1".into(),
+                vec![],
+                Authoring::Local,
+            )
             .await
             .unwrap();
         let _s2 = r
-            .send(id, host.clone(), MessageKind::Chat, "2".into(), vec![], 0)
+            .send(
+                id,
+                host.clone(),
+                MessageKind::Chat,
+                "2".into(),
+                vec![],
+                Authoring::Local,
+            )
             .await
             .unwrap();
         let _s3 = r
-            .send(id, host, MessageKind::Chat, "3".into(), vec![], 0)
+            .send(
+                id,
+                host,
+                MessageKind::Chat,
+                "3".into(),
+                vec![],
+                Authoring::Local,
+            )
             .await
             .unwrap();
 
@@ -1578,7 +2040,7 @@ mod tests {
                 MessageKind::Chat,
                 format!("m{n}"),
                 vec![],
-                0,
+                Authoring::Local,
             )
             .await
             .unwrap();
@@ -1664,9 +2126,16 @@ mod tests {
         let bob = peer(2, "bob");
         let (id, ticket) = r.host(host.clone(), None).await.unwrap();
         r.join(&ticket, bob).await.unwrap();
-        r.send(id, host, MessageKind::Chat, "x".into(), vec![], 0)
-            .await
-            .unwrap();
+        r.send(
+            id,
+            host,
+            MessageKind::Chat,
+            "x".into(),
+            vec![],
+            Authoring::Local,
+        )
+        .await
+        .unwrap();
 
         let mut summaries = r.list().await;
         assert_eq!(summaries.len(), 1);
@@ -1729,7 +2198,14 @@ mod tests {
         .unwrap();
 
         let err = r
-            .send(session_id, me, MessageKind::Chat, "x".into(), vec![], 0)
+            .send(
+                session_id,
+                me,
+                MessageKind::Chat,
+                "x".into(),
+                vec![],
+                Authoring::Local,
+            )
             .await
             .unwrap_err();
         // Without the iroh feature the registry surfaces NotHost
@@ -1813,15 +2289,36 @@ mod tests {
         let (id, _) = r.host(host.clone(), None).await.unwrap();
 
         let s1 = r
-            .send(id, host.clone(), MessageKind::Chat, "1".into(), vec![], 0)
+            .send(
+                id,
+                host.clone(),
+                MessageKind::Chat,
+                "1".into(),
+                vec![],
+                Authoring::Local,
+            )
             .await
             .unwrap();
         let _s2 = r
-            .send(id, host.clone(), MessageKind::Chat, "2".into(), vec![], 0)
+            .send(
+                id,
+                host.clone(),
+                MessageKind::Chat,
+                "2".into(),
+                vec![],
+                Authoring::Local,
+            )
             .await
             .unwrap();
         let _s3 = r
-            .send(id, host, MessageKind::Chat, "3".into(), vec![], 0)
+            .send(
+                id,
+                host,
+                MessageKind::Chat,
+                "3".into(),
+                vec![],
+                Authoring::Local,
+            )
             .await
             .unwrap();
 

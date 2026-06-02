@@ -456,7 +456,7 @@ fn load_one(dir: &Path) -> io::Result<SessionRecord> {
             ),
         ));
     }
-    let log = read_log(&dir.join(LOG_FILE))?;
+    let log = read_log(&dir.join(LOG_FILE), id)?;
     Ok(SessionRecord {
         id,
         host: meta.host,
@@ -648,11 +648,20 @@ fn append_log(path: &Path, message: &SessionMessage) -> io::Result<()> {
     Ok(())
 }
 
-/// Read every complete frame in `path`. A trailing partial frame
-/// (length prefix not fully present, length prefix says N bytes but
-/// fewer follow, or postcard parse fails) is logged and the file is
-/// truncated to the last good byte.
-fn read_log(path: &Path) -> io::Result<Vec<SessionMessage>> {
+/// Read every complete frame in `path`, verifying each frame's
+/// signature against `session_id` before returning it. A trailing
+/// partial frame (length prefix not fully present, length prefix
+/// says N bytes but fewer follow, or postcard parse fails) is logged
+/// and the file is truncated to the last good byte.
+///
+/// Frames whose signature does not verify are dropped with a `warn`
+/// and **not** appended to the returned vec. The on-disk log is
+/// **not** truncated mid-file: the surrounding good frames stay,
+/// leaving a non-contiguous `seq` gap. That is intentional — the
+/// receiver has no truth for the missing seq, and a future
+/// `Replay { since: head }` can fill it. Truncating-on-bad-frame
+/// would amputate every valid frame after a single tampered one.
+fn read_log(path: &Path, session_id: SessionId) -> io::Result<Vec<SessionMessage>> {
     let mut f = match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -711,7 +720,26 @@ fn read_log(path: &Path) -> io::Result<Vec<SessionMessage>> {
 
         match postcard::from_bytes::<SessionMessage>(&buf) {
             Ok(msg) => {
-                out.push(msg);
+                // Verify the frame's signature before including it.
+                // A bad signature (tampered payload, sentinel from a
+                // pre-Slice-B daemon, or a host that lied) drops the
+                // frame: skip-and-continue, leaving a seq hole. We
+                // do NOT truncate — a bad frame in the middle of a
+                // long log shouldn't sever every good frame after
+                // it.
+                if let Err(err) =
+                    artel_protocol::signing::verify_message(session_id, &msg, &msg.signature)
+                {
+                    warn!(
+                        file = %path.display(),
+                        seq = ?msg.seq,
+                        peer = %msg.peer.id,
+                        ?err,
+                        "dropping log frame: signature verify failed",
+                    );
+                } else {
+                    out.push(msg);
+                }
                 last_good = f.stream_position()?;
             }
             Err(err) => {
@@ -841,27 +869,69 @@ mod tests {
 
     use super::*;
 
+    /// Deterministic ed25519 signing key derived from `seed`. The
+    /// public key (i.e. the `PeerId` we advertise) is whatever
+    /// dalek's `SigningKey::from_bytes` produces; tests that need
+    /// to know the resulting `PeerId` go through [`peer_for_seed`].
+    fn signing_key_for_seed(seed: u8) -> artel_protocol::signing::SigningKey {
+        artel_protocol::signing::SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn peer_for_seed(seed: u8, name: &str) -> PeerInfo {
+        let signing = signing_key_for_seed(seed);
+        let pk = signing.verifying_key();
+        PeerInfo::new(PeerId::from_bytes(pk.to_bytes()), name)
+    }
+
     fn record(id_byte: u8) -> SessionRecord {
+        let host = peer_for_seed(id_byte, "host").id;
         SessionRecord {
             id: SessionId::from_bytes([id_byte; 16]),
-            host: PeerId::from_bytes([id_byte; 32]),
-            members: HashSet::from([PeerId::from_bytes([id_byte; 32])]),
+            host,
+            members: HashSet::from([host]),
             head: Seq::ZERO,
             log: Vec::new(),
             kind: SessionKind::Local,
         }
     }
 
-    fn message(seq: u64) -> SessionMessage {
+    /// Build a `SessionMessage` with a real signature against
+    /// `session_id`. Authoring peer is `peer_for_seed(1, "alice")`
+    /// — that pubkey is the body's `peer.id`, and the matching
+    /// `signing_key_for_seed(1)` produces the signature.
+    fn message_for(session_id: SessionId, seq: u64) -> SessionMessage {
+        let signing = signing_key_for_seed(1);
+        let peer = peer_for_seed(1, "alice");
+        let kind = MessageKind::Chat;
+        let action = "x";
+        let payload = vec![0xab; 8];
+        let timestamp_ms = seq;
+        let signature = artel_protocol::signing::sign_body(
+            &signing,
+            session_id,
+            artel_protocol::message::MESSAGE_FORMAT,
+            timestamp_ms,
+            &peer,
+            kind,
+            action,
+            &payload,
+        );
         SessionMessage::new(
             Seq::new(seq),
-            seq,
-            PeerInfo::new(PeerId::from_bytes([1; 32]), "alice"),
-            MessageKind::Chat,
-            "x",
-            vec![0xab; 8],
-            artel_protocol::message::SIGNATURE_UNSIGNED,
+            timestamp_ms,
+            peer,
+            kind,
+            action,
+            payload,
+            signature,
         )
+    }
+
+    /// Convenience for the legacy `message(seq)` test fixtures that
+    /// didn't take a session id; uses session id `[id_byte=1; 16]`
+    /// so it pairs with `record(1)` by default.
+    fn message(seq: u64) -> SessionMessage {
+        message_for(SessionId::from_bytes([1; 16]), seq)
     }
 
     #[tokio::test]
@@ -978,6 +1048,94 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(loaded[0].log, loaded_again[0].log);
+    }
+
+    #[tokio::test]
+    async fn read_log_drops_tampered_frame_and_keeps_surrounding() {
+        // Three valid frames; corrupt the middle frame's payload
+        // byte so postcard still decodes (we keep the
+        // length+postcard prefix intact and only flip a payload
+        // byte). Verify rejects, the surrounding two pass.
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+        for seq in 1..=3u64 {
+            store.append(record(1).id, &message(seq)).await.unwrap();
+        }
+
+        // Tamper byte-by-byte on disk. We need the postcard prefix
+        // to stay structurally valid, so we'll flip a single byte
+        // in the middle of the second frame's payload. Easiest
+        // approach: read the whole log, decode each frame, find
+        // the second frame's start, flip one byte inside its
+        // payload region, and write the buffer back.
+        let log_path = dir.path().join(record(1).id.to_string()).join(LOG_FILE);
+        let mut bytes = std::fs::read(&log_path).unwrap();
+        // Frame 1: 4 length-prefix bytes + len_1 payload bytes.
+        let len1 = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
+        let frame2_start = 4 + len1;
+        let len2 =
+            u32::from_be_bytes(bytes[frame2_start..frame2_start + 4].try_into().unwrap()) as usize;
+        // Flip a byte well inside frame 2's payload — picking the
+        // last byte avoids the postcard variant tags at the start.
+        let target = frame2_start + 4 + len2 - 1;
+        bytes[target] ^= 0xff;
+        std::fs::write(&log_path, &bytes).unwrap();
+
+        let loaded = FsLogStore::open(dir.path())
+            .unwrap()
+            .load_all()
+            .await
+            .unwrap();
+        assert_eq!(loaded.len(), 1);
+        // Two messages remain: seq 1 and seq 3. seq 2's hole is on
+        // purpose — the receiver has no truth for it.
+        let seqs: Vec<_> = loaded[0].log.iter().map(|m| m.seq).collect();
+        assert_eq!(seqs, vec![Seq::new(1), Seq::new(3)]);
+        // The on-disk file is NOT truncated — we left frame 3 on
+        // disk too.
+        let on_disk_size = std::fs::metadata(&log_path).unwrap().len();
+        assert_eq!(
+            on_disk_size,
+            bytes.len() as u64,
+            "tampered-frame skip must not truncate the log",
+        );
+    }
+
+    #[tokio::test]
+    async fn read_log_drops_unsigned_sentinel() {
+        // A frame with `SIGNATURE_UNSIGNED` (a pre-Slice-B daemon's
+        // wire shape, or a buggy/malicious peer that ships the
+        // sentinel) is dropped on load.
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+
+        // Hand-write a frame with the sentinel signature. Bypass
+        // the normal `append` path so we can plant the unsigned
+        // body without going through `Authoring::Local`.
+        let unsigned = SessionMessage::new(
+            Seq::new(1),
+            42,
+            peer_for_seed(1, "alice"),
+            MessageKind::Chat,
+            "x",
+            vec![0xab; 8],
+            artel_protocol::message::SIGNATURE_UNSIGNED,
+        );
+        let log_path = dir.path().join(record(1).id.to_string()).join(LOG_FILE);
+        append_log(&log_path, &unsigned).unwrap();
+
+        let loaded = FsLogStore::open(dir.path())
+            .unwrap()
+            .load_all()
+            .await
+            .unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(
+            loaded[0].log.is_empty(),
+            "unsigned-sentinel frame must be dropped",
+        );
     }
 
     #[tokio::test]

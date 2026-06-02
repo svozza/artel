@@ -50,6 +50,14 @@ pub enum ProtocolError {
     #[error("session id {0} already exists with a different host or kind")]
     SessionConflict(SessionId),
 
+    /// A per-message ed25519 signature failed to verify (or was the
+    /// unsigned sentinel). The wrapped string is the diagnostic
+    /// reason — it names the failure mode (sentinel / bad key / bad
+    /// sig) but never leaks bytes that would help an attacker tune.
+    /// See `crate::signing::VerifyError` and Auth Slice B2.
+    #[error("signature rejected: {0}")]
+    Signature(String),
+
     /// Catch-all for daemon-side failures the client cannot otherwise
     /// distinguish. The string is for diagnostics only.
     #[error("internal daemon error: {0}")]
@@ -69,6 +77,7 @@ impl ProtocolError {
             Self::NotReady => "not_ready",
             Self::NotHost => "not_host",
             Self::SessionConflict(_) => "session_conflict",
+            Self::Signature(_) => "signature",
             Self::Internal(_) => "internal",
         }
     }
@@ -111,6 +120,10 @@ mod tests {
             ProtocolError::SessionConflict(sample_session()).slug(),
             "session_conflict"
         );
+        assert_eq!(
+            ProtocolError::Signature("bad sig".into()).slug(),
+            "signature"
+        );
         assert_eq!(ProtocolError::Internal("x".into()).slug(), "internal");
     }
 
@@ -124,6 +137,7 @@ mod tests {
             ProtocolError::NotReady,
             ProtocolError::NotHost,
             ProtocolError::SessionConflict(s),
+            ProtocolError::Signature("zero sentinel".into()),
             ProtocolError::Internal("disk full".into()),
         ];
         for c in cases {
@@ -183,6 +197,7 @@ mod tests {
             Just(ProtocolError::NotHost),
             any::<[u8; 16]>()
                 .prop_map(|b| ProtocolError::SessionConflict(SessionId::from_bytes(b))),
+            "[\\PC]{0,64}".prop_map(ProtocolError::Signature),
             "[\\PC]{0,64}".prop_map(ProtocolError::Internal),
         ]
     }

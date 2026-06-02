@@ -44,7 +44,8 @@
 //! layout avoids both that and any future postcard-encoding tweak
 //! breaking existing signatures.
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
+pub use ed25519_dalek::{SigningKey, VerifyingKey as EdVerifyingKey};
 
 use crate::ids::SessionId;
 use crate::message::{

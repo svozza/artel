@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use artel_protocol::transport::{self, Framed, server::Listener};
 use artel_protocol::{
@@ -272,6 +272,7 @@ impl Daemon {
             iroh.addr_hint.clone(),
             Arc::clone(&iroh.tracked_peer_ids),
             iroh.endpoint.id(),
+            iroh.signing_key(),
         ));
 
         let store: crate::store::DynStore = Arc::new(
@@ -608,7 +609,14 @@ async fn dispatch(
                 };
             };
             match registry
-                .send(session, peer, kind, action, payload, now_ms())
+                .send(
+                    session,
+                    peer,
+                    kind,
+                    action,
+                    payload,
+                    crate::session::Authoring::Local,
+                )
                 .await
             {
                 Ok(message) => Response::Sent {
@@ -933,16 +941,6 @@ fn iroh_endpoint_to_wire(addr: &iroh::EndpointAddr) -> artel_protocol::WireEndpo
     }
 }
 
-/// Wall-clock milliseconds since the Unix epoch. Used for stamping
-/// outgoing [`SessionMessage`]s. Returns 0 if the clock is before the
-/// epoch (impossible on a sanely-configured machine, but we don't
-/// panic).
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-}
-
 /// Spawn a task that forwards events from `sub.events` as
 /// [`WireMessage::Event`] frames into `sink`. Backfills `sub.replay`
 /// first.
@@ -1019,6 +1017,9 @@ fn session_error_to_protocol(err: &SessionError) -> ProtocolError {
         // sees the actual reason (e.g., UnknownSession after a
         // session close) instead of a generic Internal.
         SessionError::HostRejected(err) => err.clone(),
+        SessionError::SignatureRejected { peer_id, reason } => {
+            ProtocolError::Signature(format!("{peer_id}: {reason}"))
+        }
     }
 }
 
