@@ -29,12 +29,20 @@ use std::net::SocketAddr;
 use data_encoding::BASE32_NOPAD;
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{PeerId, SessionId};
+use crate::ids::{PeerId, SessionId, TicketId};
 
 /// Current ticket envelope version. Incremented when the structure
 /// of the [`Wire`] payload changes in a way old daemons can't
 /// understand.
-pub const TICKET_VERSION: u8 = 2;
+///
+/// Bumped to `3` on 2026-06-03 when [`SessionTicket::ticket_id`] joined
+/// the wire form (Auth Slice C / L2). The cap-log root of trust is the
+/// originator's first grant; the joiner verifies it against the
+/// originator pubkey, which in today's star topology *is*
+/// [`SessionTicket::host_peer_id`] — so no new pubkey field is needed,
+/// only the `ticket_id` (which names the ticket for a future revocation
+/// layer).
+pub const TICKET_VERSION: u8 = 3;
 
 /// Prefix shared by every well-formed ticket. Distinguishes artel
 /// tickets from raw base32 input and makes obsolete `artel-local:`
@@ -44,6 +52,10 @@ pub const TICKET_PREFIX: &str = "artel:";
 /// Decoded form of an artel join ticket.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionTicket {
+    /// Unique id naming this issued ticket. Carried for a future
+    /// revocation layer (Auth Slice C); *carried* but not *enforced* in
+    /// v1. See [`TicketId`].
+    pub ticket_id: TicketId,
     /// The host session's id. Joiners use this to identify which
     /// session they're joining.
     pub session_id: SessionId,
@@ -118,6 +130,7 @@ pub enum TicketError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Wire {
     version: u8,
+    ticket_id: TicketId,
     session_id: SessionId,
     host_peer_id: PeerId,
     host_addr: WireEndpointAddr,
@@ -128,6 +141,7 @@ struct Wire {
 pub fn encode(ticket: &SessionTicket) -> String {
     let wire = Wire {
         version: TICKET_VERSION,
+        ticket_id: ticket.ticket_id,
         session_id: ticket.session_id,
         host_peer_id: ticket.host_peer_id,
         host_addr: ticket.host_addr.clone(),
@@ -161,6 +175,7 @@ pub fn decode(raw: &str) -> Result<SessionTicket, TicketError> {
         ));
     }
     Ok(SessionTicket {
+        ticket_id: wire.ticket_id,
         session_id: wire.session_id,
         host_peer_id: wire.host_peer_id,
         host_addr: wire.host_addr,
@@ -177,6 +192,7 @@ mod tests {
     fn sample() -> SessionTicket {
         let peer = PeerId::from_bytes([0x42; 32]);
         SessionTicket {
+            ticket_id: TicketId::from_bytes([0x01; 16]),
             session_id: SessionId::from_bytes([0xab; 16]),
             host_peer_id: peer,
             host_addr: WireEndpointAddr::id_only(peer),
@@ -189,6 +205,7 @@ mod tests {
         addrs.insert("127.0.0.1:7777".parse().unwrap());
         addrs.insert("[::1]:7778".parse().unwrap());
         SessionTicket {
+            ticket_id: TicketId::from_bytes([0x02; 16]),
             session_id: SessionId::from_bytes([0xcd; 16]),
             host_peer_id: peer,
             host_addr: WireEndpointAddr {
@@ -277,6 +294,7 @@ mod tests {
         let peer = PeerId::from_bytes([0; 32]);
         let bogus = Wire {
             version: 0xff,
+            ticket_id: TicketId::from_bytes([0; 16]),
             session_id: SessionId::from_bytes([0; 16]),
             host_peer_id: peer,
             host_addr: WireEndpointAddr::id_only(peer),
@@ -289,10 +307,12 @@ mod tests {
 
     #[test]
     fn host_peer_id_addr_mismatch_errors_as_malformed() {
-        // Hand-craft a v2 Wire whose host_addr.peer_id differs from
-        // the top-level host_peer_id and verify decode rejects it.
+        // Hand-craft a current-version Wire whose host_addr.peer_id
+        // differs from the top-level host_peer_id and verify decode
+        // rejects it.
         let bad = Wire {
             version: TICKET_VERSION,
+            ticket_id: TicketId::from_bytes([3; 16]),
             session_id: SessionId::from_bytes([1; 16]),
             host_peer_id: PeerId::from_bytes([0xaa; 32]),
             host_addr: WireEndpointAddr::id_only(PeerId::from_bytes([0xbb; 32])),
@@ -332,14 +352,54 @@ mod tests {
         assert_eq!(decoded, original);
     }
 
+    #[test]
+    fn ticket_version_is_three() {
+        assert_eq!(TICKET_VERSION, 3);
+    }
+
+    #[test]
+    fn ticket_id_survives_round_trip() {
+        // The new field must make the round trip intact, not just be
+        // defaulted away on decode.
+        let original = sample();
+        let decoded = decode(&encode(&original)).unwrap();
+        assert_eq!(decoded.ticket_id, original.ticket_id);
+        assert_eq!(decoded.ticket_id, TicketId::from_bytes([0x01; 16]));
+    }
+
+    #[test]
+    fn previous_version_byte_is_now_unsupported() {
+        // The version gate must reject the previous ticket version (2)
+        // now that the wire shape gained `ticket_id`. Hand-craft a Wire
+        // that is otherwise well-formed (current shape, so it
+        // deserializes) but stamps version 2 — decode parses it, then
+        // the version check fires. Mirrors
+        // `unknown_version_byte_errors_clearly` for the immediate
+        // predecessor rather than an arbitrary byte.
+        let peer = PeerId::from_bytes([0x55; 32]);
+        let prev = Wire {
+            version: 2,
+            ticket_id: TicketId::from_bytes([0x44; 16]),
+            session_id: SessionId::from_bytes([0x66; 16]),
+            host_peer_id: peer,
+            host_addr: WireEndpointAddr::id_only(peer),
+        };
+        let bytes = postcard::to_stdvec(&prev).unwrap();
+        let body = BASE32_NOPAD.encode(&bytes).to_ascii_lowercase();
+        let raw = format!("{TICKET_PREFIX}{body}");
+        assert_eq!(decode(&raw), Err(TicketError::UnsupportedVersion(2)));
+    }
+
     proptest! {
         #[test]
         fn round_trip_arb(
+            tid in any::<[u8; 16]>(),
             sid in any::<[u8; 16]>(),
             peer in any::<[u8; 32]>(),
         ) {
             let host_peer_id = PeerId::from_bytes(peer);
             let original = SessionTicket {
+                ticket_id: TicketId::from_bytes(tid),
                 session_id: SessionId::from_bytes(sid),
                 host_peer_id,
                 host_addr: WireEndpointAddr::id_only(host_peer_id),

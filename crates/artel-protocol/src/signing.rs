@@ -67,7 +67,9 @@ const fn kind_tag(kind: MessageKind) -> u8 {
         MessageKind::Chat => 0,
         MessageKind::Tool => 1,
         MessageKind::System => 2,
-        // 3 reserved for `MessageKind::Capability` (Slice C).
+        // Byte 3 was pre-reserved for this in Slice B so existing v3
+        // signatures stay valid once Slice C lands the variant.
+        MessageKind::Capability => 3,
     }
 }
 
@@ -579,6 +581,57 @@ mod tests {
         let sig = sign_body(&key, s, MESSAGE_FORMAT, ts, &peer, kind, action, payload);
         let m = body_matching(peer, ts, kind, action, payload, sig);
         verify_message(s, &m, &sig).unwrap();
+    }
+
+    #[test]
+    fn kind_tag_values_are_pinned() {
+        // The byte values are part of the signed bytes; changing one
+        // silently invalidates every existing signature of that kind.
+        // Pin all four — `Capability` fills the byte Slice B reserved.
+        assert_eq!(kind_tag(MessageKind::Chat), 0);
+        assert_eq!(kind_tag(MessageKind::Tool), 1);
+        assert_eq!(kind_tag(MessageKind::System), 2);
+        assert_eq!(kind_tag(MessageKind::Capability), 3);
+    }
+
+    #[test]
+    fn capability_body_sign_then_verify_round_trip() {
+        // A `Capability`-kind body signs and verifies through the exact
+        // same `sign_body`/`verify_message` path as every other kind —
+        // proving the pre-reserved byte-3 arm "just works" with no
+        // signing.rs change beyond filling the arm.
+        let key = key_a();
+        let peer = peer_for(&key);
+        let s = sample_session_id();
+        let (ts, kind, action, payload) = (
+            42u64,
+            MessageKind::Capability,
+            "capability.grant",
+            &b"some-postcard-action"[..],
+        );
+        let sig = sign_body(&key, s, MESSAGE_FORMAT, ts, &peer, kind, action, payload);
+        let m = body_matching(peer, ts, kind, action, payload, sig);
+        verify_message(s, &m, &sig).unwrap();
+    }
+
+    #[test]
+    fn preexisting_kind_signature_still_verifies_post_capability() {
+        // Regression guard for the "no MESSAGE_FORMAT bump" decision
+        // (brainstorm Q6): adding `MessageKind::Capability` must not
+        // perturb the canonical bytes of the three pre-existing kinds,
+        // so a signature produced for a Chat/Tool/System body still
+        // verifies after the variant lands. If `kind_tag` ever reorders
+        // the existing arms, this fails loudly.
+        let key = key_a();
+        let peer = peer_for(&key);
+        let s = sample_session_id();
+        for kind in [MessageKind::Chat, MessageKind::Tool, MessageKind::System] {
+            let (ts, action, payload) = (7u64, "x", &b"y"[..]);
+            let sig = sign_body(&key, s, MESSAGE_FORMAT, ts, &peer, kind, action, payload);
+            let m = body_matching(peer.clone(), ts, kind, action, payload, sig);
+            verify_message(s, &m, &sig)
+                .unwrap_or_else(|e| panic!("{kind:?} signature should still verify: {e:?}"));
+        }
     }
 
     #[test]

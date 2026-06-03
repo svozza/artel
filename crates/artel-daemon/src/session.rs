@@ -17,6 +17,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use artel_protocol::ids::TicketId;
 use artel_protocol::message::{MESSAGE_FORMAT, SIGNATURE_UNSIGNED, SigBytes};
 use artel_protocol::signing::{self, verify_reason};
 use artel_protocol::ticket::{self, SessionTicket, WireEndpointAddr};
@@ -447,6 +448,9 @@ impl Registry {
                     s.host_epoch
                 };
                 let ticket = JoinTicket::from(ticket::encode(&SessionTicket {
+                    // Carried for a future revocation layer; not enforced
+                    // in v1 (Auth Slice C). Minted fresh per issuance.
+                    ticket_id: TicketId::new_random(),
                     session_id: id,
                     host_peer_id: self.daemon_peer_id,
                     host_addr: self.daemon_addr.clone(),
@@ -488,6 +492,7 @@ impl Registry {
         // `Some(id)` whose entry doesn't exist locally yet.
         let session_id = requested_id.unwrap_or_else(SessionId::new_random);
         let ticket = JoinTicket::from(ticket::encode(&SessionTicket {
+            ticket_id: TicketId::new_random(),
             session_id,
             host_peer_id: self.daemon_peer_id,
             host_addr: self.daemon_addr.clone(),
@@ -1783,6 +1788,7 @@ mod tests {
         let bogus = SessionId::new_random();
         let host_peer_id = PeerId::from_bytes([0xff; 32]);
         let ticket = JoinTicket::from(ticket::encode(&SessionTicket {
+            ticket_id: TicketId::new_random(),
             session_id: bogus,
             host_peer_id,
             host_addr: WireEndpointAddr::id_only(host_peer_id),

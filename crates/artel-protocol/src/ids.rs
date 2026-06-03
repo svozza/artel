@@ -67,6 +67,65 @@ impl From<Uuid> for SessionId {
     }
 }
 
+/// Globally-unique identifier for an issued join ticket.
+///
+/// Backed by a v4 UUID, identical in shape to [`SessionId`]. Carried in
+/// the ticket wire form (Auth Slice C, `TICKET_VERSION` 3) so a future
+/// revocation layer can name a specific ticket. In v1 it is *carried* but
+/// never *enforced* — the field exists now so v2 needn't re-bump the
+/// ticket version. See `crate::ticket` and
+/// `docs/plans/2026-06-03-auth-slice-c-l2-capabilities-plan.md`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TicketId(Uuid);
+
+impl TicketId {
+    /// Generate a new random ticket id.
+    #[must_use]
+    pub fn new_random() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    /// Construct from raw bytes. The bytes are interpreted as a UUID; no
+    /// validation beyond UUID layout is performed.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(Uuid::from_bytes(bytes))
+    }
+
+    /// Return the underlying UUID bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        self.0.as_bytes()
+    }
+
+    /// The wrapped [`Uuid`].
+    #[must_use]
+    pub const fn as_uuid(&self) -> &Uuid {
+        &self.0
+    }
+}
+
+impl fmt::Display for TicketId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl FromStr for TicketId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(s).map(Self)
+    }
+}
+
+impl From<Uuid> for TicketId {
+    fn from(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+}
+
 /// Opaque 32-byte identifier for a peer.
 ///
 /// 32 bytes that ARE an `iroh::EndpointId` (an Ed25519 public key). The
@@ -316,6 +375,35 @@ mod tests {
         assert_eq!(json, format!("\"{}\"", s));
     }
 
+    // ---- TicketId ----
+
+    #[test]
+    fn ticket_id_random_unique() {
+        let a = TicketId::new_random();
+        let b = TicketId::new_random();
+        assert_ne!(a, b, "v4 collision is astronomically unlikely");
+    }
+
+    #[test]
+    fn ticket_id_display_parses_back() {
+        let t = TicketId::new_random();
+        let parsed: TicketId = t.to_string().parse().unwrap();
+        assert_eq!(t, parsed);
+    }
+
+    #[test]
+    fn ticket_id_json_is_transparent_uuid() {
+        let t = TicketId::from_bytes([7; 16]);
+        let json = serde_json::to_string(&t).unwrap();
+        assert_eq!(json, format!("\"{}\"", t));
+    }
+
+    #[test]
+    fn ticket_id_from_bytes_round_trips() {
+        let t = TicketId::from_bytes([0xab; 16]);
+        assert_eq!(t.as_bytes(), &[0xab; 16]);
+    }
+
     // ---- PeerId ----
 
     #[test]
@@ -394,6 +482,22 @@ mod tests {
             let v = serde_json::to_string(&s).unwrap();
             let back: SessionId = serde_json::from_str(&v).unwrap();
             prop_assert_eq!(s, back);
+        }
+
+        #[test]
+        fn ticket_id_postcard_round_trip(bytes in any::<[u8; 16]>()) {
+            let t = TicketId::from_bytes(bytes);
+            let v = postcard::to_allocvec(&t).unwrap();
+            let back: TicketId = postcard::from_bytes(&v).unwrap();
+            prop_assert_eq!(t, back);
+        }
+
+        #[test]
+        fn ticket_id_json_round_trip(bytes in any::<[u8; 16]>()) {
+            let t = TicketId::from_bytes(bytes);
+            let v = serde_json::to_string(&t).unwrap();
+            let back: TicketId = serde_json::from_str(&v).unwrap();
+            prop_assert_eq!(t, back);
         }
 
         #[test]

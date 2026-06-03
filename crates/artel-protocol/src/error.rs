@@ -58,6 +58,16 @@ pub enum ProtocolError {
     #[error("signature rejected: {0}")]
     Signature(String),
 
+    /// A capability check failed: either the payload was a malformed
+    /// [`crate::capability::CapabilityAction`], or the author lacked the
+    /// `ReadWrite` capability required to author the message at its seq
+    /// (Auth Slice C / L2). The wrapped string is the diagnostic reason;
+    /// it names the failure but never leaks payload or signature bytes.
+    /// See `crate::capability` and the host-side `Registry::send`
+    /// rejection path.
+    #[error("capability denied: {0}")]
+    Capability(String),
+
     /// Catch-all for daemon-side failures the client cannot otherwise
     /// distinguish. The string is for diagnostics only.
     #[error("internal daemon error: {0}")]
@@ -78,6 +88,7 @@ impl ProtocolError {
             Self::NotHost => "not_host",
             Self::SessionConflict(_) => "session_conflict",
             Self::Signature(_) => "signature",
+            Self::Capability(_) => "capability",
             Self::Internal(_) => "internal",
         }
     }
@@ -124,6 +135,10 @@ mod tests {
             ProtocolError::Signature("bad sig".into()).slug(),
             "signature"
         );
+        assert_eq!(
+            ProtocolError::Capability("read only".into()).slug(),
+            "capability"
+        );
         assert_eq!(ProtocolError::Internal("x".into()).slug(), "internal");
     }
 
@@ -138,6 +153,7 @@ mod tests {
             ProtocolError::NotHost,
             ProtocolError::SessionConflict(s),
             ProtocolError::Signature("zero sentinel".into()),
+            ProtocolError::Capability("had Read, needs ReadWrite".into()),
             ProtocolError::Internal("disk full".into()),
         ];
         for c in cases {
@@ -198,6 +214,7 @@ mod tests {
             any::<[u8; 16]>()
                 .prop_map(|b| ProtocolError::SessionConflict(SessionId::from_bytes(b))),
             "[\\PC]{0,64}".prop_map(ProtocolError::Signature),
+            "[\\PC]{0,64}".prop_map(ProtocolError::Capability),
             "[\\PC]{0,64}".prop_map(ProtocolError::Internal),
         ]
     }

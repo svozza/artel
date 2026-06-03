@@ -101,6 +101,13 @@ pub enum MessageKind {
     Tool,
     /// Session-control or metadata events from the application layer.
     System,
+    /// Capability grant/revoke event (Auth Slice C / L2). Unlike the
+    /// other kinds, the daemon *does* project these into a per-session
+    /// capability set — but it still never dispatches on
+    /// [`SessionMessage::action`]; the authoritative verb is the
+    /// `crate::capability::CapabilityAction` postcard-encoded into the
+    /// payload. See `docs/plans/2026-06-03-auth-slice-c-l2-capabilities-plan.md`.
+    Capability,
 }
 
 /// One ordered message in a session log.
@@ -362,6 +369,8 @@ mod tests {
         assert_eq!(json, "\"tool\"");
         let json = serde_json::to_string(&MessageKind::System).unwrap();
         assert_eq!(json, "\"system\"");
+        let json = serde_json::to_string(&MessageKind::Capability).unwrap();
+        assert_eq!(json, "\"capability\"");
     }
 
     #[test]
@@ -588,6 +597,7 @@ mod tests {
             Just(MessageKind::Chat),
             Just(MessageKind::Tool),
             Just(MessageKind::System),
+            Just(MessageKind::Capability),
         ]) {
             let bytes = postcard::to_allocvec(&k).unwrap();
             let back: MessageKind = postcard::from_bytes(&bytes).unwrap();
@@ -612,7 +622,7 @@ mod tests {
             timestamp_ms in any::<u64>(),
             peer_id in any::<[u8; 32]>(),
             display_name in "[\\PC]{0,32}",
-            kind_idx in 0u8..3,
+            kind_idx in 0u8..4,
             action in "[\\PC]{0,64}",
             payload in proptest::collection::vec(any::<u8>(), 0..512),
             signature in any::<[u8; 64]>(),
@@ -621,7 +631,8 @@ mod tests {
             let kind = match kind_idx {
                 0 => MessageKind::Chat,
                 1 => MessageKind::Tool,
-                _ => MessageKind::System,
+                2 => MessageKind::System,
+                _ => MessageKind::Capability,
             };
             let m = SessionMessage {
                 version: MessageFormat::new(version),
@@ -645,7 +656,7 @@ mod tests {
             timestamp_ms in any::<u64>(),
             peer_id in any::<[u8; 32]>(),
             display_name in "[\\PC]{0,32}",
-            kind_idx in 0u8..3,
+            kind_idx in 0u8..4,
             action in "[\\PC]{0,64}",
             payload in proptest::collection::vec(any::<u8>(), 0..256),
             signature in any::<[u8; 64]>(),
@@ -654,7 +665,8 @@ mod tests {
             let kind = match kind_idx {
                 0 => MessageKind::Chat,
                 1 => MessageKind::Tool,
-                _ => MessageKind::System,
+                2 => MessageKind::System,
+                _ => MessageKind::Capability,
             };
             let m = SessionMessage::new(
                 Seq::new(seq),

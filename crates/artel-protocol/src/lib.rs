@@ -24,6 +24,7 @@
 //! - [`MessageFormat`] / [`MESSAGE_FORMAT`] — the per-message envelope
 //!   version stamped on every [`SessionMessage`].
 
+pub mod capability;
 pub mod error;
 pub mod gossip;
 pub mod ids;
@@ -36,8 +37,9 @@ pub mod ticket;
 pub mod transport;
 pub mod version;
 
+pub use capability::{ACTION_GRANT, ACTION_REVOKE, Capability, CapabilityAction};
 pub use error::ProtocolError;
-pub use ids::{PeerId, Seq, SessionId};
+pub use ids::{PeerId, Seq, SessionId, TicketId};
 pub use message::{
     MESSAGE_FORMAT, MessageFormat, MessageKind, PeerInfo, SIGNATURE_UNSIGNED, SessionMessage,
     SigBytes,
