@@ -1,7 +1,7 @@
 ---
 date: 2026-06-02
 topic: control-frame-auth-slice-b5
-status: DECIDED — brainstorm output, ready for /workflows:plan
+status: SHIPPED — see status footer; plan at docs/plans/2026-06-03-auth-slice-b5-control-frame-auth-plan.md
 supersedes-seed: docs/brainstorms/2026-06-02-control-frame-auth-and-replay-brainstorm.md
 ---
 
@@ -203,3 +203,33 @@ So the epoch mechanism stays tightly scoped to one frame.
 
 → `/workflows:plan` Slice B.5. Resolve the D3 epoch-distribution
 mechanism first — it's the only load-bearing detail left.
+
+---
+
+## Status (2026-06-03): PLANNED → SHIPPED
+
+Planned in `docs/plans/2026-06-03-auth-slice-b5-control-frame-auth-plan.md`
+and implemented across B5.1 (protocol crate) → B5.2 (host signing +
+epoch) → B5.3 (joiner verification + enforcement + migration).
+
+**D3 resolved to a signed `EpochBeacon`**, not the unsigned per-frame
+advisory epoch this brainstorm's open question (a) floated. A plan
+review caught that an advisory (unsigned-scope) epoch on
+`Message`/`SendAck` is a correctness bug: an attacker holding a genuine
+`(seq, author_sig, host_sig)` tuple could replay it on an unseen seq
+with the advisory epoch tampered huge — it passes `verify_seq` and
+dedup, so the watermark jumps and the real host's later `SessionClosed`
+is dropped forever (the defense becomes a DoS suppressing *real*
+closes). The fix: a dedicated **signed** `EpochBeacon { host_epoch,
+host_sig }` over the same `"artel/ctrl-v1"` bytes as `SessionClosed`,
+broadcast on every host resume. It is the **only** frame that advances
+the joiner's `host_epoch` watermark, and only on a host-signed value —
+so the watermark can't be poisoned. `Message`/`SendAck` carry no epoch.
+
+**Accepted residual:** the resume beacon is lost AND an attacker
+replays a captured epoch-N close before any later beacon/activity
+reaches the joiner. Bounded (effect = a re-joinable mirror delete);
+tightenable later via beacon retry or epoch-in-`"artel/seq-v1"`-scope.
+
+Version stamps: `PROTOCOL_VERSION` 5→6, `MESSAGE_FORMAT` 2→3, `Meta`
+2→3. The gossip-frame version byte (D4) shipped as part of the cutover.

@@ -438,20 +438,19 @@ impl Registry {
                 // `SessionClosed` signed at the old epoch is rejected
                 // against a joiner whose beacon-advanced watermark has
                 // moved past it. A fresh create (below) leaves epoch 0.
-                let (host_epoch, ticket) = {
+                let host_epoch = {
                     let mut s = arc.lock().await;
                     if s.host != host_peer.id || s.kind != SessionKind::Local {
                         return Err(SessionError::SessionConflict(id));
                     }
                     s.host_epoch = s.host_epoch.saturating_add(1);
-                    let host_epoch = s.host_epoch;
-                    let ticket = JoinTicket::from(ticket::encode(&SessionTicket {
-                        session_id: id,
-                        host_peer_id: self.daemon_peer_id,
-                        host_addr: self.daemon_addr.clone(),
-                    }));
-                    (host_epoch, ticket)
+                    s.host_epoch
                 };
+                let ticket = JoinTicket::from(ticket::encode(&SessionTicket {
+                    session_id: id,
+                    host_peer_id: self.daemon_peer_id,
+                    host_addr: self.daemon_addr.clone(),
+                }));
                 // Persist the bumped epoch (targeted write — no full
                 // record rewrite). On store failure, surface it: a
                 // resume that can't durably record its new epoch would
@@ -657,6 +656,14 @@ impl Registry {
                 .create(&session_obj.record())
                 .await
                 .map_err(SessionError::Storage)?;
+            // Seed the host-epoch watermark from the persisted mirror
+            // (0 for a fresh join). The bridge's EpochBeacon arm
+            // advances this AtomicU64 on each host-signed beacon and
+            // persists the advance via `advance_host_epoch_watermark`;
+            // the SessionClosed arm reads it to gate replayed closes.
+            let host_epoch_watermark =
+                Arc::new(std::sync::atomic::AtomicU64::new(session_obj.host_epoch));
+
             let arc = Arc::new(Mutex::new(session_obj));
             self.sessions
                 .write()
@@ -686,67 +693,7 @@ impl Registry {
                 // ever matters we can replace with a per-session
                 // mpsc.
                 tokio::spawn(async move {
-                    let mut s = mirror.lock().await;
-                    // Dedup BEFORE verifying. iroh-gossip delivers a
-                    // frame at-least-once (mesh redundancy) and the
-                    // host re-broadcasts the whole log on `Replay`, so
-                    // duplicate seqs are routine. The signature check
-                    // is an ed25519 scalar-mult; running it on a frame
-                    // we already hold is wasted crypto. We still verify
-                    // every *new* frame below, before it touches disk
-                    // or the in-memory log.
-                    let pos = s.log.partition_point(|m| m.seq < msg.seq);
-                    if pos < s.log.len() && s.log[pos].seq == msg.seq {
-                        // Duplicate seq; drop quietly. Already on
-                        // disk from the first delivery.
-                        return;
-                    }
-                    // Verify the body's signature against its claimed
-                    // peer.id before any state mutation. A tampered
-                    // `Message` (or one whose host vouched
-                    // dishonestly) drops here with a warn and never
-                    // touches the mirror's log. seq is excluded from
-                    // the signed scope so the host's stamp doesn't
-                    // matter; we verify the joiner's authorship
-                    // directly.
-                    if let Err(err) = signing::verify_message(session_for_log, &msg, &msg.signature)
-                    {
-                        tracing::warn!(
-                            session = ?session_for_log,
-                            seq = ?msg.seq,
-                            peer = %msg.peer.id,
-                            ?err,
-                            "dropping inbound Message: signature verify failed",
-                        );
-                        return;
-                    }
-                    // Persist BEFORE mutating in-memory state so a
-                    // crash mid-callback doesn't leave the mirror's
-                    // in-memory log ahead of disk.
-                    //
-                    // Persist while holding the lock so a concurrent
-                    // remote-mirror cascade (`leave` of the joiner)
-                    // can't race us. Failure: log, drop the message;
-                    // the host will re-broadcast on Replay if the
-                    // joiner asks again, and the in-memory state stays
-                    // consistent with disk.
-                    if let Err(err) = store.append(session_for_log, &msg).await {
-                        tracing::warn!(
-                            session = ?session_for_log,
-                            seq = ?msg.seq,
-                            error = %err,
-                            "remote-mirror log persist failed; dropping message",
-                        );
-                        return;
-                    }
-                    s.log.insert(pos, msg.clone());
-                    if msg.seq > s.head {
-                        s.head = msg.seq;
-                    }
-                    let _ = s.events_tx.send(Event::Message {
-                        session: session_for_log,
-                        message: msg,
-                    });
+                    apply_inbound_mirror_message(&store, &mirror, session_for_log, msg).await;
                 });
             };
 
@@ -767,6 +714,7 @@ impl Registry {
                     joiner.clone(),
                     *host_peer_id,
                     host_addr,
+                    host_epoch_watermark,
                     on_message,
                 )
                 .await
@@ -1008,6 +956,45 @@ impl Registry {
         Ok(())
     }
 
+    /// Persist a beacon-advanced `host_epoch` watermark on a `Remote`
+    /// mirror record (Auth Slice B.5.3). Called from the bridge's
+    /// `EpochBeacon` arm after a host-signed beacon advances the
+    /// in-memory `AtomicU64` watermark, so the watermark survives a
+    /// daemon restart and keeps gating replayed closes. Monotonic: only
+    /// writes when `host_epoch` exceeds the stored value. A no-op for
+    /// an unknown or non-`Remote` session.
+    #[cfg(feature = "iroh")]
+    pub(crate) async fn advance_host_epoch_watermark(
+        &self,
+        session: SessionId,
+        host_epoch: u64,
+    ) -> Result<(), SessionError> {
+        let session_arc = {
+            let guard = self.sessions.read().await;
+            guard.get(&session).cloned()
+        };
+        let Some(session_arc) = session_arc else {
+            return Ok(());
+        };
+        // Advance the in-memory watermark under the lock, then release
+        // it before the (monotonic, idempotent) store write. A
+        // concurrent advance is harmless: both write a value >= what
+        // they read, and `bump_host_epoch` is a last-writer-wins
+        // targeted set.
+        {
+            let mut s = session_arc.lock().await;
+            if s.kind != SessionKind::Remote || host_epoch <= s.host_epoch {
+                return Ok(());
+            }
+            s.host_epoch = host_epoch;
+        }
+        self.store
+            .bump_host_epoch(session, host_epoch)
+            .await
+            .map_err(SessionError::Storage)?;
+        Ok(())
+    }
+
     /// Append a message to a session. Returns the freshly-built
     /// [`SessionMessage`] (with its host-assigned `seq`). Also
     /// broadcasts an [`Event::Message`] to local IPC subscribers and
@@ -1215,11 +1202,9 @@ impl Registry {
     fn sign_seq_for(&self, session: SessionId, seq: Seq, author_sig: &SigBytes) -> SigBytes {
         #[cfg(feature = "iroh")]
         {
-            self.signing_key
-                .as_ref()
-                .map_or(SIGNATURE_UNSIGNED, |key| {
-                    signing::sign_seq(key.as_signing_key(), session, seq, author_sig)
-                })
+            self.signing_key.as_ref().map_or(SIGNATURE_UNSIGNED, |key| {
+                signing::sign_seq(key.as_signing_key(), session, seq, author_sig)
+            })
         }
         #[cfg(not(feature = "iroh"))]
         {
@@ -1435,6 +1420,101 @@ fn parse_ticket(ticket: &JoinTicket) -> Result<SessionTicket, SessionError> {
         tracing::debug!(?err, "ticket decode failed");
         SessionError::InvalidTicket
     })
+}
+
+/// Apply an inbound `Message` to a `Remote` mirror, with the full
+/// joiner-side acceptance pipeline (Auth Slice B.5.3): **dedup →
+/// author signature → host sequencing signature → persist → emit**.
+///
+/// Extracted from `materialise_remote_session`'s `on_message` closure
+/// so the ordering invariant is unit-testable without a live gossip
+/// bridge. The order is load-bearing:
+/// - **Dedup first** so routine at-least-once / replay-backfill
+///   duplicates don't re-pay ed25519 (review-fix #5).
+/// - **Author sig** (`verify_message`) against the body's `peer.id`.
+/// - **Host seq-sig** (`verify_seq`) against `s.host` (= the ticket's
+///   `host_peer_id`), binding *this seq* to *this author sig* — so a
+///   genuine frame replayed under a different seq (finding #1) drops.
+///
+/// **No watermark interaction here** — the `host_epoch` watermark is
+/// moved only by the bridge's `EpochBeacon` arm. A genuine `Message`
+/// replayed on an unseen seq is dropped by `verify_seq` and never
+/// touches the watermark (`replayed_message_cannot_poison_watermark`).
+#[cfg(feature = "iroh")]
+async fn apply_inbound_mirror_message(
+    store: &DynStore,
+    mirror: &Arc<Mutex<Session>>,
+    session: SessionId,
+    msg: SessionMessage,
+) {
+    let mut s = mirror.lock().await;
+    // Dedup BEFORE verifying. iroh-gossip delivers a frame
+    // at-least-once (mesh redundancy) and the host re-broadcasts the
+    // whole log on `Replay`, so duplicate seqs are routine. The
+    // signature checks are ed25519 scalar-mults; running them on a
+    // frame we already hold is wasted crypto. We still verify every
+    // *new* frame below, before it touches disk or the in-memory log.
+    let pos = s.log.partition_point(|m| m.seq < msg.seq);
+    if pos < s.log.len() && s.log[pos].seq == msg.seq {
+        // Duplicate seq; drop quietly. Already on disk from the first
+        // delivery.
+        return;
+    }
+    // Verify the body's author signature against its claimed peer.id
+    // before any state mutation. A tampered `Message` drops here with
+    // a warn and never touches the mirror's log. seq is excluded from
+    // the author signed scope so the host's stamp doesn't matter for
+    // *this* check; we verify the joiner's authorship directly.
+    if let Err(err) = signing::verify_message(session, &msg, &msg.signature) {
+        tracing::warn!(
+            ?session,
+            seq = ?msg.seq,
+            peer = %msg.peer.id,
+            ?err,
+            "dropping inbound Message: signature verify failed",
+        );
+        return;
+    }
+    // Then verify the HOST's sequencing signature over `(session, seq,
+    // author_sig)` against the host pubkey (`s.host` = the ticket's
+    // host_peer_id). This binds *this seq* to *this body* under the
+    // host key, so a genuine frame replayed under a different seq
+    // (finding #1) is dropped — the captured host_sig is bound to the
+    // original seq.
+    if let Err(err) = signing::verify_seq(&s.host, session, msg.seq, &msg.signature, &msg.host_sig)
+    {
+        tracing::warn!(
+            ?session,
+            seq = ?msg.seq,
+            host = %s.host,
+            ?err,
+            "dropping inbound Message: host seq-sig verify failed",
+        );
+        return;
+    }
+    // Persist BEFORE mutating in-memory state so a crash mid-callback
+    // doesn't leave the mirror's in-memory log ahead of disk. Persist
+    // while holding the lock so a concurrent remote-mirror cascade
+    // (`leave` of the joiner) can't race us. Failure: log, drop the
+    // message; the host re-broadcasts on Replay if the joiner asks
+    // again, and the in-memory state stays consistent with disk.
+    if let Err(err) = store.append(session, &msg).await {
+        tracing::warn!(
+            ?session,
+            seq = ?msg.seq,
+            error = %err,
+            "remote-mirror log persist failed; dropping message",
+        );
+        return;
+    }
+    s.log.insert(pos, msg.clone());
+    if msg.seq > s.head {
+        s.head = msg.seq;
+    }
+    let _ = s.events_tx.send(Event::Message {
+        session,
+        message: msg,
+    });
 }
 
 #[cfg(test)]
@@ -2144,8 +2224,14 @@ mod tests {
         assert_eq!(appended.signature, author_sig);
         // The host_sig is over the joiner's author sig at the assigned
         // seq, verifiable under the HOST's pubkey (not the joiner's).
-        signing::verify_seq(&host.id, id, appended.seq, &appended.signature, &appended.host_sig)
-            .expect("host_sig must verify under the host pubkey");
+        signing::verify_seq(
+            &host.id,
+            id,
+            appended.seq,
+            &appended.signature,
+            &appended.host_sig,
+        )
+        .expect("host_sig must verify under the host pubkey");
     }
 
     #[tokio::test]
@@ -2209,6 +2295,250 @@ mod tests {
         // the B5.3 e2e; no real bridge exists in a MemoryStore registry.)
         let sig = artel_protocol::signing::sign_ctrl(secret.as_signing_key(), id, 2);
         signing::verify_ctrl(&peer_id, id, 2, &sig).expect("ctrl sig at bumped epoch must verify");
+    }
+
+    // ---- Joiner mirror acceptance pipeline (Auth Slice B.5.3) ----
+    //
+    // These drive `apply_inbound_mirror_message` directly — the same
+    // dedup → author sig → host seq-sig pipeline the live `on_message`
+    // closure runs — so the ordering + drop invariants are pinned
+    // without a live gossip bridge. The watermark is exercised
+    // separately (it lives in the bridge's EpochBeacon arm); these
+    // assert the load-bearing invariant that the Message path NEVER
+    // touches it.
+
+    /// A signed host + a Remote mirror keyed to it. Returns the host's
+    /// signing key (so tests can stamp `host_sig`), the session id, the
+    /// joiner author key, and the mirror arc.
+    #[cfg(feature = "iroh")]
+    fn remote_mirror_fixture() -> (
+        artel_protocol::signing::SigningKey,
+        SessionId,
+        artel_protocol::signing::SigningKey,
+        Arc<Mutex<Session>>,
+        DynStore,
+    ) {
+        let host_key = artel_protocol::signing::SigningKey::from_bytes(&[0x31; 32]);
+        let host_id = PeerId::from_bytes(host_key.verifying_key().to_bytes());
+        let session_id = SessionId::from_bytes([0xcc; 16]);
+        let mut session_obj = Session::new(
+            session_id,
+            &PeerInfo::new(host_id, "remote-host"),
+            SessionKind::Remote,
+        );
+        session_obj.host = host_id;
+        let author_key = artel_protocol::signing::SigningKey::from_bytes(&[0x32; 32]);
+        let store: DynStore = Arc::new(crate::store::MemoryStore::new());
+        (
+            host_key,
+            session_id,
+            author_key,
+            Arc::new(Mutex::new(session_obj)),
+            store,
+        )
+    }
+
+    /// Build a fully-signed `SessionMessage` as the host would emit it:
+    /// the author signs the body, the host stamps the seq-sig over
+    /// `(session, seq, author_sig)`.
+    #[cfg(feature = "iroh")]
+    fn host_signed_message(
+        host_key: &artel_protocol::signing::SigningKey,
+        author_key: &artel_protocol::signing::SigningKey,
+        session: SessionId,
+        seq: Seq,
+        payload: &[u8],
+    ) -> SessionMessage {
+        let author = PeerInfo::new(
+            PeerId::from_bytes(author_key.verifying_key().to_bytes()),
+            "bob",
+        );
+        let timestamp_ms = 1_700_000_000_000u64;
+        let author_sig = artel_protocol::signing::sign_body(
+            author_key,
+            session,
+            artel_protocol::message::MESSAGE_FORMAT,
+            timestamp_ms,
+            &author,
+            MessageKind::Chat,
+            "chat.message",
+            payload,
+        );
+        let host_sig = artel_protocol::signing::sign_seq(host_key, session, seq, &author_sig);
+        SessionMessage::new(
+            seq,
+            timestamp_ms,
+            author,
+            MessageKind::Chat,
+            "chat.message",
+            payload.to_vec(),
+            author_sig,
+            host_sig,
+        )
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "iroh")]
+    async fn mirror_accepts_message_with_valid_host_sig() {
+        let (host_key, session, author_key, mirror, store) = remote_mirror_fixture();
+        store.create(&mirror.lock().await.record()).await.unwrap();
+        let msg = host_signed_message(&host_key, &author_key, session, Seq::new(1), b"hi");
+        apply_inbound_mirror_message(&store, &mirror, session, msg).await;
+        let s = mirror.lock().await;
+        assert_eq!(s.log.len(), 1, "valid message must be appended");
+        assert_eq!(s.head, Seq::new(1));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "iroh")]
+    async fn mirror_drops_message_with_bad_host_sig() {
+        let (host_key, session, author_key, mirror, store) = remote_mirror_fixture();
+        store.create(&mirror.lock().await.record()).await.unwrap();
+        let mut msg = host_signed_message(&host_key, &author_key, session, Seq::new(1), b"hi");
+        // Corrupt the host seq-sig: author sig stays valid, host_sig
+        // doesn't verify under the host pubkey.
+        msg.host_sig[0] ^= 0xff;
+        apply_inbound_mirror_message(&store, &mirror, session, msg).await;
+        assert!(
+            mirror.lock().await.log.is_empty(),
+            "bad host_sig must be dropped",
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "iroh")]
+    async fn mirror_drops_message_signed_by_wrong_host() {
+        let (_host_key, session, author_key, mirror, store) = remote_mirror_fixture();
+        store.create(&mirror.lock().await.record()).await.unwrap();
+        // A different "host" key stamps the seq-sig — verify_seq must
+        // reject it against the mirror's real host pubkey.
+        let impostor = artel_protocol::signing::SigningKey::from_bytes(&[0x99; 32]);
+        let msg = host_signed_message(&impostor, &author_key, session, Seq::new(1), b"hi");
+        apply_inbound_mirror_message(&store, &mirror, session, msg).await;
+        assert!(mirror.lock().await.log.is_empty(), "wrong-host sig dropped");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "iroh")]
+    async fn mirror_drops_replayed_message_under_new_seq() {
+        // Finding #1, the live attack: capture a valid (message,
+        // host_sig) at seq 1, re-feed it with a bumped seq. The host
+        // seq-sig is bound to the original seq, so verify_seq rejects
+        // the replay under the new seq.
+        let (host_key, session, author_key, mirror, store) = remote_mirror_fixture();
+        store.create(&mirror.lock().await.record()).await.unwrap();
+        let genuine = host_signed_message(&host_key, &author_key, session, Seq::new(1), b"hi");
+
+        // Replay the genuine frame's bytes but on seq 5 (a gap the
+        // mirror hasn't seen). host_sig still binds seq 1.
+        let mut replayed = genuine.clone();
+        replayed.seq = Seq::new(5);
+        apply_inbound_mirror_message(&store, &mirror, session, replayed).await;
+        assert!(
+            mirror.lock().await.log.is_empty(),
+            "replay under a new seq must be dropped by verify_seq",
+        );
+
+        // The genuine frame at its real seq still applies.
+        apply_inbound_mirror_message(&store, &mirror, session, genuine).await;
+        assert_eq!(mirror.lock().await.log.len(), 1, "genuine frame applies");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "iroh")]
+    async fn mirror_dedups_duplicate_seq_without_reverifying() {
+        // A duplicate seq is dropped at the dedup gate before any
+        // crypto runs — so even a duplicate whose host_sig we corrupt
+        // (after the first genuine append) is a no-op, not a drop-warn.
+        let (host_key, session, author_key, mirror, store) = remote_mirror_fixture();
+        store.create(&mirror.lock().await.record()).await.unwrap();
+        let msg = host_signed_message(&host_key, &author_key, session, Seq::new(1), b"hi");
+        apply_inbound_mirror_message(&store, &mirror, session, msg.clone()).await;
+        assert_eq!(mirror.lock().await.log.len(), 1);
+        // Re-feed the same seq; dedup drops it, log unchanged.
+        apply_inbound_mirror_message(&store, &mirror, session, msg).await;
+        assert_eq!(mirror.lock().await.log.len(), 1, "duplicate seq deduped");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "iroh")]
+    async fn replayed_message_cannot_poison_watermark() {
+        // The review-blocker regression: feeding a genuine (message,
+        // host_sig) on an unseen seq must NOT move any host-epoch
+        // watermark — the Message path has no watermark interaction at
+        // all (only the bridge's EpochBeacon arm moves it). We model
+        // the watermark as the mirror's persisted `host_epoch` and
+        // assert it stays at its seed value across message application.
+        let (host_key, session, author_key, mirror, store) = remote_mirror_fixture();
+        // Seed a watermark of 0 (fresh join).
+        store.create(&mirror.lock().await.record()).await.unwrap();
+        assert_eq!(mirror.lock().await.host_epoch, 0);
+
+        // Apply a genuine message on an unseen seq.
+        let msg = host_signed_message(&host_key, &author_key, session, Seq::new(7), b"hi");
+        apply_inbound_mirror_message(&store, &mirror, session, msg).await;
+
+        // Watermark unchanged: a later legitimate SessionClosed at the
+        // real epoch (0) would still satisfy `host_epoch >= watermark`.
+        assert_eq!(
+            mirror.lock().await.host_epoch,
+            0,
+            "Message application must never move the host_epoch watermark",
+        );
+        // And the persisted record agrees.
+        let records = store.load_all().await.unwrap();
+        assert_eq!(records[0].host_epoch, 0);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "iroh")]
+    async fn beacon_advances_watermark_only_when_host_signed() {
+        // The EpochBeacon arm advances the watermark only on a
+        // host-signed value. `advance_host_epoch_watermark` is the
+        // persistence half of that arm; pin that a host-signed epoch
+        // advances + persists, while we never call it for an unsigned
+        // / wrong-key beacon (the bridge arm drops those before
+        // reaching it). We assert the signed advance here and the
+        // wrong-key drop via verify_ctrl directly.
+        let (host_key, session, _author, mirror, store) = remote_mirror_fixture();
+        store.create(&mirror.lock().await.record()).await.unwrap();
+        let host_id = PeerId::from_bytes(host_key.verifying_key().to_bytes());
+
+        // A host-signed beacon at epoch 3 verifies, and the registry
+        // method persists the advance.
+        let good = artel_protocol::signing::sign_ctrl(&host_key, session, 3);
+        signing::verify_ctrl(&host_id, session, 3, &good).expect("host-signed beacon verifies");
+
+        // A wrong-key beacon does NOT verify — the bridge arm would
+        // drop it before any watermark move.
+        let impostor = artel_protocol::signing::SigningKey::from_bytes(&[0x99; 32]);
+        let bad = artel_protocol::signing::sign_ctrl(&impostor, session, 99);
+        assert!(
+            signing::verify_ctrl(&host_id, session, 99, &bad).is_err(),
+            "wrong-key beacon must not verify",
+        );
+
+        // Build a registry over the same store so we can call the
+        // persistence half against the mirror.
+        let daemon_peer = PeerId::from_bytes([7; 32]);
+        let r = Registry::load(
+            daemon_peer,
+            WireEndpointAddr::id_only(daemon_peer),
+            Arc::clone(&store),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        r.advance_host_epoch_watermark(session, 3).await.unwrap();
+        assert_eq!(
+            r.store.load_all().await.unwrap()[0].host_epoch,
+            3,
+            "host-signed beacon advances + persists the watermark",
+        );
+        // Monotonic: a lower epoch is a no-op.
+        r.advance_host_epoch_watermark(session, 1).await.unwrap();
+        assert_eq!(r.store.load_all().await.unwrap()[0].host_epoch, 3);
     }
 
     // ---- subscribe / replay ----

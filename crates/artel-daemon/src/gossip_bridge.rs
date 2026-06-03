@@ -38,6 +38,7 @@
 
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -177,10 +178,26 @@ enum SessionRole {
     Host,
     /// We mirror a session whose authoritative log lives on
     /// another daemon. Inbound `Message` frames push into
-    /// `on_message`; `SendAck` frames are looked up against
-    /// `pending_sends`; `SendRequest` frames are ignored (only
-    /// the host services them).
-    Joiner { on_message: MessageHandler },
+    /// `on_message` (which verifies the host seq-sig after dedup);
+    /// `SendAck` frames are verified against `host_pubkey` then looked
+    /// up against `pending_sends`; `SendRequest` frames are ignored
+    /// (only the host services them). `SessionClosed`/`EpochBeacon`
+    /// frames are verified against `host_pubkey` and gated/advanced
+    /// against `host_epoch_watermark` (Auth Slice B.5.3).
+    Joiner {
+        on_message: MessageHandler,
+        /// The host's public key, from the ticket's `host_peer_id`
+        /// (= `session.host`). Origin authentication is by signature
+        /// against this key, not by who relayed the frame —
+        /// topology-independent.
+        host_pubkey: PeerId,
+        /// Highest host epoch verified via a signed `EpochBeacon`.
+        /// **Only** the `EpochBeacon` arm advances it; the
+        /// `SessionClosed` arm reads it to gate replayed closes. A
+        /// genuine `Message` replayed on an unseen seq must never move
+        /// it (`replayed_message_cannot_poison_watermark`).
+        host_epoch_watermark: Arc<AtomicU64>,
+    },
 }
 
 impl GossipBridge {
@@ -265,6 +282,7 @@ impl GossipBridge {
         joiner: PeerInfo,
         host_peer: PeerId,
         host_addr: &WireEndpointAddr,
+        host_epoch_watermark: Arc<AtomicU64>,
         on_message: impl Fn(SessionMessage) + Send + Sync + 'static,
     ) -> Result<(), BridgeError> {
         let host_endpoint_id = iroh::EndpointId::from_bytes(host_peer.as_bytes())
@@ -306,6 +324,8 @@ impl GossipBridge {
             vec![host_endpoint_id],
             SessionRole::Joiner {
                 on_message: Arc::new(on_message),
+                host_pubkey: host_peer,
+                host_epoch_watermark,
             },
         )
         .await?;
@@ -609,8 +629,11 @@ impl GossipBridge {
         // Host-sign over `"artel/ctrl-v1" || session || host_epoch`
         // (Auth Slice B.5, D3) — the same canonical bytes as the
         // EpochBeacon, so the joiner's `verify_ctrl` serves both.
-        let host_sig =
-            artel_protocol::signing::sign_ctrl(self.signing_key.as_signing_key(), session, host_epoch);
+        let host_sig = artel_protocol::signing::sign_ctrl(
+            self.signing_key.as_signing_key(),
+            session,
+            host_epoch,
+        );
         let bytes = Bytes::from(gossip::encode(&GossipBody::SessionClosed {
             host_epoch,
             host_sig,
@@ -642,8 +665,11 @@ impl GossipBridge {
             );
             return;
         };
-        let host_sig =
-            artel_protocol::signing::sign_ctrl(self.signing_key.as_signing_key(), session, host_epoch);
+        let host_sig = artel_protocol::signing::sign_ctrl(
+            self.signing_key.as_signing_key(),
+            session,
+            host_epoch,
+        );
         let bytes = Bytes::from(gossip::encode(&GossipBody::EpochBeacon {
             host_epoch,
             host_sig,
@@ -760,6 +786,11 @@ impl GossipBridge {
 /// auth story (see
 /// `docs/brainstorms/2026-05-30-auth-story-brainstorm.md`). Until B
 /// lands, joiners trust their host (the existing model).
+// One `match (role, body)` dispatcher: every arm is a distinct
+// role×frame case and the verify-then-act logic reads best inline
+// rather than scattered across per-arm helpers. The Slice B.5 joiner
+// verification arms pushed it past the line lint.
+#[allow(clippy::too_many_lines)]
 async fn handle_inbound_frame(
     bridge: &Arc<GossipBridge>,
     session: SessionId,
@@ -815,14 +846,43 @@ async fn handle_inbound_frame(
         // entry. Idempotent on the registry side, so a stray
         // duplicate frame is harmless.
         (
-            SessionRole::Joiner { .. },
+            SessionRole::Joiner {
+                host_pubkey,
+                host_epoch_watermark,
+                ..
+            },
             GossipBody::SessionClosed {
-                host_epoch: _,
-                host_sig: _,
+                host_epoch,
+                host_sig,
             },
         ) => {
-            // B5.1: verification of host_sig + epoch-vs-watermark lands in
-            // B5.3; until then the joiner trusts the close as before.
+            // Accept the close iff (a) the host signature verifies over
+            // `(session, host_epoch)` AND (b) host_epoch >= the
+            // beacon-advanced watermark. A forged close fails (a)
+            // (no host key); a close captured from an earlier
+            // incarnation and replayed after a resume fails (b) (its
+            // epoch is below the watermark the resume beacon advanced).
+            if let Err(err) =
+                artel_protocol::signing::verify_ctrl(host_pubkey, session, host_epoch, &host_sig)
+            {
+                warn!(
+                    ?session,
+                    host_epoch,
+                    ?err,
+                    "dropping SessionClosed: host_sig verify failed"
+                );
+                return;
+            }
+            let watermark = host_epoch_watermark.load(Ordering::Acquire);
+            if host_epoch < watermark {
+                warn!(
+                    ?session,
+                    host_epoch,
+                    watermark,
+                    "dropping SessionClosed: epoch below beacon watermark (replay across resume)",
+                );
+                return;
+            }
             track_authenticated_peer(bridge, delivered_from);
             let registry_weak = bridge.registry.lock().await.clone();
             if let Some(registry) = registry_weak.upgrade()
@@ -862,22 +922,45 @@ async fn handle_inbound_frame(
         ) => {}
 
         // Joiner receives the host's broadcast — push into the local
-        // mirror's events_tx + log.
-        (SessionRole::Joiner { on_message }, GossipBody::Message(m)) => {
+        // mirror's events_tx + log. The host seq-sig is verified
+        // *inside* `on_message`, after dedup (dedup → author sig →
+        // host seq-sig), so routine duplicate deliveries don't re-pay
+        // crypto and the watermark is never touched here.
+        (SessionRole::Joiner { on_message, .. }, GossipBody::Message(m)) => {
             track_authenticated_peer(bridge, delivered_from);
             on_message(m);
         }
         // Joiner receives the host's reply to one of our outbound
-        // sends — resolve the matching pending oneshot.
-        // B5.1: verify_ack lands in B5.3; until then resolve as before.
+        // sends. Verify the host ack-sig over `(session, req_id,
+        // result)` BEFORE resolving the oneshot. A forged ack fails
+        // here and we do NOT resolve — the joiner's `send_remote`
+        // times out, far better than surfacing a spoofed result. (A
+        // replayed genuine ack self-limits: `req_id` is a fresh v4
+        // uuid, so `pending_sends.remove` returns None for a
+        // non-pending id.)
         (
-            SessionRole::Joiner { .. },
+            SessionRole::Joiner { host_pubkey, .. },
             GossipBody::SendAck {
                 req_id,
                 result,
-                host_sig: _,
+                host_sig,
             },
         ) => {
+            if let Err(err) = artel_protocol::signing::verify_ack(
+                host_pubkey,
+                session,
+                req_id,
+                &result,
+                &host_sig,
+            ) {
+                warn!(
+                    ?session,
+                    ?req_id,
+                    ?err,
+                    "dropping SendAck: host_sig verify failed"
+                );
+                return;
+            }
             track_authenticated_peer(bridge, delivered_from);
             let pending = bridge.pending_sends.lock().await.remove(&req_id);
             if let Some(tx) = pending {
@@ -886,16 +969,54 @@ async fn handle_inbound_frame(
                 debug!(?req_id, "SendAck for unknown req_id; dropping");
             }
         }
-        // Joiner receives a host epoch beacon. B5.3 verifies the host
-        // signature and advances the watermark; in B5.1 it's a no-op.
+        // Joiner receives a host epoch beacon. This is the ONLY site
+        // that advances the watermark, and only on a host-signed
+        // value: verify the ctrl-sig over `(session, host_epoch)`,
+        // then advance the watermark to max(watermark, host_epoch) and
+        // persist it to the mirror record. A wrong-key beacon is
+        // dropped; a replayed old beacon can't lower the monotonic
+        // watermark.
         (
-            SessionRole::Joiner { .. },
+            SessionRole::Joiner {
+                host_pubkey,
+                host_epoch_watermark,
+                ..
+            },
             GossipBody::EpochBeacon {
-                host_epoch: _,
-                host_sig: _,
+                host_epoch,
+                host_sig,
             },
         ) => {
+            if let Err(err) =
+                artel_protocol::signing::verify_ctrl(host_pubkey, session, host_epoch, &host_sig)
+            {
+                warn!(
+                    ?session,
+                    host_epoch,
+                    ?err,
+                    "dropping EpochBeacon: host_sig verify failed"
+                );
+                return;
+            }
             track_authenticated_peer(bridge, delivered_from);
+            // fetch_max returns the previous value; advance only logs /
+            // persists when the watermark actually moved forward.
+            let prev = host_epoch_watermark.fetch_max(host_epoch, Ordering::AcqRel);
+            if host_epoch > prev {
+                let registry_weak = bridge.registry.lock().await.clone();
+                if let Some(registry) = registry_weak.upgrade()
+                    && let Err(err) = registry
+                        .advance_host_epoch_watermark(session, host_epoch)
+                        .await
+                {
+                    warn!(
+                        ?err,
+                        ?session,
+                        host_epoch,
+                        "epoch_beacon: persist watermark failed"
+                    );
+                }
+            }
         }
     }
 }

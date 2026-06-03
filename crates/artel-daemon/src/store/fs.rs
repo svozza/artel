@@ -452,7 +452,7 @@ impl Meta {
     /// Bumped to `3` on 2026-06-03 (Auth Slice B.5) when
     /// `MESSAGE_FORMAT` went 2 → 3: each log frame gained a `host_sig`
     /// byte run and the record gained `host_epoch`. A v2 directory is
-    /// unreadable by a v3 daemon (pre-cutover frames lack the host_sig
+    /// unreadable by a v3 daemon (pre-cutover frames lack the `host_sig`
     /// run); `load_one` rejects it and `load_all` skips-and-logs.
     const CURRENT_VERSION: u32 = 3;
 
@@ -1288,6 +1288,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pre_cutover_v2_meta_skipped_on_load() {
+        // Migration story (Auth Slice B.5.3): a pre-cutover session
+        // directory carries `version: 2` meta (the Slice B shape, no
+        // host_sig run on its log frames). `load_all` must skip it
+        // with an operator warn — not crash — while OTHER sessions
+        // still load. Reuses the existing version-rejection path
+        // (Meta::CURRENT_VERSION == 3 from B5.2).
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        // A healthy v3 session...
+        store.create(&record(1)).await.unwrap();
+        // ...and a planted pre-cutover v2 session.
+        store.create(&record(2)).await.unwrap();
+        let v2_path = dir.path().join(record(2).id.to_string()).join(META_FILE);
+        let mut meta = read_meta(&v2_path).unwrap();
+        meta.version = 2;
+        write_meta(&v2_path, &meta).unwrap();
+
+        let loaded = FsLogStore::open(dir.path())
+            .unwrap()
+            .load_all()
+            .await
+            .unwrap();
+        // The v2 dir is skipped; the v3 dir still loads.
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, record(1).id);
+    }
+
+    #[tokio::test]
     async fn load_from_empty_root_returns_empty() {
         let dir = tempdir().unwrap();
         let store = FsLogStore::open(dir.path()).unwrap();
@@ -1344,11 +1373,19 @@ mod tests {
         let store = FsLogStore::open(dir.path()).unwrap();
         store.create(&record(1)).await.unwrap();
         // Fresh create is epoch 0.
-        let loaded = FsLogStore::open(dir.path()).unwrap().load_all().await.unwrap();
+        let loaded = FsLogStore::open(dir.path())
+            .unwrap()
+            .load_all()
+            .await
+            .unwrap();
         assert_eq!(loaded[0].host_epoch, 0);
 
         store.bump_host_epoch(record(1).id, 3).await.unwrap();
-        let reloaded = FsLogStore::open(dir.path()).unwrap().load_all().await.unwrap();
+        let reloaded = FsLogStore::open(dir.path())
+            .unwrap()
+            .load_all()
+            .await
+            .unwrap();
         assert_eq!(reloaded.len(), 1);
         assert_eq!(reloaded[0].host_epoch, 3);
         // Other fields intact.
@@ -1382,7 +1419,11 @@ mod tests {
         });
         std::fs::write(&meta_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
 
-        let loaded = FsLogStore::open(dir.path()).unwrap().load_all().await.unwrap();
+        let loaded = FsLogStore::open(dir.path())
+            .unwrap()
+            .load_all()
+            .await
+            .unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].host_epoch, 0);
     }

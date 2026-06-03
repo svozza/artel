@@ -271,13 +271,16 @@ pub const fn verify_reason(err: &VerifyError) -> &'static str {
 pub const SEQ_DOMAIN_TAG: &[u8] = b"artel/seq-v1";
 
 /// Domain prefix for the host's [`crate::gossip::GossipBody::SendAck`]
-/// signature. Binds the ack `result` so a signed `Ok` cannot be flipped to
-/// `Err` (or vice-versa): `"artel/ack-v1" || session_id || req_id ||
+/// signature.
+///
+/// Binds the ack `result` so a signed `Ok` cannot be flipped to `Err` (or
+/// vice-versa): `"artel/ack-v1" || session_id || req_id ||
 /// result_discriminant || postcard(result)`.
 pub const ACK_DOMAIN_TAG: &[u8] = b"artel/ack-v1";
 
-/// Domain prefix for the host's control-frame signature, shared by
-/// [`crate::gossip::GossipBody::SessionClosed`] **and**
+/// Domain prefix for the host's control-frame signature.
+///
+/// Shared by [`crate::gossip::GossipBody::SessionClosed`] **and**
 /// [`crate::gossip::GossipBody::EpochBeacon`]:
 /// `"artel/ctrl-v1" || session_id || host_epoch`. One verifier
 /// ([`verify_ctrl`]) serves both frames, so a `host_sig` produced for a
@@ -300,7 +303,12 @@ pub fn seq_canonical_bytes(session_id: SessionId, seq: Seq, author_sig: &SigByte
 
 /// Sign the sequencing canonical bytes with the host's key.
 #[must_use]
-pub fn sign_seq(key: &SigningKey, session_id: SessionId, seq: Seq, author_sig: &SigBytes) -> SigBytes {
+pub fn sign_seq(
+    key: &SigningKey,
+    session_id: SessionId,
+    seq: Seq,
+    author_sig: &SigBytes,
+) -> SigBytes {
     key.sign(&seq_canonical_bytes(session_id, seq, author_sig))
         .to_bytes()
 }
@@ -324,7 +332,8 @@ pub fn verify_seq(
     if host_sig == &SIGNATURE_UNSIGNED {
         return Err(VerifyError::SentinelUnsigned);
     }
-    let verifying = VerifyingKey::from_bytes(host_pubkey.as_bytes()).map_err(|_| VerifyError::BadKey)?;
+    let verifying =
+        VerifyingKey::from_bytes(host_pubkey.as_bytes()).map_err(|_| VerifyError::BadKey)?;
     let sig = Signature::from_bytes(host_sig);
     verifying
         .verify_strict(&seq_canonical_bytes(session_id, seq, author_sig), &sig)
@@ -344,8 +353,14 @@ pub fn ack_canonical_bytes(
     result: &Result<SessionMessage, ProtocolError>,
 ) -> Vec<u8> {
     let (disc, body): (u8, Vec<u8>) = match result {
-        Ok(msg) => (0, postcard::to_allocvec(msg).expect("postcard encode SessionMessage")),
-        Err(err) => (1, postcard::to_allocvec(err).expect("postcard encode ProtocolError")),
+        Ok(msg) => (
+            0,
+            postcard::to_allocvec(msg).expect("postcard encode SessionMessage"),
+        ),
+        Err(err) => (
+            1,
+            postcard::to_allocvec(err).expect("postcard encode ProtocolError"),
+        ),
     };
     let mut out = Vec::with_capacity(ACK_DOMAIN_TAG.len() + 16 + 16 + 1 + body.len());
     out.extend_from_slice(ACK_DOMAIN_TAG);
@@ -384,7 +399,8 @@ pub fn verify_ack(
     if host_sig == &SIGNATURE_UNSIGNED {
         return Err(VerifyError::SentinelUnsigned);
     }
-    let verifying = VerifyingKey::from_bytes(host_pubkey.as_bytes()).map_err(|_| VerifyError::BadKey)?;
+    let verifying =
+        VerifyingKey::from_bytes(host_pubkey.as_bytes()).map_err(|_| VerifyError::BadKey)?;
     let sig = Signature::from_bytes(host_sig);
     verifying
         .verify_strict(&ack_canonical_bytes(session_id, req_id, result), &sig)
@@ -433,7 +449,8 @@ pub fn verify_ctrl(
     if host_sig == &SIGNATURE_UNSIGNED {
         return Err(VerifyError::SentinelUnsigned);
     }
-    let verifying = VerifyingKey::from_bytes(host_pubkey.as_bytes()).map_err(|_| VerifyError::BadKey)?;
+    let verifying =
+        VerifyingKey::from_bytes(host_pubkey.as_bytes()).map_err(|_| VerifyError::BadKey)?;
     let sig = Signature::from_bytes(host_sig);
     verifying
         .verify_strict(&ctrl_canonical_bytes(session_id, host_epoch), &sig)
@@ -835,8 +852,7 @@ mod tests {
         let author = [0x55u8; 64];
         let base = seq_canonical_bytes(SessionId::from_bytes([0x01; 16]), Seq::new(7), &author);
 
-        let diff_sid =
-            seq_canonical_bytes(SessionId::from_bytes([0x02; 16]), Seq::new(7), &author);
+        let diff_sid = seq_canonical_bytes(SessionId::from_bytes([0x02; 16]), Seq::new(7), &author);
         let first = base
             .iter()
             .zip(diff_sid.iter())
@@ -844,8 +860,7 @@ mod tests {
             .expect("session_id diff");
         assert_eq!(first, SEQ_DOMAIN_TAG.len());
 
-        let diff_seq =
-            seq_canonical_bytes(SessionId::from_bytes([0x01; 16]), Seq::new(8), &author);
+        let diff_seq = seq_canonical_bytes(SessionId::from_bytes([0x01; 16]), Seq::new(8), &author);
         let first = base
             .iter()
             .zip(diff_seq.iter())
@@ -922,8 +937,14 @@ mod tests {
         let key = key_a();
         let s = sample_session_id();
         assert_eq!(
-            verify_seq(&host_pubkey(&key), s, Seq::new(1), &[0x33; 64], &SIGNATURE_UNSIGNED)
-                .unwrap_err(),
+            verify_seq(
+                &host_pubkey(&key),
+                s,
+                Seq::new(1),
+                &[0x33; 64],
+                &SIGNATURE_UNSIGNED
+            )
+            .unwrap_err(),
             VerifyError::SentinelUnsigned,
         );
     }
@@ -949,8 +970,7 @@ mod tests {
         let result = Ok(sample_ack_message());
         let base = ack_canonical_bytes(SessionId::from_bytes([0x01; 16]), req, &result);
 
-        let diff_sid =
-            ack_canonical_bytes(SessionId::from_bytes([0x02; 16]), req, &result);
+        let diff_sid = ack_canonical_bytes(SessionId::from_bytes([0x02; 16]), req, &result);
         let first = base
             .iter()
             .zip(diff_sid.iter())

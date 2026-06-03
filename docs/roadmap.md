@@ -634,34 +634,41 @@ Listed for completeness, no detailed plan yet:
   reject on failure. See
   `docs/plans/2026-06-02-auth-slice-b-l3-signing-plan.md`.
   L2 (capability events) remains open as Slice C.
-- **Control-frame & sequence authentication (auth Slice B.5).** A code
-  review of the L3 landing surfaced three issues that need a gossip-
-  wire change and so were carved out of B: (#1) message **replay** —
-  `seq` is outside the signed scope and the joiner dedups by seq, so a
-  validly-signed body can be re-appended under a fresh seq (folds into
-  accepted host-trust under today's star topology; a real attack under
-  symmetric P2P); (#2) **forged `SessionClosed`** — the unauthenticated
-  joiner arm lets any topic member evict every other joiner's mirror
-  (with on-disk attachment cascade); (#3) **forged `SendAck`** — the
-  unauthenticated ack arm lets a racing peer spoof a send result to the
-  joiner's IPC client. The clean fix is **host-signed control/ack
-  frames + host counter-signed sequencing**, verified against the
-  host pubkey from the join ticket (topology-independent — does not
-  depend on `delivered_from`, which iroh-gossip defines as the relay
-  hop, not the origin). Full attack analysis, option space, and open
-  questions in
-  `docs/brainstorms/2026-06-02-control-frame-auth-and-replay-brainstorm.md`.
+- **Control-frame & sequence authentication (auth Slice B.5).** DONE
+  (2026-06-03; `PROTOCOL_VERSION` 5→6, `MESSAGE_FORMAT` 2→3, `Meta`
+  2→3). A code review of the L3 landing surfaced three issues that
+  needed a gossip-wire change and so were carved out of B: (#1) message
+  **replay** — `seq` is outside the signed scope and the joiner dedups
+  by seq, so a validly-signed body could be re-appended under a fresh
+  seq; (#2) **forged `SessionClosed`** — the unauthenticated joiner arm
+  let any topic member evict every other joiner's mirror (with on-disk
+  attachment cascade); (#3) **forged `SendAck`** — the unauthenticated
+  ack arm let a racing peer spoof a send result to the joiner's IPC
+  client. Closed with one mechanism: **the host signs everything it
+  originates or sequences; joiners verify host-origin against the host
+  pubkey from the join ticket** (`session.host` = `host_peer_id`),
+  topology-independent (does not depend on `delivered_from`, which
+  iroh-gossip defines as the relay hop, not the origin). `host_sig` on
+  `SessionMessage` (seq-sig, verified after dedup), on `SendAck`
+  (result bound), and on `SessionClosed` (over a per-incarnation
+  `host_epoch` distributed via a signed `EpochBeacon` — the only frame
+  that advances the joiner's watermark). One documented residual: a
+  lost resume beacon racing a replayed old close (effect = a re-joinable
+  mirror delete). See
+  `docs/plans/2026-06-03-auth-slice-b5-control-frame-auth-plan.md` and
+  `docs/brainstorms/2026-06-02-control-frame-auth-slice-b5-brainstorm.md`.
+  L2 (capability events) remains open as Slice C.
 - **N-1 protocol-version compatibility.** Today version mismatch is
   fatal. Some scheme that lets a daemon serve clients one version
   behind would smooth upgrades.
-- **Wire versioning for gossip frames.** Pre-1.0 we deliberately
-  removed the `GossipFrame { version, body }` envelope: both
-  daemons rebuild together and an unrecognised body just surfaces
-  as `GossipFrameError::Malformed`. Before the first real release
-  we'll want a proper capability-negotiation story (or, at minimum,
-  re-introduce a leading version byte) so daemons across versions
-  can refuse cleanly instead of swallowing garbage. Cheap to add —
-  ~30 lines plus tests — and the right time is the v1 cutover.
+- **Wire versioning for gossip frames.** DONE (2026-06-03, folded into
+  auth Slice B.5's cutover). `encode`/`decode` now stamp a leading
+  `GOSSIP_WIRE_VERSION: u8` byte (`[version][postcard(body)]`); `decode`
+  rejects an unknown leading byte with
+  `GossipFrameError::UnsupportedVersion { found, expected }` rather than
+  mis-decoding postcard bytes into the wrong variant. A full
+  capability-negotiation story is still future work, but a mixed-version
+  mesh now fails cleanly instead of swallowing garbage.
 - **Observability.** Structured metrics endpoint, `collab-daemon list`
   → `artel sessions inspect <id>` deeper view.
 - **Faster `cargo test --workspace`.** DONE. cargo-nextest +

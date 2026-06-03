@@ -547,7 +547,10 @@ mod tests {
         );
         let json = serde_json::to_string(&m).unwrap();
         let expected = format!("\"host_sig\":\"{}\"", "cd".repeat(64));
-        assert!(json.contains(&expected), "json missing hex host_sig: {json}");
+        assert!(
+            json.contains(&expected),
+            "json missing hex host_sig: {json}"
+        );
         let back: SessionMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(back.host_sig, host_sig);
     }

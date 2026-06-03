@@ -227,7 +227,9 @@ pub enum GossipFrameError {
 pub fn encode(body: &GossipBody) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(GOSSIP_WIRE_VERSION);
-    out.extend_from_slice(&postcard::to_stdvec(body).expect("postcard encode of fixed-shape types"));
+    out.extend_from_slice(
+        &postcard::to_stdvec(body).expect("postcard encode of fixed-shape types"),
+    );
     out
 }
 
