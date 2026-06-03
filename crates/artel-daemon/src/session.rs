@@ -1094,6 +1094,8 @@ impl Registry {
         // We compute the prospective seq without committing it. If the
         // store write succeeds we commit; if not, we leave head alone.
         let prospective = s.head.next().expect("seq overflow");
+        // B5.1: stamp the placeholder host_sig so the wire shape is current;
+        // B5.2 signs over seq canonical bytes here (both authoring arms).
         let message = SessionMessage::new(
             prospective,
             timestamp_ms,
@@ -1102,6 +1104,7 @@ impl Registry {
             action,
             payload,
             signature,
+            SIGNATURE_UNSIGNED,
         );
         if let Err(err) = self.store.append(session, &message).await {
             return Err(SessionError::Storage(err));
@@ -1225,7 +1228,10 @@ impl Registry {
     ) -> Result<(u64, SigBytes), SessionError> {
         // Mock up a SessionMessage shape so we can reuse
         // `verify_message` — seq is excluded from the canonical
-        // bytes so any value works.
+        // bytes so any value works. This candidate is discarded after
+        // the author-sig check, so host_sig is irrelevant here
+        // (SIGNATURE_UNSIGNED); the real host_sig is stamped in
+        // `Registry::send` once the host assigns the seq.
         let candidate = SessionMessage::new(
             Seq::ZERO,
             timestamp_ms,
@@ -1234,6 +1240,7 @@ impl Registry {
             action.to_string(),
             payload.to_vec(),
             signature,
+            SIGNATURE_UNSIGNED,
         );
         match signing::verify_message(session, &candidate, &signature) {
             Ok(()) => Ok((timestamp_ms, signature)),
@@ -1452,6 +1459,7 @@ mod tests {
             MessageKind::Chat,
             String::from("hello"),
             b"world".to_vec(),
+            artel_protocol::message::SIGNATURE_UNSIGNED,
             artel_protocol::message::SIGNATURE_UNSIGNED,
         )];
         let record = SessionRecord {

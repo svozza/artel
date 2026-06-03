@@ -44,7 +44,9 @@ use std::time::Duration;
 use artel_protocol::gossip::{self, GossipBody};
 use artel_protocol::rpc::{SendPayload, SignedSendPayload};
 use artel_protocol::ticket::WireEndpointAddr;
-use artel_protocol::{PeerId, PeerInfo, ProtocolError, Seq, SessionId, SessionMessage};
+use artel_protocol::{
+    PeerId, PeerInfo, ProtocolError, SIGNATURE_UNSIGNED, Seq, SessionId, SessionMessage,
+};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use iroh::EndpointAddr;
@@ -606,7 +608,12 @@ impl GossipBridge {
             );
             return;
         };
-        let bytes = Bytes::from(gossip::encode(&GossipBody::SessionClosed));
+        // B5.1: emit placeholder host_epoch/host_sig so the wire shape is
+        // current; B5.2 threads the real epoch + signs over ctrl bytes.
+        let bytes = Bytes::from(gossip::encode(&GossipBody::SessionClosed {
+            host_epoch: 0,
+            host_sig: SIGNATURE_UNSIGNED,
+        }));
         if let Err(err) = sender.broadcast(bytes).await {
             warn!(error = %err, "session_closed broadcast failed");
         }
@@ -672,7 +679,12 @@ impl GossipBridge {
             );
             return;
         };
-        let bytes = Bytes::from(gossip::encode(&GossipBody::SendAck { req_id, result }));
+        // B5.1: placeholder host_sig; B5.2 signs over ack canonical bytes.
+        let bytes = Bytes::from(gossip::encode(&GossipBody::SendAck {
+            req_id,
+            result,
+            host_sig: SIGNATURE_UNSIGNED,
+        }));
         if let Err(err) = sender.broadcast(bytes).await {
             warn!(error = %err, "send_ack broadcast failed");
         }
@@ -760,7 +772,15 @@ async fn handle_inbound_frame(
         // `Event::SessionClosed`, and tear down our own bridge
         // entry. Idempotent on the registry side, so a stray
         // duplicate frame is harmless.
-        (SessionRole::Joiner { .. }, GossipBody::SessionClosed) => {
+        (
+            SessionRole::Joiner { .. },
+            GossipBody::SessionClosed {
+                host_epoch: _,
+                host_sig: _,
+            },
+        ) => {
+            // B5.1: verification of host_sig + epoch-vs-watermark lands in
+            // B5.3; until then the joiner trusts the close as before.
             track_authenticated_peer(bridge, delivered_from);
             let registry_weak = bridge.registry.lock().await.clone();
             if let Some(registry) = registry_weak.upgrade()
@@ -779,14 +799,18 @@ async fn handle_inbound_frame(
             run_host_replay(bridge, session, since).await;
         }
         // Host ignores its own Message+SendAck broadcasts (Registry
-        // already fanned out locally) and its own SessionClosed
+        // already fanned out locally), its own SessionClosed
         // (we publish before forget_session, so the broadcast
-        // round-trips back here on the same forwarder); joiners
-        // ignore each other's SendRequests + JoinAnnouncements
-        // + Replays (only the host services them at this layer).
+        // round-trips back here on the same forwarder), and its own
+        // EpochBeacon round-trip; joiners ignore each other's
+        // SendRequests + JoinAnnouncements + Replays (only the host
+        // services them at this layer).
         (
             SessionRole::Host,
-            GossipBody::Message(_) | GossipBody::SendAck { .. } | GossipBody::SessionClosed,
+            GossipBody::Message(_)
+            | GossipBody::SendAck { .. }
+            | GossipBody::SessionClosed { .. }
+            | GossipBody::EpochBeacon { .. },
         )
         | (
             SessionRole::Joiner { .. },
@@ -803,7 +827,15 @@ async fn handle_inbound_frame(
         }
         // Joiner receives the host's reply to one of our outbound
         // sends — resolve the matching pending oneshot.
-        (SessionRole::Joiner { .. }, GossipBody::SendAck { req_id, result }) => {
+        // B5.1: verify_ack lands in B5.3; until then resolve as before.
+        (
+            SessionRole::Joiner { .. },
+            GossipBody::SendAck {
+                req_id,
+                result,
+                host_sig: _,
+            },
+        ) => {
             track_authenticated_peer(bridge, delivered_from);
             let pending = bridge.pending_sends.lock().await.remove(&req_id);
             if let Some(tx) = pending {
@@ -811,6 +843,17 @@ async fn handle_inbound_frame(
             } else {
                 debug!(?req_id, "SendAck for unknown req_id; dropping");
             }
+        }
+        // Joiner receives a host epoch beacon. B5.3 verifies the host
+        // signature and advances the watermark; in B5.1 it's a no-op.
+        (
+            SessionRole::Joiner { .. },
+            GossipBody::EpochBeacon {
+                host_epoch: _,
+                host_sig: _,
+            },
+        ) => {
+            track_authenticated_peer(bridge, delivered_from);
         }
     }
 }

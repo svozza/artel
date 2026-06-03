@@ -945,6 +945,7 @@ mod tests {
             action,
             payload,
             signature,
+            artel_protocol::message::SIGNATURE_UNSIGNED,
         )
     }
 
@@ -1097,9 +1098,14 @@ mod tests {
         let frame2_start = 4 + len1;
         let len2 =
             u32::from_be_bytes(bytes[frame2_start..frame2_start + 4].try_into().unwrap()) as usize;
-        // Flip a byte well inside frame 2's payload — picking the
-        // last byte avoids the postcard variant tags at the start.
-        let target = frame2_start + 4 + len2 - 1;
+        // Flip a byte inside frame 2's author `signature` field so
+        // `verify_message` rejects it. Postcard length-prefixes each
+        // serde_bytes run, so the frame tail is
+        // `[len=64][signature 64][len=64][host_sig 64]`. The last byte
+        // is `host_sig[63]` (host-seq sig, not checked by this verify
+        // path); the author `signature`'s last byte sits 65 bytes
+        // earlier (64 host_sig bytes + 1 length-prefix byte).
+        let target = frame2_start + 4 + len2 - 1 - 65;
         bytes[target] ^= 0xff;
         std::fs::write(&log_path, &bytes).unwrap();
 
@@ -1147,6 +1153,7 @@ mod tests {
             "x",
             vec![0xab; 8],
             artel_protocol::message::SIGNATURE_UNSIGNED,
+            artel_protocol::message::SIGNATURE_UNSIGNED,
         );
         let log_path = dir.path().join(record(1).id.to_string()).join(LOG_FILE);
         append_log(&log_path, &unsigned).unwrap();
@@ -1180,6 +1187,7 @@ mod tests {
             MessageKind::Chat,
             "x",
             vec![0xab; 8],
+            artel_protocol::message::SIGNATURE_UNSIGNED,
             artel_protocol::message::SIGNATURE_UNSIGNED,
         );
         let log_path = dir.path().join(record(1).id.to_string()).join(LOG_FILE);

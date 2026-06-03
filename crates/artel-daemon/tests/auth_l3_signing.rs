@@ -225,6 +225,7 @@ async fn host_drops_send_with_tampered_signature() {
                 if let GossipBody::SendAck {
                     req_id: ack_req,
                     result,
+                    ..
                 } = decoded
                     && ack_req == req_id
                 {
@@ -395,9 +396,14 @@ async fn log_replay_drops_tampered_frames() {
     let frame2_start = 4 + len1;
     let len2 =
         u32::from_be_bytes(bytes[frame2_start..frame2_start + 4].try_into().unwrap()) as usize;
-    // Flip a byte deep in frame 2's payload — postcard still
-    // decodes, signature verify fails.
-    let target = frame2_start + 4 + len2 - 1;
+    // Flip a byte in frame 2's author `signature` so postcard still
+    // decodes but signature verify fails. Postcard length-prefixes
+    // each serde_bytes run, so the frame tail is
+    // `[len=64][signature 64][len=64][host_sig 64]`; the author
+    // signature's last byte sits 65 bytes before the frame end (64
+    // host_sig bytes + 1 length-prefix byte). host_sig itself is not
+    // checked by this replay verify path (Slice B.5.3 adds that).
+    let target = frame2_start + 4 + len2 - 1 - 65;
     bytes[target] ^= 0xff;
     std::fs::write(&log_path, &bytes).unwrap();
 

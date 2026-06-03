@@ -38,9 +38,11 @@ impl MessageFormat {
 /// Current message format version.
 ///
 /// Bumped to `2` on 2026-06-02 when [`SessionMessage::signature`] became
-/// part of the wire envelope (Auth Slice B). Pre-2 daemons can't decode v2
-/// frames; the version-2 verifier is the floor.
-pub const MESSAGE_FORMAT: MessageFormat = MessageFormat::new(2);
+/// part of the wire envelope (Auth Slice B). Bumped to `3` on 2026-06-03
+/// when [`SessionMessage::host_sig`] — the host's sequencing signature —
+/// became part of the wire envelope (Auth Slice B.5). Pre-3 daemons can't
+/// decode v3 frames; the version-3 verifier is the floor.
+pub const MESSAGE_FORMAT: MessageFormat = MessageFormat::new(3);
 
 /// 64-byte ed25519 signature carried inline on every [`SessionMessage`].
 ///
@@ -139,6 +141,21 @@ pub struct SessionMessage {
     /// 64-byte run via `serde_bytes`.
     #[serde(with = "signature_serde")]
     pub signature: SigBytes,
+    /// 64-byte ed25519 signature produced by the **host** over
+    /// `crate::signing::seq_canonical_bytes` of (`session_id`, `seq`,
+    /// `author_sig`) — i.e. `"artel/seq-v1" || session_id || seq ||
+    /// signature`. Distinct from the author [`signature`](Self::signature):
+    /// the author signs the body (seq excluded, so a joiner can sign
+    /// before the host stamps the seq); the host then binds *this seq* to
+    /// *that author signature* when it sequences the message, so a captured
+    /// frame replayed under a different seq fails the host's check (Auth
+    /// Slice B.5, finding #1). Persisted (D1), so each log entry is
+    /// self-authenticating per its sequencer. [`SIGNATURE_UNSIGNED`] is the
+    /// "not yet host-signed" sentinel; joiners reject it once verification
+    /// is on (Slice B.5.3). Wire-form is a flat 64-byte run via
+    /// `serde_bytes`.
+    #[serde(with = "signature_serde")]
+    pub host_sig: SigBytes,
 }
 
 impl SessionMessage {
@@ -151,6 +168,7 @@ impl SessionMessage {
     /// catches "we forgot to wire signing in" loudly rather than
     /// silently.
     #[must_use]
+    #[allow(clippy::too_many_arguments)] // mirrors the wire field set
     pub fn new(
         seq: Seq,
         timestamp_ms: u64,
@@ -159,6 +177,7 @@ impl SessionMessage {
         action: impl Into<String>,
         payload: Vec<u8>,
         signature: SigBytes,
+        host_sig: SigBytes,
     ) -> Self {
         Self {
             version: MESSAGE_FORMAT,
@@ -169,6 +188,7 @@ impl SessionMessage {
             action: action.into(),
             payload,
             signature,
+            host_sig,
         }
     }
 }
@@ -315,15 +335,16 @@ mod tests {
             "chat.message",
             b"hello".to_vec(),
             SIGNATURE_UNSIGNED,
+            SIGNATURE_UNSIGNED,
         )
     }
 
     // ---- MessageFormat ----
 
     #[test]
-    fn message_format_constant_is_two() {
-        assert_eq!(MESSAGE_FORMAT, MessageFormat::new(2));
-        assert_eq!(MESSAGE_FORMAT.get(), 2);
+    fn message_format_constant_is_three() {
+        assert_eq!(MESSAGE_FORMAT, MessageFormat::new(3));
+        assert_eq!(MESSAGE_FORMAT.get(), 3);
     }
 
     #[test]
@@ -385,6 +406,7 @@ mod tests {
             "system.heartbeat",
             Vec::new(),
             SIGNATURE_UNSIGNED,
+            SIGNATURE_UNSIGNED,
         );
         let bytes = postcard::to_allocvec(&m).unwrap();
         let back: SessionMessage = postcard::from_bytes(&bytes).unwrap();
@@ -402,6 +424,7 @@ mod tests {
             "tool.exec",
             vec![0xab; 64 * 1024],
             [0xcd; 64],
+            [0xce; 64],
         );
         let bytes = postcard::to_allocvec(&m).unwrap();
         let back: SessionMessage = postcard::from_bytes(&bytes).unwrap();
@@ -421,14 +444,15 @@ mod tests {
             "x",
             vec![0xff; 16],
             SIGNATURE_UNSIGNED,
+            SIGNATURE_UNSIGNED,
         );
         let bytes = postcard::to_allocvec(&m).unwrap();
         // u8 + varint(1) + varint(0) + 32 bytes peer + 0-len name + variant
-        // tag + 1-char action + 16 bytes payload + 64-byte signature run,
-        // plus framing varints. Generous upper bound; will fail loudly if
-        // encoding regresses.
+        // tag + 1-char action + 16 bytes payload + 64-byte signature run +
+        // 64-byte host_sig run, plus framing varints. Generous upper bound;
+        // will fail loudly if encoding regresses.
         assert!(
-            bytes.len() < 160,
+            bytes.len() < 240,
             "postcard size grew unexpectedly: {} bytes",
             bytes.len()
         );
@@ -449,6 +473,7 @@ mod tests {
             "chat.message",
             b"hi".to_vec(),
             sig,
+            SIGNATURE_UNSIGNED,
         );
         let bytes = postcard::to_allocvec(&m).unwrap();
         let back: SessionMessage = postcard::from_bytes(&bytes).unwrap();
@@ -468,6 +493,7 @@ mod tests {
             "chat.message",
             b"hi".to_vec(),
             sig,
+            SIGNATURE_UNSIGNED,
         );
         let json = serde_json::to_string(&m).unwrap();
         let expected = format!("\"signature\":\"{}\"", "ab".repeat(64));
@@ -477,6 +503,53 @@ mod tests {
         );
         let back: SessionMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(back.signature, sig);
+    }
+
+    #[test]
+    fn session_message_host_sig_round_trips_postcard() {
+        // Pin the host_sig field's wire shape: a 64-byte run, distinct
+        // from the author `signature`.
+        let mut host_sig = [0u8; 64];
+        for (i, b) in host_sig.iter_mut().enumerate() {
+            *b = u8::try_from((i * 3) % 256).unwrap();
+        }
+        let m = SessionMessage::new(
+            Seq::new(1),
+            42,
+            sample_peer(),
+            MessageKind::Chat,
+            "chat.message",
+            b"hi".to_vec(),
+            [0x11; 64],
+            host_sig,
+        );
+        let bytes = postcard::to_allocvec(&m).unwrap();
+        let back: SessionMessage = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back.host_sig, host_sig);
+        // The two signatures are independent fields.
+        assert_eq!(back.signature, [0x11; 64]);
+        assert_ne!(back.host_sig, back.signature);
+    }
+
+    #[test]
+    fn session_message_host_sig_round_trips_json_as_hex() {
+        // JSON renders host_sig as its own 128-char lowercase-hex string.
+        let host_sig = [0xcdu8; 64];
+        let m = SessionMessage::new(
+            Seq::new(1),
+            42,
+            sample_peer(),
+            MessageKind::Chat,
+            "chat.message",
+            b"hi".to_vec(),
+            [0xab; 64],
+            host_sig,
+        );
+        let json = serde_json::to_string(&m).unwrap();
+        let expected = format!("\"host_sig\":\"{}\"", "cd".repeat(64));
+        assert!(json.contains(&expected), "json missing hex host_sig: {json}");
+        let back: SessionMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.host_sig, host_sig);
     }
 
     #[test]
@@ -540,6 +613,7 @@ mod tests {
             action in "[\\PC]{0,64}",
             payload in proptest::collection::vec(any::<u8>(), 0..512),
             signature in any::<[u8; 64]>(),
+            host_sig in any::<[u8; 64]>(),
         ) {
             let kind = match kind_idx {
                 0 => MessageKind::Chat,
@@ -555,6 +629,7 @@ mod tests {
                 action,
                 payload,
                 signature,
+                host_sig,
             };
             let bytes = postcard::to_allocvec(&m).unwrap();
             let back: SessionMessage = postcard::from_bytes(&bytes).unwrap();
@@ -571,6 +646,7 @@ mod tests {
             action in "[\\PC]{0,64}",
             payload in proptest::collection::vec(any::<u8>(), 0..256),
             signature in any::<[u8; 64]>(),
+            host_sig in any::<[u8; 64]>(),
         ) {
             let kind = match kind_idx {
                 0 => MessageKind::Chat,
@@ -585,6 +661,7 @@ mod tests {
                 action,
                 payload,
                 signature,
+                host_sig,
             );
             let json = serde_json::to_string(&m).unwrap();
             let back: SessionMessage = serde_json::from_str(&json).unwrap();

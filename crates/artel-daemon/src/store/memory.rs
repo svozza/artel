@@ -186,6 +186,7 @@ mod tests {
             "x",
             vec![],
             artel_protocol::message::SIGNATURE_UNSIGNED,
+            artel_protocol::message::SIGNATURE_UNSIGNED,
         )
     }
 

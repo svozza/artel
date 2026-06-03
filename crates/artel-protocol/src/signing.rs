@@ -46,8 +46,10 @@
 
 use ed25519_dalek::{Signature, Signer, VerifyingKey};
 pub use ed25519_dalek::{SigningKey, VerifyingKey as EdVerifyingKey};
+use uuid::Uuid;
 
-use crate::ids::SessionId;
+use crate::error::ProtocolError;
+use crate::ids::{PeerId, Seq, SessionId};
 use crate::message::{
     MESSAGE_FORMAT, MessageFormat, MessageKind, PeerInfo, SIGNATURE_UNSIGNED, SessionMessage,
     SigBytes,
@@ -245,6 +247,199 @@ pub const fn verify_reason(err: &VerifyError) -> &'static str {
     }
 }
 
+// ===========================================================================
+// Host-origin signatures (Auth Slice B.5)
+//
+// Three additional domain-separated canonical-byte layouts the **host**
+// signs over, distinct from the author `canonical_bytes` above. Each binds
+// a host-originated or host-sequenced frame to the host key so a joiner can
+// authenticate origin against the host pubkey it persists as `session.host`
+// (= the ticket's `host_peer_id`) — topology-independent, not relayer-based.
+//
+// Same hand-rolled, big-endian, length-prefixed, domain-separated discipline
+// as `canonical_bytes`: fixed-width fields are emitted as-is; variable-width
+// fields are length-prefixed. ed25519 hashes the message internally so no
+// separate digest dependency is needed.
+// ===========================================================================
+
+/// Domain prefix for the host's per-message **sequencing** signature.
+///
+/// Binds *this seq* to *this author signature* under the host key:
+/// `"artel/seq-v1" || session_id || seq || author_sig`. A genuine frame
+/// replayed under a different seq fails this check (the captured `host_sig`
+/// is bound to the original seq) — closes finding #1.
+pub const SEQ_DOMAIN_TAG: &[u8] = b"artel/seq-v1";
+
+/// Domain prefix for the host's [`crate::gossip::GossipBody::SendAck`]
+/// signature. Binds the ack `result` so a signed `Ok` cannot be flipped to
+/// `Err` (or vice-versa): `"artel/ack-v1" || session_id || req_id ||
+/// result_discriminant || postcard(result)`.
+pub const ACK_DOMAIN_TAG: &[u8] = b"artel/ack-v1";
+
+/// Domain prefix for the host's control-frame signature, shared by
+/// [`crate::gossip::GossipBody::SessionClosed`] **and**
+/// [`crate::gossip::GossipBody::EpochBeacon`]:
+/// `"artel/ctrl-v1" || session_id || host_epoch`. One verifier
+/// ([`verify_ctrl`]) serves both frames, so a `host_sig` produced for a
+/// beacon validates a close at the same epoch.
+pub const CTRL_DOMAIN_TAG: &[u8] = b"artel/ctrl-v1";
+
+/// Canonical bytes for the host's per-message sequencing signature.
+///
+/// `SEQ_DOMAIN_TAG || session_id(16) || seq.to_be_bytes()(8) ||
+/// author_sig(64)`. All fields fixed-width.
+#[must_use]
+pub fn seq_canonical_bytes(session_id: SessionId, seq: Seq, author_sig: &SigBytes) -> Vec<u8> {
+    let mut out = Vec::with_capacity(SEQ_DOMAIN_TAG.len() + 16 + 8 + 64);
+    out.extend_from_slice(SEQ_DOMAIN_TAG);
+    out.extend_from_slice(session_id.as_bytes());
+    out.extend_from_slice(&seq.get().to_be_bytes());
+    out.extend_from_slice(author_sig);
+    out
+}
+
+/// Sign the sequencing canonical bytes with the host's key.
+#[must_use]
+pub fn sign_seq(key: &SigningKey, session_id: SessionId, seq: Seq, author_sig: &SigBytes) -> SigBytes {
+    key.sign(&seq_canonical_bytes(session_id, seq, author_sig))
+        .to_bytes()
+}
+
+/// Verify a host sequencing signature against the host's public key.
+///
+/// # Errors
+///
+/// - [`VerifyError::SentinelUnsigned`] if `host_sig` is the all-zero
+///   sentinel ([`SIGNATURE_UNSIGNED`]).
+/// - [`VerifyError::BadKey`] if `host_pubkey` is not a valid ed25519 key.
+/// - [`VerifyError::BadSig`] if the signature does not verify (wrong host,
+///   tampered seq, or tampered author sig). Uses strict verification.
+pub fn verify_seq(
+    host_pubkey: &PeerId,
+    session_id: SessionId,
+    seq: Seq,
+    author_sig: &SigBytes,
+    host_sig: &SigBytes,
+) -> Result<(), VerifyError> {
+    if host_sig == &SIGNATURE_UNSIGNED {
+        return Err(VerifyError::SentinelUnsigned);
+    }
+    let verifying = VerifyingKey::from_bytes(host_pubkey.as_bytes()).map_err(|_| VerifyError::BadKey)?;
+    let sig = Signature::from_bytes(host_sig);
+    verifying
+        .verify_strict(&seq_canonical_bytes(session_id, seq, author_sig), &sig)
+        .map_err(|_| VerifyError::BadSig)
+}
+
+/// Canonical bytes for a host [`crate::gossip::GossipBody::SendAck`]
+/// signature.
+///
+/// `ACK_DOMAIN_TAG || session_id(16) || req_id(16) || disc(1) ||
+/// postcard(result)`. The 1-byte discriminant (`0`=Ok, `1`=Err) plus the
+/// postcard-encoded `result` bind the verdict so Ok↔Err cannot be flipped.
+#[must_use]
+pub fn ack_canonical_bytes(
+    session_id: SessionId,
+    req_id: Uuid,
+    result: &Result<SessionMessage, ProtocolError>,
+) -> Vec<u8> {
+    let (disc, body): (u8, Vec<u8>) = match result {
+        Ok(msg) => (0, postcard::to_allocvec(msg).expect("postcard encode SessionMessage")),
+        Err(err) => (1, postcard::to_allocvec(err).expect("postcard encode ProtocolError")),
+    };
+    let mut out = Vec::with_capacity(ACK_DOMAIN_TAG.len() + 16 + 16 + 1 + body.len());
+    out.extend_from_slice(ACK_DOMAIN_TAG);
+    out.extend_from_slice(session_id.as_bytes());
+    out.extend_from_slice(req_id.as_bytes());
+    out.push(disc);
+    out.extend_from_slice(&body);
+    out
+}
+
+/// Sign a host `SendAck` verdict.
+#[must_use]
+pub fn sign_ack(
+    key: &SigningKey,
+    session_id: SessionId,
+    req_id: Uuid,
+    result: &Result<SessionMessage, ProtocolError>,
+) -> SigBytes {
+    key.sign(&ack_canonical_bytes(session_id, req_id, result))
+        .to_bytes()
+}
+
+/// Verify a host `SendAck` signature against the host's public key.
+///
+/// # Errors
+///
+/// Mirrors [`verify_seq`]: sentinel, bad key, or bad sig. A flipped
+/// `result` (Ok↔Err) or tampered message yields [`VerifyError::BadSig`].
+pub fn verify_ack(
+    host_pubkey: &PeerId,
+    session_id: SessionId,
+    req_id: Uuid,
+    result: &Result<SessionMessage, ProtocolError>,
+    host_sig: &SigBytes,
+) -> Result<(), VerifyError> {
+    if host_sig == &SIGNATURE_UNSIGNED {
+        return Err(VerifyError::SentinelUnsigned);
+    }
+    let verifying = VerifyingKey::from_bytes(host_pubkey.as_bytes()).map_err(|_| VerifyError::BadKey)?;
+    let sig = Signature::from_bytes(host_sig);
+    verifying
+        .verify_strict(&ack_canonical_bytes(session_id, req_id, result), &sig)
+        .map_err(|_| VerifyError::BadSig)
+}
+
+/// Canonical bytes for a host control-frame signature
+/// ([`crate::gossip::GossipBody::SessionClosed`] and
+/// [`crate::gossip::GossipBody::EpochBeacon`]).
+///
+/// `CTRL_DOMAIN_TAG || session_id(16) || host_epoch.to_be_bytes()(8)`. The
+/// `host_epoch` is the freshness element defeating replay across a same-id
+/// host resume (the iroh endpoint secret is stable, so a host signature
+/// alone can't distinguish incarnations N and N+1).
+#[must_use]
+pub fn ctrl_canonical_bytes(session_id: SessionId, host_epoch: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(CTRL_DOMAIN_TAG.len() + 16 + 8);
+    out.extend_from_slice(CTRL_DOMAIN_TAG);
+    out.extend_from_slice(session_id.as_bytes());
+    out.extend_from_slice(&host_epoch.to_be_bytes());
+    out
+}
+
+/// Sign a host control-frame (close / epoch beacon) at `host_epoch`.
+#[must_use]
+pub fn sign_ctrl(key: &SigningKey, session_id: SessionId, host_epoch: u64) -> SigBytes {
+    key.sign(&ctrl_canonical_bytes(session_id, host_epoch))
+        .to_bytes()
+}
+
+/// Verify a host control-frame signature against the host's public key.
+///
+/// Shared by `SessionClosed` and `EpochBeacon` — a `host_sig` produced for
+/// either verifies the other at the same epoch.
+///
+/// # Errors
+///
+/// Mirrors [`verify_seq`]: sentinel, bad key, or bad sig. A tampered
+/// `host_epoch` yields [`VerifyError::BadSig`].
+pub fn verify_ctrl(
+    host_pubkey: &PeerId,
+    session_id: SessionId,
+    host_epoch: u64,
+    host_sig: &SigBytes,
+) -> Result<(), VerifyError> {
+    if host_sig == &SIGNATURE_UNSIGNED {
+        return Err(VerifyError::SentinelUnsigned);
+    }
+    let verifying = VerifyingKey::from_bytes(host_pubkey.as_bytes()).map_err(|_| VerifyError::BadKey)?;
+    let sig = Signature::from_bytes(host_sig);
+    verifying
+        .verify_strict(&ctrl_canonical_bytes(session_id, host_epoch), &sig)
+        .map_err(|_| VerifyError::BadSig)
+}
+
 #[cfg(test)]
 mod tests {
     use ed25519_dalek::SigningKey;
@@ -294,6 +489,7 @@ mod tests {
             action.to_string(),
             payload.to_vec(),
             signature,
+            SIGNATURE_UNSIGNED,
         )
     }
 
@@ -606,5 +802,306 @@ mod tests {
         verify_message(s, &m, &sig).unwrap();
         m.seq = crate::ids::Seq::new(u64::MAX);
         verify_message(s, &m, &sig).unwrap();
+    }
+
+    // ====================================================================
+    // Host-origin signatures (Auth Slice B.5)
+    // ====================================================================
+
+    use uuid::Uuid;
+
+    use crate::error::ProtocolError;
+    use crate::ids::Seq;
+
+    fn host_pubkey(key: &SigningKey) -> PeerId {
+        PeerId::from_bytes(key.verifying_key().to_bytes())
+    }
+
+    // ---- domain tags ----
+
+    #[test]
+    fn host_domain_tags_are_versioned() {
+        assert_eq!(SEQ_DOMAIN_TAG, b"artel/seq-v1");
+        assert_eq!(ACK_DOMAIN_TAG, b"artel/ack-v1");
+        assert_eq!(CTRL_DOMAIN_TAG, b"artel/ctrl-v1");
+    }
+
+    // ---- seq canonical bytes / round-trip ----
+
+    #[test]
+    fn seq_canonical_bytes_field_offsets() {
+        // session_id sits right after the domain tag; seq right after
+        // session_id (offset tag+16); author_sig after that (tag+16+8).
+        let author = [0x55u8; 64];
+        let base = seq_canonical_bytes(SessionId::from_bytes([0x01; 16]), Seq::new(7), &author);
+
+        let diff_sid =
+            seq_canonical_bytes(SessionId::from_bytes([0x02; 16]), Seq::new(7), &author);
+        let first = base
+            .iter()
+            .zip(diff_sid.iter())
+            .position(|(x, y)| x != y)
+            .expect("session_id diff");
+        assert_eq!(first, SEQ_DOMAIN_TAG.len());
+
+        let diff_seq =
+            seq_canonical_bytes(SessionId::from_bytes([0x01; 16]), Seq::new(8), &author);
+        let first = base
+            .iter()
+            .zip(diff_seq.iter())
+            .position(|(x, y)| x != y)
+            .expect("seq diff");
+        // be-encoded u64 differs in its last byte: tag + 16 + 7.
+        assert_eq!(first, SEQ_DOMAIN_TAG.len() + 16 + 7);
+
+        let mut author2 = author;
+        author2[0] ^= 0xff;
+        let diff_author =
+            seq_canonical_bytes(SessionId::from_bytes([0x01; 16]), Seq::new(7), &author2);
+        let first = base
+            .iter()
+            .zip(diff_author.iter())
+            .position(|(x, y)| x != y)
+            .expect("author_sig diff");
+        assert_eq!(first, SEQ_DOMAIN_TAG.len() + 16 + 8);
+    }
+
+    #[test]
+    fn sign_then_verify_seq_round_trip() {
+        let key = key_a();
+        let s = sample_session_id();
+        let author = [0x33u8; 64];
+        let host_sig = sign_seq(&key, s, Seq::new(42), &author);
+        verify_seq(&host_pubkey(&key), s, Seq::new(42), &author, &host_sig).unwrap();
+    }
+
+    #[test]
+    fn verify_seq_rejects_wrong_host_key() {
+        let signer = key_a();
+        let s = sample_session_id();
+        let author = [0x33u8; 64];
+        let host_sig = sign_seq(&signer, s, Seq::new(42), &author);
+        // Verify under a different host pubkey → BadSig.
+        assert_eq!(
+            verify_seq(&host_pubkey(&key_b()), s, Seq::new(42), &author, &host_sig).unwrap_err(),
+            VerifyError::BadSig,
+        );
+    }
+
+    #[test]
+    fn verify_seq_rejects_seq_change() {
+        // Finding #1: a captured (seq, author_sig, host_sig) tuple
+        // replayed under a different seq fails the host seq-sig.
+        let key = key_a();
+        let s = sample_session_id();
+        let author = [0x33u8; 64];
+        let host_sig = sign_seq(&key, s, Seq::new(42), &author);
+        verify_seq(&host_pubkey(&key), s, Seq::new(42), &author, &host_sig).unwrap();
+        assert_eq!(
+            verify_seq(&host_pubkey(&key), s, Seq::new(43), &author, &host_sig).unwrap_err(),
+            VerifyError::BadSig,
+        );
+    }
+
+    #[test]
+    fn verify_seq_rejects_author_sig_change() {
+        let key = key_a();
+        let s = sample_session_id();
+        let author = [0x33u8; 64];
+        let host_sig = sign_seq(&key, s, Seq::new(42), &author);
+        let mut author2 = author;
+        author2[10] ^= 0x01;
+        assert_eq!(
+            verify_seq(&host_pubkey(&key), s, Seq::new(42), &author2, &host_sig).unwrap_err(),
+            VerifyError::BadSig,
+        );
+    }
+
+    #[test]
+    fn verify_seq_rejects_sentinel() {
+        let key = key_a();
+        let s = sample_session_id();
+        assert_eq!(
+            verify_seq(&host_pubkey(&key), s, Seq::new(1), &[0x33; 64], &SIGNATURE_UNSIGNED)
+                .unwrap_err(),
+            VerifyError::SentinelUnsigned,
+        );
+    }
+
+    // ---- ack canonical bytes / round-trip ----
+
+    fn sample_ack_message() -> SessionMessage {
+        SessionMessage::new(
+            Seq::new(3),
+            42,
+            peer_for(&key_a()),
+            MessageKind::Chat,
+            "chat.message",
+            b"hi".to_vec(),
+            [0x11; 64],
+            [0x22; 64],
+        )
+    }
+
+    #[test]
+    fn ack_canonical_bytes_field_offsets() {
+        let req = Uuid::from_u128(0x1234);
+        let result = Ok(sample_ack_message());
+        let base = ack_canonical_bytes(SessionId::from_bytes([0x01; 16]), req, &result);
+
+        let diff_sid =
+            ack_canonical_bytes(SessionId::from_bytes([0x02; 16]), req, &result);
+        let first = base
+            .iter()
+            .zip(diff_sid.iter())
+            .position(|(x, y)| x != y)
+            .expect("session_id diff");
+        assert_eq!(first, ACK_DOMAIN_TAG.len());
+
+        let diff_req = ack_canonical_bytes(
+            SessionId::from_bytes([0x01; 16]),
+            Uuid::from_u128(0x1235),
+            &result,
+        );
+        let first = base
+            .iter()
+            .zip(diff_req.iter())
+            .position(|(x, y)| x != y)
+            .expect("req_id diff");
+        // req_id is a 16-byte big-endian-ish UUID after the 16-byte sid.
+        assert!(first >= ACK_DOMAIN_TAG.len() + 16);
+        assert!(first < ACK_DOMAIN_TAG.len() + 16 + 16);
+    }
+
+    #[test]
+    fn sign_then_verify_ack_round_trip_ok_and_err() {
+        let key = key_a();
+        let s = sample_session_id();
+        let req = Uuid::from_u128(0xabcd);
+        for result in [
+            Ok(sample_ack_message()),
+            Err(ProtocolError::Internal("closed".into())),
+        ] {
+            let host_sig = sign_ack(&key, s, req, &result);
+            verify_ack(&host_pubkey(&key), s, req, &result, &host_sig).unwrap();
+        }
+    }
+
+    #[test]
+    fn verify_ack_rejects_result_flip() {
+        // Sign over Ok(msg); verifying against an Err-shaped result must
+        // fail, and vice-versa. Pins the result binding (cross-check the
+        // "ack signs a message carrying its own host_sig" circularity).
+        let key = key_a();
+        let s = sample_session_id();
+        let req = Uuid::from_u128(0xabcd);
+        let ok = Ok(sample_ack_message());
+        let err = Err(ProtocolError::Internal("closed".into()));
+
+        let sig_over_ok = sign_ack(&key, s, req, &ok);
+        assert_eq!(
+            verify_ack(&host_pubkey(&key), s, req, &err, &sig_over_ok).unwrap_err(),
+            VerifyError::BadSig,
+        );
+
+        let sig_over_err = sign_ack(&key, s, req, &err);
+        assert_eq!(
+            verify_ack(&host_pubkey(&key), s, req, &ok, &sig_over_err).unwrap_err(),
+            VerifyError::BadSig,
+        );
+    }
+
+    #[test]
+    fn verify_ack_rejects_wrong_host_key() {
+        let key = key_a();
+        let s = sample_session_id();
+        let req = Uuid::from_u128(0x1);
+        let result = Ok(sample_ack_message());
+        let host_sig = sign_ack(&key, s, req, &result);
+        assert_eq!(
+            verify_ack(&host_pubkey(&key_b()), s, req, &result, &host_sig).unwrap_err(),
+            VerifyError::BadSig,
+        );
+    }
+
+    // ---- ctrl canonical bytes / round-trip ----
+
+    #[test]
+    fn ctrl_canonical_bytes_field_offsets() {
+        let base = ctrl_canonical_bytes(SessionId::from_bytes([0x01; 16]), 7);
+        let diff_sid = ctrl_canonical_bytes(SessionId::from_bytes([0x02; 16]), 7);
+        let first = base
+            .iter()
+            .zip(diff_sid.iter())
+            .position(|(x, y)| x != y)
+            .expect("session_id diff");
+        assert_eq!(first, CTRL_DOMAIN_TAG.len());
+
+        let diff_epoch = ctrl_canonical_bytes(SessionId::from_bytes([0x01; 16]), 8);
+        let first = base
+            .iter()
+            .zip(diff_epoch.iter())
+            .position(|(x, y)| x != y)
+            .expect("epoch diff");
+        // be-encoded u64 epoch differs in its last byte: tag + 16 + 7.
+        assert_eq!(first, CTRL_DOMAIN_TAG.len() + 16 + 7);
+    }
+
+    #[test]
+    fn sign_then_verify_ctrl_round_trip() {
+        let key = key_a();
+        let s = sample_session_id();
+        let host_sig = sign_ctrl(&key, s, 5);
+        verify_ctrl(&host_pubkey(&key), s, 5, &host_sig).unwrap();
+    }
+
+    #[test]
+    fn verify_ctrl_rejects_epoch_change() {
+        let key = key_a();
+        let s = sample_session_id();
+        let host_sig = sign_ctrl(&key, s, 5);
+        verify_ctrl(&host_pubkey(&key), s, 5, &host_sig).unwrap();
+        assert_eq!(
+            verify_ctrl(&host_pubkey(&key), s, 6, &host_sig).unwrap_err(),
+            VerifyError::BadSig,
+        );
+    }
+
+    #[test]
+    fn verify_ctrl_rejects_wrong_host_key() {
+        let key = key_a();
+        let s = sample_session_id();
+        let host_sig = sign_ctrl(&key, s, 5);
+        assert_eq!(
+            verify_ctrl(&host_pubkey(&key_b()), s, 5, &host_sig).unwrap_err(),
+            VerifyError::BadSig,
+        );
+    }
+
+    #[test]
+    fn verify_ctrl_shared_by_beacon_and_close() {
+        // The defining property of the shared CTRL canonical bytes: a
+        // host_sig produced for an EpochBeacon verifies a SessionClosed
+        // at the same epoch and vice-versa — they sign identical bytes.
+        let key = key_a();
+        let s = sample_session_id();
+        // "beacon" and "close" are just two call sites; the sig is over
+        // (session_id, host_epoch) regardless of frame.
+        let beacon_sig = sign_ctrl(&key, s, 9);
+        // Verify it as if it rode on a SessionClosed at epoch 9.
+        verify_ctrl(&host_pubkey(&key), s, 9, &beacon_sig).unwrap();
+        let close_sig = sign_ctrl(&key, s, 9);
+        verify_ctrl(&host_pubkey(&key), s, 9, &close_sig).unwrap();
+        assert_eq!(beacon_sig, close_sig, "deterministic over identical bytes");
+    }
+
+    #[test]
+    fn verify_ctrl_rejects_sentinel() {
+        let key = key_a();
+        let s = sample_session_id();
+        assert_eq!(
+            verify_ctrl(&host_pubkey(&key), s, 1, &SIGNATURE_UNSIGNED).unwrap_err(),
+            VerifyError::SentinelUnsigned,
+        );
     }
 }

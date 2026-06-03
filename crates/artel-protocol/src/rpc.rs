@@ -482,6 +482,7 @@ mod tests {
             "chat.message",
             b"hi".to_vec(),
             crate::message::SIGNATURE_UNSIGNED,
+            crate::message::SIGNATURE_UNSIGNED,
         )
     }
 
