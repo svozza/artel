@@ -44,9 +44,7 @@ use std::time::Duration;
 use artel_protocol::gossip::{self, GossipBody};
 use artel_protocol::rpc::{SendPayload, SignedSendPayload};
 use artel_protocol::ticket::WireEndpointAddr;
-use artel_protocol::{
-    PeerId, PeerInfo, ProtocolError, SIGNATURE_UNSIGNED, Seq, SessionId, SessionMessage,
-};
+use artel_protocol::{PeerId, PeerInfo, ProtocolError, Seq, SessionId, SessionMessage};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use iroh::EndpointAddr;
@@ -594,7 +592,7 @@ impl GossipBridge {
     /// neighbor goes silent. Best-effort — if the broadcast fails,
     /// joiners fall back to discovering the close via their next
     /// `SendRequest` timing out.
-    pub(crate) async fn publish_session_closed(&self, session: SessionId) {
+    pub(crate) async fn publish_session_closed(&self, session: SessionId, host_epoch: u64) {
         let sender = self
             .sessions
             .lock()
@@ -608,14 +606,50 @@ impl GossipBridge {
             );
             return;
         };
-        // B5.1: emit placeholder host_epoch/host_sig so the wire shape is
-        // current; B5.2 threads the real epoch + signs over ctrl bytes.
+        // Host-sign over `"artel/ctrl-v1" || session || host_epoch`
+        // (Auth Slice B.5, D3) — the same canonical bytes as the
+        // EpochBeacon, so the joiner's `verify_ctrl` serves both.
+        let host_sig =
+            artel_protocol::signing::sign_ctrl(self.signing_key.as_signing_key(), session, host_epoch);
         let bytes = Bytes::from(gossip::encode(&GossipBody::SessionClosed {
-            host_epoch: 0,
-            host_sig: SIGNATURE_UNSIGNED,
+            host_epoch,
+            host_sig,
         }));
         if let Err(err) = sender.broadcast(bytes).await {
             warn!(error = %err, "session_closed broadcast failed");
+        }
+    }
+
+    /// Broadcast a signed [`GossipBody::EpochBeacon`] on the topic for
+    /// `session` (Auth Slice B.5, D3). Called from `Registry::host`'s
+    /// resume branch after re-subscribing, so already-joined joiners
+    /// learn the bumped incarnation epoch immediately — independent of
+    /// session activity. Best-effort (warn on failure), modeled on
+    /// [`Self::publish_join_announcement`]. This is the only frame that
+    /// advances a joiner's `host_epoch` watermark, and it carries a
+    /// host-*signed* epoch so an attacker can't forge a high value.
+    pub(crate) async fn publish_epoch_beacon(&self, session: SessionId, host_epoch: u64) {
+        let sender = self
+            .sessions
+            .lock()
+            .await
+            .get(&session)
+            .map(|s| s.sender.clone());
+        let Some(sender) = sender else {
+            debug!(
+                ?session,
+                "publish_epoch_beacon: session has no gossip topic; dropping",
+            );
+            return;
+        };
+        let host_sig =
+            artel_protocol::signing::sign_ctrl(self.signing_key.as_signing_key(), session, host_epoch);
+        let bytes = Bytes::from(gossip::encode(&GossipBody::EpochBeacon {
+            host_epoch,
+            host_sig,
+        }));
+        if let Err(err) = sender.broadcast(bytes).await {
+            warn!(error = %err, "epoch_beacon broadcast failed");
         }
     }
 
@@ -679,11 +713,19 @@ impl GossipBridge {
             );
             return;
         };
-        // B5.1: placeholder host_sig; B5.2 signs over ack canonical bytes.
+        // Host-sign over `"artel/ack-v1" || session || req_id || result`
+        // (Auth Slice B.5, D2) so a racing peer can't forge an ack or
+        // flip Ok↔Err. `result` is bound into the signed scope.
+        let host_sig = artel_protocol::signing::sign_ack(
+            self.signing_key.as_signing_key(),
+            session,
+            req_id,
+            &result,
+        );
         let bytes = Bytes::from(gossip::encode(&GossipBody::SendAck {
             req_id,
             result,
-            host_sig: SIGNATURE_UNSIGNED,
+            host_sig,
         }));
         if let Err(err) = sender.broadcast(bytes).await {
             warn!(error = %err, "send_ack broadcast failed");

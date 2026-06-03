@@ -78,6 +78,14 @@ impl SessionStore for MemoryStore {
         Ok(())
     }
 
+    async fn bump_host_epoch(&self, session: SessionId, epoch: u64) -> io::Result<()> {
+        let mut guard = self.inner.lock().expect("poisoned");
+        if let Some(entry) = guard.get_mut(&session) {
+            entry.record.host_epoch = epoch;
+        }
+        Ok(())
+    }
+
     async fn add_member(&self, session: SessionId, peer: &PeerInfo) -> io::Result<()> {
         let mut guard = self.inner.lock().expect("poisoned");
         let entry = guard
@@ -174,6 +182,7 @@ mod tests {
             head: Seq::ZERO,
             log: Vec::new(),
             kind: SessionKind::Local,
+            host_epoch: 0,
         }
     }
 

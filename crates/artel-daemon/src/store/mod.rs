@@ -55,6 +55,12 @@ pub(crate) trait SessionStore: Send + Sync + std::fmt::Debug {
     /// (fsync on disk-backed implementations) before returning.
     async fn append(&self, session: SessionId, message: &SessionMessage) -> io::Result<()>;
 
+    /// Persist a new host incarnation `epoch` for `session` without
+    /// rewriting the full record (Auth Slice B.5). Called from
+    /// `Registry::host`'s resume branch after bumping the in-memory
+    /// epoch. A no-op (returning `Ok(())`) for an unknown session.
+    async fn bump_host_epoch(&self, session: SessionId, epoch: u64) -> io::Result<()>;
+
     /// Add a peer to a session's member set.
     async fn add_member(&self, session: SessionId, peer: &PeerInfo) -> io::Result<()>;
 

@@ -169,6 +169,11 @@ pub struct Session {
     members: HashSet<PeerId>,
     log: Vec<SessionMessage>,
     head: Seq,
+    /// Host incarnation epoch. On a `Local` session this is the host's
+    /// own incarnation counter (bumped on resume); on a `Remote` mirror
+    /// it is the highest beacon-verified host epoch (the watermark).
+    /// See [`SessionRecord::host_epoch`].
+    host_epoch: u64,
     events_tx: broadcast::Sender<Event>,
 }
 
@@ -184,6 +189,7 @@ impl Session {
             members,
             log: Vec::new(),
             head: Seq::ZERO,
+            host_epoch: 0,
             events_tx,
         }
     }
@@ -201,6 +207,7 @@ impl Session {
             members: record.members,
             log: record.log,
             head: record.head,
+            host_epoch: record.host_epoch,
             events_tx,
         }
     }
@@ -214,6 +221,7 @@ impl Session {
             head: self.head,
             log: self.log.clone(),
             kind: self.kind,
+            host_epoch: self.host_epoch,
         }
     }
 
@@ -423,16 +431,35 @@ impl Registry {
                 guard.get(&id).cloned()
             };
             if let Some(arc) = existing {
-                let s = arc.lock().await;
-                if s.host != host_peer.id || s.kind != SessionKind::Local {
-                    return Err(SessionError::SessionConflict(id));
-                }
-                drop(s);
-                let ticket = JoinTicket::from(ticket::encode(&SessionTicket {
-                    session_id: id,
-                    host_peer_id: self.daemon_peer_id,
-                    host_addr: self.daemon_addr.clone(),
-                }));
+                // Bump this host's incarnation epoch (Auth Slice B.5,
+                // D3) and persist it before returning the ticket or
+                // re-subscribing. This re-subscribe of an existing
+                // local-host record IS the incarnation boundary: a
+                // `SessionClosed` signed at the old epoch is rejected
+                // against a joiner whose beacon-advanced watermark has
+                // moved past it. A fresh create (below) leaves epoch 0.
+                let (host_epoch, ticket) = {
+                    let mut s = arc.lock().await;
+                    if s.host != host_peer.id || s.kind != SessionKind::Local {
+                        return Err(SessionError::SessionConflict(id));
+                    }
+                    s.host_epoch = s.host_epoch.saturating_add(1);
+                    let host_epoch = s.host_epoch;
+                    let ticket = JoinTicket::from(ticket::encode(&SessionTicket {
+                        session_id: id,
+                        host_peer_id: self.daemon_peer_id,
+                        host_addr: self.daemon_addr.clone(),
+                    }));
+                    (host_epoch, ticket)
+                };
+                // Persist the bumped epoch (targeted write — no full
+                // record rewrite). On store failure, surface it: a
+                // resume that can't durably record its new epoch would
+                // re-emit a stale epoch after the next restart.
+                self.store
+                    .bump_host_epoch(id, host_epoch)
+                    .await
+                    .map_err(SessionError::Storage)?;
 
                 // Re-open the gossip topic. The bridge tracks per-
                 // session state by id; if the daemon was restarted
@@ -443,11 +470,15 @@ impl Registry {
                 // effort: a bridge failure is non-fatal — the local
                 // session still works; we just won't reach the
                 // network until something else triggers a reattach.
+                // After (re)subscribing, broadcast a signed EpochBeacon
+                // so already-joined joiners learn the new epoch
+                // immediately, independent of session activity.
                 #[cfg(feature = "iroh")]
-                if let Some(bridge) = &self.bridge
-                    && let Err(err) = bridge.host_session(id).await
-                {
-                    tracing::warn!(?err, ?id, "gossip host_session failed on resume");
+                if let Some(bridge) = &self.bridge {
+                    if let Err(err) = bridge.host_session(id).await {
+                        tracing::warn!(?err, ?id, "gossip host_session failed on resume");
+                    }
+                    bridge.publish_epoch_beacon(id, host_epoch).await;
                 }
 
                 return Ok((id, ticket));
@@ -788,6 +819,7 @@ impl Registry {
         let host;
         let kind;
         let drop_session;
+        let host_epoch;
         {
             let mut s = session_arc.lock().await;
             if !s.members.contains(&peer) {
@@ -795,6 +827,7 @@ impl Registry {
             }
             host = s.host;
             kind = s.kind;
+            host_epoch = s.host_epoch;
             // The session's local lifetime ends in two cases: the
             // host is leaving a Local session (case 1), or the
             // (sole local) joiner is leaving a Remote mirror
@@ -836,7 +869,7 @@ impl Registry {
             #[cfg(feature = "iroh")]
             if let Some(bridge) = &self.bridge {
                 if peer == host && kind == SessionKind::Local {
-                    bridge.publish_session_closed(session).await;
+                    bridge.publish_session_closed(session, host_epoch).await;
                 }
                 bridge.forget_session(session).await;
             }
@@ -1094,8 +1127,13 @@ impl Registry {
         // We compute the prospective seq without committing it. If the
         // store write succeeds we commit; if not, we leave head alone.
         let prospective = s.head.next().expect("seq overflow");
-        // B5.1: stamp the placeholder host_sig so the wire shape is current;
-        // B5.2 signs over seq canonical bytes here (both authoring arms).
+        // Host sequencing signature (Auth Slice B.5, D1): bind *this seq*
+        // to *this author signature* under our (the host's) key. Stamped
+        // for BOTH authoring arms — our own `Authoring::Local` sends and
+        // the joiner `Authoring::Remote` re-sequences — since this is the
+        // single logged seq-assigning site. Under no-iroh / no-key we
+        // emit the sentinel (lit-fuse posture, matching `author_local`).
+        let host_sig = self.sign_seq_for(session, prospective, &signature);
         let message = SessionMessage::new(
             prospective,
             timestamp_ms,
@@ -1104,7 +1142,7 @@ impl Registry {
             action,
             payload,
             signature,
-            SIGNATURE_UNSIGNED,
+            host_sig,
         );
         if let Err(err) = self.store.append(session, &message).await {
             return Err(SessionError::Storage(err));
@@ -1165,6 +1203,28 @@ impl Registry {
                 payload,
                 session,
             ),
+        }
+    }
+
+    /// Host sequencing signature over `"artel/seq-v1" || session_id ||
+    /// seq || author_sig` (Auth Slice B.5, D1). Called once per
+    /// host-sequenced message at the prospective seq, for both
+    /// authoring arms. Under no-iroh / no-key returns the sentinel —
+    /// the same lit-fuse posture as [`Self::author_local`]: a joiner's
+    /// `verify_seq` rejects the sentinel loudly once enforcement is on.
+    fn sign_seq_for(&self, session: SessionId, seq: Seq, author_sig: &SigBytes) -> SigBytes {
+        #[cfg(feature = "iroh")]
+        {
+            self.signing_key
+                .as_ref()
+                .map_or(SIGNATURE_UNSIGNED, |key| {
+                    signing::sign_seq(key.as_signing_key(), session, seq, author_sig)
+                })
+        }
+        #[cfg(not(feature = "iroh"))]
+        {
+            let _ = (session, seq, author_sig);
+            SIGNATURE_UNSIGNED
         }
     }
 
@@ -1469,6 +1529,7 @@ mod tests {
             head: Seq::new(1),
             log: log.clone(),
             kind: SessionKind::Local,
+            host_epoch: 0,
         };
         store.create(&record).await.unwrap();
         let r = Registry::load(
@@ -1520,6 +1581,7 @@ mod tests {
             head: Seq::ZERO,
             log: Vec::new(),
             kind: SessionKind::Local,
+            host_epoch: 0,
         };
         store.create(&record).await.unwrap();
         let r = Registry::load(
@@ -1560,6 +1622,7 @@ mod tests {
             head: Seq::ZERO,
             log: Vec::new(),
             kind: SessionKind::Remote,
+            host_epoch: 0,
         };
         store.create(&record).await.unwrap();
         let r = Registry::load(
@@ -1993,6 +2056,161 @@ mod tests {
         signing::verify_message(id, &appended, &appended.signature).unwrap();
     }
 
+    // ---- Host sequencing signature + epoch (Auth Slice B.5.2) ----
+
+    #[tokio::test]
+    #[cfg(feature = "iroh")]
+    async fn host_send_local_stamps_verifiable_host_sig() {
+        // A `Local` send must stamp a `host_sig` that `verify_seq`
+        // accepts under the daemon's own pubkey, bound to (session,
+        // seq, author_sig).
+        let (r, host, _secret) = registry_with_signing_seed(0x41);
+        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        let sent = r
+            .send(
+                id,
+                host.clone(),
+                MessageKind::Chat,
+                "hello".into(),
+                b"world".to_vec(),
+                Authoring::Local,
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            sent.host_sig,
+            artel_protocol::message::SIGNATURE_UNSIGNED,
+            "Local send must stamp a real host_sig",
+        );
+        // host.id is the daemon's own pubkey (signing identity = host).
+        signing::verify_seq(&host.id, id, sent.seq, &sent.signature, &sent.host_sig)
+            .expect("host_sig must verify under the host pubkey");
+        // Bound to this seq: a bumped seq fails.
+        assert!(
+            signing::verify_seq(
+                &host.id,
+                id,
+                sent.seq.next().unwrap(),
+                &sent.signature,
+                &sent.host_sig,
+            )
+            .is_err(),
+            "host_sig must be bound to its seq",
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "iroh")]
+    async fn host_send_remote_stamps_host_sig_over_joiner_author_sig() {
+        // When the host re-sequences a joiner-authored body, it stamps
+        // its own host_sig over the *joiner's* author signature — so
+        // the seq binding holds against the joiner's sig, not the
+        // host's.
+        let (r, host, _) = registry_with_signing_seed(0x41);
+        let (id, _) = r.host(host.clone(), None).await.unwrap();
+
+        let joiner_signing = artel_protocol::signing::SigningKey::from_bytes(&[0x77; 32]);
+        let joiner = PeerInfo::new(
+            PeerId::from_bytes(joiner_signing.verifying_key().to_bytes()),
+            "bob",
+        );
+        let timestamp_ms = 1_700_000_009_000u64;
+        let author_sig = artel_protocol::signing::sign_body(
+            &joiner_signing,
+            id,
+            artel_protocol::message::MESSAGE_FORMAT,
+            timestamp_ms,
+            &joiner,
+            MessageKind::Chat,
+            "joiner.send",
+            b"payload",
+        );
+        r.ensure_member(id, joiner.clone()).await.unwrap();
+        let appended = r
+            .send(
+                id,
+                joiner.clone(),
+                MessageKind::Chat,
+                "joiner.send".into(),
+                b"payload".to_vec(),
+                Authoring::Remote {
+                    timestamp_ms,
+                    signature: author_sig,
+                },
+            )
+            .await
+            .unwrap();
+        // The author sig is the joiner's, preserved verbatim.
+        assert_eq!(appended.signature, author_sig);
+        // The host_sig is over the joiner's author sig at the assigned
+        // seq, verifiable under the HOST's pubkey (not the joiner's).
+        signing::verify_seq(&host.id, id, appended.seq, &appended.signature, &appended.host_sig)
+            .expect("host_sig must verify under the host pubkey");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "iroh")]
+    async fn fresh_host_starts_at_epoch_zero() {
+        // A brand-new hosted session has host_epoch 0 persisted.
+        let (r, host, _) = registry_with_signing_seed(0x41);
+        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        let records = r.store.load_all().await.unwrap();
+        let rec = records.iter().find(|rr| rr.id == id).unwrap();
+        assert_eq!(rec.host_epoch, 0, "fresh host starts at epoch 0");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "iroh")]
+    async fn resume_bumps_host_epoch_and_persists() {
+        // First host creates at epoch 0. A restart (Registry::load over
+        // the same store) followed by host(Some(id)) resumes and bumps
+        // to 1; a second resume bumps to 2. Each bump is persisted.
+        let secret = Arc::new(iroh::SecretKey::from_bytes(&[0x41; 32]));
+        let peer_id = PeerId::from_bytes(*secret.public().as_bytes());
+        let host = PeerInfo::new(peer_id, "alice");
+        let store: DynStore = Arc::new(crate::store::MemoryStore::new());
+
+        let r = Registry::new_with_signing_key(peer_id, Arc::clone(&store), Arc::clone(&secret));
+        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        assert_eq!(
+            store.load_all().await.unwrap()[0].host_epoch,
+            0,
+            "fresh create is epoch 0",
+        );
+        drop(r);
+
+        // Restart: load from the same store, then resume.
+        let r2 = Registry::load(
+            peer_id,
+            WireEndpointAddr::id_only(peer_id),
+            Arc::clone(&store),
+            None,
+            Some(Arc::clone(&secret)),
+        )
+        .await
+        .unwrap();
+        let (_id, _) = r2.host(host.clone(), Some(id)).await.unwrap();
+        assert_eq!(
+            store.load_all().await.unwrap()[0].host_epoch,
+            1,
+            "first resume bumps to epoch 1",
+        );
+        // Second resume (same process) bumps to 2.
+        let (_id, _) = r2.host(host.clone(), Some(id)).await.unwrap();
+        assert_eq!(
+            store.load_all().await.unwrap()[0].host_epoch,
+            2,
+            "second resume bumps to epoch 2",
+        );
+
+        // The bumped epoch produces a verify_ctrl-valid signature —
+        // the same bytes the resume EpochBeacon and a SessionClosed
+        // would carry. (The broadcast itself is driven end-to-end by
+        // the B5.3 e2e; no real bridge exists in a MemoryStore registry.)
+        let sig = artel_protocol::signing::sign_ctrl(secret.as_signing_key(), id, 2);
+        signing::verify_ctrl(&peer_id, id, 2, &sig).expect("ctrl sig at bumped epoch must verify");
+    }
+
     // ---- subscribe / replay ----
 
     #[tokio::test]
@@ -2196,6 +2414,7 @@ mod tests {
             head: Seq::ZERO,
             log: Vec::new(),
             kind: SessionKind::Remote,
+            host_epoch: 0,
         };
         store.create(&record).await.unwrap();
 
@@ -2257,6 +2476,7 @@ mod tests {
             head: Seq::ZERO,
             log: Vec::new(),
             kind: SessionKind::Remote,
+            host_epoch: 0,
         };
         store.create(&record).await.unwrap();
 
@@ -2468,6 +2688,7 @@ mod tests {
             head: Seq::ZERO,
             log: Vec::new(),
             kind: SessionKind::Remote,
+            host_epoch: 0,
         };
         store.create(&record).await.unwrap();
         let r = Registry::load(
@@ -2508,6 +2729,7 @@ mod tests {
             head: Seq::ZERO,
             log: Vec::new(),
             kind: SessionKind::Remote,
+            host_epoch: 0,
         };
         store.create(&record).await.unwrap();
         let r = Registry::load(

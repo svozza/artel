@@ -152,6 +152,25 @@ impl SessionStore for FsLogStore {
         .map_err(|e| join_to_io(&e))?
     }
 
+    async fn bump_host_epoch(&self, session: SessionId, epoch: u64) -> io::Result<()> {
+        let meta_path = self.session_dir(session).join(META_FILE);
+        tokio::task::spawn_blocking(move || -> io::Result<()> {
+            // Read-modify-write the tiny meta.json. A missing meta means
+            // the session is unknown to this store — a no-op per the
+            // trait contract.
+            let mut meta = match read_meta(&meta_path) {
+                Ok(m) => m,
+                Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+                Err(err) => return Err(err),
+            };
+            meta.host_epoch = epoch;
+            write_meta(&meta_path, &meta)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| join_to_io(&e))?
+    }
+
     async fn add_member(&self, session: SessionId, peer: &PeerInfo) -> io::Result<()> {
         let meta_path = self.session_dir(session).join(META_FILE);
         let peer_id = peer.id;
@@ -414,6 +433,11 @@ struct Meta {
     /// 2c-2e there was no way for a remote mirror to reach disk).
     #[serde(default)]
     kind: SessionKind,
+    /// Host incarnation epoch (Auth Slice B.5). See
+    /// [`SessionRecord::host_epoch`]. Old meta without this field
+    /// deserialises to 0, which is the correct fresh-session default.
+    #[serde(default)]
+    host_epoch: u64,
 }
 
 impl Meta {
@@ -424,7 +448,13 @@ impl Meta {
     /// embedding signatures. A v1 directory is unreadable by a v2
     /// daemon: pre-Slice-B logs have no signature byte run, so even
     /// unverified replay would mis-decode.
-    const CURRENT_VERSION: u32 = 2;
+    ///
+    /// Bumped to `3` on 2026-06-03 (Auth Slice B.5) when
+    /// `MESSAGE_FORMAT` went 2 → 3: each log frame gained a `host_sig`
+    /// byte run and the record gained `host_epoch`. A v2 directory is
+    /// unreadable by a v3 daemon (pre-cutover frames lack the host_sig
+    /// run); `load_one` rejects it and `load_all` skips-and-logs.
+    const CURRENT_VERSION: u32 = 3;
 
     fn from_record(r: &SessionRecord) -> Self {
         Self {
@@ -433,6 +463,7 @@ impl Meta {
             members: r.members.clone(),
             head: r.head,
             kind: r.kind,
+            host_epoch: r.host_epoch,
         }
     }
 }
@@ -468,6 +499,7 @@ fn load_one(dir: &Path) -> io::Result<SessionRecord> {
         head: meta.head,
         log,
         kind: meta.kind,
+        host_epoch: meta.host_epoch,
     })
 }
 
@@ -913,6 +945,7 @@ mod tests {
             head: Seq::ZERO,
             log: Vec::new(),
             kind: SessionKind::Local,
+            host_epoch: 0,
         }
     }
 
@@ -1277,6 +1310,81 @@ mod tests {
             .unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].kind, SessionKind::Remote);
+    }
+
+    #[test]
+    fn meta_version_is_three() {
+        // Auth Slice B.5 bumped the on-disk schema 2 → 3.
+        assert_eq!(Meta::CURRENT_VERSION, 3);
+    }
+
+    #[tokio::test]
+    async fn session_record_host_epoch_round_trips() {
+        // A record created with a non-zero host_epoch reloads with it.
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        let mut r = record(1);
+        r.host_epoch = 7;
+        store.create(&r).await.unwrap();
+
+        let loaded = FsLogStore::open(dir.path())
+            .unwrap()
+            .load_all()
+            .await
+            .unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].host_epoch, 7);
+    }
+
+    #[tokio::test]
+    async fn fs_persists_and_reloads_host_epoch() {
+        // bump_host_epoch persists a new epoch without disturbing the
+        // rest of the record, and a fresh open reloads it.
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+        // Fresh create is epoch 0.
+        let loaded = FsLogStore::open(dir.path()).unwrap().load_all().await.unwrap();
+        assert_eq!(loaded[0].host_epoch, 0);
+
+        store.bump_host_epoch(record(1).id, 3).await.unwrap();
+        let reloaded = FsLogStore::open(dir.path()).unwrap().load_all().await.unwrap();
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(reloaded[0].host_epoch, 3);
+        // Other fields intact.
+        assert_eq!(reloaded[0].host, record(1).host);
+        assert_eq!(reloaded[0].kind, SessionKind::Local);
+
+        // bump on an unknown session is a no-op, not an error.
+        store
+            .bump_host_epoch(SessionId::from_bytes([0xee; 16]), 9)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_meta_without_host_epoch_defaults_to_zero() {
+        // A v3 meta.json hand-written without the host_epoch field
+        // (e.g. a future field-add forgot a backfill) deserialises to
+        // 0 via #[serde(default)] — the correct fresh-session default.
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        let r = record(1);
+        store.create(&r).await.unwrap();
+
+        let meta_path = dir.path().join(r.id.to_string()).join(META_FILE);
+        let legacy = serde_json::json!({
+            "version": Meta::CURRENT_VERSION,
+            "host": r.host,
+            "members": r.members,
+            "head": r.head,
+            "kind": "Local",
+        });
+        std::fs::write(&meta_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+        let loaded = FsLogStore::open(dir.path()).unwrap().load_all().await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].host_epoch, 0);
     }
 
     #[tokio::test]

@@ -48,4 +48,16 @@ pub(crate) struct SessionRecord {
     /// remote host (`Remote`). See [`SessionKind`].
     #[serde(default)]
     pub(crate) kind: SessionKind,
+    /// Host incarnation epoch (Auth Slice B.5, D3). **One slot,
+    /// kind-dependent meaning:**
+    /// - `Local`: this host's incarnation counter. Starts at 0 on a
+    ///   fresh create; bumped by one on each resume (re-subscribe of an
+    ///   existing local-host record). Signed into every `SessionClosed`
+    ///   and `EpochBeacon` so a close captured from incarnation N is
+    ///   rejected against a same-id resume at N+1.
+    /// - `Remote`: the highest host epoch this mirror has verified via a
+    ///   host-signed `EpochBeacon` — the watermark a `SessionClosed`
+    ///   must meet (`host_epoch >= watermark`) to be accepted.
+    #[serde(default)]
+    pub(crate) host_epoch: u64,
 }
