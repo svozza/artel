@@ -35,6 +35,11 @@ impl PeerMap {
 
     /// Register a workspace `EndpointId` → daemon `PeerId` link.
     pub(crate) fn register(&self, workspace_id: EndpointId, daemon_peer: PeerId) {
+        tracing::debug!(
+            target: "artel_fs::peer_map",
+            %workspace_id, %daemon_peer,
+            "register",
+        );
         self.id_map
             .write()
             .unwrap()
@@ -50,6 +55,11 @@ impl PeerMap {
         let Ok(action) = CapabilityAction::decode(payload) else {
             return;
         };
+        tracing::debug!(
+            target: "artel_fs::peer_map",
+            ?action,
+            "apply_capability",
+        );
         let mut caps = self.caps.write().unwrap();
         match action {
             CapabilityAction::Grant { peer, cap } => {

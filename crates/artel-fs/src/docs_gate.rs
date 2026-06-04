@@ -32,8 +32,9 @@ impl ProtocolHandler for DocsGate {
         let remote_id = connection.remote_id();
         if self.peer_map.is_revoked_workspace_id(remote_id) {
             tracing::warn!(
+                target: "artel_fs::docs_gate",
                 %remote_id,
-                "docs_gate: rejected connection from revoked peer",
+                "rejected connection from revoked peer",
             );
             connection.close(VarInt::from_u32(1), b"revoked");
             return Err(e!(AcceptError::NotAllowed));
