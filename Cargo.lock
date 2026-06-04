@@ -214,6 +214,7 @@ dependencies = [
  "iroh-blobs",
  "iroh-docs",
  "iroh-gossip",
+ "n0-error",
  "nix",
  "notify",
  "notify-debouncer-full",

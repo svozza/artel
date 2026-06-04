@@ -20,6 +20,7 @@
 
 mod applier;
 pub mod attachment;
+mod docs_gate;
 pub mod echo_guard;
 mod endpoint_setup;
 pub mod error;
@@ -27,6 +28,7 @@ pub mod filter;
 pub mod keys;
 mod keystore;
 mod node;
+pub(crate) mod peer_map;
 pub mod rules;
 pub mod session_id;
 pub mod ticket;
@@ -45,5 +47,6 @@ pub use rules::{CompiledPathRules, Mode, PathRule, PathRules, PathRulesError};
 pub use session_id::session_id_for;
 pub use ticket::{TicketEnvelopeError, WorkspaceTicketEnvelope};
 pub use workspace::{
-    AttachPolicy, Direction, TICKET_ACTION, Workspace, WorkspaceConfig, WorkspaceEvent,
+    AttachPolicy, Direction, NODE_ID_ACTION, TICKET_ACTION, Workspace, WorkspaceConfig,
+    WorkspaceEvent,
 };

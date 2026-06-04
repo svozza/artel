@@ -19,18 +19,21 @@
 #![allow(clippy::redundant_pub_crate)]
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
-use iroh::Endpoint;
 use iroh::protocol::Router;
+use iroh::{Endpoint, EndpointId};
 use iroh_blobs::BlobsProtocol;
 use iroh_blobs::store::fs::FsStore;
 use iroh_docs::protocol::Docs;
 use iroh_gossip::net::Gossip;
 
 use crate::WorkspaceError;
+use crate::docs_gate::DocsGate;
 use crate::endpoint_setup::EndpointSetup;
 use crate::keystore::load_or_create_secret;
+use crate::peer_map::PeerMap;
 
 /// How long the substrate waits for the home-relay handshake
 /// (`endpoint.online()`) before surfacing
@@ -51,6 +54,14 @@ pub(crate) struct WorkspaceNode {
     /// Blob protocol handler over the same store; `BlobsProtocol`
     /// derefs to the `Store` so callers can `.blobs().get_bytes(...)`.
     pub blobs: BlobsProtocol,
+    /// The workspace node's peer map (shared with `DocsGate`).
+    /// Retained for test access; production code accesses via the
+    /// separate `Arc` held by the workspace constructor.
+    #[allow(dead_code)]
+    pub peer_map: Arc<PeerMap>,
+    /// This node's `EndpointId`, captured before the router takes
+    /// ownership.
+    pub endpoint_id: EndpointId,
     /// Holding the router keeps the accept loop alive. Calling
     /// [`Router::shutdown`] on it during teardown closes the
     /// endpoint for us.
@@ -87,6 +98,7 @@ impl WorkspaceNode {
     pub(crate) async fn spawn(
         state_dir: &Path,
         setup: &EndpointSetup,
+        peer_map: Arc<PeerMap>,
     ) -> Result<Self, WorkspaceError> {
         let secret = load_or_create_secret(&state_dir.join("iroh.key"))
             .map_err(|e| WorkspaceError::Iroh(format!("workspace key: {e}")))?;
@@ -130,10 +142,14 @@ impl WorkspaceNode {
             .await
             .map_err(|e| WorkspaceError::Iroh(format!("spawn docs: {e}")))?;
 
+        let endpoint_id = endpoint.id();
         let router = Router::builder(endpoint.clone())
             .accept(iroh_gossip::ALPN, gossip)
             .accept(iroh_blobs::ALPN, blobs.clone())
-            .accept(iroh_docs::ALPN, docs.clone())
+            .accept(
+                iroh_docs::ALPN,
+                DocsGate::new(docs.clone(), Arc::clone(&peer_map)),
+            )
             .spawn();
 
         // Production: block until the home-relay handshake
@@ -160,6 +176,8 @@ impl WorkspaceNode {
         Ok(Self {
             docs,
             blobs,
+            peer_map,
+            endpoint_id,
             router,
             #[cfg(feature = "test-utils")]
             shutdown_failure_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -198,9 +216,12 @@ impl WorkspaceNode {
                 "test-utils fault injection: router shutdown forced to fail".into(),
             ));
         }
+        tracing::debug!(target: "artel_fs::node", "shutdown: router.shutdown()");
         self.router
             .shutdown()
             .await
-            .map_err(|err| WorkspaceError::Iroh(format!("router shutdown: {err}")))
+            .map_err(|err| WorkspaceError::Iroh(format!("router shutdown: {err}")))?;
+        tracing::debug!(target: "artel_fs::node", "shutdown: router done, dropping node resources");
+        Ok(())
     }
 }

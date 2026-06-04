@@ -21,6 +21,7 @@ artel-fs = { path = "crates/artel-fs", version = "0.0.0" }
 
 # Third-party deps
 async-trait = "0.1"
+n0-error = "0.1"
 bytes = "1.7"
 clap = { version = "4.5", features = ["derive", "env"] }
 data-encoding = { version = "2.6", default-features = false, features = ["alloc"] }

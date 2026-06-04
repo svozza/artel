@@ -29,6 +29,7 @@ iroh.workspace = true
 iroh-blobs.workspace = true
 iroh-docs.workspace = true
 iroh-gossip.workspace = true
+n0-error.workspace = true
 postcard.workspace = true
 rand.workspace = true
 serde.workspace = true

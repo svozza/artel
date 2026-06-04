@@ -18,12 +18,14 @@ use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use artel_client::{Client, ClientError};
 use artel_protocol::{
-    Event, JoinTicket, MessageKind, ProtocolError, Request, Response, SendPayload, SessionId,
+    Event, JoinTicket, MessageKind, PeerId, ProtocolError, Request, Response, SendPayload,
+    SessionId,
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -46,6 +48,7 @@ use crate::error::{PolicyViolation, WorkspaceError};
 use crate::filter::{FilterDecision, SkipReason, WorkspaceFilter};
 use crate::keys;
 use crate::node::WorkspaceNode;
+use crate::peer_map::PeerMap;
 use crate::rules::{CompiledPathRules, Mode, PathRules};
 use crate::ticket::{self, WorkspaceTicketEnvelope};
 
@@ -59,6 +62,11 @@ const POLICY_OFFENDING_LIMIT: usize = 5;
 /// message. Joiners filter on this to find the ticket inside the
 /// session's event stream.
 pub const TICKET_ACTION: &str = "workspace.ticket";
+
+/// Action stamped on the `MessageKind::System` message a joiner sends
+/// to announce its workspace `EndpointId` to the host. Payload is the
+/// raw 32-byte `EndpointId`.
+pub const NODE_ID_ACTION: &str = "workspace.node_id";
 
 /// Capacity of the [`Workspace::events`] channel. Modest cap so a
 /// stuck consumer back-pressures the watcher rather than letting
@@ -174,6 +182,16 @@ pub struct WorkspaceConfig {
     /// with the same `WorkspaceConfig::rules` to keep them stable
     /// across resumes (see plan §"persistence-first constraint").
     pub rules: Option<PathRules>,
+
+    /// Path to the daemon's IPC socket. When set, the workspace
+    /// opens a **second** [`Client`] connection to subscribe to
+    /// session events (capability grants/revokes, node-id
+    /// announcements) and project them into the [`PeerMap`] that
+    /// backs the docs gate. Without this, the gate still rejects
+    /// connections from already-revoked peers (seeded at
+    /// construction) but cannot observe revocations that happen
+    /// after the workspace is up.
+    pub daemon_socket: Option<PathBuf>,
 }
 
 impl WorkspaceConfig {
@@ -209,6 +227,14 @@ impl WorkspaceConfig {
     #[must_use]
     pub fn with_rules(mut self, rules: PathRules) -> Self {
         self.rules = Some(rules);
+        self
+    }
+
+    /// Set the daemon socket path for the cap-listener. See
+    /// [`Self::daemon_socket`].
+    #[must_use]
+    pub fn with_daemon_socket(mut self, path: PathBuf) -> Self {
+        self.daemon_socket = Some(path);
         self
     }
 
@@ -367,6 +393,9 @@ pub struct Workspace {
     /// already had a ticket to get here, the workspace doesn't need
     /// to round-trip it. Read via [`Self::join_ticket`].
     pub(crate) join_ticket: Option<JoinTicket>,
+    /// Background task draining session events into the [`PeerMap`]
+    /// for the docs gate. Aborted on [`Self::shutdown`].
+    _cap_listener: tokio::task::JoinHandle<()>,
     /// Drop-bomb sentinel. Flipped to `true` by [`Self::shutdown`];
     /// [`Drop`] checks it and screams if it's still `false` so a
     /// caller that drops without shutting down notices in any
@@ -484,6 +513,7 @@ impl Workspace {
             rules,
             compiled_rules,
             &config.endpoint_setup,
+            config.daemon_socket.as_deref(),
             &mut rb,
         )
         .await
@@ -508,13 +538,20 @@ impl Workspace {
         rules: PathRules,
         compiled_rules: CompiledPathRules,
         endpoint_setup: &EndpointSetup,
+        daemon_socket: Option<&Path>,
         rb: &mut WorkspaceRollback,
     ) -> Result<(Self, mpsc::Receiver<WorkspaceEvent>), WorkspaceError> {
-        let node = WorkspaceNode::spawn(&state_dir, endpoint_setup).await?;
+        let daemon_peer_id = client.daemon_peer_id();
+        let peer_map = Arc::new(PeerMap::new(daemon_peer_id));
+        let node = WorkspaceNode::spawn(&state_dir, endpoint_setup, Arc::clone(&peer_map)).await?;
         rb.node = Some(node);
         // Borrow the node back for the rest of the constructor — it
         // moves into `Self` at the end via `rb.disarm()`.
         let node = rb.node.as_ref().expect("just stored");
+
+        // Register the host's own workspace EndpointId in the peer
+        // map so the gate never accidentally blocks the host itself.
+        peer_map.register(node.endpoint_id, daemon_peer_id);
 
         // Persistent docs store; default-author is managed by
         // iroh-docs at `state_dir/docs/default-author`.
@@ -613,6 +650,17 @@ impl Workspace {
 
         publish_ticket(client, session_id, &ticket, &rules).await?;
 
+        // Spawn the cap-listener on a second Client connection so we
+        // don't consume the caller's event stream.
+        let shutdown_token = CancellationToken::new();
+        let cap_listener = spawn_cap_listener_from_socket(
+            daemon_socket,
+            session_id,
+            Arc::clone(&peer_map),
+            shutdown_token.child_token(),
+        )
+        .await?;
+
         // All fallible work is done — pull the node out of the
         // rollback guard so it lives in the constructed Workspace.
         let node = std::mem::take(rb)
@@ -627,12 +675,13 @@ impl Workspace {
                 blobs,
                 echo_guard,
                 events: tx,
-                shutdown_token: CancellationToken::new(),
+                shutdown_token,
                 node: tokio::sync::Mutex::new(Some(node)),
                 rules,
                 compiled_rules,
                 session_id,
                 join_ticket: Some(join_ticket),
+                _cap_listener: cap_listener,
                 did_shutdown: AtomicBool::new(false),
             },
             rx,
@@ -714,6 +763,7 @@ impl Workspace {
             state_dir,
             config.join_ticket_timeout,
             &config.endpoint_setup,
+            config.daemon_socket.as_deref(),
             &mut rb,
         )
         .await
@@ -728,6 +778,7 @@ impl Workspace {
 
     /// Inner half of [`Self::join_with`] — see `host_with_inner` for
     /// the same rollback-tracking pattern.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn join_with_inner(
         client: &Client,
         session: SessionId,
@@ -735,21 +786,9 @@ impl Workspace {
         state_dir: PathBuf,
         join_ticket_timeout: Option<Duration>,
         endpoint_setup: &EndpointSetup,
+        join_daemon_socket: Option<&Path>,
         rb: &mut WorkspaceRollback,
     ) -> Result<(Self, mpsc::Receiver<WorkspaceEvent>), WorkspaceError> {
-        let node = WorkspaceNode::spawn(&state_dir, endpoint_setup).await?;
-        rb.node = Some(node);
-        let node = rb.node.as_ref().expect("just stored");
-        // Joiners don't persist a per-workspace `doc-id` — they
-        // import the host's namespace from the ticket each time.
-        // The default author is still useful for stamping our own
-        // writes once live sync starts.
-        let author = node
-            .docs
-            .author_default()
-            .await
-            .map_err(|e| WorkspaceError::Doc(format!("author_default: {e}")))?;
-
         // Subscribe and drain until the ticket arrives. Subscribe
         // replays historical messages, so a joiner that arrives
         // after the ticket was published still picks it up.
@@ -772,15 +811,36 @@ impl Workspace {
             .await
             .ok_or_else(|| WorkspaceError::Iroh("client events already taken".into()))?;
 
-        let envelope = wait_for_ticket(&mut events, session, join_ticket_timeout).await?;
+        let ticket_result = wait_for_ticket(&mut events, session, join_ticket_timeout).await?;
+        let host_daemon_peer_id = ticket_result.host_daemon_peer_id;
         // The host's rules are authoritative — `config.rules` on the
         // joiner side is dropped on the floor here. Documented on
         // `WorkspaceConfig::rules`. Compile here too so the joiner's
         // hot path matches against a precompiled `GlobSet`.
-        let rules = envelope.rules;
+        let rules = ticket_result.envelope.rules;
         let compiled_rules = rules.compile()?;
-        let ticket = DocTicket::from_str(&envelope.doc_ticket)
+        let ticket = DocTicket::from_str(&ticket_result.envelope.doc_ticket)
             .map_err(|e| WorkspaceError::Doc(format!("ticket parse: {e}")))?;
+
+        let peer_map = Arc::new(PeerMap::new(host_daemon_peer_id));
+        // Register the host's workspace EndpointId from the ticket's
+        // first node entry.
+        if let Some(node_info) = ticket.nodes.first() {
+            peer_map.register(node_info.id, host_daemon_peer_id);
+        }
+
+        let node = WorkspaceNode::spawn(&state_dir, endpoint_setup, Arc::clone(&peer_map)).await?;
+        rb.node = Some(node);
+        let node = rb.node.as_ref().expect("just stored");
+        // Joiners don't persist a per-workspace `doc-id` — they
+        // import the host's namespace from the ticket each time.
+        // The default author is still useful for stamping our own
+        // writes once live sync starts.
+        let author = node
+            .docs
+            .author_default()
+            .await
+            .map_err(|e| WorkspaceError::Doc(format!("author_default: {e}")))?;
 
         let (doc, live) = node
             .docs
@@ -819,6 +879,48 @@ impl Workspace {
 
         bulk_export(&root, &doc, &node.blobs, &compiled_rules, &echo_guard, &tx).await?;
 
+        // Spawn the cap-listener. On the joiner path, the existing
+        // event stream (from wait_for_ticket) is still subscribed —
+        // reuse it. If a daemon_socket is configured, prefer a
+        // dedicated connection so the caller can reuse their client.
+        let shutdown_token = CancellationToken::new();
+        let cap_listener = if join_daemon_socket.is_some() {
+            spawn_cap_listener_from_socket(
+                join_daemon_socket,
+                session,
+                Arc::clone(&peer_map),
+                shutdown_token.child_token(),
+            )
+            .await?
+        } else {
+            spawn_cap_listener(
+                events,
+                session,
+                Arc::clone(&peer_map),
+                shutdown_token.child_token(),
+            )
+        };
+
+        // Announce our workspace EndpointId to the host so it can
+        // register our mapping in its own PeerMap.
+        let announce_resp = client
+            .request(Request::Send {
+                session,
+                payload: SendPayload {
+                    kind: MessageKind::System,
+                    action: NODE_ID_ACTION.to_string(),
+                    payload: node.endpoint_id.as_bytes().to_vec(),
+                },
+            })
+            .await;
+        if let Err(err) = &announce_resp {
+            debug!(
+                target: "artel_fs::workspace",
+                %err,
+                "join_with: failed to announce workspace node_id"
+            );
+        }
+
         let node = std::mem::take(rb)
             .disarm()
             .expect("rb.node populated above");
@@ -831,12 +933,13 @@ impl Workspace {
                 blobs,
                 echo_guard,
                 events: tx,
-                shutdown_token: CancellationToken::new(),
+                shutdown_token,
                 node: tokio::sync::Mutex::new(Some(node)),
                 rules,
                 compiled_rules,
                 session_id: session,
                 join_ticket: None,
+                _cap_listener: cap_listener,
                 did_shutdown: AtomicBool::new(false),
             },
             rx,
@@ -1392,6 +1495,13 @@ where
     .map_err(|_| WorkspaceError::Doc("initial sync did not complete in 30s".into()))?
 }
 
+/// Result of [`wait_for_ticket`]: the decoded envelope plus the host's
+/// daemon `PeerId` extracted from the message that carried the ticket.
+struct TicketResult {
+    envelope: WorkspaceTicketEnvelope,
+    host_daemon_peer_id: PeerId,
+}
+
 /// Drain `events` until a `MessageKind::System` event with
 /// [`TICKET_ACTION`] for `session` arrives, then decode the payload
 /// as a [`WorkspaceTicketEnvelope`]. `deadline` caps the wait —
@@ -1401,7 +1511,7 @@ async fn wait_for_ticket(
     events: &mut artel_client::EventStream,
     session: SessionId,
     deadline: Option<Duration>,
-) -> Result<WorkspaceTicketEnvelope, WorkspaceError> {
+) -> Result<TicketResult, WorkspaceError> {
     let drain = async {
         loop {
             let ev = events.recv().await.ok_or_else(|| {
@@ -1415,8 +1525,12 @@ async fn wait_for_ticket(
                 && message.kind == MessageKind::System
                 && message.action == TICKET_ACTION
             {
+                let host_daemon_peer_id = message.peer.id;
                 let envelope = ticket::decode(&message.payload)?;
-                return Ok::<_, WorkspaceError>(envelope);
+                return Ok::<_, WorkspaceError>(TicketResult {
+                    envelope,
+                    host_daemon_peer_id,
+                });
             }
         }
     };
@@ -1807,6 +1921,98 @@ async fn reconcile_doc_against_disk(
         "reconcile_doc_against_disk complete"
     );
     Ok(())
+}
+
+/// Open a second [`Client`] connection, subscribe to `session`, and
+/// spawn the cap-listener task on that independent event stream.
+///
+/// Returns a no-op handle if `socket` is `None` (the gate still
+/// rejects based on the seed state populated at construction).
+async fn spawn_cap_listener_from_socket(
+    socket: Option<&Path>,
+    session: SessionId,
+    peer_map: Arc<PeerMap>,
+    cancel: CancellationToken,
+) -> Result<tokio::task::JoinHandle<()>, WorkspaceError> {
+    let Some(socket) = socket else {
+        return Ok(tokio::spawn(async move {
+            cancel.cancelled().await;
+        }));
+    };
+    let cap_client = Client::connect(socket)
+        .await
+        .map_err(|e| WorkspaceError::Iroh(format!("cap-listener connect: {e}")))?;
+    match cap_client
+        .request(Request::Subscribe {
+            session,
+            since: None,
+        })
+        .await?
+    {
+        Response::Subscribed { .. } => {}
+        other => {
+            return Err(WorkspaceError::Iroh(format!(
+                "cap-listener subscribe: unexpected response: {other:?}",
+            )));
+        }
+    }
+    let events = cap_client
+        .take_events()
+        .await
+        .ok_or_else(|| WorkspaceError::Iroh("cap-listener: events already taken".into()))?;
+    Ok(spawn_cap_listener(events, session, peer_map, cancel))
+}
+
+/// Spawn a background task that drains session events into `peer_map`.
+///
+/// Processes two event types:
+/// - `MessageKind::Capability`: applies grant/revoke to the cap-set
+///   projection so the docs gate starts rejecting revoked peers.
+/// - `MessageKind::System` with `NODE_ID_ACTION`: registers the mapping
+///   from a joiner's workspace `EndpointId` to their daemon `PeerId`.
+///
+/// Runs until `cancel` is triggered (from `Workspace::shutdown`).
+fn spawn_cap_listener(
+    mut events: artel_client::EventStream,
+    session: SessionId,
+    peer_map: Arc<PeerMap>,
+    cancel: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                ev = events.recv() => {
+                    let Some(ev) = ev else { break };
+                    if let Event::Message {
+                        session: ev_session,
+                        message,
+                    } = ev
+                    {
+                        if ev_session != session {
+                            continue;
+                        }
+                        match message.kind {
+                            MessageKind::Capability => {
+                                peer_map.apply_capability(
+                                    message.peer.id,
+                                    &message.payload,
+                                );
+                            }
+                            MessageKind::System if message.action == NODE_ID_ACTION => {
+                                if let Ok(bytes) = <[u8; 32]>::try_from(message.payload.as_slice())
+                                    && let Ok(workspace_id) = iroh::EndpointId::from_bytes(&bytes)
+                                {
+                                    peer_map.register(workspace_id, message.peer.id);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    })
 }
 
 #[cfg(test)]
