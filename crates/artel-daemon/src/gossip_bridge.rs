@@ -1178,6 +1178,15 @@ fn session_error_to_wire(err: &SessionError) -> ProtocolError {
         SessionError::SignatureRejected { peer_id, reason } => {
             ProtocolError::Signature(format!("{peer_id}: {reason}"))
         }
+        // L2 capability denial (Auth Slice C): a joiner-authored write
+        // (or grant) the host rejected because the author lacked the
+        // required capability at that seq. The joiner sees this as
+        // `ProtocolError::Capability` in the SendAck.
+        SessionError::CapabilityDenied {
+            peer_id,
+            had,
+            needed,
+        } => ProtocolError::Capability(format!("{peer_id}: had {had:?}, needs {needed:?}")),
     }
 }
 

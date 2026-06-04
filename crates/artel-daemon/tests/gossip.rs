@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 use artel_client::{Client, ClientError, EventStream};
 use artel_daemon::shutdown::Shutdown;
 use artel_daemon::{Daemon, DaemonConfig, EndpointSetup};
+use artel_protocol::capability::CapabilityAction;
 use artel_protocol::{Event, MessageKind, PeerInfo, ProtocolError, Request, Response, SendPayload};
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -473,6 +474,127 @@ async fn joiner_send_round_trips_through_host() {
 }
 
 // =============================================================
+// Auth Slice C / L2: capability lifecycle end-to-end. A joiner is
+// admitted via ticket → auto-granted ReadWrite → can send → host
+// revokes → joiner's next send is rejected with a Capability error.
+// Exercises the every-peer enforcement teeth across a real gossip
+// mesh: the revoke rides the log to the joiner's mirror, and the
+// host authoritatively rejects the post-revoke write at `send`.
+// =============================================================
+
+#[tokio::test]
+async fn capability_lifecycle_join_grant_write_revoke_reject() {
+    let (daemon_a, daemon_b, _dns_pkarr) = common::spawn_pair().await;
+
+    // Alice hosts.
+    let alice_client = Client::connect(&daemon_a.socket).await.unwrap();
+    let host_resp = alice_client
+        .request(Request::HostSession {
+            display_name: "alice".into(),
+            session: None,
+        })
+        .await
+        .unwrap();
+    let (session_id, ticket) = match host_resp {
+        Response::HostSession { session, ticket } => (session, ticket),
+        other => panic!("expected HostSession, got {other:?}"),
+    };
+
+    // Bob joins via the real ticket and is auto-granted ReadWrite.
+    let bob_client = Client::connect(&daemon_b.socket).await.unwrap();
+    let bob = PeerInfo::new(daemon_b.peer_id(), "bob");
+    match bob_client
+        .request(Request::JoinSession {
+            display_name: "bob".into(),
+            ticket,
+        })
+        .await
+        .unwrap()
+    {
+        Response::JoinSession { session, .. } => assert_eq!(session, session_id),
+        other => panic!("expected JoinSession, got {other:?}"),
+    }
+    bob_client
+        .request(Request::Subscribe {
+            session: session_id,
+            since: None,
+        })
+        .await
+        .unwrap();
+
+    // Bob's first send succeeds — the auto-grant gave him write.
+    let sent = bob_client
+        .request(Request::Send {
+            session: session_id,
+            payload: SendPayload {
+                kind: MessageKind::Chat,
+                action: "chat.message".into(),
+                payload: b"bob writes".to_vec(),
+            },
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(sent, Response::Sent { .. }),
+        "auto-granted joiner can write: {sent:?}",
+    );
+
+    // Alice (the host) revokes Bob via a Capability message.
+    let revoke = CapabilityAction::Revoke { peer: bob.id };
+    alice_client
+        .request(Request::Send {
+            session: session_id,
+            payload: SendPayload {
+                kind: MessageKind::Capability,
+                action: revoke.action_str().into(),
+                payload: revoke.encode(),
+            },
+        })
+        .await
+        .unwrap();
+
+    // Bob's next send is now rejected. The revoke is authoritative on
+    // the host; the joiner's `send_remote` surfaces the host's verdict
+    // as a Capability error. Retry until the rejection lands (the
+    // revoke must propagate / be sequenced before Bob's request is
+    // evaluated on the host).
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "bob's post-revoke send was never rejected",
+        );
+        let resp = bob_client
+            .request(Request::Send {
+                session: session_id,
+                payload: SendPayload {
+                    kind: MessageKind::Chat,
+                    action: "chat.message".into(),
+                    payload: b"bob writes again".to_vec(),
+                },
+            })
+            .await;
+        match resp {
+            // The host's CapabilityDenied is forwarded verbatim to Bob's
+            // IPC client as a `ProtocolError::Capability` (HostRejected
+            // wire path), surfacing as a `ClientError::Protocol`.
+            Err(ClientError::Protocol(ProtocolError::Capability(_))) => break,
+            // The revoke may not have reached the host's projection yet;
+            // a transient success means retry until it does.
+            Ok(Response::Sent { .. }) => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            other => panic!("expected Capability error or transient Sent, got {other:?}"),
+        }
+    }
+
+    drop(alice_client);
+    drop(bob_client);
+    daemon_a.stop().await;
+    daemon_b.stop().await;
+}
+
+// =============================================================
 // 2c-2c added the joiner→host send round-trip via
 // `SendRequest`/`SendAck`. 2c-2e made `LeaveSession` tear down the
 // host's gossip topic. Follow-up (a) added the `SessionClosed`
@@ -757,7 +879,12 @@ async fn joiner_replays_messages_sent_before_join() {
             Err(_) => continue,
         };
         if let Event::Message { message, .. } = event {
-            seen.insert(message.payload);
+            // Ignore the auto-grant Capability message the host emits
+            // when it admits Bob (Auth Slice C / L2) — this test pins
+            // Chat replay + live fan-out, not the cap log.
+            if message.kind == MessageKind::Chat {
+                seen.insert(message.payload);
+            }
         }
     }
     assert_eq!(seen, expected);

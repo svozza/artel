@@ -17,6 +17,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use artel_protocol::capability::{Capability, CapabilityAction};
 use artel_protocol::ids::TicketId;
 use artel_protocol::message::{MESSAGE_FORMAT, SIGNATURE_UNSIGNED, SigBytes};
 use artel_protocol::signing::{self, verify_reason};
@@ -118,6 +119,27 @@ pub enum SessionError {
         /// rejected signature.
         reason: String,
     },
+
+    /// The authoring peer lacked the capability required to author a
+    /// message at its seq (Auth Slice C / L2). For a non-`Capability`
+    /// message that means `peer` did not hold `ReadWrite`; for a
+    /// `Capability` grant/revoke it means the author did not hold
+    /// `ReadWrite` (the right to grant rides on `ReadWrite`, brainstorm
+    /// Q2). The host rejects at `send` (the message never gets a seq);
+    /// the joiner mirror drops+logs the same way. Maps to
+    /// [`artel_protocol::ProtocolError::Capability`] over the wire on
+    /// the host-side `SendRequest` rejection path. `had`/`needed` name
+    /// the cap gap for telemetry (Q5) and never leak payload bytes.
+    #[error("capability denied for peer {peer_id}: had {had:?}, needs {needed:?}")]
+    CapabilityDenied {
+        /// The author whose write was denied.
+        peer_id: PeerId,
+        /// The capability they held at that seq (`None` = absent ⇒
+        /// the `Read` floor).
+        had: Option<Capability>,
+        /// The capability the action required.
+        needed: Capability,
+    },
 }
 
 // io::Error doesn't impl PartialEq, so we hand-roll one for the
@@ -142,6 +164,18 @@ impl PartialEq for SessionError {
                     reason: b_reason,
                 },
             ) => a_peer == b_peer && a_reason == b_reason,
+            (
+                Self::CapabilityDenied {
+                    peer_id: a_peer,
+                    had: a_had,
+                    needed: a_needed,
+                },
+                Self::CapabilityDenied {
+                    peer_id: b_peer,
+                    had: b_had,
+                    needed: b_needed,
+                },
+            ) => a_peer == b_peer && a_had == b_had && a_needed == b_needed,
             (Self::InvalidTicket, Self::InvalidTicket) | (Self::NotHost, Self::NotHost) => true,
             _ => false,
         }
@@ -175,6 +209,16 @@ pub struct Session {
     /// it is the highest beacon-verified host epoch (the watermark).
     /// See [`SessionRecord::host_epoch`].
     host_epoch: u64,
+    /// Projected capability set (Auth Slice C / L2): the current cap
+    /// each peer holds, derived by replaying every `Capability` message
+    /// in the log in seq order. **Derived state — never persisted.** It
+    /// is seeded in [`Session::new`] (host ⇒ `ReadWrite`), rebuilt from
+    /// `record.log` in [`Session::from_record`], and advanced
+    /// incrementally as messages are appended on both the host-send and
+    /// joiner-mirror paths. A peer absent from this map is treated as
+    /// `Read`-only ("absent ⇒ Read" floor). See
+    /// `artel_protocol::capability`.
+    caps: HashMap<PeerId, Capability>,
     events_tx: broadcast::Sender<Event>,
 }
 
@@ -183,6 +227,14 @@ impl Session {
         let mut members = HashSet::new();
         members.insert(host.id);
         let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        // Seed the host as the cap-log root: it holds `ReadWrite` by
+        // construction. This is the equivalent of the originator's
+        // first implicit `Grant(self, ReadWrite)` — we never emit a
+        // literal self-grant; the host simply starts at the ceiling, so
+        // its first real `Grant(joiner, ..)` passes the
+        // author-holds-RW authority check (Auth Slice C / L2, Q2).
+        let mut caps = HashMap::new();
+        caps.insert(host.id, Capability::ReadWrite);
         Self {
             id,
             host: host.id,
@@ -191,6 +243,7 @@ impl Session {
             log: Vec::new(),
             head: Seq::ZERO,
             host_epoch: 0,
+            caps,
             events_tx,
         }
     }
@@ -201,6 +254,12 @@ impl Session {
     /// daemon restart.
     fn from_record(record: SessionRecord) -> Self {
         let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        // Rebuild the derived cap-set from the persisted log (Auth Slice
+        // C, Q4): caps are never persisted, so on every daemon restart /
+        // resume we replay the log in seq order to reconstruct them. The
+        // host starts at `ReadWrite` (the cap-log root), then every
+        // appended `Capability` message projects on top.
+        let caps = project_caps(record.host, &record.log);
         Self {
             id: record.id,
             host: record.host,
@@ -209,6 +268,7 @@ impl Session {
             log: record.log,
             head: record.head,
             host_epoch: record.host_epoch,
+            caps,
             events_tx,
         }
     }
@@ -239,6 +299,120 @@ impl Session {
             },
         }
     }
+
+    /// Whether `peer` may author a (non-capability) message right now —
+    /// i.e. holds `ReadWrite` in the current projected cap set. The
+    /// single source of the "can write" rule. "Absent ⇒ Read" is the
+    /// floor, so an unknown peer cannot write.
+    ///
+    /// **v1 is host-only enforcement** (Auth Slice C delivery rethink,
+    /// `docs/brainstorms/2026-06-04-auth-slice-c-l2-delivery-rethink-brainstorm.md`):
+    /// this is consulted on the host's `Registry::send` path, which is
+    /// the sole sequencer and thus the mandatory enforcement chokepoint.
+    /// Joiner mirrors do **not** re-enforce — see the loud note at
+    /// `apply_inbound_mirror_message`.
+    fn can_write(&self, peer: PeerId) -> bool {
+        self.caps
+            .get(&peer)
+            .is_some_and(|c| Capability::permits_write(*c))
+    }
+
+    /// Apply a single `Capability` message to the incremental cap set,
+    /// enforcing the authority rule (Q2): the author (`msg.peer.id`)
+    /// must currently hold `ReadWrite`, else the action is a no-op on
+    /// `caps`. The host appends in seq order, so "currently" already
+    /// *is* at-seq. Call this *after* the message is pushed to the log,
+    /// exactly once per appended `Capability`-kind message.
+    ///
+    /// A malformed payload is ignored (the message stays in the log as
+    /// an inert artifact, but never mutates caps); this only happens for
+    /// a `Capability`-kind message whose payload isn't a valid
+    /// [`CapabilityAction`], which the author signed — they get nothing.
+    fn apply_capability(&mut self, msg: &SessionMessage) {
+        debug_assert_eq!(msg.kind, MessageKind::Capability);
+        apply_capability_to(&mut self.caps, msg);
+    }
+}
+
+/// Fold a log into a capability set, in seq order, starting from the
+/// host's root `ReadWrite`. The log is assumed sorted by seq (both the
+/// host log and the joiner mirror maintain that invariant); we sort a
+/// scratch index defensively so a caller passing an unsorted slice
+/// still gets at-seq-correct output.
+fn project_caps(host: PeerId, log: &[SessionMessage]) -> HashMap<PeerId, Capability> {
+    let mut caps = HashMap::new();
+    caps.insert(host, Capability::ReadWrite);
+    // The log is maintained in seq order on every path that feeds this;
+    // iterate by ascending seq to be robust regardless.
+    let mut ordered: Vec<&SessionMessage> = log.iter().collect();
+    ordered.sort_by_key(|m| m.seq);
+    for msg in ordered {
+        if msg.kind == MessageKind::Capability {
+            apply_capability_to(&mut caps, msg);
+        }
+    }
+    caps
+}
+
+/// Core projection step shared by the incremental and full-replay
+/// paths. Enforces the Q2 authority rule against `caps` (the state as
+/// of just before this message) and mutates `caps` only if the author
+/// is authorized.
+fn apply_capability_to(caps: &mut HashMap<PeerId, Capability>, msg: &SessionMessage) {
+    // Authority check (Q2): the author must currently hold ReadWrite.
+    let author_can_grant = caps
+        .get(&msg.peer.id)
+        .is_some_and(|c| Capability::permits_write(*c));
+    if !author_can_grant {
+        // Unauthorized grant/revoke: the message may sit in the log as
+        // an audit artifact (the host rejects at send and the joiner
+        // drops at mirror, so in practice it shouldn't reach here — but
+        // if it does, it must not mutate the cap set).
+        return;
+    }
+    let Ok(action) = CapabilityAction::decode(&msg.payload) else {
+        // Author held RW but shipped a malformed payload — inert.
+        return;
+    };
+    match action {
+        CapabilityAction::Grant { peer, cap } => {
+            caps.insert(peer, cap);
+        }
+        CapabilityAction::Revoke { peer } => {
+            // Removal = back to the "absent ⇒ Read" floor.
+            caps.remove(&peer);
+        }
+    }
+}
+
+/// Host-side L2 capability gate (Auth Slice C). Returns
+/// [`SessionError::CapabilityDenied`] if `peer_id` does not currently
+/// hold `ReadWrite` in the session's projected cap set, leaving the
+/// caller to reject *before* the message is signed, sequenced, or
+/// appended — so an unauthorized write (or an unauthorized grant/revoke,
+/// which rides on the same `ReadWrite` requirement, Q2) never occupies a
+/// seq in the log (open item O1: drop-before-append). The host's cap set
+/// is at-seq by construction (it appends strictly in order). `Capability`
+/// and ordinary messages share one rule: the author must hold
+/// `ReadWrite`. Pulled out of [`Registry::send`] so the lock guard's
+/// scope is tight (no live `MutexGuard` held across the rest of `send`'s
+/// await points) and `send` stays under clippy's line cap.
+async fn ensure_can_write(
+    session_arc: &Arc<Mutex<Session>>,
+    peer_id: PeerId,
+) -> Result<(), SessionError> {
+    let (can_write, had) = {
+        let s = session_arc.lock().await;
+        (s.can_write(peer_id), s.caps.get(&peer_id).copied())
+    };
+    if can_write {
+        return Ok(());
+    }
+    Err(SessionError::CapabilityDenied {
+        peer_id,
+        had,
+        needed: Capability::ReadWrite,
+    })
 }
 
 /// In-memory session registry, backed by a [`crate::store::SessionStore`]
@@ -867,28 +1041,100 @@ impl Registry {
                 .cloned()
                 .ok_or(SessionError::UnknownSession(session))?
         };
-        let mut s = session_arc.lock().await;
-        if s.members.contains(&peer.id) {
-            return Ok(());
+        let session_kind;
+        {
+            let mut s = session_arc.lock().await;
+            if s.members.contains(&peer.id) {
+                return Ok(());
+            }
+            session_kind = s.kind;
+            // Persist before mutating in-memory state — same shape as
+            // `Registry::join`. If the store fails, the registry stays
+            // consistent with disk.
+            self.store
+                .add_member(session, &peer)
+                .await
+                .map_err(SessionError::Storage)?;
+            s.members.insert(peer.id);
+            let events_tx = s.events_tx.clone();
+            // Drop the session guard BEFORE the PeerJoined send and,
+            // crucially, before the auto-grant `Registry::send` below —
+            // `send` re-acquires this same per-session lock, so holding
+            // it here would deadlock. Mirrors the existing drop(s)
+            // discipline. (Auth Slice C, the one non-obvious hazard.)
+            drop(s);
+            let _ = events_tx.send(Event::PeerJoined {
+                session,
+                peer: peer.clone(),
+            });
         }
-        // Persist before mutating in-memory state — same shape as
-        // `Registry::join`. If the store fails, the registry stays
-        // consistent with disk.
-        self.store
-            .add_member(session, &peer)
-            .await
-            .map_err(SessionError::Storage)?;
-        s.members.insert(peer.id);
-        let events_tx = s.events_tx.clone();
-        drop(s);
-        let _ = events_tx.send(Event::PeerJoined { session, peer });
+
+        // Auto-grant on join (Auth Slice C / L2): admit a newly-joined
+        // peer to `ReadWrite` as a real signed log event, preserving the
+        // "ticket = full access" UX. Emit only for a `Local` session —
+        // we are its host (the cap-log root holding RW), so the host-key
+        // signature on this grant passes the author-holds-RW authority
+        // check. Routing through the host-local `send` path means the
+        // grant is host-signed, host-seq-signed, persisted, and projected
+        // into the host cap-set exactly like any other message. Note the
+        // grant is HOST-PRIVATE (D3): `send` never fans `Capability`
+        // messages out over gossip, and `log_since` excludes them from
+        // Replay, so it never reaches joiners — v1 enforces caps
+        // host-only, so joiners have no use for it, and keeping it off the
+        // wire means the auto-grant adds zero joiner-visible traffic
+        // (which is what kept perturbing plumtree and exposing the
+        // close-vs-teardown race). We emit here — at the single admission
+        // chokepoint — rather than in the bridge's `JoinAnnouncement`
+        // arm, so both the announcement and the `SendRequest` backstop
+        // (which also routes through `ensure_member`) are covered without
+        // duplicating the grant logic. The guard above already returned
+        // for the already-member case, so this fires once per peer.
+        if session_kind == SessionKind::Local {
+            let host_author = PeerInfo::new(self.daemon_peer_id, "host");
+            let action = CapabilityAction::Grant {
+                peer: peer.id,
+                cap: Capability::ReadWrite,
+            };
+            if let Err(err) = self
+                .send(
+                    session,
+                    host_author,
+                    MessageKind::Capability,
+                    action.action_str().to_string(),
+                    action.encode(),
+                    Authoring::Local,
+                )
+                .await
+            {
+                // Non-fatal: the peer is already a member; a failed
+                // auto-grant leaves them without write capability, which
+                // is the safe direction. Surface for ops — a persistent
+                // failure here means joiners can't write.
+                tracing::warn!(
+                    ?session,
+                    peer = %peer.id,
+                    ?err,
+                    "auto-grant ReadWrite on join failed",
+                );
+            }
+        }
         Ok(())
     }
 
-    /// Snapshot every message in `session`'s log with `seq > since`.
-    /// Used by the host's gossip bridge to answer a joiner's
-    /// `Replay` request — we re-broadcast each entry as a
-    /// `Message` frame and the joiner's mirror dedups by seq.
+    /// Snapshot every message in `session`'s log with `seq > since`,
+    /// **excluding `Capability` messages**. Used by the host's gossip
+    /// bridge to answer a joiner's `Replay` request — we re-broadcast
+    /// each entry as a `Message` frame and the joiner's mirror dedups by
+    /// seq.
+    ///
+    /// `Capability` messages are host-private in v1 (Auth Slice C
+    /// delivery rethink, D3): joiners neither enforce nor project caps,
+    /// so they have no use for a Grant/Revoke, and keeping them off the
+    /// Replay path (as well as off live fanout in `send`) means the cap
+    /// log adds zero joiner-visible gossip traffic. ⚠️ FOR P2P: caps
+    /// MUST sync to peers — drop this filter and deliver capability
+    /// events as part of the (causal) log sync. See
+    /// `docs/brainstorms/2026-06-04-auth-slice-c-l2-delivery-rethink-brainstorm.md`.
     ///
     /// Returns `Err(UnknownSession)` if `session` doesn't exist on
     /// this daemon. Returns an empty Vec if the joiner is already
@@ -907,7 +1153,11 @@ impl Registry {
                 .ok_or(SessionError::UnknownSession(session))?
         };
         let s = session_arc.lock().await;
-        Ok(s.log.iter().filter(|m| m.seq > since).cloned().collect())
+        Ok(s.log
+            .iter()
+            .filter(|m| m.seq > since && m.kind != MessageKind::Capability)
+            .cloned()
+            .collect())
     }
 
     /// Drop a remote-mirror session because the host has signalled
@@ -1097,6 +1347,11 @@ impl Registry {
             return Err(SessionError::NotHost);
         }
 
+        // L2 capability enforcement (Auth Slice C). Rejects an author who
+        // can't write *here* — before the message is signed, sequenced,
+        // or appended (O1: drop-before-append). See `ensure_can_write`.
+        ensure_can_write(&session_arc, peer.id).await?;
+
         // Local-host arm. Either we authored the body ourselves
         // (`Authoring::Local`: stamp now_ms + sign with our key) or a
         // joiner authored it and we're appending on their behalf
@@ -1141,6 +1396,14 @@ impl Registry {
         }
         s.head = prospective;
         s.log.push(message.clone());
+        // Advance the projected cap set if this was a grant/revoke
+        // (Auth Slice C). Order matches the seq-order discipline:
+        // append to the log first, then project. The author already
+        // passed the can_write gate above, so the authority check
+        // inside `apply_capability` is satisfied for a legitimate grant.
+        if message.kind == MessageKind::Capability {
+            s.apply_capability(&message);
+        }
 
         // Snapshot the broadcast handle so we can drop the per-session
         // lock before fanning out — `broadcast::send` is cheap but
@@ -1155,8 +1418,25 @@ impl Registry {
         // Forward to remote joiners over gossip. Best-effort: if the
         // bridge isn't available (no iroh, or it errored), the local
         // fan-out has already happened so IPC clients are served.
+        //
+        // `Capability` messages are HOST-PRIVATE in v1 and never leave
+        // the host (Auth Slice C delivery rethink, D3). v1 enforces caps
+        // host-only — joiners neither enforce nor project a cap-set — so
+        // a joiner has no use for a Grant/Revoke. Keeping them off the
+        // wire entirely (not just off live fanout, but off the Replay
+        // path too — see `log_since`) means Slice C adds ZERO
+        // joiner-visible gossip traffic, so it cannot perturb iroh-gossip's
+        // plumtree eager/lazy tree and cannot expose the latent
+        // close-vs-teardown race. The grant still lives in the host log
+        // (persisted, projected, replayed on resume, audit / P2P-ready).
+        // ⚠️ FOR P2P: caps MUST propagate to peers — remove this
+        // host-private gate and deliver capability events as part of the
+        // (causal) log sync. See
+        // docs/brainstorms/2026-06-04-auth-slice-c-l2-delivery-rethink-brainstorm.md
         #[cfg(feature = "iroh")]
-        if let Some(bridge) = &self.bridge {
+        if message.kind != MessageKind::Capability
+            && let Some(bridge) = &self.bridge
+        {
             bridge.publish_message(session, message.clone()).await;
         }
 
@@ -1497,6 +1777,30 @@ async fn apply_inbound_mirror_message(
         );
         return;
     }
+    // ───────────────────────────────────────────────────────────────
+    // NO L2 CAPABILITY ENFORCEMENT HERE — THIS IS DELIBERATE (v1).
+    //
+    // An earlier cut of Slice C re-enforced the cap rule on every
+    // joiner mirror ("every peer enforces locally"). That was removed:
+    // in v1's star topology the HOST is the sole sequencer, so the host's
+    // `Registry::send` cap-gate is the mandatory enforcement chokepoint —
+    // a joiner cannot get a message into the log without the host
+    // sequencing it. Re-enforcing here only defended against a malicious
+    // host forging a write, which v1 puts out of scope ("host-as-sequencer
+    // trust", parent threat model). It also required deriving the cap-set
+    // at-seq from Grant/Revoke events arriving over iroh-gossip's epidemic
+    // delivery — which is neither timely nor ordered — and that fragility
+    // caused a lost-SessionClosed flake and a real grant-ordering race.
+    //
+    // ⚠️ FOR SYMMETRIC-P2P: per-peer enforcement becomes MANDATORY (no
+    // host to delegate to). Re-add it here ONLY against causal history
+    // (hash-linked DAG + project-at-merge), NEVER against this live
+    // host-sequenced stream — a message causally depending on its
+    // authorizing Grant makes the ordering race impossible by
+    // construction. See
+    // docs/brainstorms/2026-06-04-auth-slice-c-l2-delivery-rethink-brainstorm.md
+    // ───────────────────────────────────────────────────────────────
+
     // Persist BEFORE mutating in-memory state so a crash mid-callback
     // doesn't leave the mirror's in-memory log ahead of disk. Persist
     // while holding the lock so a concurrent remote-mirror cascade
@@ -2083,9 +2387,15 @@ mod tests {
             other => panic!("expected SignatureRejected, got {other:?}"),
         }
 
-        // No state mutation: the host's log is empty, head is ZERO.
+        // The rejected Chat body must not append. The log may contain
+        // the auto-grant Capability message `ensure_member` emitted when
+        // it admitted the joiner (Auth Slice C) — but no Chat.
         let sub = r.subscribe(id, None).await.unwrap();
-        assert!(sub.replay.is_empty(), "rejected body must not append");
+        assert!(
+            sub.replay.iter().all(|m| m.kind != MessageKind::Chat),
+            "rejected Chat body must not append; log: {:?}",
+            sub.replay.iter().map(|m| m.kind).collect::<Vec<_>>(),
+        );
     }
 
     #[tokio::test]
@@ -2334,6 +2644,10 @@ mod tests {
         );
         session_obj.host = host_id;
         let author_key = artel_protocol::signing::SigningKey::from_bytes(&[0x32; 32]);
+        // No cap-seed needed: v1 mirrors do not enforce or project caps
+        // (host-only enforcement). These B.5.3 tests exercise the
+        // *signature* pipeline (dedup → author sig → host seq-sig), which
+        // is independent of L2.
         let store: DynStore = Arc::new(crate::store::MemoryStore::new());
         (
             host_key,
@@ -2545,6 +2859,419 @@ mod tests {
         // Monotonic: a lower epoch is a no-op.
         r.advance_host_epoch_watermark(session, 1).await.unwrap();
         assert_eq!(r.store.load_all().await.unwrap()[0].host_epoch, 3);
+    }
+
+    // ====================================================================
+    // L2 capabilities (Auth Slice C)
+    // ====================================================================
+
+    /// Build an unsigned `Capability` message carrying `action`. The
+    /// projection (`apply_capability`) enforces the cap-set authority
+    /// rule, not signatures — those are checked at the send/mirror gates
+    /// — so these projection-unit fixtures skip signing.
+    fn cap_msg(seq: u64, author: &PeerInfo, action: &CapabilityAction) -> SessionMessage {
+        SessionMessage::new(
+            Seq::new(seq),
+            1_700_000_000_000,
+            author.clone(),
+            MessageKind::Capability,
+            action.action_str(),
+            action.encode(),
+            SIGNATURE_UNSIGNED,
+            SIGNATURE_UNSIGNED,
+        )
+    }
+
+    // ---- projection unit (no I/O) ----
+
+    #[tokio::test]
+    async fn new_session_seeds_host_read_write() {
+        let host = peer(1, "alice");
+        let s = Session::new(SessionId::from_bytes([1; 16]), &host, SessionKind::Local);
+        assert_eq!(s.caps.get(&host.id), Some(&Capability::ReadWrite));
+        assert!(s.can_write(host.id), "host is the cap-log root");
+        // An unrelated peer is absent ⇒ Read floor ⇒ cannot write.
+        assert!(!s.can_write(peer(2, "bob").id));
+    }
+
+    #[tokio::test]
+    async fn apply_capability_grant_inserts_and_revoke_removes() {
+        let host = peer(1, "alice");
+        let bob = peer(2, "bob");
+        let mut s = Session::new(SessionId::from_bytes([1; 16]), &host, SessionKind::Local);
+
+        // Host grants bob ReadWrite.
+        let grant = CapabilityAction::Grant {
+            peer: bob.id,
+            cap: Capability::ReadWrite,
+        };
+        s.log.push(cap_msg(1, &host, &grant));
+        s.apply_capability(&s.log.last().unwrap().clone());
+        assert!(s.can_write(bob.id), "granted peer can write");
+
+        // Host revokes bob.
+        let revoke = CapabilityAction::Revoke { peer: bob.id };
+        s.log.push(cap_msg(2, &host, &revoke));
+        s.apply_capability(&s.log.last().unwrap().clone());
+        assert!(
+            !s.can_write(bob.id),
+            "revoked peer falls back to Read floor"
+        );
+        assert_eq!(s.caps.get(&bob.id), None, "revoke removes the entry");
+    }
+
+    #[tokio::test]
+    async fn grant_from_non_holder_is_a_no_op_on_caps() {
+        // A forged self-grant: a peer who holds nothing tries to grant
+        // *itself* ReadWrite. The authority check (author must already
+        // hold RW) fails, so caps are unchanged. (At the real send /
+        // mirror gates this message is dropped before it reaches here;
+        // this pins the projection's own defence in depth.)
+        let host = peer(1, "alice");
+        let mallory = peer(9, "mallory");
+        let mut s = Session::new(SessionId::from_bytes([1; 16]), &host, SessionKind::Local);
+
+        let self_grant = CapabilityAction::Grant {
+            peer: mallory.id,
+            cap: Capability::ReadWrite,
+        };
+        s.log.push(cap_msg(1, &mallory, &self_grant));
+        s.apply_capability(&s.log.last().unwrap().clone());
+        assert!(
+            !s.can_write(mallory.id),
+            "a non-holder cannot grant itself write",
+        );
+    }
+
+    #[tokio::test]
+    async fn from_record_rebuilds_caps_from_log() {
+        // Q4: caps are derived, never persisted. A record whose log
+        // contains grant→revoke rebuilds to the identical cap set on
+        // load — pinned store-free.
+        let host = peer(1, "alice");
+        let bob = peer(2, "bob");
+        let carol = peer(3, "carol");
+        let session_id = SessionId::from_bytes([0xcd; 16]);
+
+        let grant_bob = CapabilityAction::Grant {
+            peer: bob.id,
+            cap: Capability::ReadWrite,
+        };
+        let grant_carol = CapabilityAction::Grant {
+            peer: carol.id,
+            cap: Capability::ReadWrite,
+        };
+        let revoke_bob = CapabilityAction::Revoke { peer: bob.id };
+        let log = vec![
+            cap_msg(1, &host, &grant_bob),
+            cap_msg(2, &host, &grant_carol),
+            cap_msg(3, &host, &revoke_bob),
+        ];
+        let record = SessionRecord {
+            id: session_id,
+            host: host.id,
+            members: HashSet::from([host.id, bob.id, carol.id]),
+            head: Seq::new(3),
+            log,
+            kind: SessionKind::Local,
+            host_epoch: 0,
+        };
+        let s = Session::from_record(record);
+        assert!(s.can_write(host.id), "host root preserved");
+        assert!(s.can_write(carol.id), "carol's grant replayed");
+        assert!(
+            !s.can_write(bob.id),
+            "bob's grant-then-revoke nets to no write"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_after_grant_nets_to_no_write_in_projection() {
+        // Projection is seq-ordered: grant at seq 1 then revoke at seq 3
+        // leaves bob unable to write in the resulting cap-set. (v1 is
+        // host-only enforcement, so this is the host's own projection;
+        // there is no joiner-side at-seq path anymore.)
+        let host = peer(1, "alice");
+        let bob = peer(2, "bob");
+        let session_id = SessionId::from_bytes([0xcd; 16]);
+
+        let grant_bob = CapabilityAction::Grant {
+            peer: bob.id,
+            cap: Capability::ReadWrite,
+        };
+        let revoke_bob = CapabilityAction::Revoke { peer: bob.id };
+        let log = vec![
+            cap_msg(1, &host, &grant_bob),  // seq 1: bob granted
+            cap_msg(3, &host, &revoke_bob), // seq 3: bob revoked
+        ];
+        let s = Session {
+            caps: project_caps(host.id, &log),
+            log,
+            ..Session::new(session_id, &host, SessionKind::Local)
+        };
+        assert!(!s.can_write(bob.id), "grant-then-revoke nets to no write");
+        assert!(s.can_write(host.id), "host root preserved");
+    }
+
+    // ---- Registry-via-MemoryStore enforcement ----
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn host_send_rejects_read_only_peer() {
+        // A member who was never granted RW (we add them to membership
+        // directly, bypassing the auto-grant path) is rejected at the
+        // host's `send` with CapabilityDenied — never seq'd (O1).
+        let (r, host, _) = registry_with_signing_seed(0x41);
+        let (id, _) = r.host(host.clone(), None).await.unwrap();
+
+        // Add bob to membership WITHOUT auto-granting: poke the session
+        // directly so we isolate the enforcement from the auto-grant.
+        let bob = peer(2, "bob");
+        {
+            let arc = {
+                let g = r.sessions.read().await;
+                g.get(&id).unwrap().clone()
+            };
+            let mut s = arc.lock().await;
+            s.members.insert(bob.id);
+        }
+
+        let err = r
+            .send(
+                id,
+                bob.clone(),
+                MessageKind::Chat,
+                "x".into(),
+                b"hi".to_vec(),
+                Authoring::Local,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            SessionError::CapabilityDenied {
+                peer_id: bob.id,
+                had: None,
+                needed: Capability::ReadWrite,
+            },
+        );
+        // Drop-before-append: no Chat occupies a seq.
+        let sub = r.subscribe(id, None).await.unwrap();
+        assert!(sub.replay.iter().all(|m| m.kind != MessageKind::Chat));
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn host_send_rejects_revoked_peer() {
+        // grant → revoke → write must be denied at the host.
+        let (r, host, _) = registry_with_signing_seed(0x41);
+        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        let bob = peer(2, "bob");
+
+        // ensure_member auto-grants bob RW.
+        r.ensure_member(id, bob.clone()).await.unwrap();
+        assert!(
+            {
+                let arc = {
+                    let g = r.sessions.read().await;
+                    g.get(&id).unwrap().clone()
+                };
+                let s = arc.lock().await;
+                s.can_write(bob.id)
+            },
+            "auto-grant gave bob RW",
+        );
+
+        // Host revokes bob.
+        let revoke = CapabilityAction::Revoke { peer: bob.id };
+        r.send(
+            id,
+            host.clone(),
+            MessageKind::Capability,
+            revoke.action_str().to_string(),
+            revoke.encode(),
+            Authoring::Local,
+        )
+        .await
+        .unwrap();
+
+        // Bob's next write is denied.
+        let err = r
+            .send(
+                id,
+                bob.clone(),
+                MessageKind::Chat,
+                "x".into(),
+                b"hi".to_vec(),
+                Authoring::Local,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            SessionError::CapabilityDenied {
+                peer_id: bob.id,
+                had: None,
+                needed: Capability::ReadWrite,
+            },
+        );
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn auto_grant_on_ensure_member_lets_peer_write() {
+        // The round-trip: ensure_member admits + auto-grants a peer,
+        // who can then `send` successfully.
+        let (r, host, _) = registry_with_signing_seed(0x41);
+        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        let bob = peer(2, "bob");
+        r.ensure_member(id, bob.clone()).await.unwrap();
+
+        // A Grant message now sits in the log, authored by the host.
+        let sub = r.subscribe(id, None).await.unwrap();
+        let grant = sub
+            .replay
+            .iter()
+            .find(|m| m.kind == MessageKind::Capability)
+            .expect("auto-grant message in log");
+        assert_eq!(grant.peer.id, host.id, "grant authored by the host");
+        let action = CapabilityAction::decode(&grant.payload).unwrap();
+        assert_eq!(
+            action,
+            CapabilityAction::Grant {
+                peer: bob.id,
+                cap: Capability::ReadWrite,
+            },
+        );
+
+        // And bob can now write.
+        let sent = r
+            .send(
+                id,
+                bob.clone(),
+                MessageKind::Chat,
+                "hi".into(),
+                b"world".to_vec(),
+                Authoring::Local,
+            )
+            .await;
+        assert!(sent.is_ok(), "auto-granted peer can write: {sent:?}");
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn mirror_does_not_enforce_or_project_caps() {
+        // v1 is host-only enforcement: a joiner mirror neither enforces
+        // the cap rule nor projects a cap-set from inbound Capability
+        // frames (see the loud note in `apply_inbound_mirror_message`).
+        // Feed a validly host-signed `Grant` through the mirror and
+        // assert: (a) it appends like any other signed frame (the mirror
+        // does not gate on caps), and (b) the mirror's cap-set stays
+        // host-only (mirrors don't project — the forged-self-grant
+        // defense lives at the host's `send`, pinned by
+        // `grant_from_non_holder_is_a_no_op_on_caps`).
+        let (host_key, session, author_key, mirror, store) = remote_mirror_fixture();
+        store.create(&mirror.lock().await.record()).await.unwrap();
+        let author = PeerInfo::new(
+            PeerId::from_bytes(author_key.verifying_key().to_bytes()),
+            "bob",
+        );
+        let grant = CapabilityAction::Grant {
+            peer: author.id,
+            cap: Capability::ReadWrite,
+        };
+        let ts = 1_700_000_000_000u64;
+        let author_sig = artel_protocol::signing::sign_body(
+            &author_key,
+            session,
+            MESSAGE_FORMAT,
+            ts,
+            &author,
+            MessageKind::Capability,
+            grant.action_str(),
+            &grant.encode(),
+        );
+        let host_sig =
+            artel_protocol::signing::sign_seq(&host_key, session, Seq::new(1), &author_sig);
+        let msg = SessionMessage::new(
+            Seq::new(1),
+            ts,
+            author.clone(),
+            MessageKind::Capability,
+            grant.action_str(),
+            grant.encode(),
+            author_sig,
+            host_sig,
+        );
+        apply_inbound_mirror_message(&store, &mirror, session, msg).await;
+        let (log_len, caps_len, caps_has_host) = {
+            let s = mirror.lock().await;
+            (s.log.len(), s.caps.len(), s.caps.contains_key(&s.host))
+        };
+        assert_eq!(log_len, 1, "validly-signed frame appends; no cap gate");
+        // The mirror never projects: only the host root is in caps.
+        assert_eq!(caps_len, 1, "mirror does not project caps");
+        assert!(caps_has_host, "only the host root seeded");
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn cross_session_grant_replay_is_rejected_by_signature() {
+        // A grant signed for session A, fed to session B's mirror, fails
+        // `verify_message` (session_id is in the signed scope, B.5) — so
+        // it is dropped (never appended). Re-asserts the signature
+        // property for the Capability kind.
+        let (host_key, session_a, _author, _mirror_a, store) = remote_mirror_fixture();
+        let session_b = SessionId::from_bytes([0xbb; 16]);
+        // A mirror for session B with the same host.
+        let host_id = PeerId::from_bytes(host_key.verifying_key().to_bytes());
+        let mut mirror_b_obj = Session::new(
+            session_b,
+            &PeerInfo::new(host_id, "remote-host"),
+            SessionKind::Remote,
+        );
+        mirror_b_obj.host = host_id;
+        let mirror_b = Arc::new(Mutex::new(mirror_b_obj));
+        store.create(&mirror_b.lock().await.record()).await.unwrap();
+
+        let bob = peer(2, "bob");
+        let grant = CapabilityAction::Grant {
+            peer: bob.id,
+            cap: Capability::ReadWrite,
+        };
+        // Host authors+signs the grant for session A.
+        let ts = 1_700_000_000_000u64;
+        let author_sig = artel_protocol::signing::sign_body(
+            &host_key,
+            session_a, // signed FOR A
+            MESSAGE_FORMAT,
+            ts,
+            &PeerInfo::new(host_id, "remote-host"),
+            MessageKind::Capability,
+            grant.action_str(),
+            &grant.encode(),
+        );
+        let host_sig =
+            artel_protocol::signing::sign_seq(&host_key, session_b, Seq::new(1), &author_sig);
+        let msg = SessionMessage::new(
+            Seq::new(1),
+            ts,
+            PeerInfo::new(host_id, "remote-host"),
+            MessageKind::Capability,
+            grant.action_str(),
+            grant.encode(),
+            author_sig,
+            host_sig,
+        );
+        // Fed to B's mirror: author-sig verify uses session_b, but the
+        // sig was made for session_a → BadSig → dropped.
+        let _ = bob;
+        apply_inbound_mirror_message(&store, &mirror_b, session_b, msg).await;
+        let log_is_empty = {
+            let s = mirror_b.lock().await;
+            s.log.is_empty()
+        };
+        assert!(log_is_empty, "cross-session grant must not append");
     }
 
     // ---- subscribe / replay ----

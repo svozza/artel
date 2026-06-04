@@ -281,7 +281,10 @@ async fn events_stream_delivers_message_events() {
         );
         match timeout(remaining, alice_events.recv()).await {
             Ok(Some(Event::PeerJoined { .. })) => saw_join = true,
-            Ok(Some(Event::Message { message, .. })) => {
+            // Ignore the auto-grant Capability message the host emits on
+            // admitting Bob (Auth Slice C / L2); this test pins Bob's
+            // Chat send reaching Alice.
+            Ok(Some(Event::Message { message, .. })) if message.kind == MessageKind::Chat => {
                 assert_eq!(message.payload, b"hi");
                 saw_message = true;
             }

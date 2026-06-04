@@ -1020,6 +1020,14 @@ fn session_error_to_protocol(err: &SessionError) -> ProtocolError {
         SessionError::SignatureRejected { peer_id, reason } => {
             ProtocolError::Signature(format!("{peer_id}: {reason}"))
         }
+        // L2 capability denial (Auth Slice C): the joiner sees this as
+        // `ProtocolError::Capability` so they can distinguish a cap
+        // failure from a signature failure or a generic Internal.
+        SessionError::CapabilityDenied {
+            peer_id,
+            had,
+            needed,
+        } => ProtocolError::Capability(format!("{peer_id}: had {had:?}, needs {needed:?}")),
     }
 }
 
