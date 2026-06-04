@@ -330,7 +330,7 @@ impl Session {
     /// [`CapabilityAction`], which the author signed — they get nothing.
     fn apply_capability(&mut self, msg: &SessionMessage) {
         debug_assert_eq!(msg.kind, MessageKind::Capability);
-        apply_capability_to(&mut self.caps, msg);
+        apply_capability_to(&mut self.caps, self.host, msg);
     }
 }
 
@@ -348,26 +348,21 @@ fn project_caps(host: PeerId, log: &[SessionMessage]) -> HashMap<PeerId, Capabil
     ordered.sort_by_key(|m| m.seq);
     for msg in ordered {
         if msg.kind == MessageKind::Capability {
-            apply_capability_to(&mut caps, msg);
+            apply_capability_to(&mut caps, host, msg);
         }
     }
     caps
 }
 
 /// Core projection step shared by the incremental and full-replay
-/// paths. Enforces the Q2 authority rule against `caps` (the state as
-/// of just before this message) and mutates `caps` only if the author
-/// is authorized.
-fn apply_capability_to(caps: &mut HashMap<PeerId, Capability>, msg: &SessionMessage) {
-    // Authority check (Q2): the author must currently hold ReadWrite.
-    let author_can_grant = caps
-        .get(&msg.peer.id)
-        .is_some_and(|c| Capability::permits_write(*c));
-    if !author_can_grant {
-        // Unauthorized grant/revoke: the message may sit in the log as
-        // an audit artifact (the host rejects at send and the joiner
-        // drops at mirror, so in practice it shouldn't reach here — but
-        // if it does, it must not mutate the cap set).
+/// paths. Only the host may grant/revoke — tightened from the original
+/// "any RW holder" (Q2) to prevent malicious joiners from revoking
+/// peers. For P2P (no single host) this must become a quorum or
+/// causal-authority rule; see
+/// `docs/brainstorms/2026-06-04-auth-slice-c-l2-delivery-rethink-brainstorm.md`.
+fn apply_capability_to(caps: &mut HashMap<PeerId, Capability>, host: PeerId, msg: &SessionMessage) {
+    // Authority check: only the host may issue grants/revokes.
+    if msg.peer.id != host {
         return;
     }
     let Ok(action) = CapabilityAction::decode(&msg.payload) else {
@@ -2936,16 +2931,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grant_from_non_holder_is_a_no_op_on_caps() {
-        // A forged self-grant: a peer who holds nothing tries to grant
-        // *itself* ReadWrite. The authority check (author must already
-        // hold RW) fails, so caps are unchanged. (At the real send /
-        // mirror gates this message is dropped before it reaches here;
-        // this pins the projection's own defence in depth.)
+    async fn grant_from_non_host_is_a_no_op_on_caps() {
+        // Only the host may issue grants/revokes. A non-host peer —
+        // even one holding RW — cannot mutate the cap set. This pins
+        // the host-only authority rule (tightened from "any RW holder"
+        // to prevent malicious joiners from revoking peers; P2P will
+        // need a quorum/causal-authority rule instead).
         let host = peer(1, "alice");
         let mallory = peer(9, "mallory");
         let mut s = Session::new(SessionId::from_bytes([1; 16]), &host, SessionKind::Local);
 
+        // Even if mallory somehow held RW, her grant is inert.
         let self_grant = CapabilityAction::Grant {
             peer: mallory.id,
             cap: Capability::ReadWrite,
@@ -2954,7 +2950,7 @@ mod tests {
         s.apply_capability(&s.log.last().unwrap().clone());
         assert!(
             !s.can_write(mallory.id),
-            "a non-holder cannot grant itself write",
+            "non-host cannot grant — even itself",
         );
     }
 
