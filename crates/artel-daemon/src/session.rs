@@ -2289,10 +2289,25 @@ mod tests {
     /// membership and signing-identity line up.
     #[cfg(feature = "iroh")]
     fn registry_with_signing_seed(seed: u8) -> (Registry, PeerInfo, Arc<iroh::SecretKey>) {
+        let store: DynStore = Arc::new(crate::store::MemoryStore::new());
+        registry_with_signing_seed_over(seed, store)
+    }
+
+    /// Like [`registry_with_signing_seed`] but over a caller-supplied
+    /// `store`, so a test can drop the registry and `Registry::load` a
+    /// fresh one over the SAME store to exercise the real cold-start
+    /// replay path (the only path that reconstructs `caps` from the
+    /// persisted log — Auth Slice C.3, the two-resume-path nuance: an
+    /// in-process re-host leaves caps untouched in memory and proves
+    /// nothing about replay).
+    #[cfg(feature = "iroh")]
+    fn registry_with_signing_seed_over(
+        seed: u8,
+        store: DynStore,
+    ) -> (Registry, PeerInfo, Arc<iroh::SecretKey>) {
         let secret = Arc::new(iroh::SecretKey::from_bytes(&[seed; 32]));
         let endpoint_id = secret.public();
         let peer_id = PeerId::from_bytes(*endpoint_id.as_bytes());
-        let store: DynStore = Arc::new(crate::store::MemoryStore::new());
         let r = Registry::new_with_signing_key(peer_id, store, Arc::clone(&secret));
         (r, PeerInfo::new(peer_id, "alice"), secret)
     }
@@ -2983,6 +2998,85 @@ mod tests {
             !s.can_write(bob.id),
             "bob's grant-then-revoke nets to no write"
         );
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn fs_log_store_replays_caps_on_registry_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: DynStore =
+            Arc::new(crate::store::FsLogStore::open(dir.path().join("sessions")).unwrap());
+
+        // 1. Build a registry with a signing key over the FsLogStore.
+        let (r, host, secret) = registry_with_signing_seed_over(0x41, Arc::clone(&store));
+        let (id, _) = r.host(host.clone(), None).await.unwrap();
+
+        // 2. Admit bob + carol (auto-grants both RW).
+        let bob = peer(2, "bob");
+        let carol = peer(3, "carol");
+        r.ensure_member(id, bob.clone()).await.unwrap();
+        r.ensure_member(id, carol.clone()).await.unwrap();
+
+        // 3. Host revokes bob.
+        let revoke = CapabilityAction::Revoke { peer: bob.id };
+        r.send(
+            id,
+            host.clone(),
+            MessageKind::Capability,
+            revoke.action_str().to_string(),
+            revoke.encode(),
+            Authoring::Local,
+        )
+        .await
+        .unwrap();
+
+        // 4. Assert pre-resume state.
+        {
+            let arc = {
+                let g = r.sessions.read().await;
+                g.get(&id).unwrap().clone()
+            };
+            let s = arc.lock().await;
+            let (host_rw, carol_rw, bob_rw) = (
+                s.can_write(host.id),
+                s.can_write(carol.id),
+                s.can_write(bob.id),
+            );
+            drop(s);
+            assert!(host_rw, "host RW before restart");
+            assert!(carol_rw, "carol RW before restart");
+            assert!(!bob_rw, "bob revoked before restart");
+        }
+
+        // 5. Drop the registry (in-memory state gone).
+        drop(r);
+
+        // 6. Registry::load from the SAME FsLogStore (cold start).
+        let r2 = Registry::load(
+            host.id,
+            WireEndpointAddr::id_only(host.id),
+            Arc::clone(&store),
+            None,
+            Some(secret),
+        )
+        .await
+        .unwrap();
+
+        // 7. Assert identical cap-set survived the cold reload.
+        let arc = {
+            let g = r2.sessions.read().await;
+            g.get(&id).unwrap().clone()
+        };
+        let s = arc.lock().await;
+        let (host_rw, carol_rw, bob_rw) = (
+            s.can_write(host.id),
+            s.can_write(carol.id),
+            s.can_write(bob.id),
+        );
+        drop(s);
+        assert!(host_rw, "host RW after reload");
+        assert!(carol_rw, "carol RW after reload");
+        assert!(!bob_rw, "bob still revoked after reload");
     }
 
     #[tokio::test]

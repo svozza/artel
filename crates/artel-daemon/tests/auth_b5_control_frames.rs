@@ -763,3 +763,157 @@ async fn forged_session_closed_dropped_n0() {
     daemon_a.stop().await;
     daemon_b.stop().await;
 }
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn capability_survives_host_restart_n0() {
+    use artel_client::ClientError;
+    use artel_protocol::ProtocolError;
+    use artel_protocol::capability::CapabilityAction;
+    use artel_protocol::rpc::SendPayload;
+    use tempfile::TempDir;
+
+    // Persistent state for the host (survives across stop/respawn).
+    let host_root = TempDir::new().unwrap();
+    let host_paths = common::RestartState::under(host_root.path());
+
+    // 1. Spawn host + joiner (both Production/n0).
+    let daemon_a = common::spawn_daemon_at(&host_paths, EndpointSetup::Production).await;
+    let daemon_b = common::spawn_daemon(common::fresh_state(), EndpointSetup::Production).await;
+
+    // Alice hosts, bob joins → auto-granted RW.
+    let (session_id, alice_client, bob_client, _bob_events) =
+        wire_host_and_join(&daemon_a, &daemon_b).await;
+
+    // Bob writes successfully (auto-grant in effect).
+    let sent = bob_client
+        .request(Request::Send {
+            session: session_id,
+            payload: SendPayload {
+                kind: MessageKind::Chat,
+                action: "chat.message".into(),
+                payload: b"bob writes before restart".to_vec(),
+            },
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(sent, Response::Sent { .. }),
+        "bob can write pre-restart: {sent:?}",
+    );
+
+    // 2. Stop host gracefully (publishes SessionClosed, tears bob's mirror).
+    drop(alice_client);
+    daemon_a.stop().await;
+
+    // 3. Respawn host at the SAME paths (cold start from disk).
+    let daemon_a = common::spawn_daemon_at(&host_paths, EndpointSetup::Production).await;
+
+    // 4. Alice resumes the session (host(Some(id))).
+    let alice_client = Client::connect(&daemon_a.socket).await.unwrap();
+    let host_resp = alice_client
+        .request(Request::HostSession {
+            display_name: "alice".into(),
+            session: Some(session_id),
+        })
+        .await
+        .unwrap();
+    let fresh_ticket = match host_resp {
+        Response::HostSession { ticket, .. } => ticket,
+        other => panic!("expected HostSession, got {other:?}"),
+    };
+
+    // 5. Bob re-joins via a fresh ticket (his mirror was torn down).
+    drop(bob_client);
+    daemon_b.stop().await;
+    let daemon_b = common::spawn_daemon(common::fresh_state(), EndpointSetup::Production).await;
+    let bob_client = Client::connect(&daemon_b.socket).await.unwrap();
+    let join_resp = bob_client
+        .request(Request::JoinSession {
+            display_name: "bob".into(),
+            ticket: fresh_ticket,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(join_resp, Response::JoinSession { .. }));
+    bob_client
+        .request(Request::Subscribe {
+            session: session_id,
+            since: None,
+        })
+        .await
+        .unwrap();
+
+    // 6. Bob writes → succeeds (session + caps survived restart,
+    //    re-join triggered a fresh auto-grant).
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "bob's post-restart write never succeeded",
+        );
+        let resp = bob_client
+            .request(Request::Send {
+                session: session_id,
+                payload: SendPayload {
+                    kind: MessageKind::Chat,
+                    action: "chat.message".into(),
+                    payload: b"bob writes after restart".to_vec(),
+                },
+            })
+            .await;
+        match resp {
+            Ok(Response::Sent { .. }) => break,
+            // Transient: bob's join may not have propagated to the host yet.
+            Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    // 7. Alice revokes bob on the reloaded session.
+    let revoke = CapabilityAction::Revoke {
+        peer: daemon_b.peer_id(),
+    };
+    alice_client
+        .request(Request::Send {
+            session: session_id,
+            payload: SendPayload {
+                kind: MessageKind::Capability,
+                action: revoke.action_str().into(),
+                payload: revoke.encode(),
+            },
+        })
+        .await
+        .unwrap();
+
+    // 8. Bob's next send is rejected (enforcement works post-resume).
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "bob's post-revoke send was never rejected after restart",
+        );
+        let resp = bob_client
+            .request(Request::Send {
+                session: session_id,
+                payload: SendPayload {
+                    kind: MessageKind::Chat,
+                    action: "chat.message".into(),
+                    payload: b"bob tries after revoke".to_vec(),
+                },
+            })
+            .await;
+        match resp {
+            Err(ClientError::Protocol(ProtocolError::Capability(_))) => break,
+            Ok(Response::Sent { .. }) => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            other => panic!("expected Capability error or transient Sent, got {other:?}"),
+        }
+    }
+
+    drop(alice_client);
+    drop(bob_client);
+    daemon_a.stop().await;
+    daemon_b.stop().await;
+}
