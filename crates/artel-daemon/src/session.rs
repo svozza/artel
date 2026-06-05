@@ -1088,7 +1088,7 @@ impl Registry {
         // Verify the claim BEFORE any state mutation so a forged or
         // expired ticket never touches the member set.
         if let Some(ref claim) = cap_claim {
-            if claim.expiry_ms != 0 && claim.expiry_ms < now_ms() {
+            if claim.expiry_ms != 0 && claim.expiry_ms <= now_ms() {
                 return Err(SessionError::TicketExpired);
             }
             if let Err(err) = signing::verify_ticket_cap(

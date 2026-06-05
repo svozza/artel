@@ -5,7 +5,7 @@
 // crate-visibility lint so they stop fighting (see memory).
 #![allow(clippy::redundant_pub_crate)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
 use artel_protocol::PeerId;
@@ -18,6 +18,11 @@ pub(crate) struct PeerMap {
     id_map: RwLock<HashMap<EndpointId, PeerId>>,
     /// Daemon `PeerId` → current capability (projected from session log).
     caps: RwLock<HashMap<PeerId, Capability>>,
+    /// Peers that were explicitly revoked (removed from caps). A peer
+    /// in this set is blocked unconditionally, even if their endpoint
+    /// mapping is still registered. Distinguishes "never granted yet"
+    /// and "Read-only" from "was a member, then kicked".
+    revoked: RwLock<HashSet<PeerId>>,
     /// The host's daemon `PeerId` (cap-log root, always RW).
     host: PeerId,
 }
@@ -29,6 +34,7 @@ impl PeerMap {
         Self {
             id_map: RwLock::new(HashMap::new()),
             caps: RwLock::new(caps),
+            revoked: RwLock::new(HashSet::new()),
             host,
         }
     }
@@ -61,28 +67,42 @@ impl PeerMap {
             "apply_capability",
         );
         let mut caps = self.caps.write().unwrap();
-        match action {
+        let revoke_peer = match action {
             CapabilityAction::Grant { peer, cap } => {
                 caps.insert(peer, cap);
+                Some((peer, false))
             }
             CapabilityAction::Revoke { peer } => {
                 caps.remove(&peer);
+                Some((peer, true))
+            }
+        };
+        drop(caps);
+        if let Some((peer, is_revoke)) = revoke_peer {
+            let mut revoked = self.revoked.write().unwrap();
+            if is_revoke {
+                revoked.insert(peer);
+            } else {
+                revoked.remove(&peer);
             }
         }
     }
 
     /// Check whether an incoming workspace `EndpointId` belongs to a
-    /// revoked peer. Returns `false` (allow) for unknown `EndpointId`s
-    /// — if we haven't seen the mapping yet, we can't revoke them.
-    #[allow(clippy::significant_drop_tightening)]
+    /// peer that was explicitly revoked. Returns `false` (allow) for:
+    /// - Unknown `EndpointId`s (haven't seen the mapping yet)
+    /// - Peers not yet granted (race: registered before grant arrives)
+    /// - Read-only peers (legitimate tiered-ticket holders)
+    ///
+    /// Only returns `true` for peers that once held a capability and
+    /// were then explicitly revoked by the host.
     pub(crate) fn is_revoked_workspace_id(&self, workspace_id: EndpointId) -> bool {
         let id_map = self.id_map.read().unwrap();
         let Some(&daemon_peer) = id_map.get(&workspace_id) else {
             return false;
         };
         drop(id_map);
-        let caps = self.caps.read().unwrap();
-        !caps.get(&daemon_peer).is_some_and(|c| c.permits_write())
+        self.revoked.read().unwrap().contains(&daemon_peer)
     }
 }
 
@@ -151,8 +171,8 @@ mod tests {
         let wid = test_workspace_id();
 
         map.register(wid, peer);
-        // Before grant: peer absent from caps → revoked
-        assert!(map.is_revoked_workspace_id(wid));
+        // Before grant: peer absent from caps but never revoked → allowed
+        assert!(!map.is_revoked_workspace_id(wid));
 
         map.apply_capability(host, &grant_payload(peer, Capability::ReadWrite));
         assert!(!map.is_revoked_workspace_id(wid));
@@ -164,14 +184,19 @@ mod tests {
     #[test]
     fn non_host_authored_grant_is_ignored() {
         let map = PeerMap::new(test_host());
+        let host = test_host();
         let peer = test_peer();
         let wid = test_workspace_id();
         let impostor = PeerId::from_bytes([99; 32]);
 
+        // Grant from host, then revoke, then impostor tries to re-grant.
         map.register(wid, peer);
-        map.apply_capability(impostor, &grant_payload(peer, Capability::ReadWrite));
+        map.apply_capability(host, &grant_payload(peer, Capability::ReadWrite));
+        map.apply_capability(host, &revoke_payload(peer));
+        assert!(map.is_revoked_workspace_id(wid));
 
-        // Still revoked — the non-host grant was ignored
+        // Impostor grant is ignored — peer stays revoked.
+        map.apply_capability(impostor, &grant_payload(peer, Capability::ReadWrite));
         assert!(map.is_revoked_workspace_id(wid));
     }
 
@@ -192,7 +217,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_cap_is_considered_revoked() {
+    fn read_only_cap_is_allowed() {
         let map = PeerMap::new(test_host());
         let host = test_host();
         let peer = test_peer();
@@ -201,7 +226,23 @@ mod tests {
         map.register(wid, peer);
         map.apply_capability(host, &grant_payload(peer, Capability::Read));
 
+        assert!(!map.is_revoked_workspace_id(wid));
+    }
+
+    #[test]
+    fn re_grant_after_revoke_clears_revoked_status() {
+        let map = PeerMap::new(test_host());
+        let host = test_host();
+        let peer = test_peer();
+        let wid = test_workspace_id();
+
+        map.register(wid, peer);
+        map.apply_capability(host, &grant_payload(peer, Capability::ReadWrite));
+        map.apply_capability(host, &revoke_payload(peer));
         assert!(map.is_revoked_workspace_id(wid));
+
+        map.apply_capability(host, &grant_payload(peer, Capability::Read));
+        assert!(!map.is_revoked_workspace_id(wid));
     }
 
     #[test]

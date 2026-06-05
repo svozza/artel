@@ -1089,16 +1089,13 @@ async fn run_host_send(
         // Daemon shutting down; nothing useful to say.
         return Err(ProtocolError::Internal("daemon shutting down".into()));
     };
-    // Idempotent backstop: in the common case the joiner's
-    // `JoinAnnouncement` already drove ensure_member, but if the
-    // announcement broadcast was lost (or this SendRequest beat it
-    // through the mesh) we want to admit the peer here too. No-op
-    // when membership is already in place. Pass `None` — the
-    // JoinAnnouncement is the canonical cap-claim path; the backstop
-    // does not re-verify or re-grant.
-    if let Err(err) = registry.ensure_member(session, peer.clone(), None).await {
-        return Err(session_error_to_wire(&err));
-    }
+    // The JoinAnnouncement is the sole admission path: it carries
+    // the signed CapClaim that determines the peer's tier. If the
+    // announcement was lost, the peer must re-send it — we do NOT
+    // admit on the SendRequest path because that would bypass ticket
+    // verification and grant unconditional RW (privilege escalation).
+    // The send() below will reject with NotMember if the peer hasn't
+    // been admitted yet.
     let SignedSendPayload {
         timestamp_ms,
         kind,
