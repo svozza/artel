@@ -40,16 +40,29 @@ impl PeerMap {
     }
 
     /// Register a workspace `EndpointId` → daemon `PeerId` link.
-    pub(crate) fn register(&self, workspace_id: EndpointId, daemon_peer: PeerId) {
-        tracing::debug!(
-            target: "artel_fs::peer_map",
-            %workspace_id, %daemon_peer,
-            "register",
-        );
+    /// Returns `true` if the peer is currently revoked (the mapping
+    /// arrived after the revocation — the peer may already have an
+    /// active connection that predates the mapping).
+    pub(crate) fn register(&self, workspace_id: EndpointId, daemon_peer: PeerId) -> bool {
+        let is_revoked = self.revoked.read().unwrap().contains(&daemon_peer);
+        if is_revoked {
+            tracing::warn!(
+                target: "artel_fs::peer_map",
+                %workspace_id, %daemon_peer,
+                "register: mapping arrived for already-revoked peer",
+            );
+        } else {
+            tracing::debug!(
+                target: "artel_fs::peer_map",
+                %workspace_id, %daemon_peer,
+                "register",
+            );
+        }
         self.id_map
             .write()
             .unwrap()
             .insert(workspace_id, daemon_peer);
+        is_revoked
     }
 
     /// Apply a Capability message to the local projection.
@@ -253,5 +266,30 @@ mod tests {
         map.register(host_wid, host);
 
         assert!(!map.is_revoked_workspace_id(host_wid));
+    }
+
+    #[test]
+    fn register_returns_true_for_already_revoked_peer() {
+        let map = PeerMap::new(test_host());
+        let host = test_host();
+        let peer = test_peer();
+        let wid = test_workspace_id();
+
+        map.apply_capability(host, &grant_payload(peer, Capability::ReadWrite));
+        map.apply_capability(host, &revoke_payload(peer));
+
+        // Mapping arrives after revocation — register signals it.
+        assert!(map.register(wid, peer));
+    }
+
+    #[test]
+    fn register_returns_false_for_non_revoked_peer() {
+        let map = PeerMap::new(test_host());
+        let host = test_host();
+        let peer = test_peer();
+        let wid = test_workspace_id();
+
+        map.apply_capability(host, &grant_payload(peer, Capability::ReadWrite));
+        assert!(!map.register(wid, peer));
     }
 }

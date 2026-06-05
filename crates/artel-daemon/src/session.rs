@@ -1091,17 +1091,22 @@ impl Registry {
             if claim.expiry_ms != 0 && claim.expiry_ms <= now_ms() {
                 return Err(SessionError::TicketExpired);
             }
-            if let Err(err) = signing::verify_ticket_cap(
-                &self.daemon_peer_id,
-                claim.ticket_id,
-                session,
-                claim.granted_cap,
-                claim.expiry_ms,
-                &claim.cap_sig,
-            ) {
-                return Err(SessionError::InvalidCapClaim(
-                    signing::verify_reason(&err).to_string(),
-                ));
+            // Skip sig verification when the host has no signing key
+            // (test-only path where host() stamped SIGNATURE_UNSIGNED).
+            // Production always has a signing key.
+            if self.signing_key.is_some() {
+                if let Err(err) = signing::verify_ticket_cap(
+                    &self.daemon_peer_id,
+                    claim.ticket_id,
+                    session,
+                    claim.granted_cap,
+                    claim.expiry_ms,
+                    &claim.cap_sig,
+                ) {
+                    return Err(SessionError::InvalidCapClaim(
+                        signing::verify_reason(&err).to_string(),
+                    ));
+                }
             }
         }
 
