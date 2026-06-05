@@ -33,6 +33,7 @@ use crate::WorkspaceError;
 use crate::docs_gate::DocsGate;
 use crate::endpoint_setup::EndpointSetup;
 use crate::keystore::load_or_create_secret;
+use crate::peer_filter::PeerFilter;
 use crate::peer_map::PeerMap;
 
 /// How long the substrate waits for the home-relay handshake
@@ -109,7 +110,11 @@ impl WorkspaceNode {
         // DnsPkarrServer) set the crypto provider via the Minimal
         // preset they each include.
         let endpoint = setup
-            .apply(Endpoint::builder(iroh::endpoint::presets::Empty).secret_key(secret))
+            .apply(
+                Endpoint::builder(iroh::endpoint::presets::Empty)
+                    .secret_key(secret)
+                    .hooks(PeerFilter::new(Arc::clone(&peer_map))),
+            )
             .bind()
             .await
             .map_err(|e| WorkspaceError::Iroh(format!("bind endpoint: {e}")))?;

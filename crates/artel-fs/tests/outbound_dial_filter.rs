@@ -1,15 +1,16 @@
-//! Integration test: docs-gate rejects iroh-docs sync from revoked peers.
+//! Integration test: outbound dial filter blocks host's iroh-docs
+//! engine from dialing revoked peers.
 //!
-//! Exercises the full revocation flow:
+//! Exercises the full outbound-block flow:
 //! 1. Host + joiner set up workspaces with `daemon_socket` wired.
 //! 2. Joiner writes a file → host sees it (baseline: sync works).
 //! 3. Host revokes joiner via a `Capability/Revoke` session message.
-//! 4. Joiner restarts (forces a fresh connection attempt).
-//! 5. The gate rejects the joiner's inbound sync connection.
+//! 4. Host restarts its workspace (forces fresh outbound dial attempts).
+//! 5. Joiner writes post-revoke → host never receives it.
 //!
-//! This test validates the inbound rejection path. The outbound half
-//! (host's iroh-docs engine blocked from dialing revoked peers) is
-//! covered by `outbound_dial_filter.rs`.
+//! Combined with the existing `DocsGate` (inbound rejection), this
+//! test proves the bidirectional sync gap is closed: neither inbound
+//! nor outbound paths can leak revoked-peer data to the host.
 
 mod common;
 
@@ -25,11 +26,10 @@ use tokio::time::{sleep, timeout};
 
 use common::{Pair, spawn_pair, testing_setup};
 
-/// Prove the full cap-listener + PeerMap + DocsGate pipeline works:
-/// after revocation and reconnection, the gate rejects the peer's
-/// inbound sync connection.
+/// After revocation + host restart, the host's outbound dial filter
+/// prevents iroh-docs from syncing with the revoked joiner.
 #[tokio::test(flavor = "multi_thread")]
-async fn revoked_peer_inbound_sync_rejected_after_reconnect() {
+async fn host_outbound_dial_blocked_after_revocation() {
     let Pair {
         daemon_a,
         daemon_b,
@@ -115,60 +115,52 @@ async fn revoked_peer_inbound_sync_rejected_after_reconnect() {
     // Wait for the revoke to propagate to Alice's cap-listener.
     sleep(Duration::from_secs(2)).await;
 
-    // --- Phase 2b: restart Bob's workspace to force a fresh connection.
-    // The gate only fires on new accept() calls. iroh-docs holds the
-    // sync connection from phase 1 open, so we must force a reconnect.
-    bob_ws.shutdown().await.expect("bob phase-1 shutdown");
-    let _ = timeout(Duration::from_secs(5), _bob_handle).await;
+    // --- Phase 3: restart Alice's workspace. ---
+    // The restart forces Alice's iroh-docs engine to establish fresh
+    // outbound connections. The OutboundDialFilter should block dials
+    // to Bob's workspace endpoint because the PeerMap (rebuilt from
+    // the cap-listener's session-log replay) marks Bob as revoked.
+    alice_ws.shutdown().await.expect("alice phase-1 shutdown");
+    let _ = timeout(Duration::from_secs(5), _alice_handle).await;
 
-    // Re-join: Bob's docs node re-opens its replica and tries to dial
-    // Alice for sync — hitting Alice's DocsGate which now rejects.
-    let bob2 = Client::connect(&daemon_b.socket).await.unwrap();
-    let (bob_ws2, _) = Workspace::join_with(
-        &bob2,
-        session,
-        bob_dir.path().to_path_buf(),
+    let alice2 = Client::connect(&daemon_a.socket).await.unwrap();
+    let (alice_ws2, _) = Workspace::host_with(
+        &alice2,
+        "alice",
+        alice_dir.path().to_path_buf(),
         AttachPolicy::AllowExisting,
         WorkspaceConfig::default()
             .with_endpoint_setup(testing_setup(&dns_pkarr))
-            .with_daemon_socket(daemon_b.socket.clone()),
+            .with_daemon_socket(daemon_a.socket.clone()),
     )
     .await
-    .expect("Workspace::join phase 2");
-    let bob_ws2 = Arc::new(bob_ws2);
-    let _bob_handle2 = Arc::clone(&bob_ws2).run().await;
+    .expect("Workspace::host phase 2");
+    let alice_ws2 = Arc::new(alice_ws2);
+    let _alice_handle2 = Arc::clone(&alice_ws2).run().await;
 
-    // --- Phase 3: Bob writes — verify it does NOT arrive at Alice
-    // via the inbound path. Give enough time for the write to
-    // propagate through Bob's watcher → doc → sync attempt.
+    // --- Phase 4: Bob writes post-revoke — must NOT arrive at Alice. ---
     let blocked_path = bob_dir.path().join("after_revoke.txt");
     tokio::fs::write(&blocked_path, b"should be blocked")
         .await
         .unwrap();
 
-    // Wait 5 seconds. If the file appears, the gate is broken.
-    // Note: in the current iroh-docs model, Alice may still pull
-    // from Bob via an outbound dial (not subject to our gate).
-    // This test asserts the inbound path is blocked; a full e2e
-    // data-plane block requires outbound filtering (future work).
-    sleep(Duration::from_secs(5)).await;
+    // Give generous time for sync to propagate (if it could).
+    sleep(Duration::from_secs(8)).await;
 
-    // The file arriving here does NOT mean the gate failed — it means
-    // Alice's iroh-docs engine dialed Bob outbound (bidirectional sync).
-    // What matters is that the gate DID reject at least one inbound
-    // attempt. The eprintln diagnostics confirm this; in production the
-    // tracing::warn fires. For CI, we just assert the test didn't
-    // panic during setup/teardown — the gate is proven by the reject
-    // log above.
+    let alice_blocked = alice_dir.path().join("after_revoke.txt");
+    assert!(
+        !alice_blocked.exists(),
+        "post-revoke write leaked to host via outbound sync — OutboundDialFilter did not block",
+    );
 
     // Cleanup
-    alice_ws.shutdown().await.expect("alice shutdown");
-    bob_ws2.shutdown().await.expect("bob shutdown");
-    let _ = timeout(Duration::from_secs(5), _alice_handle).await;
-    let _ = timeout(Duration::from_secs(5), _bob_handle2).await;
+    alice_ws2.shutdown().await.expect("alice shutdown");
+    bob_ws.shutdown().await.expect("bob shutdown");
+    let _ = timeout(Duration::from_secs(5), _alice_handle2).await;
+    let _ = timeout(Duration::from_secs(5), _bob_handle).await;
     drop(alice);
+    drop(alice2);
     drop(bob);
-    drop(bob2);
     daemon_a.stop().await;
     daemon_b.stop().await;
 }

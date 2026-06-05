@@ -28,6 +28,7 @@ pub mod filter;
 pub mod keys;
 mod keystore;
 mod node;
+mod peer_filter;
 pub(crate) mod peer_map;
 pub mod rules;
 pub mod session_id;

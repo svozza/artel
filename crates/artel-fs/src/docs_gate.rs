@@ -1,6 +1,11 @@
 //! `ProtocolHandler` wrapper that rejects incoming iroh-docs sync
 //! connections from peers whose daemon-level capability has been
 //! revoked.
+//!
+//! NOTE: `PeerFilter::after_handshake` now rejects ALL inbound
+//! connections from revoked peers at the transport layer, making this
+//! gate technically redundant. Kept as defense-in-depth for now;
+//! candidate for removal once `PeerFilter` has proven stable.
 
 // Crate-private module: pair `unreachable_pub` with the
 // crate-visibility lint so they stop fighting (see memory).
