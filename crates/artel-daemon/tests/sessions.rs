@@ -835,6 +835,9 @@ async fn session_and_log_survive_daemon_restart() {
                 session_id,
                 host_peer_id: daemon_id,
                 host_addr: WireEndpointAddr::id_only(daemon_id),
+                granted_cap: artel_protocol::Capability::ReadWrite,
+                expiry_ms: 0,
+                cap_sig: artel_protocol::SIGNATURE_UNSIGNED,
             })
             .into(),
         })

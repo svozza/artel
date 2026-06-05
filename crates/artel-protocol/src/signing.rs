@@ -48,8 +48,9 @@ use ed25519_dalek::{Signature, Signer, VerifyingKey};
 pub use ed25519_dalek::{SigningKey, VerifyingKey as EdVerifyingKey};
 use uuid::Uuid;
 
+use crate::capability::Capability;
 use crate::error::ProtocolError;
-use crate::ids::{PeerId, Seq, SessionId};
+use crate::ids::{PeerId, Seq, SessionId, TicketId};
 use crate::message::{
     MESSAGE_FORMAT, MessageFormat, MessageKind, PeerInfo, SIGNATURE_UNSIGNED, SessionMessage,
     SigBytes,
@@ -456,6 +457,94 @@ pub fn verify_ctrl(
     let sig = Signature::from_bytes(host_sig);
     verifying
         .verify_strict(&ctrl_canonical_bytes(session_id, host_epoch), &sig)
+        .map_err(|_| VerifyError::BadSig)
+}
+
+// ===========================================================================
+// Ticket-cap signatures (Tiered Tickets)
+//
+// The host signs (ticket_id, session_id, granted_cap, expiry_ms) under a
+// dedicated domain so the ticket is a self-contained, stateless bearer token.
+// The host verifies its own signature at admission — no persistent registry of
+// issued tickets needed.
+// ===========================================================================
+
+/// Domain prefix for ticket capability claims.
+pub const TICKET_CAP_DOMAIN_TAG: &[u8] = b"artel/ticket-cap-v1";
+
+/// Pinned single-byte encoding for [`Capability`] inside the signed scope.
+///
+/// NOT postcard-derived — we pin these manually so a serde representation
+/// change can never silently invalidate existing ticket signatures.
+const fn cap_byte(cap: Capability) -> u8 {
+    match cap {
+        Capability::Read => 0,
+        Capability::ReadWrite => 1,
+    }
+}
+
+/// Build the canonical signed bytes for a ticket capability claim.
+///
+/// Layout: `TICKET_CAP_DOMAIN_TAG || ticket_id(16) || session_id(16) ||
+/// cap_byte(1) || expiry_ms_be(8)`. All fields fixed-width.
+#[must_use]
+pub fn ticket_cap_canonical_bytes(
+    ticket_id: TicketId,
+    session_id: SessionId,
+    granted_cap: Capability,
+    expiry_ms: u64,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(TICKET_CAP_DOMAIN_TAG.len() + 16 + 16 + 1 + 8);
+    out.extend_from_slice(TICKET_CAP_DOMAIN_TAG);
+    out.extend_from_slice(ticket_id.as_bytes());
+    out.extend_from_slice(session_id.as_bytes());
+    out.push(cap_byte(granted_cap));
+    out.extend_from_slice(&expiry_ms.to_be_bytes());
+    out
+}
+
+/// Sign a ticket capability claim with the host's signing key.
+#[must_use]
+pub fn sign_ticket_cap(
+    key: &SigningKey,
+    ticket_id: TicketId,
+    session_id: SessionId,
+    granted_cap: Capability,
+    expiry_ms: u64,
+) -> SigBytes {
+    key.sign(&ticket_cap_canonical_bytes(
+        ticket_id, session_id, granted_cap, expiry_ms,
+    ))
+    .to_bytes()
+}
+
+/// Verify a ticket capability claim against the host's public key.
+///
+/// # Errors
+///
+/// - [`VerifyError::SentinelUnsigned`] if `cap_sig` is the all-zero sentinel.
+/// - [`VerifyError::BadKey`] if `host_pubkey` is not a valid ed25519 key.
+/// - [`VerifyError::BadSig`] if the signature does not verify (wrong host,
+///   tampered fields, or wrong cap). Uses strict verification.
+pub fn verify_ticket_cap(
+    host_pubkey: &PeerId,
+    ticket_id: TicketId,
+    session_id: SessionId,
+    granted_cap: Capability,
+    expiry_ms: u64,
+    cap_sig: &SigBytes,
+) -> Result<(), VerifyError> {
+    if cap_sig == &SIGNATURE_UNSIGNED {
+        return Err(VerifyError::SentinelUnsigned);
+    }
+    let verifying =
+        VerifyingKey::from_bytes(host_pubkey.as_bytes()).map_err(|_| VerifyError::BadKey)?;
+    let sig = Signature::from_bytes(cap_sig);
+    verifying
+        .verify_strict(
+            &ticket_cap_canonical_bytes(ticket_id, session_id, granted_cap, expiry_ms),
+            &sig,
+        )
         .map_err(|_| VerifyError::BadSig)
 }
 
@@ -1174,6 +1263,206 @@ mod tests {
         let s = sample_session_id();
         assert_eq!(
             verify_ctrl(&host_pubkey(&key), s, 1, &SIGNATURE_UNSIGNED).unwrap_err(),
+            VerifyError::SentinelUnsigned,
+        );
+    }
+
+    // ====================================================================
+    // Ticket-cap signatures (Tiered Tickets)
+    // ====================================================================
+
+    use crate::capability::Capability;
+    use crate::ids::TicketId;
+
+    #[test]
+    fn ticket_cap_domain_tag_is_versioned() {
+        assert_eq!(TICKET_CAP_DOMAIN_TAG, b"artel/ticket-cap-v1");
+    }
+
+    #[test]
+    fn cap_byte_values_are_pinned() {
+        assert_eq!(cap_byte(Capability::Read), 0);
+        assert_eq!(cap_byte(Capability::ReadWrite), 1);
+    }
+
+    #[test]
+    fn ticket_cap_canonical_bytes_field_offsets() {
+        let tid = TicketId::from_bytes([0x01; 16]);
+        let sid = SessionId::from_bytes([0x01; 16]);
+        let base = ticket_cap_canonical_bytes(tid, sid, Capability::Read, 1000);
+
+        // ticket_id starts after the domain tag
+        let diff_tid = ticket_cap_canonical_bytes(
+            TicketId::from_bytes([0x02; 16]),
+            sid,
+            Capability::Read,
+            1000,
+        );
+        let first = base
+            .iter()
+            .zip(diff_tid.iter())
+            .position(|(x, y)| x != y)
+            .expect("ticket_id diff");
+        assert_eq!(first, TICKET_CAP_DOMAIN_TAG.len());
+
+        // session_id starts after ticket_id
+        let diff_sid = ticket_cap_canonical_bytes(
+            tid,
+            SessionId::from_bytes([0x02; 16]),
+            Capability::Read,
+            1000,
+        );
+        let first = base
+            .iter()
+            .zip(diff_sid.iter())
+            .position(|(x, y)| x != y)
+            .expect("session_id diff");
+        assert_eq!(first, TICKET_CAP_DOMAIN_TAG.len() + 16);
+
+        // cap_byte is after session_id
+        let diff_cap = ticket_cap_canonical_bytes(tid, sid, Capability::ReadWrite, 1000);
+        let first = base
+            .iter()
+            .zip(diff_cap.iter())
+            .position(|(x, y)| x != y)
+            .expect("cap diff");
+        assert_eq!(first, TICKET_CAP_DOMAIN_TAG.len() + 16 + 16);
+
+        // expiry_ms is after cap_byte (last byte differs for 1000 vs 1001)
+        let diff_expiry = ticket_cap_canonical_bytes(tid, sid, Capability::Read, 1001);
+        let first = base
+            .iter()
+            .zip(diff_expiry.iter())
+            .position(|(x, y)| x != y)
+            .expect("expiry diff");
+        assert_eq!(first, TICKET_CAP_DOMAIN_TAG.len() + 16 + 16 + 1 + 7);
+    }
+
+    #[test]
+    fn ticket_cap_canonical_bytes_total_length() {
+        let bytes = ticket_cap_canonical_bytes(
+            TicketId::from_bytes([0; 16]),
+            SessionId::from_bytes([0; 16]),
+            Capability::Read,
+            0,
+        );
+        assert_eq!(bytes.len(), TICKET_CAP_DOMAIN_TAG.len() + 16 + 16 + 1 + 8);
+    }
+
+    #[test]
+    fn sign_then_verify_ticket_cap_round_trip() {
+        let key = key_a();
+        let tid = TicketId::from_bytes([0x01; 16]);
+        let sid = sample_session_id();
+        for cap in [Capability::Read, Capability::ReadWrite] {
+            let sig = sign_ticket_cap(&key, tid, sid, cap, 5000);
+            verify_ticket_cap(&host_pubkey(&key), tid, sid, cap, 5000, &sig).unwrap();
+        }
+    }
+
+    #[test]
+    fn verify_ticket_cap_rejects_wrong_host_key() {
+        let signer = key_a();
+        let tid = TicketId::from_bytes([0x01; 16]);
+        let sid = sample_session_id();
+        let sig = sign_ticket_cap(&signer, tid, sid, Capability::Read, 0);
+        assert_eq!(
+            verify_ticket_cap(&host_pubkey(&key_b()), tid, sid, Capability::Read, 0, &sig)
+                .unwrap_err(),
+            VerifyError::BadSig,
+        );
+    }
+
+    #[test]
+    fn verify_ticket_cap_rejects_tampered_ticket_id() {
+        let key = key_a();
+        let tid = TicketId::from_bytes([0x01; 16]);
+        let sid = sample_session_id();
+        let sig = sign_ticket_cap(&key, tid, sid, Capability::Read, 0);
+        let other_tid = TicketId::from_bytes([0x02; 16]);
+        assert_eq!(
+            verify_ticket_cap(&host_pubkey(&key), other_tid, sid, Capability::Read, 0, &sig)
+                .unwrap_err(),
+            VerifyError::BadSig,
+        );
+    }
+
+    #[test]
+    fn verify_ticket_cap_rejects_tampered_session_id() {
+        let key = key_a();
+        let tid = TicketId::from_bytes([0x01; 16]);
+        let sid = sample_session_id();
+        let sig = sign_ticket_cap(&key, tid, sid, Capability::ReadWrite, 0);
+        let other_sid = SessionId::from_bytes([0x02; 16]);
+        assert_eq!(
+            verify_ticket_cap(
+                &host_pubkey(&key),
+                tid,
+                other_sid,
+                Capability::ReadWrite,
+                0,
+                &sig
+            )
+            .unwrap_err(),
+            VerifyError::BadSig,
+        );
+    }
+
+    #[test]
+    fn verify_ticket_cap_rejects_tampered_cap() {
+        let key = key_a();
+        let tid = TicketId::from_bytes([0x01; 16]);
+        let sid = sample_session_id();
+        let sig = sign_ticket_cap(&key, tid, sid, Capability::Read, 0);
+        assert_eq!(
+            verify_ticket_cap(
+                &host_pubkey(&key),
+                tid,
+                sid,
+                Capability::ReadWrite,
+                0,
+                &sig
+            )
+            .unwrap_err(),
+            VerifyError::BadSig,
+        );
+    }
+
+    #[test]
+    fn verify_ticket_cap_rejects_tampered_expiry() {
+        let key = key_a();
+        let tid = TicketId::from_bytes([0x01; 16]);
+        let sid = sample_session_id();
+        let sig = sign_ticket_cap(&key, tid, sid, Capability::ReadWrite, 1000);
+        assert_eq!(
+            verify_ticket_cap(
+                &host_pubkey(&key),
+                tid,
+                sid,
+                Capability::ReadWrite,
+                1001,
+                &sig
+            )
+            .unwrap_err(),
+            VerifyError::BadSig,
+        );
+    }
+
+    #[test]
+    fn verify_ticket_cap_rejects_sentinel() {
+        let key = key_a();
+        let tid = TicketId::from_bytes([0x01; 16]);
+        let sid = sample_session_id();
+        assert_eq!(
+            verify_ticket_cap(
+                &host_pubkey(&key),
+                tid,
+                sid,
+                Capability::Read,
+                0,
+                &SIGNATURE_UNSIGNED
+            )
+            .unwrap_err(),
             VerifyError::SentinelUnsigned,
         );
     }

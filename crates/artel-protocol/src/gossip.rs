@@ -43,8 +43,9 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::capability::Capability;
 use crate::error::ProtocolError;
-use crate::ids::Seq;
+use crate::ids::{Seq, TicketId};
 use crate::message::{PeerInfo, SessionMessage, SigBytes};
 use crate::rpc::SignedSendPayload;
 
@@ -132,6 +133,17 @@ pub enum GossipBody {
         /// `PeerJoined` event has a meaningful timestamp; not
         /// otherwise interpreted.
         timestamp_ms: u64,
+        /// Ticket id from the join ticket used. Carried so the host
+        /// can correlate admission to a specific issued ticket.
+        ticket_id: TicketId,
+        /// Capability tier the ticket claims to grant.
+        granted_cap: Capability,
+        /// Expiry from the ticket (0 = no expiry).
+        expiry_ms: u64,
+        /// Host signature over the cap claim. The host verifies this
+        /// against its own pubkey at admission.
+        #[serde(with = "crate::message::signature_serde")]
+        cap_sig: SigBytes,
     },
 
     /// Host-published broadcast that the session has been closed.
@@ -361,6 +373,25 @@ mod tests {
         let body = GossipBody::JoinAnnouncement {
             peer: PeerInfo::new(PeerId::from_bytes([4; 32]), "carol"),
             timestamp_ms: 1_700_000_000_000,
+            ticket_id: crate::ids::TicketId::from_bytes([0x01; 16]),
+            granted_cap: crate::capability::Capability::Read,
+            expiry_ms: 5000,
+            cap_sig: [0x99; 64],
+        };
+        let bytes = encode(&body);
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn join_announcement_readwrite_cap_round_trips() {
+        let body = GossipBody::JoinAnnouncement {
+            peer: PeerInfo::new(PeerId::from_bytes([5; 32]), "dave"),
+            timestamp_ms: 1_700_000_000_000,
+            ticket_id: crate::ids::TicketId::from_bytes([0x02; 16]),
+            granted_cap: crate::capability::Capability::ReadWrite,
+            expiry_ms: 0,
+            cap_sig: [0xaa; 64],
         };
         let bytes = encode(&body);
         let decoded = decode(&bytes).unwrap();

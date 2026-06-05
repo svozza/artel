@@ -29,20 +29,20 @@ use std::net::SocketAddr;
 use data_encoding::BASE32_NOPAD;
 use serde::{Deserialize, Serialize};
 
+use crate::capability::Capability;
 use crate::ids::{PeerId, SessionId, TicketId};
+use crate::message::SigBytes;
 
 /// Current ticket envelope version. Incremented when the structure
 /// of the [`Wire`] payload changes in a way old daemons can't
 /// understand.
 ///
-/// Bumped to `3` on 2026-06-03 when [`SessionTicket::ticket_id`] joined
-/// the wire form (Auth Slice C / L2). The cap-log root of trust is the
-/// originator's first grant; the joiner verifies it against the
-/// originator pubkey, which in today's star topology *is*
-/// [`SessionTicket::host_peer_id`] — so no new pubkey field is needed,
-/// only the `ticket_id` (which names the ticket for a future revocation
-/// layer).
-pub const TICKET_VERSION: u8 = 3;
+/// Bumped to `4` on 2026-06-05 when tiered tickets landed:
+/// [`SessionTicket::granted_cap`], [`SessionTicket::expiry_ms`], and
+/// [`SessionTicket::cap_sig`] joined the wire form. The host signs
+/// the cap claim under `"artel/ticket-cap-v1"` and verifies its own
+/// signature at admission — stateless bearer-token capability.
+pub const TICKET_VERSION: u8 = 4;
 
 /// Prefix shared by every well-formed ticket. Distinguishes artel
 /// tickets from raw base32 input and makes obsolete `artel-local:`
@@ -69,6 +69,16 @@ pub struct SessionTicket {
     /// yet, in which case dialers fall back to whatever address-
     /// lookup mechanism is configured.
     pub host_addr: WireEndpointAddr,
+    /// Capability tier this ticket grants the bearer on admission.
+    pub granted_cap: Capability,
+    /// Expiry as milliseconds since Unix epoch. `0` means no expiry.
+    /// The host checks this at admission time; decode does NOT reject
+    /// expired tickets (the host clock is authoritative).
+    pub expiry_ms: u64,
+    /// Host signature over `(ticket_id, session_id, granted_cap,
+    /// expiry_ms)` under the `"artel/ticket-cap-v1"` domain. Verified
+    /// by the host at admission to prove this ticket was genuinely issued.
+    pub cap_sig: SigBytes,
 }
 
 /// Wire-friendly mirror of `iroh::EndpointAddr`. Lives in
@@ -134,6 +144,10 @@ struct Wire {
     session_id: SessionId,
     host_peer_id: PeerId,
     host_addr: WireEndpointAddr,
+    granted_cap: Capability,
+    expiry_ms: u64,
+    #[serde(with = "crate::message::signature_serde")]
+    cap_sig: SigBytes,
 }
 
 /// Encode `ticket` to its `artel:<base32>` text form.
@@ -145,6 +159,9 @@ pub fn encode(ticket: &SessionTicket) -> String {
         session_id: ticket.session_id,
         host_peer_id: ticket.host_peer_id,
         host_addr: ticket.host_addr.clone(),
+        granted_cap: ticket.granted_cap,
+        expiry_ms: ticket.expiry_ms,
+        cap_sig: ticket.cap_sig,
     };
     let bytes = postcard::to_stdvec(&wire).expect("postcard encode of fixed-size types");
     let body = BASE32_NOPAD.encode(&bytes).to_ascii_lowercase();
@@ -179,6 +196,9 @@ pub fn decode(raw: &str) -> Result<SessionTicket, TicketError> {
         session_id: wire.session_id,
         host_peer_id: wire.host_peer_id,
         host_addr: wire.host_addr,
+        granted_cap: wire.granted_cap,
+        expiry_ms: wire.expiry_ms,
+        cap_sig: wire.cap_sig,
     })
 }
 
@@ -188,6 +208,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+    use crate::message::SIGNATURE_UNSIGNED;
 
     fn sample() -> SessionTicket {
         let peer = PeerId::from_bytes([0x42; 32]);
@@ -196,6 +217,9 @@ mod tests {
             session_id: SessionId::from_bytes([0xab; 16]),
             host_peer_id: peer,
             host_addr: WireEndpointAddr::id_only(peer),
+            granted_cap: Capability::ReadWrite,
+            expiry_ms: 0,
+            cap_sig: [0xaa; 64],
         }
     }
 
@@ -213,6 +237,9 @@ mod tests {
                 relay_url: "https://relay.example.com".into(),
                 direct_addrs: addrs,
             },
+            granted_cap: Capability::Read,
+            expiry_ms: 1_700_000_000_000,
+            cap_sig: [0xbb; 64],
         }
     }
 
@@ -288,9 +315,6 @@ mod tests {
 
     #[test]
     fn unknown_version_byte_errors_clearly() {
-        // Hand-craft a Wire with version != TICKET_VERSION, encode it
-        // ourselves, and verify the decoder rejects it without
-        // touching the inner fields.
         let peer = PeerId::from_bytes([0; 32]);
         let bogus = Wire {
             version: 0xff,
@@ -298,6 +322,9 @@ mod tests {
             session_id: SessionId::from_bytes([0; 16]),
             host_peer_id: peer,
             host_addr: WireEndpointAddr::id_only(peer),
+            granted_cap: Capability::Read,
+            expiry_ms: 0,
+            cap_sig: SIGNATURE_UNSIGNED,
         };
         let bytes = postcard::to_stdvec(&bogus).unwrap();
         let body = BASE32_NOPAD.encode(&bytes).to_ascii_lowercase();
@@ -307,15 +334,15 @@ mod tests {
 
     #[test]
     fn host_peer_id_addr_mismatch_errors_as_malformed() {
-        // Hand-craft a current-version Wire whose host_addr.peer_id
-        // differs from the top-level host_peer_id and verify decode
-        // rejects it.
         let bad = Wire {
             version: TICKET_VERSION,
             ticket_id: TicketId::from_bytes([3; 16]),
             session_id: SessionId::from_bytes([1; 16]),
             host_peer_id: PeerId::from_bytes([0xaa; 32]),
             host_addr: WireEndpointAddr::id_only(PeerId::from_bytes([0xbb; 32])),
+            granted_cap: Capability::Read,
+            expiry_ms: 0,
+            cap_sig: SIGNATURE_UNSIGNED,
         };
         let bytes = postcard::to_stdvec(&bad).unwrap();
         let body = BASE32_NOPAD.encode(&bytes).to_ascii_lowercase();
@@ -331,14 +358,14 @@ mod tests {
 
     #[test]
     fn ticket_text_for_id_only_is_paste_friendly() {
-        // id-only (no relay, no direct addrs) = 1 (ver) + 16 (UUID) +
-        // 32 (peer id) + 32 (addr peer id) + 0 (empty relay) +
-        // 0 (empty addrs) ≈ ~82 bytes postcard. base32-encoded plus
-        // the "artel:" prefix lands well under 200 chars — fits on
-        // one terminal line.
+        // id-only (no relay, no direct addrs) = 1 (ver) + 16 (ticket_id) +
+        // 16 (session_id) + 32 (peer id) + 32 (addr peer id) + 0 (empty
+        // relay) + 0 (empty addrs) + 1 (cap) + 8 (expiry) + 64 (cap_sig)
+        // ≈ ~170 bytes postcard. base32 encodes at 8:5, so ~272 chars +
+        // "artel:" prefix. Fits on two terminal lines; still paste-friendly.
         let encoded = encode(&sample());
         assert!(
-            encoded.len() <= 200,
+            encoded.len() <= 300,
             "id-only ticket too long ({} chars): {encoded}",
             encoded.len(),
         );
@@ -353,14 +380,12 @@ mod tests {
     }
 
     #[test]
-    fn ticket_version_is_three() {
-        assert_eq!(TICKET_VERSION, 3);
+    fn ticket_version_is_four() {
+        assert_eq!(TICKET_VERSION, 4);
     }
 
     #[test]
     fn ticket_id_survives_round_trip() {
-        // The new field must make the round trip intact, not just be
-        // defaulted away on decode.
         let original = sample();
         let decoded = decode(&encode(&original)).unwrap();
         assert_eq!(decoded.ticket_id, original.ticket_id);
@@ -368,26 +393,42 @@ mod tests {
     }
 
     #[test]
+    fn read_cap_ticket_round_trips() {
+        let original = sample_with_addrs();
+        assert_eq!(original.granted_cap, Capability::Read);
+        let decoded = decode(&encode(&original)).unwrap();
+        assert_eq!(decoded.granted_cap, Capability::Read);
+        assert_eq!(decoded.expiry_ms, 1_700_000_000_000);
+        assert_eq!(decoded.cap_sig, [0xbb; 64]);
+    }
+
+    #[test]
+    fn readwrite_cap_ticket_round_trips() {
+        let original = sample();
+        assert_eq!(original.granted_cap, Capability::ReadWrite);
+        let decoded = decode(&encode(&original)).unwrap();
+        assert_eq!(decoded.granted_cap, Capability::ReadWrite);
+        assert_eq!(decoded.expiry_ms, 0);
+        assert_eq!(decoded.cap_sig, [0xaa; 64]);
+    }
+
+    #[test]
     fn previous_version_byte_is_now_unsupported() {
-        // The version gate must reject the previous ticket version (2)
-        // now that the wire shape gained `ticket_id`. Hand-craft a Wire
-        // that is otherwise well-formed (current shape, so it
-        // deserializes) but stamps version 2 — decode parses it, then
-        // the version check fires. Mirrors
-        // `unknown_version_byte_errors_clearly` for the immediate
-        // predecessor rather than an arbitrary byte.
         let peer = PeerId::from_bytes([0x55; 32]);
         let prev = Wire {
-            version: 2,
+            version: 3,
             ticket_id: TicketId::from_bytes([0x44; 16]),
             session_id: SessionId::from_bytes([0x66; 16]),
             host_peer_id: peer,
             host_addr: WireEndpointAddr::id_only(peer),
+            granted_cap: Capability::ReadWrite,
+            expiry_ms: 0,
+            cap_sig: SIGNATURE_UNSIGNED,
         };
         let bytes = postcard::to_stdvec(&prev).unwrap();
         let body = BASE32_NOPAD.encode(&bytes).to_ascii_lowercase();
         let raw = format!("{TICKET_PREFIX}{body}");
-        assert_eq!(decode(&raw), Err(TicketError::UnsupportedVersion(2)));
+        assert_eq!(decode(&raw), Err(TicketError::UnsupportedVersion(3)));
     }
 
     proptest! {
@@ -396,13 +437,20 @@ mod tests {
             tid in any::<[u8; 16]>(),
             sid in any::<[u8; 16]>(),
             peer in any::<[u8; 32]>(),
+            cap_is_rw in any::<bool>(),
+            expiry in any::<u64>(),
+            sig in any::<[u8; 64]>(),
         ) {
             let host_peer_id = PeerId::from_bytes(peer);
+            let granted_cap = if cap_is_rw { Capability::ReadWrite } else { Capability::Read };
             let original = SessionTicket {
                 ticket_id: TicketId::from_bytes(tid),
                 session_id: SessionId::from_bytes(sid),
                 host_peer_id,
                 host_addr: WireEndpointAddr::id_only(host_peer_id),
+                granted_cap,
+                expiry_ms: expiry,
+                cap_sig: sig,
             };
             let encoded = encode(&original);
             let decoded = decode(&encoded).expect("round trip");

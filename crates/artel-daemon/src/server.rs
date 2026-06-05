@@ -1007,7 +1007,7 @@ fn session_error_to_protocol(err: &SessionError) -> ProtocolError {
     match err {
         SessionError::UnknownSession(s) => ProtocolError::UnknownSession(*s),
         SessionError::NotMember(_) => ProtocolError::Internal("not a member".into()),
-        SessionError::InvalidTicket => ProtocolError::InvalidTicket,
+        SessionError::InvalidTicket | SessionError::TicketExpired => ProtocolError::InvalidTicket,
         SessionError::Storage(io_err) => ProtocolError::Internal(format!("storage: {io_err}")),
         SessionError::InvalidAddr(msg) => ProtocolError::Internal(format!("invalid addr: {msg}")),
         SessionError::Internal(msg) => ProtocolError::Internal(msg.clone()),
@@ -1028,6 +1028,9 @@ fn session_error_to_protocol(err: &SessionError) -> ProtocolError {
             had,
             needed,
         } => ProtocolError::Capability(format!("{peer_id}: had {had:?}, needs {needed:?}")),
+        SessionError::InvalidCapClaim(reason) => {
+            ProtocolError::Internal(format!("invalid cap claim: {reason}"))
+        }
     }
 }
 

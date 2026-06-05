@@ -140,6 +140,16 @@ pub enum SessionError {
         /// The capability the action required.
         needed: Capability,
     },
+
+    /// The ticket's `expiry_ms` is in the past at admission time.
+    #[error("ticket expired")]
+    TicketExpired,
+
+    /// The ticket's `cap_sig` did not verify against the host's pubkey,
+    /// or the claim was otherwise malformed (sentinel signature, bad
+    /// key). The string carries a diagnostic reason.
+    #[error("invalid cap claim: {0}")]
+    InvalidCapClaim(String),
 }
 
 // io::Error doesn't impl PartialEq, so we hand-roll one for the
@@ -152,7 +162,8 @@ impl PartialEq for SessionError {
             | (Self::SessionConflict(a), Self::SessionConflict(b)) => a == b,
             (Self::Storage(a), Self::Storage(b)) => a.kind() == b.kind(),
             (Self::InvalidAddr(a), Self::InvalidAddr(b))
-            | (Self::Internal(a), Self::Internal(b)) => a == b,
+            | (Self::Internal(a), Self::Internal(b))
+            | (Self::InvalidCapClaim(a), Self::InvalidCapClaim(b)) => a == b,
             (Self::HostRejected(a), Self::HostRejected(b)) => a == b,
             (
                 Self::SignatureRejected {
@@ -176,12 +187,26 @@ impl PartialEq for SessionError {
                     needed: b_needed,
                 },
             ) => a_peer == b_peer && a_had == b_had && a_needed == b_needed,
-            (Self::InvalidTicket, Self::InvalidTicket) | (Self::NotHost, Self::NotHost) => true,
+            (Self::InvalidTicket, Self::InvalidTicket)
+            | (Self::NotHost, Self::NotHost)
+            | (Self::TicketExpired, Self::TicketExpired) => true,
             _ => false,
         }
     }
 }
 impl Eq for SessionError {}
+
+/// Signed capability claim extracted from a `JoinAnnouncement`. The
+/// host verifies this against its own pubkey at admission to grant the
+/// ticket-specified capability tier rather than unconditional RW.
+#[derive(Clone, Debug)]
+#[cfg(feature = "iroh")]
+pub(crate) struct CapClaim {
+    pub ticket_id: TicketId,
+    pub granted_cap: Capability,
+    pub expiry_ms: u64,
+    pub cap_sig: SigBytes,
+}
 
 /// Outcome of a successful `subscribe`: a snapshot of the log to
 /// replay, plus a live event receiver for everything that follows.
@@ -616,13 +641,18 @@ impl Registry {
                     s.host_epoch = s.host_epoch.saturating_add(1);
                     s.host_epoch
                 };
+                let tid = TicketId::new_random();
+                let cap_sig = self.signing_key.as_ref().map_or(SIGNATURE_UNSIGNED, |key| {
+                    signing::sign_ticket_cap(key.as_signing_key(), tid, id, Capability::ReadWrite, 0)
+                });
                 let ticket = JoinTicket::from(ticket::encode(&SessionTicket {
-                    // Carried for a future revocation layer; not enforced
-                    // in v1 (Auth Slice C). Minted fresh per issuance.
-                    ticket_id: TicketId::new_random(),
+                    ticket_id: tid,
                     session_id: id,
                     host_peer_id: self.daemon_peer_id,
                     host_addr: self.daemon_addr.clone(),
+                    granted_cap: Capability::ReadWrite,
+                    expiry_ms: 0,
+                    cap_sig,
                 }));
                 // Persist the bumped epoch (targeted write — no full
                 // record rewrite). On store failure, surface it: a
@@ -660,11 +690,18 @@ impl Registry {
         // Create path. Either no `requested_id` (mint random) or
         // `Some(id)` whose entry doesn't exist locally yet.
         let session_id = requested_id.unwrap_or_else(SessionId::new_random);
+        let tid = TicketId::new_random();
+        let cap_sig = self.signing_key.as_ref().map_or(SIGNATURE_UNSIGNED, |key| {
+            signing::sign_ticket_cap(key.as_signing_key(), tid, session_id, Capability::ReadWrite, 0)
+        });
         let ticket = JoinTicket::from(ticket::encode(&SessionTicket {
-            ticket_id: TicketId::new_random(),
+            ticket_id: tid,
             session_id,
             host_peer_id: self.daemon_peer_id,
             host_addr: self.daemon_addr.clone(),
+            granted_cap: Capability::ReadWrite,
+            expiry_ms: 0,
+            cap_sig,
         }));
         let session = Session::new(session_id, &host_peer, SessionKind::Local);
         let record = session.record();
@@ -734,6 +771,10 @@ impl Registry {
                 &parsed.host_peer_id,
                 &parsed.host_addr,
                 &peer,
+                parsed.ticket_id,
+                parsed.granted_cap,
+                parsed.expiry_ms,
+                parsed.cap_sig,
             )
             .await?
         };
@@ -782,19 +823,24 @@ impl Registry {
     /// `session_id`, persists it, and asks the bridge to subscribe
     /// to the host's gossip topic. Inbound gossip messages land in
     /// the mirror's `log` and `events_tx`.
+    #[allow(clippy::too_many_arguments)]
     async fn materialise_remote_session(
         &self,
         session_id: SessionId,
         host_peer_id: &PeerId,
         host_addr: &WireEndpointAddr,
         joiner: &PeerInfo,
+        ticket_id: TicketId,
+        granted_cap: Capability,
+        expiry_ms: u64,
+        cap_sig: SigBytes,
     ) -> Result<Arc<Mutex<Session>>, SessionError> {
         // Without the `iroh` feature, there's no way to actually
         // reach the host; refuse cleanly rather than silently
         // creating an unreachable session.
         #[cfg(not(feature = "iroh"))]
         {
-            let _ = (host_peer_id, host_addr, joiner);
+            let _ = (host_peer_id, host_addr, joiner, ticket_id, granted_cap, expiry_ms, cap_sig);
             tracing::debug!(
                 ?session_id,
                 "remote ticket received but iroh feature is off",
@@ -890,6 +936,10 @@ impl Registry {
                     host_addr,
                     host_epoch_watermark,
                     on_message,
+                    ticket_id,
+                    granted_cap,
+                    expiry_ms,
+                    cap_sig,
                 )
                 .await
                 .map_err(|e| match e {
@@ -1020,6 +1070,11 @@ impl Registry {
     /// arrives out of order. Persists the membership change and
     /// emits [`Event::PeerJoined`] when the peer is newly added.
     ///
+    /// When `cap_claim` is `Some`, the host verifies the ticket's
+    /// capability signature and grants the claimed tier. When `None`
+    /// (the `SendRequest` backstop path), no new grant is emitted —
+    /// the peer was already admitted by a prior `JoinAnnouncement`.
+    ///
     /// Returns `Err(UnknownSession)` if `session` doesn't exist on
     /// this daemon. Other failures surface the underlying
     /// [`SessionError`].
@@ -1028,7 +1083,28 @@ impl Registry {
         &self,
         session: SessionId,
         peer: PeerInfo,
+        cap_claim: Option<CapClaim>,
     ) -> Result<(), SessionError> {
+        // Verify the claim BEFORE any state mutation so a forged or
+        // expired ticket never touches the member set.
+        if let Some(ref claim) = cap_claim {
+            if claim.expiry_ms != 0 && claim.expiry_ms < now_ms() {
+                return Err(SessionError::TicketExpired);
+            }
+            if let Err(err) = signing::verify_ticket_cap(
+                &self.daemon_peer_id,
+                claim.ticket_id,
+                session,
+                claim.granted_cap,
+                claim.expiry_ms,
+                &claim.cap_sig,
+            ) {
+                return Err(SessionError::InvalidCapClaim(
+                    signing::verify_reason(&err).to_string(),
+                ));
+            }
+        }
+
         let session_arc = {
             let guard = self.sessions.read().await;
             guard
@@ -1064,31 +1140,20 @@ impl Registry {
             });
         }
 
-        // Auto-grant on join (Auth Slice C / L2): admit a newly-joined
-        // peer to `ReadWrite` as a real signed log event, preserving the
-        // "ticket = full access" UX. Emit only for a `Local` session —
-        // we are its host (the cap-log root holding RW), so the host-key
-        // signature on this grant passes the author-holds-RW authority
-        // check. Routing through the host-local `send` path means the
-        // grant is host-signed, host-seq-signed, persisted, and projected
-        // into the host cap-set exactly like any other message. Note the
-        // grant is HOST-PRIVATE (D3): `send` never fans `Capability`
-        // messages out over gossip, and `log_since` excludes them from
-        // Replay, so it never reaches joiners — v1 enforces caps
-        // host-only, so joiners have no use for it, and keeping it off the
-        // wire means the auto-grant adds zero joiner-visible traffic
-        // (which is what kept perturbing plumtree and exposing the
-        // close-vs-teardown race). We emit here — at the single admission
-        // chokepoint — rather than in the bridge's `JoinAnnouncement`
-        // arm, so both the announcement and the `SendRequest` backstop
-        // (which also routes through `ensure_member`) are covered without
-        // duplicating the grant logic. The guard above already returned
-        // for the already-member case, so this fires once per peer.
+        // Auto-grant on join (Auth Slice C / L2): grant the capability
+        // tier the ticket claims (or RW if no claim is present — the
+        // `SendRequest` backstop path for pre-tiered-ticket joiners).
+        // Emit only for a `Local` session — we are its host. See the
+        // original comment block in the pre-tiered version for the full
+        // rationale re: HOST-PRIVATE (D3) delivery.
         if session_kind == SessionKind::Local {
+            let granted_cap = cap_claim
+                .as_ref()
+                .map_or(Capability::ReadWrite, |c| c.granted_cap);
             let host_author = PeerInfo::new(self.daemon_peer_id, "host");
             let action = CapabilityAction::Grant {
                 peer: peer.id,
-                cap: Capability::ReadWrite,
+                cap: granted_cap,
             };
             if let Err(err) = self
                 .send(
@@ -1101,15 +1166,11 @@ impl Registry {
                 )
                 .await
             {
-                // Non-fatal: the peer is already a member; a failed
-                // auto-grant leaves them without write capability, which
-                // is the safe direction. Surface for ops — a persistent
-                // failure here means joiners can't write.
                 tracing::warn!(
                     ?session,
                     peer = %peer.id,
                     ?err,
-                    "auto-grant ReadWrite on join failed",
+                    "auto-grant on join failed",
                 );
             }
         }
@@ -2091,6 +2152,9 @@ mod tests {
             session_id: bogus,
             host_peer_id,
             host_addr: WireEndpointAddr::id_only(host_peer_id),
+            granted_cap: Capability::ReadWrite,
+            expiry_ms: 0,
+            cap_sig: SIGNATURE_UNSIGNED,
         }));
         let err = r.join(&ticket, peer(2, "bob")).await.unwrap_err();
         assert_eq!(err, SessionError::UnknownSession(bogus));
@@ -2370,7 +2434,7 @@ mod tests {
         // Admit the joiner first so the membership check passes —
         // this test pins the verify-before-append property, not the
         // membership path.
-        r.ensure_member(id, claimed_peer.clone()).await.unwrap();
+        r.ensure_member(id, claimed_peer.clone(), None).await.unwrap();
 
         let err = r
             .send(
@@ -2434,7 +2498,7 @@ mod tests {
             "joiner.send",
             b"payload",
         );
-        r.ensure_member(id, joiner.clone()).await.unwrap();
+        r.ensure_member(id, joiner.clone(), None).await.unwrap();
         let appended = r
             .send(
                 id,
@@ -2531,7 +2595,7 @@ mod tests {
             "joiner.send",
             b"payload",
         );
-        r.ensure_member(id, joiner.clone()).await.unwrap();
+        r.ensure_member(id, joiner.clone(), None).await.unwrap();
         let appended = r
             .send(
                 id,
@@ -3010,8 +3074,8 @@ mod tests {
         // 2. Admit bob + carol (auto-grants both RW).
         let bob = peer(2, "bob");
         let carol = peer(3, "carol");
-        r.ensure_member(id, bob.clone()).await.unwrap();
-        r.ensure_member(id, carol.clone()).await.unwrap();
+        r.ensure_member(id, bob.clone(), None).await.unwrap();
+        r.ensure_member(id, carol.clone(), None).await.unwrap();
 
         // 3. Host revokes bob.
         let revoke = CapabilityAction::Revoke { peer: bob.id };
@@ -3159,7 +3223,7 @@ mod tests {
         let bob = peer(2, "bob");
 
         // ensure_member auto-grants bob RW.
-        r.ensure_member(id, bob.clone()).await.unwrap();
+        r.ensure_member(id, bob.clone(), None).await.unwrap();
         assert!(
             {
                 let arc = {
@@ -3215,7 +3279,7 @@ mod tests {
         let (r, host, _) = registry_with_signing_seed(0x41);
         let (id, _) = r.host(host.clone(), None).await.unwrap();
         let bob = peer(2, "bob");
-        r.ensure_member(id, bob.clone()).await.unwrap();
+        r.ensure_member(id, bob.clone(), None).await.unwrap();
 
         // A Grant message now sits in the log, authored by the host.
         let sub = r.subscribe(id, None).await.unwrap();
@@ -3998,5 +4062,146 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- cap_claim verification (tiered tickets Phase 2A) ----
+
+    #[cfg(feature = "iroh")]
+    fn valid_cap_claim(
+        host_key: &iroh::SecretKey,
+        session: SessionId,
+        granted_cap: Capability,
+        expiry_ms: u64,
+    ) -> CapClaim {
+        use artel_protocol::ids::TicketId;
+        let ticket_id = TicketId::from_bytes([0xCC; 16]);
+        let cap_sig = signing::sign_ticket_cap(
+            host_key.as_signing_key(),
+            ticket_id,
+            session,
+            granted_cap,
+            expiry_ms,
+        );
+        CapClaim {
+            ticket_id,
+            granted_cap,
+            expiry_ms,
+            cap_sig,
+        }
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn ensure_member_with_valid_rw_claim_grants_rw() {
+        let (r, host, key) = registry_with_signing_seed(0x50);
+        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        let bob = peer(2, "bob");
+        let claim = valid_cap_claim(&key, id, Capability::ReadWrite, 0);
+        r.ensure_member(id, bob.clone(), Some(claim)).await.unwrap();
+
+        // Bob can write.
+        let sent = r
+            .send(
+                id,
+                bob.clone(),
+                MessageKind::Chat,
+                "hi".into(),
+                b"hello".to_vec(),
+                Authoring::Local,
+            )
+            .await;
+        assert!(sent.is_ok(), "RW-claimed peer can write: {sent:?}");
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn ensure_member_with_valid_read_claim_grants_read() {
+        let (r, host, key) = registry_with_signing_seed(0x51);
+        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        let bob = peer(2, "bob");
+        let claim = valid_cap_claim(&key, id, Capability::Read, 0);
+        r.ensure_member(id, bob.clone(), Some(claim)).await.unwrap();
+
+        // Bob cannot write — cap is Read.
+        let sent = r
+            .send(
+                id,
+                bob.clone(),
+                MessageKind::Chat,
+                "hi".into(),
+                b"hello".to_vec(),
+                Authoring::Local,
+            )
+            .await;
+        assert_eq!(
+            sent.unwrap_err(),
+            SessionError::CapabilityDenied {
+                peer_id: bob.id,
+                had: Some(Capability::Read),
+                needed: Capability::ReadWrite,
+            },
+        );
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn ensure_member_rejects_forged_cap_sig() {
+        let (r, host, _host_key) = registry_with_signing_seed(0x52);
+        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        let bob = peer(2, "bob");
+
+        // Sign with a different key (attacker key) — sig won't verify
+        // against the host's pubkey.
+        let attacker_key = iroh::SecretKey::from_bytes(&[0xAA; 32]);
+        let claim = valid_cap_claim(&attacker_key, id, Capability::ReadWrite, 0);
+
+        let err = r
+            .ensure_member(id, bob.clone(), Some(claim))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            SessionError::InvalidCapClaim("signature does not verify".into()),
+        );
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn ensure_member_rejects_expired_ticket() {
+        let (r, host, key) = registry_with_signing_seed(0x53);
+        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        let bob = peer(2, "bob");
+
+        // Expiry set to 1ms — always in the past.
+        let claim = valid_cap_claim(&key, id, Capability::ReadWrite, 1);
+
+        let err = r
+            .ensure_member(id, bob.clone(), Some(claim))
+            .await
+            .unwrap_err();
+        assert_eq!(err, SessionError::TicketExpired);
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn ensure_member_with_none_claim_grants_rw_backwards_compat() {
+        // The `None` path (SendRequest backstop) still grants RW for
+        // pre-tiered-ticket joiners.
+        let (r, host, _) = registry_with_signing_seed(0x54);
+        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        let bob = peer(2, "bob");
+        r.ensure_member(id, bob.clone(), None).await.unwrap();
+
+        let sent = r
+            .send(
+                id,
+                bob.clone(),
+                MessageKind::Chat,
+                "hi".into(),
+                b"hello".to_vec(),
+                Authoring::Local,
+            )
+            .await;
+        assert!(sent.is_ok(), "None-claim peer gets RW: {sent:?}");
     }
 }

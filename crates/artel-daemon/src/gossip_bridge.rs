@@ -45,7 +45,9 @@ use std::time::Duration;
 use artel_protocol::gossip::{self, GossipBody};
 use artel_protocol::rpc::{SendPayload, SignedSendPayload};
 use artel_protocol::ticket::WireEndpointAddr;
-use artel_protocol::{PeerId, PeerInfo, ProtocolError, Seq, SessionId, SessionMessage};
+use artel_protocol::{
+    Capability, PeerId, PeerInfo, ProtocolError, Seq, SessionId, SessionMessage, SigBytes, TicketId,
+};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use iroh::EndpointAddr;
@@ -276,6 +278,7 @@ impl GossipBridge {
     /// joiner stays invisible until their first `SendRequest`.
     ///
     /// [`Event::PeerJoined`]: artel_protocol::Event::PeerJoined
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn join_session(
         self: &Arc<Self>,
         session: SessionId,
@@ -284,6 +287,10 @@ impl GossipBridge {
         host_addr: &WireEndpointAddr,
         host_epoch_watermark: Arc<AtomicU64>,
         on_message: impl Fn(SessionMessage) + Send + Sync + 'static,
+        ticket_id: TicketId,
+        granted_cap: Capability,
+        expiry_ms: u64,
+        cap_sig: SigBytes,
     ) -> Result<(), BridgeError> {
         let host_endpoint_id = iroh::EndpointId::from_bytes(host_peer.as_bytes())
             .map_err(|e| BridgeError::Iroh(format!("bad host peer id: {e}")))?;
@@ -335,7 +342,8 @@ impl GossipBridge {
         // Best-effort: a failure here just degrades to lazy
         // admission on first `SendRequest`, the same shape we had
         // pre-2c-2d.
-        self.publish_join_announcement(session, joiner).await;
+        self.publish_join_announcement(session, joiner, ticket_id, granted_cap, expiry_ms, cap_sig)
+            .await;
         // Ask the host to backfill any committed messages we
         // missed before the mesh was up. Since this is a fresh
         // mirror, we have nothing — `since: ZERO` requests the
@@ -684,7 +692,15 @@ impl GossipBridge {
     /// mesh is up. Best-effort — a failed broadcast falls back to
     /// the lazy-admission path (the host learns about us on our
     /// first `SendRequest`).
-    async fn publish_join_announcement(&self, session: SessionId, peer: PeerInfo) {
+    async fn publish_join_announcement(
+        &self,
+        session: SessionId,
+        peer: PeerInfo,
+        ticket_id: TicketId,
+        granted_cap: Capability,
+        expiry_ms: u64,
+        cap_sig: SigBytes,
+    ) {
         let sender = self
             .sessions
             .lock()
@@ -710,6 +726,10 @@ impl GossipBridge {
         let body = GossipBody::JoinAnnouncement {
             peer,
             timestamp_ms: now_ms(),
+            ticket_id,
+            granted_cap,
+            expiry_ms,
+            cap_sig,
         };
         let bytes = Bytes::from(gossip::encode(&body));
         if let Err(err) = sender.broadcast(bytes).await {
@@ -827,15 +847,26 @@ async fn handle_inbound_frame(
             GossipBody::JoinAnnouncement {
                 peer,
                 timestamp_ms: _,
+                ticket_id,
+                granted_cap,
+                expiry_ms,
+                cap_sig,
             },
         ) => {
             if drop_if_spoofed(session, peer.id, delivered_from) {
                 return;
             }
             track_authenticated_peer(bridge, delivered_from);
+            let cap_claim = crate::session::CapClaim {
+                ticket_id,
+                granted_cap,
+                expiry_ms,
+                cap_sig,
+            };
             let registry_weak = bridge.registry.lock().await.clone();
             if let Some(registry) = registry_weak.upgrade()
-                && let Err(err) = registry.ensure_member(session, peer).await
+                && let Err(err) =
+                    registry.ensure_member(session, peer, Some(cap_claim)).await
             {
                 warn!(?err, "join_announcement: ensure_member failed");
             }
@@ -1062,8 +1093,10 @@ async fn run_host_send(
     // `JoinAnnouncement` already drove ensure_member, but if the
     // announcement broadcast was lost (or this SendRequest beat it
     // through the mesh) we want to admit the peer here too. No-op
-    // when membership is already in place.
-    if let Err(err) = registry.ensure_member(session, peer.clone()).await {
+    // when membership is already in place. Pass `None` — the
+    // JoinAnnouncement is the canonical cap-claim path; the backstop
+    // does not re-verify or re-grant.
+    if let Err(err) = registry.ensure_member(session, peer.clone(), None).await {
         return Err(session_error_to_wire(&err));
     }
     let SignedSendPayload {
@@ -1156,7 +1189,7 @@ fn session_error_to_wire(err: &SessionError) -> ProtocolError {
     match err {
         SessionError::UnknownSession(s) => ProtocolError::UnknownSession(*s),
         SessionError::NotMember(_) => ProtocolError::Internal("not a member".into()),
-        SessionError::InvalidTicket => ProtocolError::InvalidTicket,
+        SessionError::InvalidTicket | SessionError::TicketExpired => ProtocolError::InvalidTicket,
         SessionError::Storage(io_err) => ProtocolError::Internal(format!("storage: {io_err}")),
         // The bridge currently doesn't surface InvalidAddr to the
         // wire layer (it fails the local join only), but keep the
@@ -1187,6 +1220,9 @@ fn session_error_to_wire(err: &SessionError) -> ProtocolError {
             had,
             needed,
         } => ProtocolError::Capability(format!("{peer_id}: had {had:?}, needs {needed:?}")),
+        SessionError::InvalidCapClaim(reason) => {
+            ProtocolError::Internal(format!("invalid cap claim: {reason}"))
+        }
     }
 }
 
