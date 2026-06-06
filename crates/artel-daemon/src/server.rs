@@ -652,6 +652,16 @@ async fn dispatch(
         req @ (Request::RegisterAttachment { .. }
         | Request::ListAttachments { .. }
         | Request::ForgetAttachment { .. }) => dispatch_attachment(registry, req).await,
+        Request::IssueTicket {
+            session,
+            granted_cap,
+            expiry_ms,
+        } => match registry.issue_ticket(session, granted_cap, expiry_ms).await {
+            Ok(ticket) => Response::IssuedTicket { ticket },
+            Err(err) => Response::Error {
+                error: session_error_to_protocol(&err),
+            },
+        },
     }
 }
 

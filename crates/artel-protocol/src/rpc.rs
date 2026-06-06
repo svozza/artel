@@ -226,6 +226,21 @@ pub enum Request {
         /// Tag of the attachment to remove.
         kind: String,
     },
+
+    /// Issue an additional ticket for an existing hosted session with
+    /// a specific capability level and optional expiry.
+    ///
+    /// Only the host of a `SessionKind::Local` session may issue
+    /// tickets. Returns [`ProtocolError::Capability`] if the caller is
+    /// not the host.
+    IssueTicket {
+        /// Session to issue the ticket for.
+        session: SessionId,
+        /// Capability the ticket grants to the joiner.
+        granted_cap: crate::capability::Capability,
+        /// Ticket expiry in milliseconds since epoch (0 = no expiry).
+        expiry_ms: u64,
+    },
 }
 
 /// Fields of a [`Request::Send`] that the client supplies.
@@ -371,6 +386,12 @@ pub enum Response {
 
     /// Reply to [`Request::ForgetAttachment`] (success).
     AttachmentForgotten,
+
+    /// Reply to [`Request::IssueTicket`].
+    IssuedTicket {
+        /// The newly minted ticket.
+        ticket: JoinTicket,
+    },
 
     /// Any request may produce this in place of its expected variant.
     Error {
@@ -631,6 +652,27 @@ mod tests {
     }
 
     #[test]
+    fn issue_ticket_request_round_trip() {
+        for cap in [
+            crate::capability::Capability::Read,
+            crate::capability::Capability::ReadWrite,
+        ] {
+            let req = Request::IssueTicket {
+                session: SessionId::from_bytes([0xab; 16]),
+                granted_cap: cap,
+                expiry_ms: 1_700_000_000_000,
+            };
+            let bytes = postcard::to_allocvec(&req).unwrap();
+            let back: Request = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(req, back);
+
+            let json = serde_json::to_string(&req).unwrap();
+            let back: Request = serde_json::from_str(&json).unwrap();
+            assert_eq!(req, back);
+        }
+    }
+
+    #[test]
     fn send_request_round_trip() {
         let req = Request::Send {
             session: SessionId::from_bytes([2; 16]),
@@ -811,6 +853,20 @@ mod tests {
     }
 
     #[test]
+    fn issued_ticket_response_round_trip() {
+        let resp = Response::IssuedTicket {
+            ticket: JoinTicket::from("artel:some-ticket-data"),
+        };
+        let bytes = postcard::to_allocvec(&resp).unwrap();
+        let back: Response = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(resp, back);
+
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: Response = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp, back);
+    }
+
+    #[test]
     fn error_response_carries_protocol_error() {
         let resp = Response::Error {
             error: ProtocolError::VersionMismatch(VersionMismatch {
@@ -972,6 +1028,17 @@ mod tests {
                     kind,
                 }
             }),
+            (any::<[u8; 16]>(), any::<bool>(), any::<u64>()).prop_map(
+                |(s, is_rw, expiry_ms)| Request::IssueTicket {
+                    session: SessionId::from_bytes(s),
+                    granted_cap: if is_rw {
+                        crate::capability::Capability::ReadWrite
+                    } else {
+                        crate::capability::Capability::Read
+                    },
+                    expiry_ms,
+                },
+            ),
         ]
     }
 

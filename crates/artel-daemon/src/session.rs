@@ -730,6 +730,47 @@ impl Registry {
         Ok((session_id, ticket))
     }
 
+    /// Issue an additional ticket for an existing locally-hosted session.
+    ///
+    /// Only sessions with `SessionKind::Local` whose host matches the
+    /// daemon's own peer id may issue tickets. Returns
+    /// `SessionError::NotHost` if the session is remote, and
+    /// `SessionError::UnknownSession` if it doesn't exist.
+    pub async fn issue_ticket(
+        &self,
+        session: SessionId,
+        granted_cap: Capability,
+        expiry_ms: u64,
+    ) -> Result<JoinTicket, SessionError> {
+        let arc = {
+            let guard = self.sessions.read().await;
+            guard
+                .get(&session)
+                .cloned()
+                .ok_or(SessionError::UnknownSession(session))?
+        };
+        {
+            let s = arc.lock().await;
+            if s.kind != SessionKind::Local {
+                return Err(SessionError::NotHost);
+            }
+        }
+        let tid = TicketId::new_random();
+        let cap_sig = self.signing_key.as_ref().map_or(SIGNATURE_UNSIGNED, |key| {
+            signing::sign_ticket_cap(key.as_signing_key(), tid, session, granted_cap, expiry_ms)
+        });
+        let ticket = JoinTicket::from(ticket::encode(&SessionTicket {
+            ticket_id: tid,
+            session_id: session,
+            host_peer_id: self.daemon_peer_id,
+            host_addr: self.daemon_addr.clone(),
+            granted_cap,
+            expiry_ms,
+            cap_sig,
+        }));
+        Ok(ticket)
+    }
+
     /// Join an existing session via its ticket. Returns the session id
     /// and the head seq at join time.
     ///
@@ -2127,6 +2168,73 @@ mod tests {
 
         let err = r.host_rw(remote_host, Some(session_id)).await.unwrap_err();
         assert_eq!(err, SessionError::SessionConflict(session_id));
+    }
+
+    // ---- issue_ticket ----
+
+    #[tokio::test]
+    async fn issue_ticket_for_hosted_session_returns_ticket_with_requested_cap() {
+        let r = registry();
+        let (id, _) = r.host_rw(peer(1, "alice"), None).await.unwrap();
+
+        let ticket = r
+            .issue_ticket(id, Capability::Read, 0)
+            .await
+            .unwrap();
+        let decoded = ticket::decode(ticket.as_str()).unwrap();
+        assert_eq!(decoded.session_id, id);
+        assert_eq!(decoded.granted_cap, Capability::Read);
+        assert_eq!(decoded.expiry_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn issue_ticket_with_expiry_propagates() {
+        let r = registry();
+        let (id, _) = r.host_rw(peer(1, "alice"), None).await.unwrap();
+
+        let expiry = 1_700_000_000_000u64;
+        let ticket = r
+            .issue_ticket(id, Capability::ReadWrite, expiry)
+            .await
+            .unwrap();
+        let decoded = ticket::decode(ticket.as_str()).unwrap();
+        assert_eq!(decoded.granted_cap, Capability::ReadWrite);
+        assert_eq!(decoded.expiry_ms, expiry);
+    }
+
+    #[tokio::test]
+    async fn issue_ticket_for_unknown_session_returns_error() {
+        let r = registry();
+        let fake = SessionId::from_bytes([0xde; 16]);
+        let err = r
+            .issue_ticket(fake, Capability::Read, 0)
+            .await
+            .unwrap_err();
+        assert_eq!(err, SessionError::UnknownSession(fake));
+    }
+
+    #[tokio::test]
+    async fn issue_ticket_for_remote_session_returns_not_host() {
+        let r = registry();
+        let host = peer(1, "alice");
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
+
+        // Create a second registry (different daemon_peer_id) that joins
+        // the same session — simulates a remote mirror.
+        let r2 = registry_with_peer(PeerId::from_bytes([0xaa; 32]));
+        // Manually seed a remote-mirror session in r2.
+        {
+            let session = Session::new(id, &host, SessionKind::Remote);
+            r2.sessions
+                .write()
+                .await
+                .insert(id, Arc::new(Mutex::new(session)));
+        }
+        let err = r2
+            .issue_ticket(id, Capability::Read, 0)
+            .await
+            .unwrap_err();
+        assert_eq!(err, SessionError::NotHost);
     }
 
     // ---- join ----
