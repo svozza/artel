@@ -643,19 +643,7 @@ impl Registry {
                     s.host_epoch = s.host_epoch.saturating_add(1);
                     s.host_epoch
                 };
-                let tid = TicketId::new_random();
-                let cap_sig = self.signing_key.as_ref().map_or(SIGNATURE_UNSIGNED, |key| {
-                    signing::sign_ticket_cap(key.as_signing_key(), tid, id, granted_cap, expiry_ms)
-                });
-                let ticket = JoinTicket::from(ticket::encode(&SessionTicket {
-                    ticket_id: tid,
-                    session_id: id,
-                    host_peer_id: self.daemon_peer_id,
-                    host_addr: self.daemon_addr.clone(),
-                    granted_cap,
-                    expiry_ms,
-                    cap_sig,
-                }));
+                let ticket = self.mint_ticket(id, granted_cap, expiry_ms);
                 // Persist the bumped epoch (targeted write — no full
                 // record rewrite). On store failure, surface it: a
                 // resume that can't durably record its new epoch would
@@ -692,19 +680,7 @@ impl Registry {
         // Create path. Either no `requested_id` (mint random) or
         // `Some(id)` whose entry doesn't exist locally yet.
         let session_id = requested_id.unwrap_or_else(SessionId::new_random);
-        let tid = TicketId::new_random();
-        let cap_sig = self.signing_key.as_ref().map_or(SIGNATURE_UNSIGNED, |key| {
-            signing::sign_ticket_cap(key.as_signing_key(), tid, session_id, granted_cap, expiry_ms)
-        });
-        let ticket = JoinTicket::from(ticket::encode(&SessionTicket {
-            ticket_id: tid,
-            session_id,
-            host_peer_id: self.daemon_peer_id,
-            host_addr: self.daemon_addr.clone(),
-            granted_cap,
-            expiry_ms,
-            cap_sig,
-        }));
+        let ticket = self.mint_ticket(session_id, granted_cap, expiry_ms);
         let session = Session::new(session_id, &host_peer, SessionKind::Local);
         let record = session.record();
         self.store
@@ -755,20 +731,28 @@ impl Registry {
                 return Err(SessionError::NotHost);
             }
         }
+        Ok(self.mint_ticket(session, granted_cap, expiry_ms))
+    }
+
+    fn mint_ticket(
+        &self,
+        session_id: SessionId,
+        granted_cap: Capability,
+        expiry_ms: u64,
+    ) -> JoinTicket {
         let tid = TicketId::new_random();
         let cap_sig = self.signing_key.as_ref().map_or(SIGNATURE_UNSIGNED, |key| {
-            signing::sign_ticket_cap(key.as_signing_key(), tid, session, granted_cap, expiry_ms)
+            signing::sign_ticket_cap(key.as_signing_key(), tid, session_id, granted_cap, expiry_ms)
         });
-        let ticket = JoinTicket::from(ticket::encode(&SessionTicket {
+        JoinTicket::from(ticket::encode(&SessionTicket {
             ticket_id: tid,
-            session_id: session,
+            session_id,
             host_peer_id: self.daemon_peer_id,
             host_addr: self.daemon_addr.clone(),
             granted_cap,
             expiry_ms,
             cap_sig,
-        }));
-        Ok(ticket)
+        }))
     }
 
     /// Join an existing session via its ticket. Returns the session id

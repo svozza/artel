@@ -231,8 +231,8 @@ pub enum Request {
     /// a specific capability level and optional expiry.
     ///
     /// Only the host of a `SessionKind::Local` session may issue
-    /// tickets. Returns [`ProtocolError::Capability`] if the caller is
-    /// not the host.
+    /// tickets. Returns [`ProtocolError::NotHost`] if the session is
+    /// remote.
     IssueTicket {
         /// Session to issue the ticket for.
         session: SessionId,

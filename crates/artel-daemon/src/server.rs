@@ -656,12 +656,19 @@ async fn dispatch(
             session,
             granted_cap,
             expiry_ms,
-        } => match registry.issue_ticket(session, granted_cap, expiry_ms).await {
-            Ok(ticket) => Response::IssuedTicket { ticket },
-            Err(err) => Response::Error {
-                error: session_error_to_protocol(&err),
-            },
-        },
+        } => {
+            if !memberships.contains_key(&session) {
+                return Response::Error {
+                    error: ProtocolError::NotSubscribed(session),
+                };
+            }
+            match registry.issue_ticket(session, granted_cap, expiry_ms).await {
+                Ok(ticket) => Response::IssuedTicket { ticket },
+                Err(err) => Response::Error {
+                    error: session_error_to_protocol(&err),
+                },
+            }
+        }
     }
 }
 
