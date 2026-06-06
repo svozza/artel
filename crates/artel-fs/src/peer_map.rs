@@ -101,6 +101,22 @@ impl PeerMap {
         }
     }
 
+    /// The host's daemon `PeerId`.
+    pub(crate) const fn host_peer_id(&self) -> PeerId {
+        self.host
+    }
+
+    /// Whether `peer` currently holds `ReadWrite` in the local
+    /// projection. Used to gate upgrade delivery so revoked peers
+    /// don't receive re-deliveries on host resume.
+    pub(crate) fn has_rw(&self, peer: PeerId) -> bool {
+        self.caps
+            .read()
+            .unwrap()
+            .get(&peer)
+            .is_some_and(|c| *c == Capability::ReadWrite)
+    }
+
     /// Check whether an incoming workspace `EndpointId` belongs to a
     /// peer that was explicitly revoked. Returns `false` (allow) for:
     /// - Unknown `EndpointId`s (haven't seen the mapping yet)

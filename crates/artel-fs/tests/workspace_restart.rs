@@ -173,7 +173,10 @@ async fn workspace_state_survives_graceful_restart() {
         let bob_handle = Arc::clone(&bob_ws).run().await;
 
         // Grant Bob RW so he receives the NamespaceSecret needed to write.
-        common::grant_rw(&alice, session, bob_peer_id).await;
+        common::grant_rw_and_wait(
+            &alice, session, bob_peer_id,
+            bob_root.path(), alice_root.path(),
+        ).await;
 
         // Sanity: a.txt makes it to bob.
         wait_for_file(&bob_root.path().join("a.txt"), b"alpha").await;
@@ -425,7 +428,10 @@ async fn alice_post_restart_writes_reach_bob() {
     let bob_handle = Arc::clone(&bob_ws).run().await;
 
     // Grant Bob RW so he receives the NamespaceSecret needed to write.
-    common::grant_rw(&alice, session, bob_peer_id).await;
+    common::grant_rw_and_wait(
+        &alice, session, bob_peer_id,
+        bob_root.path(), alice_root.path(),
+    ).await;
 
     // Pre-restart bidirectional sanity.
     tokio::fs::write(alice_root.path().join("pre_alice.txt"), b"alpha")
@@ -691,7 +697,10 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
 
     // Grant Bob RW so he receives the NamespaceSecret via the upgrade
     // path and can produce valid signed entries.
-    common::grant_rw(&alice, session, bob_peer_id).await;
+    common::grant_rw_and_wait(
+        &alice, session, bob_peer_id,
+        bob_root.path(), alice_root.path(),
+    ).await;
 
     tokio::fs::write(alice_root.path().join("pre_alice.txt"), b"alpha")
         .await

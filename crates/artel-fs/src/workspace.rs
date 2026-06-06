@@ -68,10 +68,7 @@ pub const TICKET_ACTION: &str = "workspace.ticket";
 /// raw 32-byte `EndpointId`.
 pub const NODE_ID_ACTION: &str = "workspace.node_id";
 
-/// Action stamped on the targeted `MessageKind::System` message that
-/// delivers the `NamespaceSecret` to an RW-promoted joiner. Excluded
-/// from replay (see `artel-daemon` `log_since`).
-pub(crate) const UPGRADE_ACTION: &str = "workspace.upgrade";
+use artel_protocol::UPGRADE_ACTION;
 
 /// Payload for the `workspace.upgrade` system message.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -697,7 +694,7 @@ impl Workspace {
                 .await
                 .map_err(|e| WorkspaceError::Iroh(format!("upgrade-client host: {e}")))?;
             Some(HostUpgradeCtx {
-                client: upgrade_client,
+                client: Arc::new(upgrade_client),
                 session: session_id,
                 namespace_secret,
             })
@@ -2016,7 +2013,7 @@ async fn reconcile_doc_against_disk(
 /// Host-side context for delivering `NamespaceSecret` upgrades when a
 /// peer is granted RW. `None` on the joiner side.
 struct HostUpgradeCtx {
-    client: Client,
+    client: Arc<Client>,
     session: SessionId,
     namespace_secret: [u8; 32],
 }
@@ -2093,58 +2090,89 @@ fn spawn_cap_listener(
                 () = cancel.cancelled() => break,
                 ev = events.recv() => {
                     let Some(ev) = ev else { break };
-                    if let Event::Message {
-                        session: ev_session,
-                        message,
-                    } = ev
-                    {
-                        if ev_session != session {
-                            continue;
-                        }
-                        match message.kind {
-                            MessageKind::Capability => {
-                                peer_map.apply_capability(
-                                    message.peer.id,
-                                    &message.payload,
-                                );
-                                // Host: on RW grant, deliver the
-                                // NamespaceSecret to the promoted peer.
-                                if let Some(ref ctx) = host_ctx
-                                    && let Ok(artel_protocol::capability::CapabilityAction::Grant {
-                                        peer,
-                                        cap: artel_protocol::capability::Capability::ReadWrite,
-                                    }) = artel_protocol::capability::CapabilityAction::decode(&message.payload)
-                                    && let Err(e) = publish_upgrade(
-                                        &ctx.client,
-                                        ctx.session,
-                                        peer,
-                                        ctx.namespace_secret,
-                                    ).await
-                                {
-                                    warn!(?e, ?peer, "upgrade delivery failed");
-                                }
-                            }
-                            MessageKind::System if message.action == NODE_ID_ACTION => {
-                                if let Ok(bytes) = <[u8; 32]>::try_from(message.payload.as_slice())
-                                    && let Ok(workspace_id) = iroh::EndpointId::from_bytes(&bytes)
-                                {
-                                    peer_map.register(workspace_id, message.peer.id);
-                                }
-                            }
-                            MessageKind::System if message.action == UPGRADE_ACTION => {
-                                if let Some(ref ctx) = joiner_ctx
-                                    && let Ok(payload) = postcard::from_bytes::<UpgradePayload>(&message.payload)
-                                    && payload.target_peer == ctx.my_peer_id
-                                {
-                                    let secret = iroh_docs::NamespaceSecret::from_bytes(&payload.namespace_secret);
-                                    let cap = iroh_docs::Capability::Write(secret);
-                                    if let Err(e) = ctx.docs.import_namespace(cap).await {
-                                        warn!("workspace.upgrade import_namespace failed: {e}");
+                    match ev {
+                        Event::Message {
+                            session: ev_session,
+                            message,
+                        } if ev_session == session => {
+                            match message.kind {
+                                MessageKind::Capability => {
+                                    peer_map.apply_capability(
+                                        message.peer.id,
+                                        &message.payload,
+                                    );
+                                    // Host: on RW grant, deliver the
+                                    // NamespaceSecret to the promoted peer.
+                                    // Check has_rw AFTER apply so a grant
+                                    // whose peer was later revoked (during
+                                    // replay) is suppressed.
+                                    if let Some(ref ctx) = host_ctx
+                                        && let Ok(artel_protocol::capability::CapabilityAction::Grant {
+                                            peer,
+                                            cap: artel_protocol::capability::Capability::ReadWrite,
+                                        }) = artel_protocol::capability::CapabilityAction::decode(&message.payload)
+                                        && peer_map.has_rw(peer)
+                                    {
+                                        let client = Arc::clone(&ctx.client);
+                                        let sess = ctx.session;
+                                        let secret = ctx.namespace_secret;
+                                        tokio::spawn(async move {
+                                            if let Err(e) = publish_upgrade(
+                                                &client, sess, peer, secret,
+                                            ).await {
+                                                warn!(?e, ?peer, "upgrade delivery failed");
+                                            }
+                                        });
                                     }
                                 }
+                                MessageKind::System if message.action == NODE_ID_ACTION => {
+                                    if let Ok(bytes) = <[u8; 32]>::try_from(message.payload.as_slice())
+                                        && let Ok(workspace_id) = iroh::EndpointId::from_bytes(&bytes)
+                                    {
+                                        peer_map.register(workspace_id, message.peer.id);
+                                    }
+                                }
+                                MessageKind::System if message.action == UPGRADE_ACTION => {
+                                    if let Some(ref ctx) = joiner_ctx
+                                        && message.peer.id == peer_map.host_peer_id()
+                                        && let Ok(payload) = postcard::from_bytes::<UpgradePayload>(&message.payload)
+                                        && payload.target_peer == ctx.my_peer_id
+                                    {
+                                        let secret = iroh_docs::NamespaceSecret::from_bytes(&payload.namespace_secret);
+                                        let cap = iroh_docs::Capability::Write(secret);
+                                        if let Err(e) = ctx.docs.import_namespace(cap).await {
+                                            warn!("workspace.upgrade import_namespace failed: {e}");
+                                        }
+                                    }
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         }
+                        // Host: re-deliver the upgrade to a peer that
+                        // (re-)joins while already holding RW. Covers
+                        // the case where the original broadcast was
+                        // missed due to a network blip.
+                        Event::PeerJoined {
+                            session: ev_session,
+                            peer: joined_peer,
+                        } if ev_session == session => {
+                            if let Some(ref ctx) = host_ctx
+                                && peer_map.has_rw(joined_peer.id)
+                            {
+                                let client = Arc::clone(&ctx.client);
+                                let sess = ctx.session;
+                                let secret = ctx.namespace_secret;
+                                let peer = joined_peer.id;
+                                tokio::spawn(async move {
+                                    if let Err(e) = publish_upgrade(
+                                        &client, sess, peer, secret,
+                                    ).await {
+                                        warn!(?e, ?peer, "upgrade re-delivery on rejoin failed");
+                                    }
+                                });
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }

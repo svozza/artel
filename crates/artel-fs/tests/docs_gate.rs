@@ -89,7 +89,10 @@ async fn revoked_peer_inbound_sync_rejected_after_reconnect() {
     let bob_handle = Arc::clone(&bob_ws).run().await;
 
     // Grant Bob RW so he can write (the ticket is now Read-only).
-    common::grant_rw(&alice, session, bob_peer_id).await;
+    common::grant_rw_and_wait(
+        &alice, session, bob_peer_id,
+        bob_dir.path(), alice_dir.path(),
+    ).await;
 
     // --- Phase 1: baseline — Bob writes, Alice sees it. ---
     let baseline_path = bob_dir.path().join("before_revoke.txt");

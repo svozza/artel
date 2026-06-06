@@ -91,7 +91,10 @@ async fn host_outbound_dial_blocked_after_revocation() {
 
     // Grant Bob RW so he receives the NamespaceSecret upgrade and can
     // produce valid signed entries.
-    common::grant_rw(&alice, session, bob_peer_id).await;
+    common::grant_rw_and_wait(
+        &alice, session, bob_peer_id,
+        bob_dir.path(), alice_dir.path(),
+    ).await;
 
     // --- Phase 1: baseline — Bob writes, Alice sees it. ---
     let baseline_path = bob_dir.path().join("before_revoke.txt");

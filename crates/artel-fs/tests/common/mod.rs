@@ -413,10 +413,11 @@ pub async fn wait_for_endpoint(dns_pkarr: &DnsPkarrServer, endpoint_id: &iroh::E
         .expect("endpoint pkarr-published in time");
 }
 
-/// Grant RW capability to `target_peer` and wait for the upgrade
-/// delivery to propagate. Tests that need a joiner to write must
-/// call this after the joiner has connected — the Read-only ticket
-/// no longer includes the `NamespaceSecret`.
+/// Grant RW capability to `target_peer`. Sends the grant message and
+/// returns immediately — callers must observe the effect (e.g.
+/// successful write via `wait_for_file`) rather than assuming a fixed
+/// propagation delay. Use [`grant_rw_and_wait`] for the common
+/// pattern where you want to block until the upgrade has propagated.
 pub async fn grant_rw(client: &Client, session: SessionId, target_peer: PeerId) {
     let grant = CapabilityAction::Grant {
         peer: target_peer,
@@ -434,5 +435,41 @@ pub async fn grant_rw(client: &Client, session: SessionId, target_peer: PeerId) 
         .await
         .unwrap();
     assert!(matches!(resp, Response::Sent { .. }), "{resp:?}");
-    sleep(Duration::from_secs(2)).await;
+}
+
+/// Grant RW and wait for the upgrade to propagate by polling a probe
+/// write. Writes `".artel_rw_probe"` from the joiner's workspace dir
+/// and waits for it to appear in the host's dir, proving the full
+/// round-trip (grant → upgrade delivery → import_namespace → signed
+/// entry → sync → host applies).
+pub async fn grant_rw_and_wait(
+    client: &Client,
+    session: SessionId,
+    target_peer: PeerId,
+    joiner_dir: &Path,
+    host_dir: &Path,
+) {
+    grant_rw(client, session, target_peer).await;
+    let probe = b"rw-probe";
+    let joiner_probe = joiner_dir.join(".artel_rw_probe");
+    let host_probe = host_dir.join(".artel_rw_probe");
+    // Poll: write the probe repeatedly until the host sees it,
+    // proving the joiner has Write capability.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let _ = tokio::fs::write(&joiner_probe, probe).await;
+        sleep(POLL_INTERVAL).await;
+        if let Ok(bytes) = tokio::fs::read(&host_probe).await {
+            if bytes == probe {
+                // Clean up probe files.
+                let _ = tokio::fs::remove_file(&joiner_probe).await;
+                let _ = tokio::fs::remove_file(&host_probe).await;
+                return;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "grant_rw_and_wait: upgrade never propagated (probe never reached host)",
+        );
+    }
 }

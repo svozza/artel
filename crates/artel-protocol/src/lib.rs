@@ -42,7 +42,7 @@ pub use error::ProtocolError;
 pub use ids::{PeerId, Seq, SessionId, TicketId};
 pub use message::{
     MESSAGE_FORMAT, MessageFormat, MessageKind, PeerInfo, SIGNATURE_UNSIGNED, SessionMessage,
-    SigBytes,
+    SigBytes, UPGRADE_ACTION,
 };
 pub use rpc::{
     Attachment, Event, JoinTicket, Request, RequestId, Response, SendPayload, SessionSummary,

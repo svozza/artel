@@ -731,7 +731,10 @@ async fn round_trip_once(run: usize) {
 
     // Grant Bob RW so the upgrade delivery gives him the
     // NamespaceSecret needed to produce valid signed entries.
-    common::grant_rw(&alice, session, bob_peer_id).await;
+    common::grant_rw_and_wait(
+        &alice, session, bob_peer_id,
+        bob_dir.path(), alice_dir.path(),
+    ).await;
 
     // 1. Alice writes a.txt → Bob sees it.
     let alice_a = alice_dir.path().join("a.txt");

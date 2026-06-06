@@ -60,6 +60,11 @@ pub type SigBytes = [u8; 64];
 /// `sign_body`" into a loud test failure once verification is on.
 pub const SIGNATURE_UNSIGNED: SigBytes = [0u8; 64];
 
+/// Action string for the FS-layer upgrade message that delivers the
+/// `NamespaceSecret` to RW joiners. Both the daemon's replay filter
+/// and the FS layer's publisher/consumer must agree on this value.
+pub const UPGRADE_ACTION: &str = "workspace.upgrade";
+
 /// Identity of the peer that authored a message.
 ///
 /// Includes a human-readable display name distinct from the cryptographic
