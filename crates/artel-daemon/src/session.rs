@@ -40,6 +40,11 @@ use crate::store::{DynStore, SessionKind, SessionRecord, StoredAttachment};
 /// one slow subscriber.
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
+/// Action string for the FS-layer upgrade message that delivers the
+/// NamespaceSecret to RW joiners. Excluded from replay so future
+/// Read-only joiners never see the secret.
+const UPGRADE_ACTION: &str = "workspace.upgrade";
+
 /// Wall-clock millis since the Unix epoch. The `Local` arm of
 /// [`Authoring`] stamps this onto every body it signs.
 fn now_ms() -> u64 {
@@ -1243,7 +1248,11 @@ impl Registry {
         let s = session_arc.lock().await;
         Ok(s.log
             .iter()
-            .filter(|m| m.seq > since && m.kind != MessageKind::Capability)
+            .filter(|m| {
+                m.seq > since
+                    && m.kind != MessageKind::Capability
+                    && !(m.kind == MessageKind::System && m.action == UPGRADE_ACTION)
+            })
             .cloned()
             .collect())
     }
@@ -3929,6 +3938,62 @@ mod tests {
         let bogus = SessionId::new_random();
         let err = r.log_since(bogus, Seq::ZERO).await.unwrap_err();
         assert_eq!(err, SessionError::UnknownSession(bogus));
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn log_since_excludes_upgrade_messages() {
+        let r = registry();
+        let host = peer(1, "alice");
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
+
+        r.send(
+            id,
+            host.clone(),
+            MessageKind::Chat,
+            "hello".into(),
+            vec![],
+            Authoring::Local,
+        )
+        .await
+        .unwrap();
+
+        r.send(
+            id,
+            host.clone(),
+            MessageKind::System,
+            UPGRADE_ACTION.into(),
+            vec![0xAB; 32],
+            Authoring::Local,
+        )
+        .await
+        .unwrap();
+
+        r.send(
+            id,
+            host.clone(),
+            MessageKind::Capability,
+            "cap.grant".into(),
+            vec![],
+            Authoring::Local,
+        )
+        .await
+        .unwrap();
+
+        r.send(
+            id,
+            host,
+            MessageKind::Chat,
+            "world".into(),
+            vec![],
+            Authoring::Local,
+        )
+        .await
+        .unwrap();
+
+        let messages = r.log_since(id, Seq::ZERO).await.unwrap();
+        let actions: Vec<&str> = messages.iter().map(|m| m.action.as_str()).collect();
+        assert_eq!(actions, vec!["hello", "world"]);
     }
 
     #[cfg(feature = "iroh")]
