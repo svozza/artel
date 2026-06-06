@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use artel_protocol::transport::{self, Framed, server::Listener};
 use artel_protocol::{
-    Event, PROTOCOL_VERSION, PeerInfo, ProtocolError, ProtocolVersion, Request, Response,
-    SendPayload, SessionId, SessionMessage, VersionMismatch, WireMessage,
+    Capability, Event, PROTOCOL_VERSION, PeerInfo, ProtocolError, ProtocolVersion, Request,
+    Response, SendPayload, SessionId, SessionMessage, VersionMismatch, WireMessage,
 };
 use futures_util::{SinkExt, StreamExt, stream::SplitSink};
 use tokio::net::UnixStream;
@@ -669,7 +669,7 @@ async fn dispatch_host(
         id: registry.daemon_peer_id(),
         display_name,
     };
-    match registry.host(peer.clone(), session).await {
+    match registry.host(peer.clone(), session, Capability::ReadWrite, 0).await {
         Ok((session, ticket)) => {
             memberships.insert(session, peer);
             Response::HostSession { session, ticket }

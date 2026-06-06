@@ -1292,7 +1292,7 @@ mod tests {
         let base = ticket_cap_canonical_bytes(tid, sid, Capability::Read, 1000);
 
         // ticket_id starts after the domain tag
-        let diff_tid = ticket_cap_canonical_bytes(
+        let with_other_ticket = ticket_cap_canonical_bytes(
             TicketId::from_bytes([0x02; 16]),
             sid,
             Capability::Read,
@@ -1300,13 +1300,13 @@ mod tests {
         );
         let first = base
             .iter()
-            .zip(diff_tid.iter())
+            .zip(with_other_ticket.iter())
             .position(|(x, y)| x != y)
             .expect("ticket_id diff");
         assert_eq!(first, TICKET_CAP_DOMAIN_TAG.len());
 
         // session_id starts after ticket_id
-        let diff_sid = ticket_cap_canonical_bytes(
+        let with_other_session = ticket_cap_canonical_bytes(
             tid,
             SessionId::from_bytes([0x02; 16]),
             Capability::Read,
@@ -1314,7 +1314,7 @@ mod tests {
         );
         let first = base
             .iter()
-            .zip(diff_sid.iter())
+            .zip(with_other_session.iter())
             .position(|(x, y)| x != y)
             .expect("session_id diff");
         assert_eq!(first, TICKET_CAP_DOMAIN_TAG.len() + 16);

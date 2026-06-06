@@ -25,7 +25,7 @@ use tokio::time::{sleep, timeout};
 
 use common::{Pair, spawn_pair, testing_setup};
 
-/// Prove the full cap-listener + PeerMap + DocsGate pipeline works:
+/// Prove the full cap-listener + `PeerMap` + `DocsGate` pipeline works:
 /// after revocation and reconnection, the gate rejects the peer's
 /// inbound sync connection.
 #[tokio::test(flavor = "multi_thread")]
@@ -58,7 +58,7 @@ async fn revoked_peer_inbound_sync_rejected_after_reconnect() {
         .expect("host has join_ticket")
         .clone();
     let alice_ws = Arc::new(alice_ws);
-    let _alice_handle = Arc::clone(&alice_ws).run().await;
+    let alice_handle = Arc::clone(&alice_ws).run().await;
 
     // Bob joins.
     let bob = Client::connect(&daemon_b.socket).await.unwrap();
@@ -86,7 +86,7 @@ async fn revoked_peer_inbound_sync_rejected_after_reconnect() {
     .expect("Workspace::join");
 
     let bob_ws = Arc::new(bob_ws);
-    let _bob_handle = Arc::clone(&bob_ws).run().await;
+    let bob_handle = Arc::clone(&bob_ws).run().await;
 
     // --- Phase 1: baseline — Bob writes, Alice sees it. ---
     let baseline_path = bob_dir.path().join("before_revoke.txt");
@@ -119,7 +119,7 @@ async fn revoked_peer_inbound_sync_rejected_after_reconnect() {
     // The gate only fires on new accept() calls. iroh-docs holds the
     // sync connection from phase 1 open, so we must force a reconnect.
     bob_ws.shutdown().await.expect("bob phase-1 shutdown");
-    let _ = timeout(Duration::from_secs(5), _bob_handle).await;
+    let _ = timeout(Duration::from_secs(5), bob_handle).await;
 
     // Re-join: Bob's docs node re-opens its replica and tries to dial
     // Alice for sync — hitting Alice's DocsGate which now rejects.
@@ -136,7 +136,7 @@ async fn revoked_peer_inbound_sync_rejected_after_reconnect() {
     .await
     .expect("Workspace::join phase 2");
     let bob_ws2 = Arc::new(bob_ws2);
-    let _bob_handle2 = Arc::clone(&bob_ws2).run().await;
+    let bob_handle2 = Arc::clone(&bob_ws2).run().await;
 
     // --- Phase 3: Bob writes — verify it does NOT arrive at Alice
     // via the inbound path. Give enough time for the write to
@@ -164,8 +164,8 @@ async fn revoked_peer_inbound_sync_rejected_after_reconnect() {
     // Cleanup
     alice_ws.shutdown().await.expect("alice shutdown");
     bob_ws2.shutdown().await.expect("bob shutdown");
-    let _ = timeout(Duration::from_secs(5), _alice_handle).await;
-    let _ = timeout(Duration::from_secs(5), _bob_handle2).await;
+    let _ = timeout(Duration::from_secs(5), alice_handle).await;
+    let _ = timeout(Duration::from_secs(5), bob_handle2).await;
     drop(alice);
     drop(bob);
     drop(bob2);

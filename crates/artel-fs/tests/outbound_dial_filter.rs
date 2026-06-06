@@ -29,6 +29,7 @@ use common::{Pair, spawn_pair, testing_setup};
 /// After revocation + host restart, the host's outbound dial filter
 /// prevents iroh-docs from syncing with the revoked joiner.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
 async fn host_outbound_dial_blocked_after_revocation() {
     let Pair {
         daemon_a,
@@ -58,7 +59,7 @@ async fn host_outbound_dial_blocked_after_revocation() {
         .expect("host has join_ticket")
         .clone();
     let alice_ws = Arc::new(alice_ws);
-    let _alice_handle = Arc::clone(&alice_ws).run().await;
+    let alice_handle = Arc::clone(&alice_ws).run().await;
 
     // Bob joins.
     let bob = Client::connect(&daemon_b.socket).await.unwrap();
@@ -86,7 +87,7 @@ async fn host_outbound_dial_blocked_after_revocation() {
     .expect("Workspace::join");
 
     let bob_ws = Arc::new(bob_ws);
-    let _bob_handle = Arc::clone(&bob_ws).run().await;
+    let bob_handle = Arc::clone(&bob_ws).run().await;
 
     // --- Phase 1: baseline — Bob writes, Alice sees it. ---
     let baseline_path = bob_dir.path().join("before_revoke.txt");
@@ -121,7 +122,7 @@ async fn host_outbound_dial_blocked_after_revocation() {
     // to Bob's workspace endpoint because the PeerMap (rebuilt from
     // the cap-listener's session-log replay) marks Bob as revoked.
     alice_ws.shutdown().await.expect("alice phase-1 shutdown");
-    let _ = timeout(Duration::from_secs(5), _alice_handle).await;
+    let _ = timeout(Duration::from_secs(5), alice_handle).await;
 
     let alice2 = Client::connect(&daemon_a.socket).await.unwrap();
     let (alice_ws2, _) = Workspace::host_with(
@@ -136,7 +137,7 @@ async fn host_outbound_dial_blocked_after_revocation() {
     .await
     .expect("Workspace::host phase 2");
     let alice_ws2 = Arc::new(alice_ws2);
-    let _alice_handle2 = Arc::clone(&alice_ws2).run().await;
+    let alice_handle2 = Arc::clone(&alice_ws2).run().await;
 
     // --- Phase 4: Bob writes post-revoke — must NOT arrive at Alice. ---
     let blocked_path = bob_dir.path().join("after_revoke.txt");
@@ -156,8 +157,8 @@ async fn host_outbound_dial_blocked_after_revocation() {
     // Cleanup
     alice_ws2.shutdown().await.expect("alice shutdown");
     bob_ws.shutdown().await.expect("bob shutdown");
-    let _ = timeout(Duration::from_secs(5), _alice_handle2).await;
-    let _ = timeout(Duration::from_secs(5), _bob_handle).await;
+    let _ = timeout(Duration::from_secs(5), alice_handle2).await;
+    let _ = timeout(Duration::from_secs(5), bob_handle).await;
     drop(alice);
     drop(alice2);
     drop(bob);

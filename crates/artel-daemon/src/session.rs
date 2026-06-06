@@ -616,6 +616,8 @@ impl Registry {
         &self,
         host_peer: PeerInfo,
         requested_id: Option<SessionId>,
+        granted_cap: Capability,
+        expiry_ms: u64,
     ) -> Result<(SessionId, JoinTicket), SessionError> {
         // Resume path: caller supplied an id and we already have a
         // matching local-host record. Reuse the in-memory session
@@ -643,15 +645,15 @@ impl Registry {
                 };
                 let tid = TicketId::new_random();
                 let cap_sig = self.signing_key.as_ref().map_or(SIGNATURE_UNSIGNED, |key| {
-                    signing::sign_ticket_cap(key.as_signing_key(), tid, id, Capability::ReadWrite, 0)
+                    signing::sign_ticket_cap(key.as_signing_key(), tid, id, granted_cap, expiry_ms)
                 });
                 let ticket = JoinTicket::from(ticket::encode(&SessionTicket {
                     ticket_id: tid,
                     session_id: id,
                     host_peer_id: self.daemon_peer_id,
                     host_addr: self.daemon_addr.clone(),
-                    granted_cap: Capability::ReadWrite,
-                    expiry_ms: 0,
+                    granted_cap,
+                    expiry_ms,
                     cap_sig,
                 }));
                 // Persist the bumped epoch (targeted write — no full
@@ -692,15 +694,15 @@ impl Registry {
         let session_id = requested_id.unwrap_or_else(SessionId::new_random);
         let tid = TicketId::new_random();
         let cap_sig = self.signing_key.as_ref().map_or(SIGNATURE_UNSIGNED, |key| {
-            signing::sign_ticket_cap(key.as_signing_key(), tid, session_id, Capability::ReadWrite, 0)
+            signing::sign_ticket_cap(key.as_signing_key(), tid, session_id, granted_cap, expiry_ms)
         });
         let ticket = JoinTicket::from(ticket::encode(&SessionTicket {
             ticket_id: tid,
             session_id,
             host_peer_id: self.daemon_peer_id,
             host_addr: self.daemon_addr.clone(),
-            granted_cap: Capability::ReadWrite,
-            expiry_ms: 0,
+            granted_cap,
+            expiry_ms,
             cap_sig,
         }));
         let session = Session::new(session_id, &host_peer, SessionKind::Local);
@@ -1094,19 +1096,19 @@ impl Registry {
             // Skip sig verification when the host has no signing key
             // (test-only path where host() stamped SIGNATURE_UNSIGNED).
             // Production always has a signing key.
-            if self.signing_key.is_some() {
-                if let Err(err) = signing::verify_ticket_cap(
+            if self.signing_key.is_some()
+                && let Err(err) = signing::verify_ticket_cap(
                     &self.daemon_peer_id,
                     claim.ticket_id,
                     session,
                     claim.granted_cap,
                     claim.expiry_ms,
                     &claim.cap_sig,
-                ) {
-                    return Err(SessionError::InvalidCapClaim(
-                        signing::verify_reason(&err).to_string(),
-                    ));
-                }
+                )
+            {
+                return Err(SessionError::InvalidCapClaim(
+                    signing::verify_reason(&err).to_string(),
+                ));
             }
         }
 
@@ -1910,13 +1912,24 @@ mod tests {
         Registry::new(daemon_peer_id, store)
     }
 
+    impl Registry {
+        async fn host_rw(
+            &self,
+            host_peer: PeerInfo,
+            requested_id: Option<SessionId>,
+        ) -> Result<(SessionId, JoinTicket), SessionError> {
+            self.host(host_peer, requested_id, Capability::ReadWrite, 0)
+                .await
+        }
+    }
+
     // ---- host ----
 
     #[tokio::test]
     async fn host_creates_session_and_returns_artel_ticket() {
         let daemon_peer = PeerId::from_bytes([0xff; 32]);
         let r = registry_with_peer(daemon_peer);
-        let (id, ticket) = r.host(peer(1, "alice"), None).await.unwrap();
+        let (id, ticket) = r.host_rw(peer(1, "alice"), None).await.unwrap();
         assert!(ticket.as_str().starts_with("artel:"));
         // The ticket round-trips and embeds this daemon's identity.
         let decoded = ticket::decode(ticket.as_str()).unwrap();
@@ -1935,6 +1948,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn host_with_read_cap_produces_read_ticket() {
+        let r = registry();
+        let (_, ticket) = r
+            .host(peer(1, "alice"), None, Capability::Read, 0)
+            .await
+            .unwrap();
+        let decoded = ticket::decode(ticket.as_str()).unwrap();
+        assert_eq!(decoded.granted_cap, Capability::Read);
+        assert_eq!(decoded.expiry_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn host_with_expiry_produces_ticket_with_expiry_ms() {
+        let r = registry();
+        let expiry = 1_700_000_000_000u64;
+        let (_, ticket) = r
+            .host(peer(1, "alice"), None, Capability::ReadWrite, expiry)
+            .await
+            .unwrap();
+        let decoded = ticket::decode(ticket.as_str()).unwrap();
+        assert_eq!(decoded.granted_cap, Capability::ReadWrite);
+        assert_eq!(decoded.expiry_ms, expiry);
+    }
+
+    #[tokio::test]
     async fn host_with_some_id_creates_session_at_that_id() {
         // First-time host with a caller-supplied id and no
         // pre-existing record. The id propagates verbatim and is
@@ -1942,7 +1980,7 @@ mod tests {
         let r = registry();
         let alice = peer(1, "alice");
         let chosen = SessionId::from_bytes([0xab; 16]);
-        let (id, _ticket) = r.host(alice.clone(), Some(chosen)).await.unwrap();
+        let (id, _ticket) = r.host_rw(alice.clone(), Some(chosen)).await.unwrap();
         assert_eq!(id, chosen);
         let summaries = r.list().await;
         assert_eq!(summaries.len(), 1);
@@ -1994,7 +2032,7 @@ mod tests {
         .await
         .unwrap();
 
-        let (id, ticket) = r.host(alice.clone(), Some(session_id)).await.unwrap();
+        let (id, ticket) = r.host_rw(alice.clone(), Some(session_id)).await.unwrap();
         assert_eq!(id, session_id);
 
         // Ticket re-stamped with this daemon's current addr.
@@ -2046,7 +2084,7 @@ mod tests {
         .await
         .unwrap();
 
-        let err = r.host(bob, Some(session_id)).await.unwrap_err();
+        let err = r.host_rw(bob, Some(session_id)).await.unwrap_err();
         assert_eq!(err, SessionError::SessionConflict(session_id));
 
         // Existing session is still present and still alice's.
@@ -2087,7 +2125,7 @@ mod tests {
         .await
         .unwrap();
 
-        let err = r.host(remote_host, Some(session_id)).await.unwrap_err();
+        let err = r.host_rw(remote_host, Some(session_id)).await.unwrap_err();
         assert_eq!(err, SessionError::SessionConflict(session_id));
     }
 
@@ -2097,7 +2135,7 @@ mod tests {
     async fn join_artel_ticket_succeeds_and_emits_peer_joined() {
         let r = registry();
         let host = peer(1, "alice");
-        let (id, ticket) = r.host(host, None).await.unwrap();
+        let (id, ticket) = r.host_rw(host, None).await.unwrap();
 
         // Subscribe before second peer joins so we observe the event.
         let mut sub = r.subscribe(id, None).await.unwrap();
@@ -2168,7 +2206,7 @@ mod tests {
     #[tokio::test]
     async fn join_twice_is_idempotent() {
         let r = registry();
-        let (id, ticket) = r.host(peer(1, "alice"), None).await.unwrap();
+        let (id, ticket) = r.host_rw(peer(1, "alice"), None).await.unwrap();
         let (got_first, head_first) = r.join(&ticket, peer(2, "bob")).await.unwrap();
         // Second call must NOT error — it's a no-op for the same
         // authenticated id (auth L1 fix #3, idempotent self-rejoin).
@@ -2201,7 +2239,7 @@ mod tests {
         let daemon_peer = PeerId::from_bytes([0xff; 32]);
         let r = registry();
         let alice = PeerInfo::new(daemon_peer, "alice");
-        let (id, ticket) = r.host(alice.clone(), None).await.unwrap();
+        let (id, ticket) = r.host_rw(alice.clone(), None).await.unwrap();
         // Same authenticated id rejoining via the host's own ticket.
         let (got, head) = r.join(&ticket, alice.clone()).await.unwrap();
         assert_eq!(got, id);
@@ -2230,7 +2268,7 @@ mod tests {
     async fn send_assigns_strictly_monotonic_seq() {
         let r = registry();
         let host = peer(1, "alice");
-        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
 
         let s1 = r
             .send(
@@ -2276,7 +2314,7 @@ mod tests {
     async fn send_by_non_member_errors() {
         let r = registry();
         let host = peer(1, "alice");
-        let (id, _) = r.host(host, None).await.unwrap();
+        let (id, _) = r.host_rw(host, None).await.unwrap();
         let err = r
             .send(
                 id,
@@ -2313,7 +2351,7 @@ mod tests {
     async fn send_emits_message_event() {
         let r = registry();
         let host = peer(1, "alice");
-        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
 
         let mut sub = r.subscribe(id, None).await.unwrap();
         let sent = r
@@ -2383,7 +2421,7 @@ mod tests {
         // must produce a `SessionMessage` whose signature verifies
         // against the body's peer.id (= the daemon's own pubkey).
         let (r, host, _secret) = registry_with_signing_seed(0x41);
-        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
         let sent = r
             .send(
                 id,
@@ -2414,7 +2452,7 @@ mod tests {
         // A `Remote`-arm body whose signature does NOT verify must
         // be rejected with `SignatureRejected`, not appended.
         let (r, host, _) = registry_with_signing_seed(0x41);
-        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
 
         // Build a body whose claimed peer is a real ed25519 key but
         // sign with a different key — that's the "BadSig" failure
@@ -2484,7 +2522,7 @@ mod tests {
         // verbatim. Sign off-registry, drive the `Remote` arm, and
         // assert the appended message carries exactly those bytes.
         let (r, host, _) = registry_with_signing_seed(0x41);
-        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
         // The joiner signs with their own key; the body's peer.id is
         // their own pubkey.
         let joiner_signing = artel_protocol::signing::SigningKey::from_bytes(&[0x77; 32]);
@@ -2540,7 +2578,7 @@ mod tests {
         // accepts under the daemon's own pubkey, bound to (session,
         // seq, author_sig).
         let (r, host, _secret) = registry_with_signing_seed(0x41);
-        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
         let sent = r
             .send(
                 id,
@@ -2582,7 +2620,7 @@ mod tests {
         // the seq binding holds against the joiner's sig, not the
         // host's.
         let (r, host, _) = registry_with_signing_seed(0x41);
-        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
 
         let joiner_signing = artel_protocol::signing::SigningKey::from_bytes(&[0x77; 32]);
         let joiner = PeerInfo::new(
@@ -2634,7 +2672,7 @@ mod tests {
     async fn fresh_host_starts_at_epoch_zero() {
         // A brand-new hosted session has host_epoch 0 persisted.
         let (r, host, _) = registry_with_signing_seed(0x41);
-        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
         let records = r.store.load_all().await.unwrap();
         let rec = records.iter().find(|rr| rr.id == id).unwrap();
         assert_eq!(rec.host_epoch, 0, "fresh host starts at epoch 0");
@@ -2652,7 +2690,7 @@ mod tests {
         let store: DynStore = Arc::new(crate::store::MemoryStore::new());
 
         let r = Registry::new_with_signing_key(peer_id, Arc::clone(&store), Arc::clone(&secret));
-        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
         assert_eq!(
             store.load_all().await.unwrap()[0].host_epoch,
             0,
@@ -2670,14 +2708,14 @@ mod tests {
         )
         .await
         .unwrap();
-        let (_id, _) = r2.host(host.clone(), Some(id)).await.unwrap();
+        let (_id, _) = r2.host_rw(host.clone(), Some(id)).await.unwrap();
         assert_eq!(
             store.load_all().await.unwrap()[0].host_epoch,
             1,
             "first resume bumps to epoch 1",
         );
         // Second resume (same process) bumps to 2.
-        let (_id, _) = r2.host(host.clone(), Some(id)).await.unwrap();
+        let (_id, _) = r2.host_rw(host.clone(), Some(id)).await.unwrap();
         assert_eq!(
             store.load_all().await.unwrap()[0].host_epoch,
             2,
@@ -3074,7 +3112,7 @@ mod tests {
 
         // 1. Build a registry with a signing key over the FsLogStore.
         let (r, host, secret) = registry_with_signing_seed_over(0x41, Arc::clone(&store));
-        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
 
         // 2. Admit bob + carol (auto-grants both RW).
         let bob = peer(2, "bob");
@@ -3181,7 +3219,7 @@ mod tests {
         // directly, bypassing the auto-grant path) is rejected at the
         // host's `send` with CapabilityDenied — never seq'd (O1).
         let (r, host, _) = registry_with_signing_seed(0x41);
-        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
 
         // Add bob to membership WITHOUT auto-granting: poke the session
         // directly so we isolate the enforcement from the auto-grant.
@@ -3224,7 +3262,7 @@ mod tests {
     async fn host_send_rejects_revoked_peer() {
         // grant → revoke → write must be denied at the host.
         let (r, host, _) = registry_with_signing_seed(0x41);
-        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
         let bob = peer(2, "bob");
 
         // ensure_member auto-grants bob RW.
@@ -3282,7 +3320,7 @@ mod tests {
         // The round-trip: ensure_member admits + auto-grants a peer,
         // who can then `send` successfully.
         let (r, host, _) = registry_with_signing_seed(0x41);
-        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
         let bob = peer(2, "bob");
         r.ensure_member(id, bob.clone(), None).await.unwrap();
 
@@ -3439,7 +3477,7 @@ mod tests {
     async fn subscribe_replays_messages_after_since() {
         let r = registry();
         let host = peer(1, "alice");
-        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
 
         let s1 = r
             .send(
@@ -3486,7 +3524,7 @@ mod tests {
     async fn subscribe_with_no_since_replays_full_log() {
         let r = registry();
         let host = peer(1, "alice");
-        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
         for n in 0..5 {
             r.send(
                 id,
@@ -3518,7 +3556,7 @@ mod tests {
         let r = registry();
         let host = peer(1, "alice");
         let bob = peer(2, "bob");
-        let (id, ticket) = r.host(host, None).await.unwrap();
+        let (id, ticket) = r.host_rw(host, None).await.unwrap();
         r.join(&ticket, bob.clone()).await.unwrap();
 
         let mut sub = r.subscribe(id, None).await.unwrap();
@@ -3542,7 +3580,7 @@ mod tests {
     async fn host_leave_emits_session_closed_and_removes_session() {
         let r = registry();
         let host = peer(1, "alice");
-        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
         let mut sub = r.subscribe(id, None).await.unwrap();
         r.leave(id, host.id).await.unwrap();
 
@@ -3558,7 +3596,7 @@ mod tests {
     #[tokio::test]
     async fn leave_non_member_errors() {
         let r = registry();
-        let (id, _) = r.host(peer(1, "alice"), None).await.unwrap();
+        let (id, _) = r.host_rw(peer(1, "alice"), None).await.unwrap();
         let err = r.leave(id, peer(9, "intruder").id).await.unwrap_err();
         assert_eq!(err, SessionError::NotMember(id));
     }
@@ -3578,7 +3616,7 @@ mod tests {
         let r = registry();
         let host = peer(1, "alice");
         let bob = peer(2, "bob");
-        let (id, ticket) = r.host(host.clone(), None).await.unwrap();
+        let (id, ticket) = r.host_rw(host.clone(), None).await.unwrap();
         r.join(&ticket, bob).await.unwrap();
         r.send(
             id,
@@ -3607,7 +3645,7 @@ mod tests {
         let daemon_peer = PeerId::from_bytes([7; 32]);
         let r = registry_with_peer(daemon_peer);
         let host = PeerInfo::new(daemon_peer, "self");
-        r.host(host, None).await.unwrap();
+        r.host_rw(host, None).await.unwrap();
         let summaries = r.list().await;
         assert!(summaries[0].is_host);
     }
@@ -3742,7 +3780,7 @@ mod tests {
     async fn log_since_returns_only_messages_after_cursor() {
         let r = registry();
         let host = peer(1, "alice");
-        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
 
         let s1 = r
             .send(
@@ -3809,7 +3847,7 @@ mod tests {
         // `Registry::leave(session, host_peer)`, not this one.
         let r = registry();
         let host = peer(1, "alice");
-        let (id, _) = r.host(host, None).await.unwrap();
+        let (id, _) = r.host_rw(host, None).await.unwrap();
 
         r.host_closed_session(id).await.unwrap();
 
@@ -3825,7 +3863,7 @@ mod tests {
     async fn register_attachment_persists_via_store() {
         let r = registry();
         let alice = peer(1, "alice");
-        let (id, _) = r.host(alice, None).await.unwrap();
+        let (id, _) = r.host_rw(alice, None).await.unwrap();
         r.register_attachment(id, KIND_V1.into(), b"payload".to_vec())
             .await
             .unwrap();
@@ -3850,8 +3888,8 @@ mod tests {
     #[tokio::test]
     async fn list_attachments_returns_entries_across_multiple_sessions() {
         let r = registry();
-        let (id1, _) = r.host(peer(1, "alice"), None).await.unwrap();
-        let (id2, ticket2) = r.host(peer(2, "bob"), None).await.unwrap();
+        let (id1, _) = r.host_rw(peer(1, "alice"), None).await.unwrap();
+        let (id2, ticket2) = r.host_rw(peer(2, "bob"), None).await.unwrap();
         let _ = ticket2;
         r.register_attachment(id1, KIND_V1.into(), b"one".to_vec())
             .await
@@ -3870,7 +3908,7 @@ mod tests {
     #[tokio::test]
     async fn forget_attachment_removes_entry() {
         let r = registry();
-        let (id, _) = r.host(peer(1, "alice"), None).await.unwrap();
+        let (id, _) = r.host_rw(peer(1, "alice"), None).await.unwrap();
         r.register_attachment(id, KIND_V1.into(), b"x".to_vec())
             .await
             .unwrap();
@@ -3882,7 +3920,7 @@ mod tests {
     async fn cascade_removes_attachments_when_host_leaves() {
         let r = registry();
         let alice = peer(1, "alice");
-        let (id, _) = r.host(alice.clone(), None).await.unwrap();
+        let (id, _) = r.host_rw(alice.clone(), None).await.unwrap();
         r.register_attachment(id, KIND_V1.into(), b"x".to_vec())
             .await
             .unwrap();
@@ -4002,7 +4040,7 @@ mod tests {
         let host = peer(1, "alice");
         let bob = peer(2, "bob");
         let charlie = peer(3, "charlie");
-        let (id, ticket) = r.host(host.clone(), None).await.unwrap();
+        let (id, ticket) = r.host_rw(host.clone(), None).await.unwrap();
         r.join(&ticket, bob.clone()).await.unwrap();
         r.join(&ticket, charlie.clone()).await.unwrap();
 
@@ -4031,7 +4069,7 @@ mod tests {
         for _ in 0..200 {
             let r = Arc::new(registry());
             let alice = peer(1, "alice");
-            let (id, _) = r.host(alice.clone(), None).await.unwrap();
+            let (id, _) = r.host_rw(alice.clone(), None).await.unwrap();
 
             let r1 = Arc::clone(&r);
             let r2 = Arc::clone(&r);
@@ -4099,7 +4137,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_member_with_valid_rw_claim_grants_rw() {
         let (r, host, key) = registry_with_signing_seed(0x50);
-        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
         let bob = peer(2, "bob");
         let claim = valid_cap_claim(&key, id, Capability::ReadWrite, 0);
         r.ensure_member(id, bob.clone(), Some(claim)).await.unwrap();
@@ -4122,7 +4160,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_member_with_valid_read_claim_grants_read() {
         let (r, host, key) = registry_with_signing_seed(0x51);
-        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
         let bob = peer(2, "bob");
         let claim = valid_cap_claim(&key, id, Capability::Read, 0);
         r.ensure_member(id, bob.clone(), Some(claim)).await.unwrap();
@@ -4152,7 +4190,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_member_rejects_forged_cap_sig() {
         let (r, host, _host_key) = registry_with_signing_seed(0x52);
-        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
         let bob = peer(2, "bob");
 
         // Sign with a different key (attacker key) — sig won't verify
@@ -4174,7 +4212,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_member_rejects_expired_ticket() {
         let (r, host, key) = registry_with_signing_seed(0x53);
-        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
         let bob = peer(2, "bob");
 
         // Expiry set to 1ms — always in the past.
@@ -4193,7 +4231,7 @@ mod tests {
         // The `None` path (SendRequest backstop) still grants RW for
         // pre-tiered-ticket joiners.
         let (r, host, _) = registry_with_signing_seed(0x54);
-        let (id, _) = r.host(host.clone(), None).await.unwrap();
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
         let bob = peer(2, "bob");
         r.ensure_member(id, bob.clone(), None).await.unwrap();
 
