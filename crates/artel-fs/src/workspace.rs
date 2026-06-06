@@ -68,6 +68,18 @@ pub const TICKET_ACTION: &str = "workspace.ticket";
 /// raw 32-byte `EndpointId`.
 pub const NODE_ID_ACTION: &str = "workspace.node_id";
 
+/// Action stamped on the targeted `MessageKind::System` message that
+/// delivers the `NamespaceSecret` to an RW-promoted joiner. Excluded
+/// from replay (see `artel-daemon` `log_since`).
+pub(crate) const UPGRADE_ACTION: &str = "workspace.upgrade";
+
+/// Payload for the `workspace.upgrade` system message.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct UpgradePayload {
+    target_peer: PeerId,
+    namespace_secret: [u8; 32],
+}
+
 /// Capacity of the [`Workspace::events`] channel. Modest cap so a
 /// stuck consumer back-pressures the watcher rather than letting
 /// events queue without bound.
@@ -214,6 +226,7 @@ impl WorkspaceConfig {
     /// [`Self::endpoint_setup`] for variant semantics. Production
     /// is the default; tests pass an [`EndpointSetup::Testing`]
     /// constructed from a shared `Arc<DnsPkarrServer>`.
+    #[allow(clippy::missing_const_for_fn)]
     #[must_use]
     pub fn with_endpoint_setup(mut self, setup: EndpointSetup) -> Self {
         self.endpoint_setup = setup;
@@ -529,7 +542,7 @@ impl Workspace {
     /// Inner half of [`Self::host_with`] that runs everything past the
     /// "no rollback needed yet" point. Populates `rb` as fallible
     /// state is acquired so the outer fn can undo on Err.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn host_with_inner(
         client: &Client,
         display_name: String,
@@ -643,8 +656,23 @@ impl Workspace {
         // `bac631f` for `Registry::join`, applied at the right
         // layer (the workspace's iroh-docs node, not the daemon's
         // gossip node).
-        let ticket = doc
+        // Extract the NamespaceSecret for later delivery to RW joiners.
+        // share(Write) returns a DocTicket whose capability contains
+        // the secret.
+        let write_ticket = doc
             .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+            .await
+            .map_err(|e| WorkspaceError::Doc(format!("share doc (write): {e}")))?;
+        let namespace_secret = match write_ticket.capability {
+            iroh_docs::Capability::Write(ref secret) => secret.to_bytes(),
+            iroh_docs::Capability::Read(_) => unreachable!("host always has Write capability"),
+        };
+
+        // Broadcast a Read-only ticket. The NamespaceSecret is never
+        // included in the broadcast; RW joiners receive it via the
+        // targeted upgrade path (see spawn_cap_listener / 3D).
+        let ticket = doc
+            .share(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
             .await
             .map_err(|e| WorkspaceError::Doc(format!("share doc: {e}")))?;
 
@@ -653,11 +681,36 @@ impl Workspace {
         // Spawn the cap-listener on a second Client connection so we
         // don't consume the caller's event stream.
         let shutdown_token = CancellationToken::new();
+        let host_ctx = if let Some(socket) = daemon_socket {
+            let upgrade_client = Client::connect(socket)
+                .await
+                .map_err(|e| WorkspaceError::Iroh(format!("upgrade-client connect: {e}")))?;
+            // The upgrade client needs a session membership on this
+            // connection so the daemon's `Send` handler recognises it.
+            // Re-host with the existing session_id (resume path) to
+            // populate the per-connection memberships map.
+            upgrade_client
+                .request(Request::HostSession {
+                    display_name: String::new(),
+                    session: Some(session_id),
+                })
+                .await
+                .map_err(|e| WorkspaceError::Iroh(format!("upgrade-client host: {e}")))?;
+            Some(HostUpgradeCtx {
+                client: upgrade_client,
+                session: session_id,
+                namespace_secret,
+            })
+        } else {
+            None
+        };
         let cap_listener = spawn_cap_listener_from_socket(
             daemon_socket,
             session_id,
             Arc::clone(&peer_map),
             shutdown_token.child_token(),
+            host_ctx,
+            None,
         )
         .await?;
 
@@ -884,12 +937,18 @@ impl Workspace {
         // reuse it. If a daemon_socket is configured, prefer a
         // dedicated connection so the caller can reuse their client.
         let shutdown_token = CancellationToken::new();
+        let joiner_ctx = Some(JoinerUpgradeCtx {
+            my_peer_id: client.daemon_peer_id(),
+            docs: node.docs.clone(),
+        });
         let cap_listener = if join_daemon_socket.is_some() {
             spawn_cap_listener_from_socket(
                 join_daemon_socket,
                 session,
                 Arc::clone(&peer_map),
                 shutdown_token.child_token(),
+                None,
+                joiner_ctx,
             )
             .await?
         } else {
@@ -898,6 +957,8 @@ impl Workspace {
                 session,
                 Arc::clone(&peer_map),
                 shutdown_token.child_token(),
+                None,
+                joiner_ctx,
             )
         };
 
@@ -1462,6 +1523,30 @@ pub(crate) async fn publish_ticket(
     }
 }
 
+async fn publish_upgrade(
+    client: &Client,
+    session: SessionId,
+    target_peer: PeerId,
+    namespace_secret: [u8; 32],
+) -> Result<(), ClientError> {
+    let payload = postcard::to_allocvec(&UpgradePayload {
+        target_peer,
+        namespace_secret,
+    })
+    .expect("UpgradePayload is infallible to serialize");
+    client
+        .request(Request::Send {
+            session,
+            payload: SendPayload {
+                kind: MessageKind::System,
+                action: UPGRADE_ACTION.to_string(),
+                payload,
+            },
+        })
+        .await?;
+    Ok(())
+}
+
 /// Wait for `iroh-docs` to finish its first reconciliation pass and
 /// download all pending content. Returns when [`LiveEvent::SyncFinished`]
 /// has been observed *and* a subsequent
@@ -1928,11 +2013,27 @@ async fn reconcile_doc_against_disk(
 ///
 /// Returns a no-op handle if `socket` is `None` (the gate still
 /// rejects based on the seed state populated at construction).
+/// Host-side context for delivering `NamespaceSecret` upgrades when a
+/// peer is granted RW. `None` on the joiner side.
+struct HostUpgradeCtx {
+    client: Client,
+    session: SessionId,
+    namespace_secret: [u8; 32],
+}
+
+/// Joiner-side context for receiving `NamespaceSecret` upgrades.
+struct JoinerUpgradeCtx {
+    my_peer_id: PeerId,
+    docs: iroh_docs::protocol::Docs,
+}
+
 async fn spawn_cap_listener_from_socket(
     socket: Option<&Path>,
     session: SessionId,
     peer_map: Arc<PeerMap>,
     cancel: CancellationToken,
+    host_ctx: Option<HostUpgradeCtx>,
+    joiner_ctx: Option<JoinerUpgradeCtx>,
 ) -> Result<tokio::task::JoinHandle<()>, WorkspaceError> {
     let Some(socket) = socket else {
         return Ok(tokio::spawn(async move {
@@ -1960,16 +2061,22 @@ async fn spawn_cap_listener_from_socket(
         .take_events()
         .await
         .ok_or_else(|| WorkspaceError::Iroh("cap-listener: events already taken".into()))?;
-    Ok(spawn_cap_listener(events, session, peer_map, cancel))
+    Ok(spawn_cap_listener(
+        events, session, peer_map, cancel, host_ctx, joiner_ctx,
+    ))
 }
 
 /// Spawn a background task that drains session events into `peer_map`.
 ///
-/// Processes two event types:
+/// Processes three event types:
 /// - `MessageKind::Capability`: applies grant/revoke to the cap-set
 ///   projection so the docs gate starts rejecting revoked peers.
+///   On the host side, an RW grant also triggers delivery of the
+///   `NamespaceSecret` to the promoted peer.
 /// - `MessageKind::System` with `NODE_ID_ACTION`: registers the mapping
 ///   from a joiner's workspace `EndpointId` to their daemon `PeerId`.
+/// - `MessageKind::System` with `UPGRADE_ACTION`: on the joiner side,
+///   imports the `NamespaceSecret` to gain Write capability.
 ///
 /// Runs until `cancel` is triggered (from `Workspace::shutdown`).
 fn spawn_cap_listener(
@@ -1977,6 +2084,8 @@ fn spawn_cap_listener(
     session: SessionId,
     peer_map: Arc<PeerMap>,
     cancel: CancellationToken,
+    host_ctx: Option<HostUpgradeCtx>,
+    joiner_ctx: Option<JoinerUpgradeCtx>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -1998,12 +2107,40 @@ fn spawn_cap_listener(
                                     message.peer.id,
                                     &message.payload,
                                 );
+                                // Host: on RW grant, deliver the
+                                // NamespaceSecret to the promoted peer.
+                                if let Some(ref ctx) = host_ctx
+                                    && let Ok(artel_protocol::capability::CapabilityAction::Grant {
+                                        peer,
+                                        cap: artel_protocol::capability::Capability::ReadWrite,
+                                    }) = artel_protocol::capability::CapabilityAction::decode(&message.payload)
+                                    && let Err(e) = publish_upgrade(
+                                        &ctx.client,
+                                        ctx.session,
+                                        peer,
+                                        ctx.namespace_secret,
+                                    ).await
+                                {
+                                    warn!(?e, ?peer, "upgrade delivery failed");
+                                }
                             }
                             MessageKind::System if message.action == NODE_ID_ACTION => {
                                 if let Ok(bytes) = <[u8; 32]>::try_from(message.payload.as_slice())
                                     && let Ok(workspace_id) = iroh::EndpointId::from_bytes(&bytes)
                                 {
                                     peer_map.register(workspace_id, message.peer.id);
+                                }
+                            }
+                            MessageKind::System if message.action == UPGRADE_ACTION => {
+                                if let Some(ref ctx) = joiner_ctx
+                                    && let Ok(payload) = postcard::from_bytes::<UpgradePayload>(&message.payload)
+                                    && payload.target_peer == ctx.my_peer_id
+                                {
+                                    let secret = iroh_docs::NamespaceSecret::from_bytes(&payload.namespace_secret);
+                                    let cap = iroh_docs::Capability::Write(secret);
+                                    if let Err(e) = ctx.docs.import_namespace(cap).await {
+                                        warn!("workspace.upgrade import_namespace failed: {e}");
+                                    }
                                 }
                             }
                             _ => {}

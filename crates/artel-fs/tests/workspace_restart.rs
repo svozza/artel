@@ -106,7 +106,8 @@ async fn workspace_state_survives_graceful_restart() {
         let alice = Client::connect(&daemon_a.socket).await.unwrap();
         let alice_cfg = WorkspaceConfig::default()
             .with_state_dir(alice_wstate.path().to_path_buf())
-            .with_endpoint_setup(testing_setup(&dns_pkarr));
+            .with_endpoint_setup(testing_setup(&dns_pkarr))
+            .with_daemon_socket(daemon_a.socket.clone());
         let (alice_ws, _alice_ws_events) = Workspace::host_with(
             &alice,
             "alice",
@@ -141,6 +142,7 @@ async fn workspace_state_survives_graceful_restart() {
 
         // Bob joins via the daemon-issued artel ticket.
         let bob = Client::connect(&daemon_b.socket).await.unwrap();
+        let bob_peer_id = bob.daemon_peer_id();
         let resp = bob
             .request(Request::JoinSession {
                 display_name: "bob".into(),
@@ -156,7 +158,8 @@ async fn workspace_state_survives_graceful_restart() {
 
         let bob_cfg = WorkspaceConfig::default()
             .with_state_dir(bob_wstate.path().to_path_buf())
-            .with_endpoint_setup(testing_setup(&dns_pkarr));
+            .with_endpoint_setup(testing_setup(&dns_pkarr))
+            .with_daemon_socket(daemon_b.socket.clone());
         let (bob_ws, _bob_ws_events) = Workspace::join_with(
             &bob,
             session,
@@ -168,6 +171,9 @@ async fn workspace_state_survives_graceful_restart() {
         .expect("Workspace::join_with");
         let bob_ws = Arc::new(bob_ws);
         let bob_handle = Arc::clone(&bob_ws).run().await;
+
+        // Grant Bob RW so he receives the NamespaceSecret needed to write.
+        common::grant_rw(&alice, session, bob_peer_id).await;
 
         // Sanity: a.txt makes it to bob.
         wait_for_file(&bob_root.path().join("a.txt"), b"alpha").await;
@@ -222,7 +228,8 @@ async fn workspace_state_survives_graceful_restart() {
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
     let alice_cfg = WorkspaceConfig::default()
         .with_state_dir(alice_wstate.path().to_path_buf())
-        .with_endpoint_setup(testing_setup(&dns_pkarr));
+        .with_endpoint_setup(testing_setup(&dns_pkarr))
+        .with_daemon_socket(daemon_a.socket.clone());
     let (alice_ws, _alice_ws_events) = Workspace::host_with(
         &alice,
         "alice",
@@ -278,7 +285,8 @@ async fn workspace_state_survives_graceful_restart() {
 
     let bob_cfg = WorkspaceConfig::default()
         .with_state_dir(bob_wstate.path().to_path_buf())
-        .with_endpoint_setup(testing_setup(&dns_pkarr));
+        .with_endpoint_setup(testing_setup(&dns_pkarr))
+        .with_daemon_socket(daemon_b.socket.clone());
     let (bob_ws, _bob_ws_events) = Workspace::join_with(
         &bob,
         session,
@@ -355,7 +363,8 @@ async fn alice_post_restart_writes_reach_bob() {
     let alice = Client::connect(&alice_daemon.socket).await.unwrap();
     let alice_cfg = WorkspaceConfig::default()
         .with_state_dir(alice_wstate.path().to_path_buf())
-        .with_endpoint_setup(testing_setup(&dns_pkarr));
+        .with_endpoint_setup(testing_setup(&dns_pkarr))
+        .with_daemon_socket(alice_daemon.socket.clone());
     let (alice_ws, _alice_ws_events) = Workspace::host_with(
         &alice,
         "alice",
@@ -385,6 +394,7 @@ async fn alice_post_restart_writes_reach_bob() {
     let alice_handle = Arc::clone(&alice_ws).run().await;
 
     let bob = Client::connect(&bob_daemon.socket).await.unwrap();
+    let bob_peer_id = bob.daemon_peer_id();
     let resp = bob
         .request(Request::JoinSession {
             display_name: "bob".into(),
@@ -400,7 +410,8 @@ async fn alice_post_restart_writes_reach_bob() {
 
     let bob_cfg = WorkspaceConfig::default()
         .with_state_dir(bob_wstate.path().to_path_buf())
-        .with_endpoint_setup(testing_setup(&dns_pkarr));
+        .with_endpoint_setup(testing_setup(&dns_pkarr))
+        .with_daemon_socket(bob_daemon.socket.clone());
     let (bob_ws, _bob_ws_events) = Workspace::join_with(
         &bob,
         session,
@@ -412,6 +423,9 @@ async fn alice_post_restart_writes_reach_bob() {
     .expect("Workspace::join_with");
     let bob_ws = Arc::new(bob_ws);
     let bob_handle = Arc::clone(&bob_ws).run().await;
+
+    // Grant Bob RW so he receives the NamespaceSecret needed to write.
+    common::grant_rw(&alice, session, bob_peer_id).await;
 
     // Pre-restart bidirectional sanity.
     tokio::fs::write(alice_root.path().join("pre_alice.txt"), b"alpha")
@@ -437,7 +451,8 @@ async fn alice_post_restart_writes_reach_bob() {
     let alice = Client::connect(&alice_daemon.socket).await.unwrap();
     let alice_cfg = WorkspaceConfig::default()
         .with_state_dir(alice_wstate.path().to_path_buf())
-        .with_endpoint_setup(testing_setup(&dns_pkarr));
+        .with_endpoint_setup(testing_setup(&dns_pkarr))
+        .with_daemon_socket(alice_daemon.socket.clone());
     let (alice_ws, _alice_ws_events) = Workspace::host_with(
         &alice,
         "alice",

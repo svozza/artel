@@ -41,7 +41,7 @@ use crate::store::{DynStore, SessionKind, SessionRecord, StoredAttachment};
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
 /// Action string for the FS-layer upgrade message that delivers the
-/// NamespaceSecret to RW joiners. Excluded from replay so future
+/// `NamespaceSecret` to RW joiners. Excluded from replay so future
 /// Read-only joiners never see the secret.
 const UPGRADE_ACTION: &str = "workspace.upgrade";
 

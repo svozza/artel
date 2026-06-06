@@ -688,7 +688,9 @@ async fn round_trip_once(run: usize) {
         "alice",
         alice_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
-        WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
+        WorkspaceConfig::default()
+            .with_endpoint_setup(testing_setup(&dns_pkarr))
+            .with_daemon_socket(daemon_a.socket.clone()),
     )
     .await
     .expect("Workspace::host");
@@ -702,6 +704,7 @@ async fn round_trip_once(run: usize) {
 
     // Bob on daemon B joins, then mounts a workspace.
     let bob = Client::connect(&daemon_b.socket).await.unwrap();
+    let bob_peer_id = bob.daemon_peer_id();
     let resp = bob
         .request(Request::JoinSession {
             display_name: "bob".into(),
@@ -717,15 +720,18 @@ async fn round_trip_once(run: usize) {
         session,
         bob_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
-        WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
+        WorkspaceConfig::default()
+            .with_endpoint_setup(testing_setup(&dns_pkarr))
+            .with_daemon_socket(daemon_b.socket.clone()),
     )
     .await
     .expect("Workspace::join");
     let bob_ws = Arc::new(bob_ws);
     let bob_handle = Arc::clone(&bob_ws).run().await;
 
-    // No settling delay needed — `Workspace::run().await` only
-    // resolves once the OS-level filesystem watch is attached.
+    // Grant Bob RW so the upgrade delivery gives him the
+    // NamespaceSecret needed to produce valid signed entries.
+    common::grant_rw(&alice, session, bob_peer_id).await;
 
     // 1. Alice writes a.txt → Bob sees it.
     let alice_a = alice_dir.path().join("a.txt");

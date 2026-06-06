@@ -26,9 +26,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use artel_client::Client;
 use artel_daemon::shutdown::Shutdown;
 use artel_daemon::{Daemon, DaemonConfig, EndpointSetup as DaemonEndpointSetup};
 use artel_fs::EndpointSetup as FsEndpointSetup;
+use artel_protocol::capability::{Capability, CapabilityAction};
+use artel_protocol::{MessageKind, PeerId, Request, Response, SendPayload, SessionId};
 use futures_util::StreamExt;
 use iroh::test_utils::DnsPkarrServer;
 use iroh_docs::api::Doc;
@@ -408,4 +411,28 @@ pub async fn wait_for_endpoint(dns_pkarr: &DnsPkarrServer, endpoint_id: &iroh::E
         .on_endpoint(endpoint_id, PKARR_READY_TIMEOUT)
         .await
         .expect("endpoint pkarr-published in time");
+}
+
+/// Grant RW capability to `target_peer` and wait for the upgrade
+/// delivery to propagate. Tests that need a joiner to write must
+/// call this after the joiner has connected — the Read-only ticket
+/// no longer includes the `NamespaceSecret`.
+pub async fn grant_rw(client: &Client, session: SessionId, target_peer: PeerId) {
+    let grant = CapabilityAction::Grant {
+        peer: target_peer,
+        cap: Capability::ReadWrite,
+    };
+    let resp = client
+        .request(Request::Send {
+            session,
+            payload: SendPayload {
+                kind: MessageKind::Capability,
+                action: grant.action_str().to_string(),
+                payload: grant.encode(),
+            },
+        })
+        .await
+        .unwrap();
+    assert!(matches!(resp, Response::Sent { .. }), "{resp:?}");
+    sleep(Duration::from_secs(2)).await;
 }
