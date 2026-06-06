@@ -616,7 +616,9 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
 
     // Phase 1: alice hosts, bob joins, exchange one file each way.
     let alice = Client::connect(&alice_daemon.socket).await.unwrap();
-    let alice_cfg = WorkspaceConfig::default().with_state_dir(alice_wstate.path().to_path_buf());
+    let alice_cfg = WorkspaceConfig::default()
+        .with_state_dir(alice_wstate.path().to_path_buf())
+        .with_daemon_socket(alice_daemon.socket.clone());
     let (alice_ws, _alice_ws_events) = phase(
         "alice Workspace::host_with (phase 1)",
         Workspace::host_with(
@@ -653,6 +655,7 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
     let alice_handle = Arc::clone(&alice_ws).run().await;
 
     let bob = Client::connect(&bob_daemon.socket).await.unwrap();
+    let bob_peer_id = bob.daemon_peer_id();
     let resp = phase(
         "bob JoinSession over IPC (gossip subscribe + JOIN_READY)",
         bob.request(Request::JoinSession {
@@ -668,7 +671,9 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
     };
     assert_eq!(bob_session, session, "joiner must land on same session id");
 
-    let bob_cfg = WorkspaceConfig::default().with_state_dir(bob_wstate.path().to_path_buf());
+    let bob_cfg = WorkspaceConfig::default()
+        .with_state_dir(bob_wstate.path().to_path_buf())
+        .with_daemon_socket(bob_daemon.socket.clone());
     let (bob_ws, _bob_ws_events) = phase(
         "bob Workspace::join_with (doc import + bulk_export)",
         Workspace::join_with(
@@ -683,6 +688,10 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
     .expect("Workspace::join_with");
     let bob_ws = Arc::new(bob_ws);
     let bob_handle = Arc::clone(&bob_ws).run().await;
+
+    // Grant Bob RW so he receives the NamespaceSecret via the upgrade
+    // path and can produce valid signed entries.
+    common::grant_rw(&alice, session, bob_peer_id).await;
 
     tokio::fs::write(alice_root.path().join("pre_alice.txt"), b"alpha")
         .await
@@ -719,7 +728,9 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
     )
     .await;
     let alice = Client::connect(&alice_daemon.socket).await.unwrap();
-    let alice_cfg = WorkspaceConfig::default().with_state_dir(alice_wstate.path().to_path_buf());
+    let alice_cfg = WorkspaceConfig::default()
+        .with_state_dir(alice_wstate.path().to_path_buf())
+        .with_daemon_socket(alice_daemon.socket.clone());
     let (alice_ws, _alice_ws_events) = phase(
         "alice Workspace::host_with (phase 2 — post-restart)",
         Workspace::host_with(
