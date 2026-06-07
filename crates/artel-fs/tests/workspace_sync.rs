@@ -560,6 +560,132 @@ async fn join_with_no_timeout_stays_pending_when_no_ticket_published() {
 }
 
 // =============================================================
+// A Read-only joiner's writes must NOT propagate to the host.
+//
+// Bob joins without receiving a `grant_rw`, so he never receives the
+// NamespaceSecret needed to produce valid signed entries. Even though
+// his local watcher sees the file and attempts to set_bytes, the doc
+// layer cannot produce a valid entry and the host never observes it.
+//
+// Sentinel approach: after Bob writes his file, Alice writes a second
+// file. Once Bob sees Alice's second file (proving the sync pipeline
+// is healthy), we assert Bob's file never reached Alice — no fixed
+// sleep needed.
+// =============================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn read_only_joiner_write_does_not_propagate() {
+    let Pair {
+        daemon_a,
+        daemon_b,
+        dns_pkarr,
+    } = spawn_pair().await;
+
+    // Alice hosts.
+    let alice = Client::connect(&daemon_a.socket).await.unwrap();
+    let alice_dir = tempfile::tempdir().unwrap();
+    let (alice_ws, _) = Workspace::host_with(
+        &alice,
+        "alice",
+        alice_dir.path().to_path_buf(),
+        AttachPolicy::RequireEmpty,
+        WorkspaceConfig::default()
+            .with_endpoint_setup(testing_setup(&dns_pkarr))
+            .with_daemon_socket(daemon_a.socket.clone()),
+    )
+    .await
+    .expect("Workspace::host");
+    let session = alice_ws.session_id();
+    let alice_ws = Arc::new(alice_ws);
+    let alice_handle = Arc::clone(&alice_ws).run().await;
+
+    // Issue a Read-only ticket for Bob so his daemon-level cap is
+    // Read (no auto-grant of RW, no upgrade delivery).
+    use artel_protocol::capability::Capability;
+    let issue_resp = alice
+        .request(Request::IssueTicket {
+            session,
+            granted_cap: Capability::Read,
+            expiry_ms: 0,
+        })
+        .await
+        .unwrap();
+    let read_ticket = match issue_resp {
+        Response::IssuedTicket { ticket: t } => t,
+        other => panic!("expected IssuedTicket, got {other:?}"),
+    };
+
+    // Bob joins with the Read-only ticket.
+    let bob = Client::connect(&daemon_b.socket).await.unwrap();
+    let resp = bob
+        .request(Request::JoinSession {
+            display_name: "bob".into(),
+            ticket: read_ticket,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(resp, Response::JoinSession { .. }), "{resp:?}");
+
+    let bob_dir = tempfile::tempdir().unwrap();
+    let (bob_ws, _) = Workspace::join_with(
+        &bob,
+        session,
+        bob_dir.path().to_path_buf(),
+        AttachPolicy::RequireEmpty,
+        WorkspaceConfig::default()
+            .with_endpoint_setup(testing_setup(&dns_pkarr))
+            .with_daemon_socket(daemon_b.socket.clone()),
+    )
+    .await
+    .expect("Workspace::join");
+    let bob_ws = Arc::new(bob_ws);
+    let bob_handle = Arc::clone(&bob_ws).run().await;
+
+    // Step 1: Alice writes a file → Bob should see it (Read syncs
+    // inbound).
+    let alice_first = alice_dir.path().join("from_alice.txt");
+    tokio::fs::write(&alice_first, b"hello from alice")
+        .await
+        .unwrap();
+    common::wait_for_file(&bob_dir.path().join("from_alice.txt"), b"hello from alice").await;
+
+    // Step 2: Bob writes a file locally. Without the NamespaceSecret
+    // this cannot produce a valid signed entry.
+    let bob_file = bob_dir.path().join("from_bob.txt");
+    tokio::fs::write(&bob_file, b"hello from bob")
+        .await
+        .unwrap();
+
+    // Step 3: Alice writes a second sentinel file. Once Bob sees it,
+    // the full pipeline has flushed; if Bob's file were going to
+    // propagate, it would have arrived by then.
+    sleep(Duration::from_secs(1)).await; // let Bob's watcher fire first
+    let alice_sentinel = alice_dir.path().join("sentinel.txt");
+    tokio::fs::write(&alice_sentinel, b"sentinel")
+        .await
+        .unwrap();
+    common::wait_for_file(&bob_dir.path().join("sentinel.txt"), b"sentinel").await;
+
+    // Step 4: Assert Alice does NOT have Bob's file.
+    let leaked = tokio::fs::try_exists(alice_dir.path().join("from_bob.txt"))
+        .await
+        .unwrap_or(false);
+    assert!(
+        !leaked,
+        "Read-only joiner's write propagated to host — capability enforcement broken",
+    );
+
+    alice_ws.shutdown().await.expect("shutdown");
+    bob_ws.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), alice_handle).await;
+    let _ = timeout(Duration::from_secs(5), bob_handle).await;
+    drop(alice);
+    drop(bob);
+    daemon_a.stop().await;
+    daemon_b.stop().await;
+}
+
+// =============================================================
 // A live edit on the host's filesystem propagates to the joiner via
 // the watcher → doc → applier pipeline.
 //
