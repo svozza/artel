@@ -108,13 +108,30 @@ fn build_config(args: &Args) -> Result<DaemonConfig, String> {
     // route anything.
     let iroh_key_path = state_dir.join("iroh.key");
 
+    #[cfg(feature = "iroh")]
+    let endpoint_setup = {
+        #[cfg(feature = "test-utils")]
+        {
+            if let Ok(url) = std::env::var("ARTEL_RELAY_URL") {
+                let relay_url = url.parse().expect("ARTEL_RELAY_URL invalid");
+                artel_daemon::EndpointSetup::ProductionCustomRelay { relay_url }
+            } else {
+                artel_daemon::EndpointSetup::default()
+            }
+        }
+        #[cfg(not(feature = "test-utils"))]
+        {
+            artel_daemon::EndpointSetup::default()
+        }
+    };
+
     Ok(DaemonConfig {
         socket_path,
         pid_path,
         sessions_dir,
         iroh_key_path: Some(iroh_key_path),
         #[cfg(feature = "iroh")]
-        endpoint_setup: artel_daemon::EndpointSetup::default(),
+        endpoint_setup,
         #[cfg(not(feature = "iroh"))]
         endpoint_setup: (),
     })

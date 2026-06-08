@@ -39,6 +39,15 @@ pub enum EndpointSetup {
     /// instead of hanging. Mirrors `artel_fs::EndpointSetup`.
     #[cfg(feature = "test-utils")]
     TestingUnreachableRelay,
+    /// Production with a custom relay URL: uses N0's DNS/pkarr infra
+    /// but overrides the relay to a caller-supplied URL and skips TLS
+    /// cert verification. Used by binary-spawn tests to point the
+    /// daemon subprocess at a localhost relay with self-signed certs.
+    #[cfg(feature = "test-utils")]
+    ProductionCustomRelay {
+        /// The relay URL to use instead of n0's default.
+        relay_url: iroh::RelayUrl,
+    },
 }
 
 impl std::fmt::Debug for EndpointSetup {
@@ -49,6 +58,10 @@ impl std::fmt::Debug for EndpointSetup {
             Self::Testing { .. } => f.write_str("EndpointSetup::Testing { dns_pkarr: <..> }"),
             #[cfg(feature = "test-utils")]
             Self::TestingUnreachableRelay => f.write_str("EndpointSetup::TestingUnreachableRelay"),
+            #[cfg(feature = "test-utils")]
+            Self::ProductionCustomRelay { relay_url } => {
+                write!(f, "EndpointSetup::ProductionCustomRelay {{ {relay_url} }}")
+            }
         }
     }
 }
@@ -88,6 +101,13 @@ impl EndpointSetup {
                     .expect("static RFC 5737 TEST-NET-1 url parses");
                 builder.relay_mode(iroh::RelayMode::custom([url]))
             }
+            #[cfg(feature = "test-utils")]
+            Self::ProductionCustomRelay { relay_url } => {
+                let builder = iroh::endpoint::presets::N0.apply(builder);
+                builder
+                    .relay_mode(iroh::RelayMode::custom([relay_url.clone()]))
+                    .ca_roots_config(iroh::tls::CaRootsConfig::insecure_skip_verify())
+            }
         }
     }
 
@@ -104,6 +124,8 @@ impl EndpointSetup {
             Self::Testing { .. } => false,
             #[cfg(feature = "test-utils")]
             Self::TestingUnreachableRelay => true,
+            #[cfg(feature = "test-utils")]
+            Self::ProductionCustomRelay { .. } => true,
         }
     }
 }
