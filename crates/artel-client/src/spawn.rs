@@ -73,6 +73,8 @@ pub struct SpawnOptions {
     /// `--socket` and `--state-dir`-equivalent flags via `socket_path`
     /// and `pid_path`; these args are appended after.
     pub extra_args: Vec<String>,
+    /// Extra environment variables passed to the spawned daemon process.
+    pub extra_envs: Vec<(String, String)>,
     /// How long to wait for the daemon to come up after spawn.
     pub spawn_timeout: Duration,
 }
@@ -91,6 +93,7 @@ impl SpawnOptions {
             pid_path: pid_path.into(),
             daemon_binary: daemon_binary.into(),
             extra_args: Vec::new(),
+            extra_envs: Vec::new(),
             spawn_timeout: DEFAULT_SPAWN_TIMEOUT,
         }
     }
@@ -103,6 +106,21 @@ impl SpawnOptions {
         S: Into<String>,
     {
         self.extra_args = args.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Replace [`Self::extra_envs`].
+    #[must_use]
+    pub fn with_envs<I, K, V>(mut self, envs: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.extra_envs = envs
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect();
         self
     }
 
@@ -247,6 +265,8 @@ fn spawn_detached(opts: &SpawnOptions) -> Result<(), ClientError> {
     for a in &opts.extra_args {
         cmd.arg(a);
     }
+
+    cmd.envs(opts.extra_envs.iter().map(|(k, v)| (k, v)));
 
     debug!(
         binary = %opts.daemon_binary.display(),
