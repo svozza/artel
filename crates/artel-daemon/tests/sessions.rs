@@ -31,10 +31,12 @@ use artel_protocol::{
     Response, SendPayload, Seq, SessionId, WireMessage,
 };
 use futures_util::{SinkExt, StreamExt};
+use iroh_relay::server::Server as RelayServer;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
+use tokio::sync::OnceCell;
 use tokio::time::{sleep, timeout};
 
 async fn next_event(events: &mut EventStream) -> Event {
@@ -42,6 +44,24 @@ async fn next_event(events: &mut EventStream) -> Event {
         .await
         .expect("timed out waiting for event")
         .expect("event channel closed")
+}
+
+/// Per-binary shared localhost relay server. Keeps the `RelayServer`
+/// alive for the test binary's lifetime; all binary-spawn tests reuse
+/// the same relay URL so the spawned daemon subprocess can reach a
+/// relay without touching n0's public TLS-fronted infra.
+static SHARED_RELAY: OnceCell<(RelayServer, String)> = OnceCell::const_new();
+
+async fn shared_relay_url() -> &'static str {
+    &SHARED_RELAY
+        .get_or_init(|| async {
+            let (_relay_map, relay_url, server) = iroh::test_utils::run_relay_server()
+                .await
+                .expect("run_relay_server for binary-spawn tests");
+            (server, relay_url.to_string())
+        })
+        .await
+        .1
 }
 
 /// Allocate a fresh temp dir + the [`common::RestartState`] paths
@@ -149,7 +169,8 @@ async fn sigterm_pidfile(pid_path: &Path) -> std::io::Result<()> {
 #[tokio::test]
 async fn happy_path_cold_dir_spawns_daemon() {
     let (tempdir, socket, pid_path) = fresh_paths();
-    let opts = SpawnOptions::new(&socket, &pid_path, daemon_binary());
+    let opts = SpawnOptions::new(&socket, &pid_path, daemon_binary())
+        .with_envs([("ARTEL_RELAY_URL", shared_relay_url().await)]);
     let client = Client::connect_or_spawn(opts).await.unwrap();
     // Daemon answered Hello.
     assert!(client.daemon_version().get() > 0);
@@ -167,13 +188,20 @@ async fn happy_path_cold_dir_spawns_daemon() {
 #[tokio::test]
 async fn second_call_reuses_existing_daemon() {
     let (tempdir, socket, pid_path) = fresh_paths();
-    let first = Client::connect_or_spawn(SpawnOptions::new(&socket, &pid_path, daemon_binary()))
-        .await
-        .unwrap();
+    let relay_url = shared_relay_url().await;
+    let first = Client::connect_or_spawn(
+        SpawnOptions::new(&socket, &pid_path, daemon_binary())
+            .with_envs([("ARTEL_RELAY_URL", relay_url)]),
+    )
+    .await
+    .unwrap();
     let pid_after_first = std::fs::read_to_string(&pid_path).unwrap();
-    let second = Client::connect_or_spawn(SpawnOptions::new(&socket, &pid_path, daemon_binary()))
-        .await
-        .unwrap();
+    let second = Client::connect_or_spawn(
+        SpawnOptions::new(&socket, &pid_path, daemon_binary())
+            .with_envs([("ARTEL_RELAY_URL", relay_url)]),
+    )
+    .await
+    .unwrap();
     let pid_after_second = std::fs::read_to_string(&pid_path).unwrap();
     assert_eq!(
         pid_after_first.trim(),
@@ -201,9 +229,12 @@ async fn stale_pid_file_is_recovered() {
     throwaway.wait().unwrap();
     std::fs::write(&pid_path, format!("{dead_pid}\n")).unwrap();
 
-    let client = Client::connect_or_spawn(SpawnOptions::new(&socket, &pid_path, daemon_binary()))
-        .await
-        .unwrap();
+    let client = Client::connect_or_spawn(
+        SpawnOptions::new(&socket, &pid_path, daemon_binary())
+            .with_envs([("ARTEL_RELAY_URL", shared_relay_url().await)]),
+    )
+    .await
+    .unwrap();
     let new_pid = std::fs::read_to_string(&pid_path).unwrap();
     assert_ne!(
         new_pid.trim(),
@@ -227,9 +258,12 @@ async fn stale_socket_file_is_recovered() {
     let (tempdir, socket, pid_path) = fresh_paths();
     std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
     std::fs::write(&socket, b"junk").unwrap();
-    let client = Client::connect_or_spawn(SpawnOptions::new(&socket, &pid_path, daemon_binary()))
-        .await
-        .unwrap();
+    let client = Client::connect_or_spawn(
+        SpawnOptions::new(&socket, &pid_path, daemon_binary())
+            .with_envs([("ARTEL_RELAY_URL", shared_relay_url().await)]),
+    )
+    .await
+    .unwrap();
     drop(client);
     AutoSpawned {
         _tempdir: tempdir,
@@ -245,8 +279,11 @@ async fn parallel_calls_settle_on_one_daemon() {
     // contention means only one survives. Both clients connect to the
     // survivor and see the same peer id.
     let (tempdir, socket, pid_path) = fresh_paths();
-    let opts_a = SpawnOptions::new(&socket, &pid_path, daemon_binary());
-    let opts_b = SpawnOptions::new(&socket, &pid_path, daemon_binary());
+    let relay_url = shared_relay_url().await;
+    let opts_a = SpawnOptions::new(&socket, &pid_path, daemon_binary())
+        .with_envs([("ARTEL_RELAY_URL", relay_url)]);
+    let opts_b = SpawnOptions::new(&socket, &pid_path, daemon_binary())
+        .with_envs([("ARTEL_RELAY_URL", relay_url)]);
 
     let (a, b) = tokio::join!(
         Client::connect_or_spawn(opts_a),
@@ -280,9 +317,12 @@ async fn parallel_calls_settle_on_one_daemon() {
 async fn missing_daemon_binary_yields_launch_error() {
     let (tempdir, socket, pid_path) = fresh_paths();
     let bogus = tempdir.path().join("does-not-exist");
-    let err = Client::connect_or_spawn(SpawnOptions::new(&socket, &pid_path, &bogus))
-        .await
-        .unwrap_err();
+    let err = Client::connect_or_spawn(
+        SpawnOptions::new(&socket, &pid_path, &bogus)
+            .with_envs([("ARTEL_RELAY_URL", shared_relay_url().await)]),
+    )
+    .await
+    .unwrap_err();
     match err {
         ClientError::Spawn(SpawnError::Launch { path, .. }) => {
             assert_eq!(path, bogus);
@@ -304,6 +344,7 @@ async fn live_pid_no_socket_waits_for_socket_then_times_out() {
     std::fs::write(&pid_path, format!("{}\n", std::process::id())).unwrap();
 
     let opts = SpawnOptions::new(&socket, &pid_path, daemon_binary())
+        .with_envs([("ARTEL_RELAY_URL", shared_relay_url().await)])
         .with_spawn_timeout(Duration::from_millis(200));
     let err = Client::connect_or_spawn(opts).await.unwrap_err();
     match err {

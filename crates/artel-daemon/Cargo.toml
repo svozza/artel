@@ -46,6 +46,7 @@ artel-daemon = { path = ".", features = ["test-utils"] }
 bytes = { workspace = true }
 iroh = { workspace = true, features = ["test-utils"] }
 iroh-gossip = { workspace = true }
+iroh-relay = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "time"] }
