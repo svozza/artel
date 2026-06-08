@@ -35,6 +35,7 @@ pub mod signing;
 pub mod ticket;
 #[cfg(feature = "tokio")]
 pub mod transport;
+pub mod upgrade;
 pub mod version;
 
 pub use capability::{ACTION_GRANT, ACTION_REVOKE, Capability, CapabilityAction};
@@ -49,4 +50,5 @@ pub use rpc::{
     SignedSendPayload, WireMessage,
 };
 pub use ticket::{SessionTicket, TICKET_PREFIX, TICKET_VERSION, TicketError, WireEndpointAddr};
+pub use upgrade::{UPGRADE_ACK, UPGRADE_ALPN, UpgradeFrame};
 pub use version::{PROTOCOL_VERSION, ProtocolVersion, VersionMismatch};

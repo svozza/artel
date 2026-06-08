@@ -241,6 +241,23 @@ pub enum Request {
         /// Ticket expiry in milliseconds since epoch (0 = no expiry).
         expiry_ms: u64,
     },
+
+    /// Deliver the `NamespaceSecret` directly to a target peer via a
+    /// dedicated QUIC stream. Only the host of a `SessionKind::Local`
+    /// session may call this.
+    ///
+    /// The daemon opens a direct stream to the target peer using
+    /// [`crate::upgrade::UPGRADE_ALPN`], sends the secret, and waits
+    /// for an ACK. Returns [`Response::UpgradeDelivered`] on success.
+    DeliverUpgrade {
+        /// Session the upgrade applies to.
+        session: SessionId,
+        /// Peer to deliver the secret to.
+        target_peer: PeerId,
+        /// The 32-byte namespace secret.
+        #[serde(with = "serde_bytes")]
+        namespace_secret: [u8; 32],
+    },
 }
 
 /// Fields of a [`Request::Send`] that the client supplies.
@@ -392,6 +409,10 @@ pub enum Response {
         /// The newly minted ticket.
         ticket: JoinTicket,
     },
+
+    /// Reply to [`Request::DeliverUpgrade`]. Confirms the target peer
+    /// received and acknowledged the namespace secret.
+    UpgradeDelivered,
 
     /// Any request may produce this in place of its expected variant.
     Error {
@@ -649,6 +670,32 @@ mod tests {
         let bytes = postcard::to_allocvec(&req).unwrap();
         let back: Request = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(req, back);
+    }
+
+    #[test]
+    fn deliver_upgrade_request_round_trip() {
+        let req = Request::DeliverUpgrade {
+            session: SessionId::from_bytes([0xab; 16]),
+            target_peer: PeerId::from_bytes([0xcd; 32]),
+            namespace_secret: [0x42; 32],
+        };
+        let bytes = postcard::to_allocvec(&req).unwrap();
+        let back: Request = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(req, back);
+
+        let json = serde_json::to_string(&req).unwrap();
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn upgrade_delivered_response_round_trip() {
+        let resp = Response::UpgradeDelivered;
+        let bytes = postcard::to_allocvec(&resp).unwrap();
+        let back: Response = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(resp, back);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(json, "\"upgrade_delivered\"");
     }
 
     #[test]
@@ -1037,6 +1084,13 @@ mod tests {
                         crate::capability::Capability::Read
                     },
                     expiry_ms,
+                },
+            ),
+            (any::<[u8; 16]>(), any::<[u8; 32]>(), any::<[u8; 32]>()).prop_map(
+                |(s, peer, secret)| Request::DeliverUpgrade {
+                    session: SessionId::from_bytes(s),
+                    target_peer: PeerId::from_bytes(peer),
+                    namespace_secret: secret,
                 },
             ),
         ]

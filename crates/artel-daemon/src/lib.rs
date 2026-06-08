@@ -17,6 +17,8 @@ pub mod server;
 pub mod session;
 pub mod shutdown;
 pub(crate) mod store;
+#[cfg(feature = "iroh")]
+pub(crate) mod upgrade_protocol;
 
 #[cfg(feature = "iroh")]
 pub use endpoint_setup::EndpointSetup;

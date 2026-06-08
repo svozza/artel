@@ -470,6 +470,12 @@ pub struct Registry {
     /// *not* silently treated as "signed".
     #[cfg(feature = "iroh")]
     signing_key: Option<Arc<iroh::SecretKey>>,
+    /// The daemon's iroh `Endpoint`, needed by the direct-stream
+    /// upgrade delivery path (`DeliverUpgrade`) to dial target peers.
+    /// `None` only for unit tests that don't wire up a full iroh
+    /// runtime.
+    #[cfg(feature = "iroh")]
+    endpoint: Option<iroh::Endpoint>,
 }
 
 /// Where the body handed to [`Registry::send`] was authored.
@@ -528,6 +534,8 @@ impl Registry {
             bridge: None,
             #[cfg(feature = "iroh")]
             signing_key: None,
+            #[cfg(feature = "iroh")]
+            endpoint: None,
         }
     }
 
@@ -550,6 +558,7 @@ impl Registry {
             store,
             bridge: None,
             signing_key: Some(signing_key),
+            endpoint: None,
         }
     }
 
@@ -561,6 +570,7 @@ impl Registry {
         store: DynStore,
         #[cfg(feature = "iroh")] bridge: Option<Arc<crate::gossip_bridge::GossipBridge>>,
         #[cfg(feature = "iroh")] signing_key: Option<Arc<iroh::SecretKey>>,
+        #[cfg(feature = "iroh")] endpoint: Option<iroh::Endpoint>,
     ) -> std::io::Result<Self> {
         let records = store.load_all().await?;
         let mut sessions = HashMap::with_capacity(records.len());
@@ -577,6 +587,8 @@ impl Registry {
             bridge,
             #[cfg(feature = "iroh")]
             signing_key,
+            #[cfg(feature = "iroh")]
+            endpoint,
         })
     }
 
@@ -584,6 +596,24 @@ impl Registry {
     #[must_use]
     pub const fn daemon_peer_id(&self) -> PeerId {
         self.daemon_peer_id
+    }
+
+    /// Returns `Some(true)` if the session exists and is `Local` (we
+    /// are the host), `Some(false)` if it exists but is `Remote`, or
+    /// `None` if the session is unknown.
+    pub(crate) async fn is_local_session(&self, session: SessionId) -> Option<bool> {
+        let guard = self.sessions.read().await;
+        let session_arc = guard.get(&session)?.clone();
+        drop(guard);
+        let s = session_arc.lock().await;
+        Some(s.kind == SessionKind::Local)
+    }
+
+    /// Borrow the iroh `Endpoint` (if wired). Used by the
+    /// `DeliverUpgrade` dispatch to dial target peers.
+    #[cfg(feature = "iroh")]
+    pub(crate) const fn endpoint(&self) -> Option<&iroh::Endpoint> {
+        self.endpoint.as_ref()
     }
 
     /// Host or resume a session. Returns the session's id and a
@@ -1785,6 +1815,81 @@ impl Registry {
         drop(s);
         Ok(Subscription { replay, events })
     }
+
+    /// Emit a synthetic upgrade event into a session's broadcast channel.
+    ///
+    /// Called by [`crate::upgrade_protocol::UpgradeProtocol`] when the
+    /// host delivers a `NamespaceSecret` over a direct stream. The
+    /// synthetic event has `kind: System`, `action: UPGRADE_ACTION`, and
+    /// a postcard-encoded payload matching the `UpgradePayload` shape
+    /// that `artel-fs`'s `cap_listener` already processes.
+    ///
+    /// Validates:
+    /// - Session exists locally.
+    /// - Session is `Remote` (we are a joiner, not the host).
+    /// - `sender_peer` matches the session's host.
+    #[cfg(feature = "iroh")]
+    #[allow(dead_code)] // Called by UpgradeProtocol; wired in Phase 4.
+    pub(crate) async fn emit_upgrade(
+        &self,
+        session: SessionId,
+        sender_peer: PeerId,
+        namespace_secret: [u8; 32],
+    ) -> Result<(), SessionError> {
+        #[derive(serde::Serialize)]
+        struct UpgradePayload {
+            target_peer: PeerId,
+            namespace_secret: [u8; 32],
+        }
+
+        let session_arc = {
+            let guard = self.sessions.read().await;
+            guard
+                .get(&session)
+                .cloned()
+                .ok_or(SessionError::UnknownSession(session))?
+        };
+
+        let s = session_arc.lock().await;
+
+        // Only joiners (Remote sessions) should accept upgrades.
+        if s.kind != SessionKind::Remote {
+            return Err(SessionError::NotHost);
+        }
+
+        // The sender must be the session's host.
+        if sender_peer != s.host {
+            return Err(SessionError::Internal(format!(
+                "upgrade sender {sender_peer} is not the session host {}",
+                s.host,
+            )));
+        }
+
+        let payload = postcard::to_allocvec(&UpgradePayload {
+            target_peer: self.daemon_peer_id,
+            namespace_secret,
+        })
+        .expect("UpgradePayload is infallible to serialize");
+
+        let message = SessionMessage::new(
+            Seq::ZERO,
+            0,
+            PeerInfo::new(s.host, "host"),
+            MessageKind::System,
+            UPGRADE_ACTION,
+            payload,
+            SIGNATURE_UNSIGNED,
+            SIGNATURE_UNSIGNED,
+        );
+
+        let events_tx = s.events_tx.clone();
+        drop(s);
+
+        // Best-effort: if no subscribers are listening, that's fine.
+        let _ = events_tx.send(Event::Message { session, message });
+
+        Ok(())
+    }
 }
 
 /// Parse an artel join ticket. Phase 2b: returns the session id; the
@@ -2059,6 +2164,8 @@ mod tests {
             None,
             #[cfg(feature = "iroh")]
             None,
+            #[cfg(feature = "iroh")]
+            None,
         )
         .await
         .unwrap();
@@ -2111,6 +2218,8 @@ mod tests {
             None,
             #[cfg(feature = "iroh")]
             None,
+            #[cfg(feature = "iroh")]
+            None,
         )
         .await
         .unwrap();
@@ -2148,6 +2257,8 @@ mod tests {
             daemon_peer,
             WireEndpointAddr::id_only(daemon_peer),
             store,
+            #[cfg(feature = "iroh")]
+            None,
             #[cfg(feature = "iroh")]
             None,
             #[cfg(feature = "iroh")]
@@ -2803,6 +2914,7 @@ mod tests {
             Arc::clone(&store),
             None,
             Some(Arc::clone(&secret)),
+            None,
         )
         .await
         .unwrap();
@@ -3062,6 +3174,7 @@ mod tests {
             Arc::clone(&store),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3259,6 +3372,7 @@ mod tests {
             Arc::clone(&store),
             None,
             Some(secret),
+            None,
         )
         .await
         .unwrap();
@@ -3784,6 +3898,8 @@ mod tests {
             None,
             #[cfg(feature = "iroh")]
             None,
+            #[cfg(feature = "iroh")]
+            None,
         )
         .await
         .unwrap();
@@ -3842,6 +3958,7 @@ mod tests {
             daemon_peer,
             WireEndpointAddr::id_only(daemon_peer),
             store.clone(),
+            None,
             None,
             None,
         )
@@ -4111,6 +4228,7 @@ mod tests {
             store.clone(),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -4150,6 +4268,7 @@ mod tests {
             daemon_peer,
             WireEndpointAddr::id_only(daemon_peer),
             store.clone(),
+            None,
             None,
             None,
         )

@@ -288,6 +288,8 @@ impl Daemon {
                 Some(Arc::clone(&bridge)),
                 #[cfg(feature = "iroh")]
                 Some(iroh.signing_key()),
+                #[cfg(feature = "iroh")]
+                Some(iroh.endpoint.clone()),
             )
             .await
             .map_err(StartError::LoadSessions)?,
@@ -563,6 +565,7 @@ async fn serve_connection(
 }
 
 /// Dispatch a non-Hello request to the registry.
+#[allow(clippy::too_many_lines)]
 async fn dispatch(
     registry: &Registry,
     request: Request,
@@ -669,6 +672,25 @@ async fn dispatch(
                 },
             }
         }
+        #[cfg(feature = "iroh")]
+        Request::DeliverUpgrade {
+            session,
+            target_peer,
+            namespace_secret,
+        } => {
+            if !memberships.contains_key(&session) {
+                return Response::Error {
+                    error: ProtocolError::NotSubscribed(session),
+                };
+            }
+            dispatch_deliver_upgrade(registry, session, target_peer, namespace_secret).await
+        }
+        #[cfg(not(feature = "iroh"))]
+        Request::DeliverUpgrade { .. } => Response::Error {
+            error: ProtocolError::Internal(
+                "DeliverUpgrade requires the iroh feature".into(),
+            ),
+        },
     }
 }
 
@@ -717,6 +739,105 @@ async fn dispatch_join(
         Err(err) => Response::Error {
             error: session_error_to_protocol(&err),
         },
+    }
+}
+
+/// Deliver the `NamespaceSecret` to a target peer over a direct QUIC
+/// stream. Only the host of a Local session may call this. The daemon
+/// dials the target via `Endpoint::connect`, sends a length-prefixed
+/// `UpgradeFrame`, and reads a 1-byte ACK.
+#[cfg(feature = "iroh")]
+async fn dispatch_deliver_upgrade(
+    registry: &Registry,
+    session: SessionId,
+    target_peer: artel_protocol::PeerId,
+    namespace_secret: [u8; 32],
+) -> Response {
+    use artel_protocol::upgrade::{UPGRADE_ACK, UPGRADE_ALPN, UpgradeFrame};
+
+    // Verify session exists and is Local (we are the host).
+    match registry.is_local_session(session).await {
+        Some(true) => {}
+        Some(false) => {
+            return Response::Error {
+                error: ProtocolError::NotHost,
+            };
+        }
+        None => {
+            return Response::Error {
+                error: ProtocolError::UnknownSession(session),
+            };
+        }
+    }
+
+    // Dial the target peer. PeerId IS EndpointId (same 32-byte key).
+    let target_endpoint_id =
+        iroh::EndpointId::from_bytes(target_peer.as_bytes()).expect("PeerId is 32 bytes");
+    let Some(endpoint) = registry.endpoint() else {
+        return Response::Error {
+            error: ProtocolError::Internal("no iroh endpoint available".into()),
+        };
+    };
+
+    let connection = match endpoint.connect(target_endpoint_id, UPGRADE_ALPN).await {
+        Ok(conn) => conn,
+        Err(e) => {
+            warn!(error = %e, %target_peer, "deliver_upgrade: connect failed");
+            return Response::Error {
+                error: ProtocolError::Internal(format!("connect to target peer failed: {e}")),
+            };
+        }
+    };
+
+    let (mut send, mut recv) = match connection.open_bi().await {
+        Ok(pair) => pair,
+        Err(e) => {
+            warn!(error = %e, "deliver_upgrade: open_bi failed");
+            return Response::Error {
+                error: ProtocolError::Internal(format!("open_bi failed: {e}")),
+            };
+        }
+    };
+
+    // Send length-prefixed UpgradeFrame.
+    let frame = UpgradeFrame {
+        session_id: session,
+        namespace_secret,
+    };
+    let frame_bytes = postcard::to_allocvec(&frame).expect("UpgradeFrame is infallible");
+    #[allow(clippy::cast_possible_truncation)] // UpgradeFrame is ~48 bytes, never exceeds u32
+    let len = (frame_bytes.len() as u32).to_le_bytes();
+
+    if let Err(e) = send.write_all(&len).await {
+        warn!(error = %e, "deliver_upgrade: write length failed");
+        return Response::Error {
+            error: ProtocolError::Internal(format!("write frame length failed: {e}")),
+        };
+    }
+    if let Err(e) = send.write_all(&frame_bytes).await {
+        warn!(error = %e, "deliver_upgrade: write frame failed");
+        return Response::Error {
+            error: ProtocolError::Internal(format!("write frame failed: {e}")),
+        };
+    }
+    let _ = send.finish();
+
+    // Read ACK.
+    let mut ack_buf = [0u8; 1];
+    match recv.read_exact(&mut ack_buf).await {
+        Ok(()) if ack_buf[0] == UPGRADE_ACK => Response::UpgradeDelivered,
+        Ok(()) => {
+            warn!(byte = ack_buf[0], "deliver_upgrade: unexpected ACK byte");
+            Response::Error {
+                error: ProtocolError::Internal("unexpected ACK byte from target".into()),
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "deliver_upgrade: read ACK failed");
+            Response::Error {
+                error: ProtocolError::Internal(format!("read ACK failed: {e}")),
+            }
+        }
     }
 }
 
