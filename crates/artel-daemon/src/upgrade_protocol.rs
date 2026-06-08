@@ -25,12 +25,10 @@ use crate::session::Registry;
 /// under [`UPGRADE_ALPN`]. Accepts inbound direct-stream upgrade
 /// deliveries from a session's host.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Wired into the Router in Phase 4.
 pub(crate) struct UpgradeProtocol {
     registry: Arc<Registry>,
 }
 
-#[allow(dead_code)] // Wired into the Router in Phase 4.
 impl UpgradeProtocol {
     pub(crate) const fn new(registry: Arc<Registry>) -> Self {
         Self { registry }

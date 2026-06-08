@@ -1829,7 +1829,6 @@ impl Registry {
     /// - Session is `Remote` (we are a joiner, not the host).
     /// - `sender_peer` matches the session's host.
     #[cfg(feature = "iroh")]
-    #[allow(dead_code)] // Called by UpgradeProtocol; wired in Phase 4.
     pub(crate) async fn emit_upgrade(
         &self,
         session: SessionId,

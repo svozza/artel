@@ -152,8 +152,10 @@ pub struct IrohRuntime {
     /// Gossip handle. `Clone` is cheap (it's an `Arc` inside).
     pub gossip: iroh_gossip::net::Gossip,
     /// Protocol router; calling `.shutdown().await` cleans up both
-    /// the accept loop and the endpoint.
-    pub router: iroh::protocol::Router,
+    /// the accept loop and the endpoint. `None` only briefly during
+    /// construction (between `resolve_iroh_runtime` and `Daemon::start`
+    /// spawning the router with all protocols registered).
+    pub router: Option<iroh::protocol::Router>,
     /// In-memory address-lookup service the gossip bridge populates
     /// with each inbound ticket's wire-form addr before subscribing.
     /// Same instance lives in `endpoint.address_lookup()` so the
@@ -248,7 +250,7 @@ impl Daemon {
         // Iroh on: load key, bind endpoint, EndpointId -> PeerId.
         // Off: synthetic id, no runtime.
         #[cfg(feature = "iroh")]
-        let (daemon_peer_id, iroh) =
+        let (daemon_peer_id, mut iroh) =
             resolve_iroh_runtime(config.iroh_key_path.as_deref(), &config.endpoint_setup).await?;
         #[cfg(not(feature = "iroh"))]
         let daemon_peer_id = SYNTHETIC_LOCAL_PEER_ID;
@@ -301,6 +303,21 @@ impl Daemon {
         // call back into `Registry::send` for inbound SendRequests.
         #[cfg(feature = "iroh")]
         bridge.attach_registry(Arc::downgrade(&registry)).await;
+
+        // Build and spawn the Router now that the Registry is available.
+        // UpgradeProtocol needs the Registry to emit upgrade events into
+        // session broadcast channels; the gossip ALPN is the only other
+        // protocol on the daemon's endpoint.
+        #[cfg(feature = "iroh")]
+        {
+            let upgrade_proto =
+                crate::upgrade_protocol::UpgradeProtocol::new(Arc::clone(&registry));
+            let router = iroh::protocol::Router::builder(iroh.endpoint.clone())
+                .accept(iroh_gossip::ALPN, iroh.gossip.clone())
+                .accept(crate::upgrade_protocol::UpgradeProtocol::alpn(), upgrade_proto)
+                .spawn();
+            iroh.router = Some(router);
+        }
 
         let shutdown = Arc::new(Shutdown::new());
         shutdown
@@ -446,7 +463,9 @@ impl Daemon {
                 ..
             } = iroh;
             snapshot_peer_addrs(&endpoint, &tracked_peer_ids, &peer_addr_cache).await;
-            if let Err(err) = router.shutdown().await {
+            if let Some(router) = router
+                && let Err(err) = router.shutdown().await
+            {
                 warn!(error = %err, "iroh router shutdown failed");
             }
         }
@@ -987,18 +1006,16 @@ async fn resolve_iroh_runtime(
     }
 
     // Gossip needs a clone of the endpoint to register itself for the
-    // ALPN; the Router does the actual accepting.
+    // ALPN; the Router is built later in Daemon::start (after the
+    // Registry exists) so UpgradeProtocol can be registered on it.
     let gossip = iroh_gossip::net::Gossip::builder().spawn(endpoint.clone());
-    let router = iroh::protocol::Router::builder(endpoint.clone())
-        .accept(iroh_gossip::ALPN, gossip.clone())
-        .spawn();
 
     Ok((
         peer_id,
         IrohRuntime {
             endpoint,
             gossip,
-            router,
+            router: None,
             addr_hint,
             tracked_peer_ids,
             peer_addr_cache,
@@ -1235,6 +1252,8 @@ mod tests {
         assert_eq!(on_runtime, on_disk.to_bytes());
 
         // Tear down to avoid leaking the iroh router's accept loop.
-        runtime.router.shutdown().await.expect("router shutdown");
+        if let Some(router) = runtime.router {
+            router.shutdown().await.expect("router shutdown");
+        }
     }
 }
