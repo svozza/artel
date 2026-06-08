@@ -1526,19 +1526,11 @@ async fn publish_upgrade(
     target_peer: PeerId,
     namespace_secret: [u8; 32],
 ) -> Result<(), ClientError> {
-    let payload = postcard::to_allocvec(&UpgradePayload {
-        target_peer,
-        namespace_secret,
-    })
-    .expect("UpgradePayload is infallible to serialize");
     client
-        .request(Request::Send {
+        .request(Request::DeliverUpgrade {
             session,
-            payload: SendPayload {
-                kind: MessageKind::System,
-                action: UPGRADE_ACTION.to_string(),
-                payload,
-            },
+            target_peer,
+            namespace_secret,
         })
         .await?;
     Ok(())
