@@ -142,7 +142,11 @@ async fn run(args: Args) -> Result<(), String> {
         .await
         .map_err(|e| format!("connect daemon: {e}"))?;
 
-    let cfg = WorkspaceConfig::default().with_state_dir(args.state_dir.clone());
+    let mut cfg = WorkspaceConfig::default().with_state_dir(args.state_dir.clone());
+    if let Ok(url) = std::env::var("ARTEL_RELAY_URL") {
+        let relay_url: iroh::RelayUrl = url.parse().expect("ARTEL_RELAY_URL invalid");
+        cfg = cfg.with_endpoint_setup(artel_fs::EndpointSetup::TestingWithRelay { relay_url });
+    }
     let (ws, mut events) = Workspace::host_with(
         &client,
         args.peer_name.clone(),

@@ -104,7 +104,7 @@ pub async fn doc_has_key(doc: &Doc, key: &[u8]) -> bool {
 /// [`spawn_pair`], which mints its own server.
 static SHARED_DNS_PKARR: OnceCell<Arc<DnsPkarrServer>> = OnceCell::const_new();
 
-async fn shared_dns_pkarr() -> Arc<DnsPkarrServer> {
+pub async fn shared_dns_pkarr() -> Arc<DnsPkarrServer> {
     SHARED_DNS_PKARR
         .get_or_init(|| async {
             Arc::new(

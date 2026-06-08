@@ -36,9 +36,30 @@ use artel_client::Client;
 use artel_daemon::{Daemon, DaemonConfig, EndpointSetup, StartError};
 use artel_protocol::{Event, MessageKind, Request, Response, SendPayload, ticket};
 use iroh::test_utils::DnsPkarrServer;
+use iroh_relay::server::Server as RelayServer;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
+use tokio::sync::OnceCell;
 use tokio::time::timeout;
+
+static SHARED_RELAY: OnceCell<(RelayServer, String)> = OnceCell::const_new();
+
+async fn shared_relay_url() -> &'static str {
+    &SHARED_RELAY
+        .get_or_init(|| async {
+            let (_relay_map, relay_url, server) = iroh::test_utils::run_relay_server()
+                .await
+                .expect("run_relay_server for identity tests");
+            (server, relay_url.to_string())
+        })
+        .await
+        .1
+}
+
+async fn custom_relay_setup() -> EndpointSetup {
+    let relay_url: iroh::RelayUrl = shared_relay_url().await.parse().unwrap();
+    EndpointSetup::ProductionCustomRelay { relay_url }
+}
 
 // =============================================================
 // `EndpointId` is stable across daemon restarts when the iroh secret
@@ -52,7 +73,7 @@ async fn endpoint_id_is_stable_across_daemon_restarts_n0() {
     let paths = common::RestartState::under(root.path());
 
     // First boot generates and persists the key.
-    let daemon = common::spawn_daemon_at(&paths, EndpointSetup::Production).await;
+    let daemon = common::spawn_daemon_at(&paths, custom_relay_setup().await).await;
     let client = Client::connect(&paths.socket).await.unwrap();
     let first_id = client.daemon_peer_id();
     assert!(paths.iroh_key.exists(), "iroh.key should be persisted");
@@ -69,7 +90,7 @@ async fn endpoint_id_is_stable_across_daemon_restarts_n0() {
     daemon.stop().await;
 
     // Second boot reuses the persisted key.
-    let daemon = common::spawn_daemon_at(&paths, EndpointSetup::Production).await;
+    let daemon = common::spawn_daemon_at(&paths, custom_relay_setup().await).await;
     let client = Client::connect(&paths.socket).await.unwrap();
     let second_id = client.daemon_peer_id();
     assert_eq!(
@@ -88,7 +109,7 @@ async fn host_ticket_carries_a_real_endpoint_addr_n0() {
     // direct addrs / relay url because those are environment-
     // dependent — but the addr must be self-consistent and match
     // the live peer id.
-    let daemon = common::spawn_daemon(common::fresh_state(), EndpointSetup::Production).await;
+    let daemon = common::spawn_daemon(common::fresh_state(), custom_relay_setup().await).await;
     let client = Client::connect(&daemon.socket).await.unwrap();
     let daemon_id = client.daemon_peer_id();
 
@@ -120,7 +141,7 @@ async fn iroh_key_file_is_chmod_0600() {
 
     let state = common::fresh_state();
     let iroh_key = state.iroh_key.clone();
-    let daemon = common::spawn_daemon(state, EndpointSetup::Production).await;
+    let daemon = common::spawn_daemon(state, custom_relay_setup().await).await;
     let mode = std::fs::metadata(&iroh_key).unwrap().mode() & 0o777;
     assert_eq!(mode, 0o600, "iroh.key must be owner-only");
     daemon.stop().await;
@@ -138,7 +159,11 @@ async fn missing_iroh_key_path_under_iroh_feature_errors() {
         pid_path: root.path().join("daemon.pid"),
         sessions_dir: root.path().join("sessions"),
         iroh_key_path: None,
-        endpoint_setup: EndpointSetup::Production,
+        endpoint_setup: EndpointSetup::Testing {
+            dns_pkarr: std::sync::Arc::new(
+                DnsPkarrServer::run().await.expect("DnsPkarrServer"),
+            ),
+        },
     })
     .await
     .expect_err("daemon start should reject missing iroh_key_path under the iroh feature");
@@ -180,7 +205,7 @@ async fn join_succeeds_within_tight_budget_real_n0() {
     // after alice has issued her HostSession — that way bob's daemon
     // is freshly born with an empty DNS cache when it immediately
     // needs to resolve alice.
-    let alice = common::spawn_daemon(alice_state, EndpointSetup::Production).await;
+    let alice = common::spawn_daemon(alice_state, custom_relay_setup().await).await;
 
     // Alice hosts immediately.
     let alice_client = Client::connect(&alice.socket).await.unwrap();
@@ -200,7 +225,7 @@ async fn join_succeeds_within_tight_budget_real_n0() {
     // `wait_for_endpoint` gating, no artificial delay. Bob's daemon
     // has an empty DNS cache and must dial alice by EndpointId. That
     // dial races alice's pkarr publish-loop on the n0 network.
-    let bob = common::spawn_daemon(bob_state, EndpointSetup::Production).await;
+    let bob = common::spawn_daemon(bob_state, custom_relay_setup().await).await;
     let bob_client = Client::connect(&bob.socket).await.unwrap();
 
     let started = Instant::now();

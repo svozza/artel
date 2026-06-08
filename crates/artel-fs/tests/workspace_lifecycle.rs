@@ -30,7 +30,15 @@ use iroh_docs::store::Query;
 use tempfile::TempDir;
 use tokio::time::{sleep, timeout};
 
-use common::{LocalDaemon, daemon_testing_setup, testing_setup};
+use common::{LocalDaemon, daemon_testing_setup, shared_dns_pkarr, testing_setup};
+
+/// [`WorkspaceConfig::default`] with the `Testing` endpoint setup so
+/// tests don't hit n0's production relay (which times out on
+/// restricted networks).
+async fn test_ws_config() -> WorkspaceConfig {
+    let dns_pkarr = shared_dns_pkarr().await;
+    WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr))
+}
 
 // =============================================================
 // Local helpers
@@ -134,17 +142,19 @@ async fn host_require_empty_rejects_non_empty_dir_without_creating_state() {
 async fn host_allow_existing_publishes_pre_seeded_contents() {
     let harness = LocalDaemon::spawn().await;
     let client = Client::connect(&harness.socket).await.unwrap();
+    let dns_pkarr = common::shared_dns_pkarr().await;
 
     let ws_dir = TempDir::new().unwrap();
     tokio::fs::write(ws_dir.path().join("README.md"), b"hello")
         .await
         .unwrap();
 
-    let (ws, _events) = Workspace::host(
+    let (ws, _events) = Workspace::host_with(
         &client,
         host_peer(),
         ws_dir.path().to_path_buf(),
         AttachPolicy::AllowExisting,
+        WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
     )
     .await
     .expect("AllowExisting should succeed against pre-seeded dir");
@@ -175,6 +185,7 @@ async fn host_allow_existing_publishes_pre_seeded_contents() {
 async fn host_require_empty_accepts_truly_empty_dir() {
     let harness = LocalDaemon::spawn().await;
     let client = Client::connect(&harness.socket).await.unwrap();
+    let dns_pkarr = common::shared_dns_pkarr().await;
 
     let ws_dir = TempDir::new().unwrap();
     let (ws, _events) = Workspace::host_with(
@@ -182,7 +193,7 @@ async fn host_require_empty_accepts_truly_empty_dir() {
         host_peer(),
         ws_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
-        WorkspaceConfig::default(),
+        WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
     )
     .await
     .expect("RequireEmpty should accept fresh empty dir");
@@ -356,11 +367,12 @@ async fn require_empty_accepts_dir_with_only_artel_fs_state() {
     let state_dir = ws_dir.path().join(".artel-fs");
     tokio::fs::create_dir_all(&state_dir).await.unwrap();
 
-    let (ws, _events) = Workspace::host(
+    let (ws, _events) = Workspace::host_with(
         &client,
         host_peer(),
         ws_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
+        test_ws_config().await,
     )
     .await
     .expect("RequireEmpty should accept dir with only .artel-fs/");
@@ -399,11 +411,12 @@ async fn host_lands_ticket_on_session() {
         .await
         .unwrap();
 
-    let (workspace, _ws_events) = Workspace::host(
+    let (workspace, _ws_events) = Workspace::host_with(
         &alice,
         "alice",
         ws_dir.path().to_path_buf(),
         AttachPolicy::AllowExisting,
+        test_ws_config().await,
     )
     .await
     .expect("Workspace::host");
@@ -488,11 +501,12 @@ async fn watcher_attached_when_run_resolves() {
     let client = Client::connect(&harness.socket).await.unwrap();
 
     let ws_dir = TempDir::new().unwrap();
-    let (ws, _ws_events) = Workspace::host(
+    let (ws, _ws_events) = Workspace::host_with(
         &client,
         "alice",
         ws_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
+        test_ws_config().await,
     )
     .await
     .expect("Workspace::host");
@@ -537,13 +551,15 @@ async fn watcher_attached_when_run_resolves() {
 async fn applier_subscribed_when_run_resolves() {
     let harness = LocalDaemon::spawn().await;
     let client = Client::connect(&harness.socket).await.unwrap();
+    let dns_pkarr = common::shared_dns_pkarr().await;
 
     let ws_dir = TempDir::new().unwrap();
-    let (ws, _ws_events) = Workspace::host(
+    let (ws, _ws_events) = Workspace::host_with(
         &client,
         "alice",
         ws_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
+        WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
     )
     .await
     .expect("Workspace::host");

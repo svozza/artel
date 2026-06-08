@@ -235,7 +235,7 @@ async fn wait_for_file(path: &Path, expected: &[u8]) {
 /// in sync, then kill -9. Restart should reproduce identical disk
 /// state and live sync should resume.
 #[tokio::test(flavor = "multi_thread")]
-async fn steady_state_sigkill_preserves_state() {
+async fn steady_state_sigkill_preserves_state_n0() {
     // Crash-recovery tests deliberately don't override the workspace
     // address-lookup: the child binary runs in a separate process
     // and an in-memory MemoryLookup can't be shared across the
@@ -352,7 +352,7 @@ async fn steady_state_sigkill_preserves_state() {
 /// non-deterministic. Restart it and assert that all N files
 /// converge into the doc and onto Bob's disk.
 #[tokio::test(flavor = "multi_thread")]
-async fn mid_scan_sigkill_recovers_via_reconcile() {
+async fn mid_scan_sigkill_recovers_via_reconcile_n0() {
     const N: usize = 16;
 
     // Crash-recovery tests are inherently real-n0: the child binary
@@ -447,7 +447,7 @@ async fn mid_scan_sigkill_recovers_via_reconcile() {
 /// (`scan_and_publish_existing`) must reconcile any on-disk file
 /// the prior process didn't get to publish.
 #[tokio::test(flavor = "multi_thread")]
-async fn mid_write_sigkill_resyncs_on_restart() {
+async fn mid_write_sigkill_resyncs_on_restart_n0() {
     // Crash-recovery tests are inherently real-n0: the child binary
     // runs in a separate process, so it can't share an in-process
     // `DnsPkarrServer` (or any other in-process discovery fixture)

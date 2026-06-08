@@ -25,8 +25,24 @@ use artel_fs::{
 use artel_protocol::{Event, MessageKind, Request, Response, SessionId};
 use iroh::test_utils::DnsPkarrServer;
 use iroh_docs::DocTicket;
+use iroh_relay::server::Server as RelayServer;
 use tempfile::TempDir;
+use tokio::sync::OnceCell;
 use tokio::time::timeout;
+
+static SHARED_RELAY: OnceCell<(RelayServer, String)> = OnceCell::const_new();
+
+async fn shared_relay_url() -> &'static str {
+    &SHARED_RELAY
+        .get_or_init(|| async {
+            let (_relay_map, relay_url, server) = iroh::test_utils::run_relay_server()
+                .await
+                .expect("run_relay_server for workspace-restart tests");
+            (server, relay_url.to_string())
+        })
+        .await
+        .1
+}
 
 use common::{
     DaemonPaths, LocalDaemon, Pair, daemon_testing_setup, fresh_state, spawn_daemon_at,
@@ -604,19 +620,27 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
     let bob_root = TempDir::new().unwrap();
     let bob_wstate = TempDir::new().unwrap();
 
-    // Real n0 discovery — both daemons get `Production` for the
-    // address-lookup chain, so they go through pkarr + DNS like
-    // production.
+    let relay_url: iroh::RelayUrl = shared_relay_url().await.parse().unwrap();
     let alice_daemon = phase(
         "spawn alice daemon (initial)",
-        spawn_daemon_at(&alice_paths, artel_daemon::EndpointSetup::Production),
+        spawn_daemon_at(
+            &alice_paths,
+            artel_daemon::EndpointSetup::ProductionCustomRelay {
+                relay_url: relay_url.clone(),
+            },
+        ),
     )
     .await;
     let bob_daemon_state = fresh_state();
     let bob_paths = DaemonPaths::at(bob_daemon_state.root.path());
     let bob_daemon = phase(
         "spawn bob daemon",
-        spawn_daemon_at(&bob_paths, artel_daemon::EndpointSetup::Production),
+        spawn_daemon_at(
+            &bob_paths,
+            artel_daemon::EndpointSetup::ProductionCustomRelay {
+                relay_url: relay_url.clone(),
+            },
+        ),
     )
     .await;
 
@@ -624,7 +648,10 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
     let alice = Client::connect(&alice_daemon.socket).await.unwrap();
     let alice_cfg = WorkspaceConfig::default()
         .with_state_dir(alice_wstate.path().to_path_buf())
-        .with_daemon_socket(alice_daemon.socket.clone());
+        .with_daemon_socket(alice_daemon.socket.clone())
+        .with_endpoint_setup(artel_fs::EndpointSetup::ProductionCustomRelay {
+            relay_url: relay_url.clone(),
+        });
     let (alice_ws, _alice_ws_events) = phase(
         "alice Workspace::host_with (phase 1)",
         Workspace::host_with(
@@ -679,7 +706,10 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
 
     let bob_cfg = WorkspaceConfig::default()
         .with_state_dir(bob_wstate.path().to_path_buf())
-        .with_daemon_socket(bob_daemon.socket.clone());
+        .with_daemon_socket(bob_daemon.socket.clone())
+        .with_endpoint_setup(artel_fs::EndpointSetup::ProductionCustomRelay {
+            relay_url: relay_url.clone(),
+        });
     let (bob_ws, _bob_ws_events) = phase(
         "bob Workspace::join_with (doc import + bulk_export)",
         Workspace::join_with(
@@ -733,13 +763,21 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
     // workspace-state dirs.
     let alice_daemon = phase(
         "spawn alice daemon (post-restart)",
-        spawn_daemon_at(&alice_paths, artel_daemon::EndpointSetup::Production),
+        spawn_daemon_at(
+            &alice_paths,
+            artel_daemon::EndpointSetup::ProductionCustomRelay {
+                relay_url: relay_url.clone(),
+            },
+        ),
     )
     .await;
     let alice = Client::connect(&alice_daemon.socket).await.unwrap();
     let alice_cfg = WorkspaceConfig::default()
         .with_state_dir(alice_wstate.path().to_path_buf())
-        .with_daemon_socket(alice_daemon.socket.clone());
+        .with_daemon_socket(alice_daemon.socket.clone())
+        .with_endpoint_setup(artel_fs::EndpointSetup::ProductionCustomRelay {
+            relay_url: relay_url.clone(),
+        });
     let (alice_ws, _alice_ws_events) = phase(
         "alice Workspace::host_with (phase 2 — post-restart)",
         Workspace::host_with(
@@ -847,13 +885,14 @@ async fn re_hosting_same_dir_yields_structurally_identical_ticket() {
 /// Stand up a workspace, capture the published ticket, shut down.
 async fn host_once_and_capture_ticket(harness: &LocalDaemon, root: PathBuf) -> DocTicket {
     let alice = Client::connect(&harness.socket).await.unwrap();
+    let dns_pkarr = common::shared_dns_pkarr().await;
 
     let (workspace, _ws_events) = Workspace::host_with(
         &alice,
         "alice",
         root,
         AttachPolicy::AllowExisting,
-        WorkspaceConfig::default(),
+        WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
     )
     .await
     .expect("Workspace::host_with");

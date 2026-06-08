@@ -41,8 +41,29 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use iroh_gossip::api::Event as GossipEvent;
 use iroh_gossip::proto::TopicId;
+use iroh_relay::server::Server as RelayServer;
 use pretty_assertions::assert_eq;
+use tokio::sync::OnceCell;
 use tokio::time::timeout;
+
+static SHARED_RELAY: OnceCell<(RelayServer, String)> = OnceCell::const_new();
+
+async fn shared_relay_url() -> &'static str {
+    &SHARED_RELAY
+        .get_or_init(|| async {
+            let (_relay_map, relay_url, server) = iroh::test_utils::run_relay_server()
+                .await
+                .expect("run_relay_server for auth-b5 tests");
+            (server, relay_url.to_string())
+        })
+        .await
+        .1
+}
+
+async fn custom_relay_setup() -> EndpointSetup {
+    let relay_url: iroh::RelayUrl = shared_relay_url().await.parse().unwrap();
+    EndpointSetup::ProductionCustomRelay { relay_url }
+}
 
 /// Mirrors `gossip_bridge::topic_for` (private). Session UUID in the
 /// high 16 bytes, zeros in the low 16.
@@ -743,8 +764,8 @@ async fn legit_host_frames_accepted() {
 /// queryable, mirroring `common::spawn_pair` but on
 /// `EndpointSetup::Production`.
 async fn spawn_pair_n0() -> (common::RunningDaemon, common::RunningDaemon) {
-    let a = common::spawn_daemon(common::fresh_state(), EndpointSetup::Production).await;
-    let b = common::spawn_daemon(common::fresh_state(), EndpointSetup::Production).await;
+    let a = common::spawn_daemon(common::fresh_state(), custom_relay_setup().await).await;
+    let b = common::spawn_daemon(common::fresh_state(), custom_relay_setup().await).await;
     (a, b)
 }
 
@@ -778,8 +799,8 @@ async fn capability_survives_host_restart_n0() {
     let host_paths = common::RestartState::under(host_root.path());
 
     // 1. Spawn host + joiner (both Production/n0).
-    let daemon_a = common::spawn_daemon_at(&host_paths, EndpointSetup::Production).await;
-    let daemon_b = common::spawn_daemon(common::fresh_state(), EndpointSetup::Production).await;
+    let daemon_a = common::spawn_daemon_at(&host_paths, custom_relay_setup().await).await;
+    let daemon_b = common::spawn_daemon(common::fresh_state(), custom_relay_setup().await).await;
 
     // Alice hosts, bob joins → auto-granted RW.
     let (session_id, alice_client, bob_client, _bob_events) =
@@ -807,7 +828,7 @@ async fn capability_survives_host_restart_n0() {
     daemon_a.stop().await;
 
     // 3. Respawn host at the SAME paths (cold start from disk).
-    let daemon_a = common::spawn_daemon_at(&host_paths, EndpointSetup::Production).await;
+    let daemon_a = common::spawn_daemon_at(&host_paths, custom_relay_setup().await).await;
 
     // 4. Alice resumes the session (host(Some(id))).
     let alice_client = Client::connect(&daemon_a.socket).await.unwrap();
@@ -826,7 +847,7 @@ async fn capability_survives_host_restart_n0() {
     // 5. Bob re-joins via a fresh ticket (his mirror was torn down).
     drop(bob_client);
     daemon_b.stop().await;
-    let daemon_b = common::spawn_daemon(common::fresh_state(), EndpointSetup::Production).await;
+    let daemon_b = common::spawn_daemon(common::fresh_state(), custom_relay_setup().await).await;
     let bob_client = Client::connect(&daemon_b.socket).await.unwrap();
     let join_resp = bob_client
         .request(Request::JoinSession {

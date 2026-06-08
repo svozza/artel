@@ -22,7 +22,24 @@ mod common;
 use std::path::PathBuf;
 use std::process::Command;
 
+use iroh_relay::server::Server as RelayServer;
+use tokio::sync::OnceCell;
+
 const MARKER: &str = "[artel-fs] Workspace dropped without calling shutdown()";
+
+static SHARED_RELAY: OnceCell<(RelayServer, String)> = OnceCell::const_new();
+
+async fn shared_relay_url() -> &'static str {
+    &SHARED_RELAY
+        .get_or_init(|| async {
+            let (_relay_map, relay_url, server) = iroh::test_utils::run_relay_server()
+                .await
+                .expect("run_relay_server for drop-bomb tests");
+            (server, relay_url.to_string())
+        })
+        .await
+        .1
+}
 
 /// Bin-local thin wrapper over [`common::LocalDaemon`]. Pre-A2 the
 /// harness ran the daemon with the iroh runtime disabled; post-A2
@@ -46,6 +63,7 @@ impl DaemonHarness {
 }
 
 async fn run_child_against(harness: &DaemonHarness, mode: &str) -> String {
+    let relay_url = shared_relay_url().await.to_string();
     let exe = env!("CARGO_BIN_EXE_drop_bomb_child");
     let ws_root = tempfile::tempdir().unwrap();
     let ws_state = tempfile::tempdir().unwrap();
@@ -67,6 +85,7 @@ async fn run_child_against(harness: &DaemonHarness, mode: &str) -> String {
                 "--mode",
                 &mode_for_child,
             ])
+            .env("ARTEL_RELAY_URL", &relay_url)
             .output()
             .expect("spawn drop_bomb_child")
     })
