@@ -2,6 +2,7 @@
 //! - Read-only ticket joiners cannot send.
 //! - RW ticket joiners (default from HostSession) can send.
 //! - Expired tickets are rejected at admission.
+//! - Direct-stream upgrade delivers secret only to the target peer.
 
 #![cfg(feature = "iroh")]
 
@@ -13,7 +14,9 @@ use tokio::time::timeout;
 
 use artel_client::{Client, ClientError};
 use artel_protocol::capability::Capability;
-use artel_protocol::{Event, MessageKind, ProtocolError, Request, Response, SendPayload};
+use artel_protocol::{
+    Event, MessageKind, PeerId, ProtocolError, Request, Response, SendPayload, UPGRADE_ACTION,
+};
 
 // =============================================================
 // A joiner admitted via a Read-only ticket cannot send messages.
@@ -277,4 +280,211 @@ async fn expired_ticket_rejected_at_admission() {
     drop(bob_client);
     daemon_a.stop().await;
     daemon_b.stop().await;
+}
+
+// =============================================================
+// Direct-stream upgrade delivers the namespace secret ONLY to
+// the target peer — a third read-only peer does NOT observe it.
+// =============================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_stream_upgrade_delivers_secret() {
+    let dns_pkarr = std::sync::Arc::new(
+        iroh::test_utils::DnsPkarrServer::run()
+            .await
+            .expect("DnsPkarrServer::run"),
+    );
+
+    let fut_a = Box::pin(common::spawn_daemon(
+        common::fresh_state(),
+        common::testing_setup(&dns_pkarr),
+    ));
+    let fut_b = Box::pin(common::spawn_daemon(
+        common::fresh_state(),
+        common::testing_setup(&dns_pkarr),
+    ));
+    let fut_c = Box::pin(common::spawn_daemon(
+        common::fresh_state(),
+        common::testing_setup(&dns_pkarr),
+    ));
+    let (daemon_a, daemon_b, daemon_c) = tokio::join!(fut_a, fut_b, fut_c);
+
+    // Wait for all three to publish their pkarr records.
+    let (ra, rb, rc) = tokio::join!(
+        dns_pkarr.on_endpoint(&daemon_a.iroh_addr.id, common::PKARR_READY_TIMEOUT),
+        dns_pkarr.on_endpoint(&daemon_b.iroh_addr.id, common::PKARR_READY_TIMEOUT),
+        dns_pkarr.on_endpoint(&daemon_c.iroh_addr.id, common::PKARR_READY_TIMEOUT),
+    );
+    ra.expect("daemon_a pkarr");
+    rb.expect("daemon_b pkarr");
+    rc.expect("daemon_c pkarr");
+
+    // Alice hosts on daemon A.
+    let alice = Client::connect(&daemon_a.socket).await.unwrap();
+    let host_resp = alice
+        .request(Request::HostSession {
+            display_name: "alice".into(),
+            session: None,
+        })
+        .await
+        .unwrap();
+    let (session_id, ticket) = match host_resp {
+        Response::HostSession { session, ticket } => (session, ticket),
+        other => panic!("expected HostSession, got {other:?}"),
+    };
+    alice
+        .request(Request::Subscribe {
+            session: session_id,
+            since: None,
+        })
+        .await
+        .unwrap();
+    let mut alice_events = alice.take_events().await.expect("alice events");
+
+    // Bob joins on daemon B with default (RW) ticket.
+    let bob = Client::connect(&daemon_b.socket).await.unwrap();
+    bob.request(Request::JoinSession {
+        display_name: "bob".into(),
+        ticket: ticket.clone(),
+    })
+    .await
+    .unwrap();
+    bob.request(Request::Subscribe {
+        session: session_id,
+        since: None,
+    })
+    .await
+    .unwrap();
+    let mut bob_events = bob.take_events().await.expect("bob events");
+
+    // Carol joins on daemon C with a Read-only ticket.
+    let carol_ticket = match alice
+        .request(Request::IssueTicket {
+            session: session_id,
+            granted_cap: Capability::Read,
+            expiry_ms: 0,
+        })
+        .await
+        .unwrap()
+    {
+        Response::IssuedTicket { ticket } => ticket,
+        other => panic!("expected IssuedTicket, got {other:?}"),
+    };
+    let carol = Client::connect(&daemon_c.socket).await.unwrap();
+    carol
+        .request(Request::JoinSession {
+            display_name: "carol".into(),
+            ticket: carol_ticket,
+        })
+        .await
+        .unwrap();
+    carol
+        .request(Request::Subscribe {
+            session: session_id,
+            since: None,
+        })
+        .await
+        .unwrap();
+    let mut carol_events = carol.take_events().await.expect("carol events");
+
+    // Wait for both Bob and Carol to be admitted by the host.
+    let bob_peer_id = daemon_b.peer_id();
+    let carol_peer_id = daemon_c.peer_id();
+    wait_for_peer_joined(&mut alice_events, bob_peer_id, "alice sees bob").await;
+    wait_for_peer_joined(&mut alice_events, carol_peer_id, "alice sees carol").await;
+
+    // Alice delivers the upgrade secret to Bob via direct stream.
+    let secret = [0x42u8; 32];
+    let deliver_resp = alice
+        .request(Request::DeliverUpgrade {
+            session: session_id,
+            target_peer: bob_peer_id,
+            namespace_secret: secret,
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(deliver_resp, Response::UpgradeDelivered),
+        "expected UpgradeDelivered, got {deliver_resp:?}",
+    );
+
+    // Bob should receive the upgrade event.
+    let bob_msg = wait_for_upgrade_event(&mut bob_events, "bob").await;
+    assert_eq!(bob_msg.action, UPGRADE_ACTION);
+    assert!(
+        bob_msg.payload.len() >= 32,
+        "upgrade payload should contain the secret",
+    );
+
+    // Carol must NOT see any upgrade event (she's not the target).
+    let carol_upgrade = timeout(Duration::from_secs(3), async {
+        loop {
+            let Some(ev) = carol_events.recv().await else {
+                return false;
+            };
+            if let Event::Message { message, .. } = ev {
+                if message.action == UPGRADE_ACTION {
+                    return true;
+                }
+            }
+        }
+    })
+    .await;
+    assert!(
+        carol_upgrade.is_err() || !carol_upgrade.unwrap(),
+        "Carol (read-only) must NOT receive the upgrade secret",
+    );
+
+    drop(alice_events);
+    drop(bob_events);
+    drop(carol_events);
+    drop(alice);
+    drop(bob);
+    drop(carol);
+    daemon_a.stop().await;
+    daemon_b.stop().await;
+    daemon_c.stop().await;
+}
+
+async fn wait_for_peer_joined(
+    events: &mut artel_client::EventStream,
+    peer_id: PeerId,
+    label: &str,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(!remaining.is_zero(), "{label}: PeerJoined({peer_id}) never arrived");
+        let event = match timeout(remaining, events.recv()).await {
+            Ok(Some(ev)) => ev,
+            Ok(None) => panic!("{label}: events channel closed"),
+            Err(_) => continue,
+        };
+        if let Event::PeerJoined { peer, .. } = event {
+            if peer.id == peer_id {
+                return;
+            }
+        }
+    }
+}
+
+async fn wait_for_upgrade_event(
+    events: &mut artel_client::EventStream,
+    label: &str,
+) -> artel_protocol::SessionMessage {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(!remaining.is_zero(), "{label}: upgrade event never arrived");
+        let event = match timeout(remaining, events.recv()).await {
+            Ok(Some(ev)) => ev,
+            Ok(None) => panic!("{label}: events channel closed"),
+            Err(_) => continue,
+        };
+        if let Event::Message { message, .. } = event {
+            if message.action == UPGRADE_ACTION {
+                return message;
+            }
+        }
+    }
 }

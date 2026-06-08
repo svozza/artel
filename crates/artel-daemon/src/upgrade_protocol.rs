@@ -101,7 +101,13 @@ impl ProtocolHandler for UpgradeProtocol {
             warn!(error = %e, "upgrade_protocol: failed to send ACK");
             AcceptError::from_err(std::io::Error::other(e.to_string()))
         })?;
-        let _ = send.finish();
+        send.finish().map_err(|e| {
+            AcceptError::from_err(std::io::Error::other(e.to_string()))
+        })?;
+        // Wait until the remote has received all data. Without this,
+        // returning from `accept` drops the Connection and the ACK byte
+        // may not reach the sender.
+        send.stopped().await.ok();
 
         Ok(())
     }
