@@ -29,6 +29,7 @@ use common::{Pair, spawn_pair, testing_setup};
 /// after revocation and reconnection, the gate rejects the peer's
 /// inbound sync connection.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
 async fn revoked_peer_inbound_sync_rejected_after_reconnect() {
     let Pair {
         daemon_a,
@@ -90,9 +91,13 @@ async fn revoked_peer_inbound_sync_rejected_after_reconnect() {
 
     // Grant Bob RW so he can write (the ticket is now Read-only).
     common::grant_rw_and_wait(
-        &alice, session, bob_peer_id,
-        bob_dir.path(), alice_dir.path(),
-    ).await;
+        &alice,
+        session,
+        bob_peer_id,
+        bob_dir.path(),
+        alice_dir.path(),
+    )
+    .await;
 
     // --- Phase 1: baseline — Bob writes, Alice sees it. ---
     let baseline_path = bob_dir.path().join("before_revoke.txt");

@@ -8,10 +8,10 @@
 
 use std::sync::Arc;
 
+use iroh::EndpointAddr;
 use iroh::endpoint::{
     AfterHandshakeOutcome, BeforeConnectOutcome, ConnectionInfo, EndpointHooks, Side, VarInt,
 };
-use iroh::EndpointAddr;
 
 use crate::peer_map::PeerMap;
 
@@ -44,13 +44,8 @@ impl EndpointHooks for PeerFilter {
         }
     }
 
-    async fn after_handshake<'a>(
-        &'a self,
-        conn: &'a ConnectionInfo,
-    ) -> AfterHandshakeOutcome {
-        if conn.side() == Side::Server
-            && self.peer_map.is_revoked_workspace_id(conn.remote_id())
-        {
+    async fn after_handshake<'a>(&'a self, conn: &'a ConnectionInfo) -> AfterHandshakeOutcome {
+        if conn.side() == Side::Server && self.peer_map.is_revoked_workspace_id(conn.remote_id()) {
             tracing::warn!(
                 target: "artel_fs::peer_filter",
                 remote_id = %conn.remote_id(),

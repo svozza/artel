@@ -575,6 +575,8 @@ async fn join_with_no_timeout_stays_pending_when_no_ticket_published() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn read_only_joiner_write_does_not_propagate() {
+    use artel_protocol::capability::Capability;
+
     let Pair {
         daemon_a,
         daemon_b,
@@ -601,7 +603,6 @@ async fn read_only_joiner_write_does_not_propagate() {
 
     // Issue a Read-only ticket for Bob so his daemon-level cap is
     // Read (no auto-grant of RW, no upgrade delivery).
-    use artel_protocol::capability::Capability;
     let issue_resp = alice
         .request(Request::IssueTicket {
             session,
@@ -858,9 +859,13 @@ async fn round_trip_once(run: usize) {
     // Grant Bob RW so the upgrade delivery gives him the
     // NamespaceSecret needed to produce valid signed entries.
     common::grant_rw_and_wait(
-        &alice, session, bob_peer_id,
-        bob_dir.path(), alice_dir.path(),
-    ).await;
+        &alice,
+        session,
+        bob_peer_id,
+        bob_dir.path(),
+        alice_dir.path(),
+    )
+    .await;
 
     // 1. Alice writes a.txt → Bob sees it.
     let alice_a = alice_dir.path().join("a.txt");

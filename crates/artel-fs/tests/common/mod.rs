@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use artel_client::Client;
 use artel_daemon::shutdown::Shutdown;
 use artel_daemon::{Daemon, DaemonConfig, EndpointSetup as DaemonEndpointSetup};
-use artel_fs::EndpointSetup as FsEndpointSetup;
+use artel_fs::{EndpointSetup as FsEndpointSetup, WorkspaceEvent};
 use artel_protocol::capability::{Capability, CapabilityAction};
 use artel_protocol::{MessageKind, PeerId, Request, Response, SendPayload, SessionId};
 use futures_util::StreamExt;
@@ -87,6 +87,23 @@ pub async fn wait_for_missing(path: &Path) {
         );
         sleep(POLL_INTERVAL).await;
     }
+}
+
+/// Spawn a task that drains a [`WorkspaceEvent`] receiver to the
+/// floor for the rest of the test.
+///
+/// Real consumers (e.g. `wsdemo`) always drain this channel; a test
+/// that binds the receiver and never reads it is the one that hangs.
+/// The applier emits a `WorkspaceEvent` per peer-driven write/delete;
+/// the channel is bounded ([`artel_fs`]'s `EVENT_BUFFER`), so an
+/// undrained receiver fills it under any burst (e.g. a CRDT conflict
+/// storm from a between-restart edit). The production live loops now
+/// drop advisory events rather than block when the channel is full,
+/// so a leak here no longer wedges sync — but draining keeps the test
+/// faithful to how the API is actually consumed and avoids the
+/// dropped-event log noise.
+pub fn drain_ws_events(mut rx: tokio::sync::mpsc::Receiver<WorkspaceEvent>) {
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
 }
 
 /// Whether `doc` has any (non-tombstone) entry for `key`. Used by
@@ -440,7 +457,7 @@ pub async fn grant_rw(client: &Client, session: SessionId, target_peer: PeerId) 
 /// Grant RW and wait for the upgrade to propagate by polling a probe
 /// write. Writes `".artel_rw_probe"` from the joiner's workspace dir
 /// and waits for it to appear in the host's dir, proving the full
-/// round-trip (grant → upgrade delivery → import_namespace → signed
+/// round-trip (grant → upgrade delivery → `import_namespace` → signed
 /// entry → sync → host applies).
 pub async fn grant_rw_and_wait(
     client: &Client,
@@ -459,13 +476,13 @@ pub async fn grant_rw_and_wait(
     loop {
         let _ = tokio::fs::write(&joiner_probe, probe).await;
         sleep(POLL_INTERVAL).await;
-        if let Ok(bytes) = tokio::fs::read(&host_probe).await {
-            if bytes == probe {
-                // Clean up probe files.
-                let _ = tokio::fs::remove_file(&joiner_probe).await;
-                let _ = tokio::fs::remove_file(&host_probe).await;
-                return;
-            }
+        if let Ok(bytes) = tokio::fs::read(&host_probe).await
+            && bytes == probe
+        {
+            // Clean up probe files.
+            let _ = tokio::fs::remove_file(&joiner_probe).await;
+            let _ = tokio::fs::remove_file(&host_probe).await;
+            return;
         }
         assert!(
             std::time::Instant::now() < deadline,

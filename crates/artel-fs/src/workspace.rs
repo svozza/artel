@@ -318,6 +318,40 @@ pub enum WorkspaceEvent {
     Error(String),
 }
 
+/// Emit a [`WorkspaceEvent`] from a live loop **without ever
+/// blocking** on the channel.
+///
+/// The applier drives `doc.subscribe()`; if it parks in
+/// `events.send().await` waiting for a slow or absent
+/// [`WorkspaceEvent`] consumer, the bounded subscribe channel
+/// back-pressures into iroh-docs' single live actor and **all sync +
+/// gossip for the namespace freezes** — every peer goes silent until
+/// the consumer drains, not just this workspace. This was observed as
+/// a multi-second runtime-wide stall when a between-restart edit
+/// produced a CRDT conflict storm whose `PeerWrote` / `PeerDeleted`
+/// events overran [`EVENT_BUFFER`] against a non-draining receiver.
+///
+/// `WorkspaceEvent`s are advisory (diagnostics + skip notices), so
+/// dropping one when the consumer can't keep up is strictly better
+/// than wedging replication. Used by the live loops (applier,
+/// watcher); the construction-time emitters (scan / bulk-export /
+/// reconcile) keep their blocking `send` — they run bounded by the
+/// directory size, not a feedback loop, and aren't coupled to the
+/// live actor.
+pub(crate) fn emit_event(events: &mpsc::Sender<WorkspaceEvent>, ev: WorkspaceEvent) {
+    use tokio::sync::mpsc::error::TrySendError;
+    // `Ok` (delivered) and `Closed` (consumer dropped its stream) both
+    // need no action — the workspace keeps replicating regardless.
+    // Only a full channel is worth a line, and only at debug.
+    if let Err(TrySendError::Full(ev)) = events.try_send(ev) {
+        debug!(
+            target: "artel_fs::workspace",
+            ?ev,
+            "event channel full; dropping advisory event to keep sync live",
+        );
+    }
+}
+
 /// A live, attached filesystem workspace.
 ///
 /// Construct via [`Self::host`] or [`Self::join`]. Hold the value
@@ -573,11 +607,14 @@ impl Workspace {
 
         let doc_id_path = state_dir.join(DOC_ID_FILE);
         let (doc, returning) = open_or_create_doc(node, &doc_id_path).await?;
+        doc.start_sync(vec![])
+            .await
+            .map_err(|e| WorkspaceError::Doc(format!("start_sync: {e}")))?;
         debug!(
             target: "artel_fs::workspace",
             namespace = %doc.id(),
             returning,
-            "host_with: doc opened"
+            "host_with: doc opened + sync registered"
         );
 
         // Derive the session id from the persisted NamespaceId
@@ -2398,5 +2435,63 @@ mod tests {
             err,
             WorkspaceError::Policy(PolicyViolation::InitFromExistingNotMeaningfulOnJoin)
         ));
+    }
+
+    /// `emit_event` delivers to a receiver with spare capacity.
+    #[tokio::test]
+    async fn emit_event_delivers_when_capacity_available() {
+        let (tx, mut rx) = mpsc::channel(4);
+        emit_event(
+            &tx,
+            WorkspaceEvent::PeerWrote {
+                path: PathBuf::from("/w/a.txt"),
+            },
+        );
+        match rx.recv().await {
+            Some(WorkspaceEvent::PeerWrote { path }) => {
+                assert_eq!(path, PathBuf::from("/w/a.txt"));
+            }
+            other => panic!("expected PeerWrote, got {other:?}"),
+        }
+    }
+
+    /// The load-bearing property: a full channel makes `emit_event`
+    /// drop the event and return immediately rather than block. This
+    /// is what stops the applier from parking in `send().await` and
+    /// back-pressuring iroh-docs' live actor into a sync-wide freeze.
+    /// The synchronous body asserts non-blocking: if `emit_event`
+    /// awaited, this test would never reach the assertion.
+    #[tokio::test]
+    async fn emit_event_drops_when_channel_full_without_blocking() {
+        let (tx, mut rx) = mpsc::channel(1);
+        // Fill the single slot.
+        emit_event(&tx, WorkspaceEvent::Error("first".into()));
+        // Channel is now full; this must drop, not block.
+        emit_event(&tx, WorkspaceEvent::Error("dropped".into()));
+        // Drain: only the first event is present, the second was
+        // dropped on the floor.
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(WorkspaceEvent::Error(ref m)) if m == "first"
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "second event must have been dropped, not queued",
+        );
+    }
+
+    /// A closed receiver makes `emit_event` a no-op — the workspace
+    /// keeps replicating after the consumer drops its stream.
+    #[tokio::test]
+    async fn emit_event_is_noop_when_receiver_dropped() {
+        let (tx, rx) = mpsc::channel(4);
+        drop(rx);
+        // Must not panic or block.
+        emit_event(
+            &tx,
+            WorkspaceEvent::PeerDeleted {
+                path: PathBuf::from("/w/gone.txt"),
+            },
+        );
     }
 }

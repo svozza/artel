@@ -98,6 +98,8 @@ async fn capture_ticket(events: &mut EventStream, session: SessionId) -> DocTick
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread")]
 async fn workspace_state_survives_graceful_restart() {
+    init_n0_tracing();
+
     // Workspace state dirs and content roots live in tempdirs that
     // outlive the daemons.
     let alice_root = tempfile::tempdir().unwrap();
@@ -124,7 +126,7 @@ async fn workspace_state_survives_graceful_restart() {
             .with_state_dir(alice_wstate.path().to_path_buf())
             .with_endpoint_setup(testing_setup(&dns_pkarr))
             .with_daemon_socket(daemon_a.socket.clone());
-        let (alice_ws, _alice_ws_events) = Workspace::host_with(
+        let (alice_ws, alice_ws_events) = Workspace::host_with(
             &alice,
             "alice",
             alice_root.path().to_path_buf(),
@@ -133,6 +135,7 @@ async fn workspace_state_survives_graceful_restart() {
         )
         .await
         .expect("Workspace::host_with");
+        common::drain_ws_events(alice_ws_events);
         let session = alice_ws.session_id();
         let artel_ticket = alice_ws
             .join_ticket()
@@ -176,7 +179,7 @@ async fn workspace_state_survives_graceful_restart() {
             .with_state_dir(bob_wstate.path().to_path_buf())
             .with_endpoint_setup(testing_setup(&dns_pkarr))
             .with_daemon_socket(daemon_b.socket.clone());
-        let (bob_ws, _bob_ws_events) = Workspace::join_with(
+        let (bob_ws, bob_ws_events) = Workspace::join_with(
             &bob,
             session,
             bob_root.path().to_path_buf(),
@@ -185,14 +188,19 @@ async fn workspace_state_survives_graceful_restart() {
         )
         .await
         .expect("Workspace::join_with");
+        common::drain_ws_events(bob_ws_events);
         let bob_ws = Arc::new(bob_ws);
         let bob_handle = Arc::clone(&bob_ws).run().await;
 
         // Grant Bob RW so he receives the NamespaceSecret needed to write.
         common::grant_rw_and_wait(
-            &alice, session, bob_peer_id,
-            bob_root.path(), alice_root.path(),
-        ).await;
+            &alice,
+            session,
+            bob_peer_id,
+            bob_root.path(),
+            alice_root.path(),
+        )
+        .await;
 
         // Sanity: a.txt makes it to bob.
         wait_for_file(&bob_root.path().join("a.txt"), b"alpha").await;
@@ -249,7 +257,7 @@ async fn workspace_state_survives_graceful_restart() {
         .with_state_dir(alice_wstate.path().to_path_buf())
         .with_endpoint_setup(testing_setup(&dns_pkarr))
         .with_daemon_socket(daemon_a.socket.clone());
-    let (alice_ws, _alice_ws_events) = Workspace::host_with(
+    let (alice_ws, alice_ws_events) = Workspace::host_with(
         &alice,
         "alice",
         alice_root.path().to_path_buf(),
@@ -258,6 +266,7 @@ async fn workspace_state_survives_graceful_restart() {
     )
     .await
     .expect("Workspace::host_with phase 2");
+    common::drain_ws_events(alice_ws_events);
     let session = alice_ws.session_id();
     let artel_ticket = alice_ws
         .join_ticket()
@@ -306,7 +315,7 @@ async fn workspace_state_survives_graceful_restart() {
         .with_state_dir(bob_wstate.path().to_path_buf())
         .with_endpoint_setup(testing_setup(&dns_pkarr))
         .with_daemon_socket(daemon_b.socket.clone());
-    let (bob_ws, _bob_ws_events) = Workspace::join_with(
+    let (bob_ws, bob_ws_events) = Workspace::join_with(
         &bob,
         session,
         bob_root.path().to_path_buf(),
@@ -315,28 +324,59 @@ async fn workspace_state_survives_graceful_restart() {
     )
     .await
     .expect("Workspace::join_with phase 2");
+    common::drain_ws_events(bob_ws_events);
     let bob_ws = Arc::new(bob_ws);
     let bob_handle = Arc::clone(&bob_ws).run().await;
 
-    // Reconcile-driven delete propagates to bob.
-    wait_for_missing(&bob_root.path().join("a.txt")).await;
+    // Reconcile-driven delete propagates to bob. This proves the
+    // initial doc-sync (bob→alice import path) succeeded.
+    phase(
+        "p2: a.txt delete propagates to bob",
+        wait_for_missing(&bob_root.path().join("a.txt")),
+    )
+    .await;
 
-    // Live sync resumed both ways. No settling sleep needed.
+    // Gate on bidirectional gossip: bob writes a probe that alice
+    // must see. This blocks until iroh-docs' gossip neighbors are
+    // mutually registered — without it, alice's subsequent writes
+    // race the NeighborUp event and may never gossip-broadcast.
+    tokio::fs::write(bob_root.path().join(".sync_probe"), b"ok")
+        .await
+        .unwrap();
+    phase(
+        "p2: bob→alice gossip probe",
+        wait_for_file(&alice_root.path().join(".sync_probe"), b"ok"),
+    )
+    .await;
+
+    // Live sync resumed both ways.
     tokio::fs::write(alice_root.path().join("b.txt"), b"beta")
         .await
         .unwrap();
-    wait_for_file(&bob_root.path().join("b.txt"), b"beta").await;
+    phase(
+        "p2: b.txt reaches bob",
+        wait_for_file(&bob_root.path().join("b.txt"), b"beta"),
+    )
+    .await;
 
     tokio::fs::write(bob_root.path().join("c.txt"), b"charlie")
         .await
         .unwrap();
-    wait_for_file(&alice_root.path().join("c.txt"), b"charlie").await;
+    phase(
+        "p2: c.txt reaches alice",
+        wait_for_file(&alice_root.path().join("c.txt"), b"charlie"),
+    )
+    .await;
 
     // Delete after restart still propagates.
     tokio::fs::remove_file(alice_root.path().join("b.txt"))
         .await
         .unwrap();
-    wait_for_missing(&bob_root.path().join("b.txt")).await;
+    phase(
+        "p2: b.txt delete propagates to bob",
+        wait_for_missing(&bob_root.path().join("b.txt")),
+    )
+    .await;
 
     alice_ws.shutdown().await.expect("shutdown");
     bob_ws.shutdown().await.expect("shutdown");
@@ -384,7 +424,7 @@ async fn alice_post_restart_writes_reach_bob() {
         .with_state_dir(alice_wstate.path().to_path_buf())
         .with_endpoint_setup(testing_setup(&dns_pkarr))
         .with_daemon_socket(alice_daemon.socket.clone());
-    let (alice_ws, _alice_ws_events) = Workspace::host_with(
+    let (alice_ws, alice_ws_events) = Workspace::host_with(
         &alice,
         "alice",
         alice_root.path().to_path_buf(),
@@ -393,6 +433,7 @@ async fn alice_post_restart_writes_reach_bob() {
     )
     .await
     .expect("Workspace::host_with phase 1");
+    common::drain_ws_events(alice_ws_events);
     let session = alice_ws.session_id();
     let artel_ticket = alice_ws
         .join_ticket()
@@ -431,7 +472,7 @@ async fn alice_post_restart_writes_reach_bob() {
         .with_state_dir(bob_wstate.path().to_path_buf())
         .with_endpoint_setup(testing_setup(&dns_pkarr))
         .with_daemon_socket(bob_daemon.socket.clone());
-    let (bob_ws, _bob_ws_events) = Workspace::join_with(
+    let (bob_ws, bob_ws_events) = Workspace::join_with(
         &bob,
         session,
         bob_root.path().to_path_buf(),
@@ -440,14 +481,19 @@ async fn alice_post_restart_writes_reach_bob() {
     )
     .await
     .expect("Workspace::join_with");
+    common::drain_ws_events(bob_ws_events);
     let bob_ws = Arc::new(bob_ws);
     let bob_handle = Arc::clone(&bob_ws).run().await;
 
     // Grant Bob RW so he receives the NamespaceSecret needed to write.
     common::grant_rw_and_wait(
-        &alice, session, bob_peer_id,
-        bob_root.path(), alice_root.path(),
-    ).await;
+        &alice,
+        session,
+        bob_peer_id,
+        bob_root.path(),
+        alice_root.path(),
+    )
+    .await;
 
     // Pre-restart bidirectional sanity.
     tokio::fs::write(alice_root.path().join("pre_alice.txt"), b"alpha")
@@ -475,7 +521,7 @@ async fn alice_post_restart_writes_reach_bob() {
         .with_state_dir(alice_wstate.path().to_path_buf())
         .with_endpoint_setup(testing_setup(&dns_pkarr))
         .with_daemon_socket(alice_daemon.socket.clone());
-    let (alice_ws, _alice_ws_events) = Workspace::host_with(
+    let (alice_ws, alice_ws_events) = Workspace::host_with(
         &alice,
         "alice",
         alice_root.path().to_path_buf(),
@@ -484,6 +530,7 @@ async fn alice_post_restart_writes_reach_bob() {
     )
     .await
     .expect("Workspace::host_with phase 2");
+    common::drain_ws_events(alice_ws_events);
     let alice_ws = Arc::new(alice_ws);
     let alice_handle = Arc::clone(&alice_ws).run().await;
 
@@ -652,7 +699,7 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
         .with_endpoint_setup(artel_fs::EndpointSetup::ProductionCustomRelay {
             relay_url: relay_url.clone(),
         });
-    let (alice_ws, _alice_ws_events) = phase(
+    let (alice_ws, alice_ws_events) = phase(
         "alice Workspace::host_with (phase 1)",
         Workspace::host_with(
             &alice,
@@ -664,6 +711,7 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
     )
     .await
     .expect("Workspace::host_with phase 1");
+    common::drain_ws_events(alice_ws_events);
     let session = alice_ws.session_id();
     let artel_ticket = alice_ws
         .join_ticket()
@@ -710,7 +758,7 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
         .with_endpoint_setup(artel_fs::EndpointSetup::ProductionCustomRelay {
             relay_url: relay_url.clone(),
         });
-    let (bob_ws, _bob_ws_events) = phase(
+    let (bob_ws, bob_ws_events) = phase(
         "bob Workspace::join_with (doc import + bulk_export)",
         Workspace::join_with(
             &bob,
@@ -722,15 +770,20 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
     )
     .await
     .expect("Workspace::join_with");
+    common::drain_ws_events(bob_ws_events);
     let bob_ws = Arc::new(bob_ws);
     let bob_handle = Arc::clone(&bob_ws).run().await;
 
     // Grant Bob RW so he receives the NamespaceSecret via the upgrade
     // path and can produce valid signed entries.
     common::grant_rw_and_wait(
-        &alice, session, bob_peer_id,
-        bob_root.path(), alice_root.path(),
-    ).await;
+        &alice,
+        session,
+        bob_peer_id,
+        bob_root.path(),
+        alice_root.path(),
+    )
+    .await;
 
     tokio::fs::write(alice_root.path().join("pre_alice.txt"), b"alpha")
         .await
@@ -778,7 +831,7 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
         .with_endpoint_setup(artel_fs::EndpointSetup::ProductionCustomRelay {
             relay_url: relay_url.clone(),
         });
-    let (alice_ws, _alice_ws_events) = phase(
+    let (alice_ws, alice_ws_events) = phase(
         "alice Workspace::host_with (phase 2 — post-restart)",
         Workspace::host_with(
             &alice,
@@ -790,6 +843,7 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
     )
     .await
     .expect("Workspace::host_with phase 2");
+    common::drain_ws_events(alice_ws_events);
     let alice_ws = Arc::new(alice_ws);
     let alice_handle = Arc::clone(&alice_ws).run().await;
 
@@ -965,7 +1019,7 @@ async fn re_hosting_recovers_session_id_and_resumes_message_flow() {
     let alice_cfg = WorkspaceConfig::default()
         .with_state_dir(alice_wstate.path().to_path_buf())
         .with_endpoint_setup(testing_setup(&dns_pkarr));
-    let (alice_ws_1, _alice_events_1) = Workspace::host_with(
+    let (alice_ws_1, alice_events_1) = Workspace::host_with(
         &alice_a1,
         "alice",
         alice_root.path().to_path_buf(),
@@ -974,6 +1028,7 @@ async fn re_hosting_recovers_session_id_and_resumes_message_flow() {
     )
     .await
     .expect("Workspace::host_with phase 1");
+    common::drain_ws_events(alice_events_1);
     let session_id_1 = alice_ws_1.session_id();
     let ticket = alice_ws_1
         .join_ticket()
@@ -1004,7 +1059,7 @@ async fn re_hosting_recovers_session_id_and_resumes_message_flow() {
     let bob_cfg = WorkspaceConfig::default()
         .with_state_dir(bob_wstate.path().to_path_buf())
         .with_endpoint_setup(testing_setup(&dns_pkarr));
-    let (bob_ws, _bob_events) = Workspace::join_with(
+    let (bob_ws, bob_events) = Workspace::join_with(
         &bob,
         session_id_1,
         bob_root.path().to_path_buf(),
@@ -1013,6 +1068,7 @@ async fn re_hosting_recovers_session_id_and_resumes_message_flow() {
     )
     .await
     .expect("Workspace::join_with phase 1");
+    common::drain_ws_events(bob_events);
     let bob_ws = Arc::new(bob_ws);
     let bob_handle = Arc::clone(&bob_ws).run().await;
 
@@ -1052,7 +1108,7 @@ async fn re_hosting_recovers_session_id_and_resumes_message_flow() {
     let alice_cfg_2 = WorkspaceConfig::default()
         .with_state_dir(alice_wstate.path().to_path_buf())
         .with_endpoint_setup(testing_setup(&dns_pkarr));
-    let (alice_ws_2, _alice_events_2) = Workspace::host_with(
+    let (alice_ws_2, alice_events_2) = Workspace::host_with(
         &alice_a2,
         "alice",
         alice_root.path().to_path_buf(),
@@ -1061,6 +1117,7 @@ async fn re_hosting_recovers_session_id_and_resumes_message_flow() {
     )
     .await
     .expect("Workspace::host_with phase 2");
+    common::drain_ws_events(alice_events_2);
 
     // The whole point of this slice: same session id across the
     // restart.

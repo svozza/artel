@@ -21,7 +21,7 @@ use tracing::{debug, warn};
 
 use crate::filter::{FilterDecision, SkipReason, WorkspaceFilter};
 use crate::rules::Mode;
-use crate::workspace::{Direction, Workspace, WorkspaceEvent};
+use crate::workspace::{Direction, Workspace, WorkspaceEvent, emit_event};
 use crate::{EchoGuard, keys};
 
 /// Local change observed by the debounced watcher. Two flavours
@@ -161,13 +161,13 @@ async fn on_modified(
     match filter.check(&path) {
         FilterDecision::Skip(SkipReason::TooLarge { size }) => {
             debug!(target: "artel_fs::watcher", path = %path.display(), size, "filter: skip too-large");
-            let _ = workspace
-                .events
-                .send(WorkspaceEvent::SkippedTooLarge {
+            emit_event(
+                &workspace.events,
+                WorkspaceEvent::SkippedTooLarge {
                     path: path.clone(),
                     size,
-                })
-                .await;
+                },
+            );
             return;
         }
         FilterDecision::Skip(reason) => {
@@ -187,13 +187,13 @@ async fn on_modified(
     let rel = path.strip_prefix(&workspace.root).unwrap_or(&path);
     if workspace.compiled_rules.mode_for(rel) == Mode::ReadOnly {
         debug!(target: "artel_fs::watcher", path = %path.display(), "rules: skip ReadOnly outgoing");
-        let _ = workspace
-            .events
-            .send(WorkspaceEvent::SkippedReadOnly {
+        emit_event(
+            &workspace.events,
+            WorkspaceEvent::SkippedReadOnly {
                 path,
                 direction: Direction::Outgoing,
-            })
-            .await;
+            },
+        );
         return;
     }
 
@@ -236,7 +236,7 @@ async fn on_modified(
         return;
     }
 
-    let Some(key) = path_to_key_or_emit(&workspace.root, &path, &workspace.events).await else {
+    let Some(key) = path_to_key_or_emit(&workspace.root, &path, &workspace.events) else {
         return;
     };
 
@@ -254,13 +254,10 @@ async fn on_modified(
         }
         Err(err) => {
             warn!(target: "artel_fs::watcher", path = %path.display(), len, %err, "set_bytes failed");
-            let _ = workspace
-                .events
-                .send(WorkspaceEvent::Error(format!(
-                    "publish {} failed: {err}",
-                    path.display(),
-                )))
-                .await;
+            emit_event(
+                &workspace.events,
+                WorkspaceEvent::Error(format!("publish {} failed: {err}", path.display())),
+            );
         }
     }
 }
@@ -275,16 +272,16 @@ async fn on_removed(workspace: &Arc<Workspace>, path: PathBuf) {
     let rel = path.strip_prefix(&workspace.root).unwrap_or(&path);
     if workspace.compiled_rules.mode_for(rel) == Mode::ReadOnly {
         debug!(target: "artel_fs::watcher", path = %path.display(), "rules: skip ReadOnly outgoing tombstone");
-        let _ = workspace
-            .events
-            .send(WorkspaceEvent::SkippedReadOnly {
+        emit_event(
+            &workspace.events,
+            WorkspaceEvent::SkippedReadOnly {
                 path,
                 direction: Direction::Outgoing,
-            })
-            .await;
+            },
+        );
         return;
     }
-    let Some(key) = path_to_key_or_emit(&workspace.root, &path, &workspace.events).await else {
+    let Some(key) = path_to_key_or_emit(&workspace.root, &path, &workspace.events) else {
         return;
     };
     match workspace.doc.del(workspace.author, key).await {
@@ -293,13 +290,10 @@ async fn on_removed(workspace: &Arc<Workspace>, path: PathBuf) {
         }
         Err(err) => {
             warn!(target: "artel_fs::watcher", path = %path.display(), %err, "doc.del failed");
-            let _ = workspace
-                .events
-                .send(WorkspaceEvent::Error(format!(
-                    "tombstone {} failed: {err}",
-                    path.display(),
-                )))
-                .await;
+            emit_event(
+                &workspace.events,
+                WorkspaceEvent::Error(format!("tombstone {} failed: {err}", path.display())),
+            );
         }
     }
 }
@@ -317,7 +311,7 @@ async fn on_removed(workspace: &Arc<Workspace>, path: PathBuf) {
 /// `on_modified` emitted [`WorkspaceEvent::Error`] but `on_removed`
 /// only `tracing::warn!`'d, hiding the failure from event-stream
 /// consumers).
-async fn path_to_key_or_emit(
+fn path_to_key_or_emit(
     root: &Path,
     path: &Path,
     events: &mpsc::Sender<WorkspaceEvent>,
@@ -326,12 +320,10 @@ async fn path_to_key_or_emit(
         Ok(k) => Some(k),
         Err(err) => {
             warn!(target: "artel_fs::watcher", path = %path.display(), %err, "path_to_key failed");
-            let _ = events
-                .send(WorkspaceEvent::Error(format!(
-                    "path_to_key {}: {err}",
-                    path.display(),
-                )))
-                .await;
+            emit_event(
+                events,
+                WorkspaceEvent::Error(format!("path_to_key {}: {err}", path.display())),
+            );
             None
         }
     }
@@ -375,7 +367,7 @@ mod tests {
         // A path that isn't under `root` makes `path_to_key`'s
         // `strip_prefix` fail.
         let outside = PathBuf::from("/elsewhere/foo.txt");
-        let result = path_to_key_or_emit(&root(), &outside, &tx).await;
+        let result = path_to_key_or_emit(&root(), &outside, &tx);
         assert!(
             result.is_none(),
             "path_to_key failure must return None — callers rely on \
@@ -410,7 +402,6 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<WorkspaceEvent>(8);
         let inside = root().join("a").join("b.txt");
         let key = path_to_key_or_emit(&root(), &inside, &tx)
-            .await
             .expect("happy-path translation must succeed");
         assert_eq!(key, b"path/a/b.txt");
         // Nothing should land on the events channel; a short timeout
