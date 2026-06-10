@@ -1075,8 +1075,8 @@ mod tests {
                     kind,
                 }
             }),
-            (any::<[u8; 16]>(), any::<bool>(), any::<u64>()).prop_map(
-                |(s, is_rw, expiry_ms)| Request::IssueTicket {
+            (any::<[u8; 16]>(), any::<bool>(), any::<u64>()).prop_map(|(s, is_rw, expiry_ms)| {
+                Request::IssueTicket {
                     session: SessionId::from_bytes(s),
                     granted_cap: if is_rw {
                         crate::capability::Capability::ReadWrite
@@ -1084,8 +1084,8 @@ mod tests {
                         crate::capability::Capability::Read
                     },
                     expiry_ms,
-                },
-            ),
+                }
+            },),
             (any::<[u8; 16]>(), any::<[u8; 32]>(), any::<[u8; 32]>()).prop_map(
                 |(s, peer, secret)| Request::DeliverUpgrade {
                     session: SessionId::from_bytes(s),

@@ -24,7 +24,7 @@ use artel_protocol::signing::{self, verify_reason};
 use artel_protocol::ticket::{self, SessionTicket, WireEndpointAddr};
 use artel_protocol::{
     Event, JoinTicket, MessageKind, PeerId, PeerInfo, Seq, SessionId, SessionMessage,
-    SessionSummary,
+    SessionSummary, UpgradePayload,
 };
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, broadcast};
@@ -774,7 +774,13 @@ impl Registry {
     ) -> JoinTicket {
         let tid = TicketId::new_random();
         let cap_sig = self.signing_key.as_ref().map_or(SIGNATURE_UNSIGNED, |key| {
-            signing::sign_ticket_cap(key.as_signing_key(), tid, session_id, granted_cap, expiry_ms)
+            signing::sign_ticket_cap(
+                key.as_signing_key(),
+                tid,
+                session_id,
+                granted_cap,
+                expiry_ms,
+            )
         });
         JoinTicket::from(ticket::encode(&SessionTicket {
             ticket_id: tid,
@@ -899,7 +905,15 @@ impl Registry {
         // creating an unreachable session.
         #[cfg(not(feature = "iroh"))]
         {
-            let _ = (host_peer_id, host_addr, joiner, ticket_id, granted_cap, expiry_ms, cap_sig);
+            let _ = (
+                host_peer_id,
+                host_addr,
+                joiner,
+                ticket_id,
+                granted_cap,
+                expiry_ms,
+                cap_sig,
+            );
             tracing::debug!(
                 ?session_id,
                 "remote ticket received but iroh feature is off",
@@ -1835,12 +1849,6 @@ impl Registry {
         sender_peer: PeerId,
         namespace_secret: [u8; 32],
     ) -> Result<(), SessionError> {
-        #[derive(serde::Serialize)]
-        struct UpgradePayload {
-            target_peer: PeerId,
-            namespace_secret: [u8; 32],
-        }
-
         let session_arc = {
             let guard = self.sessions.read().await;
             guard
@@ -1851,9 +1859,14 @@ impl Registry {
 
         let s = session_arc.lock().await;
 
-        // Only joiners (Remote sessions) should accept upgrades.
+        // Only joiners (Remote sessions) should accept upgrades. A
+        // Local session IS the host, so it has nothing to receive —
+        // surface that directly rather than the host-side `NotHost`,
+        // whose message is the semantic opposite of what happened.
         if s.kind != SessionKind::Remote {
-            return Err(SessionError::NotHost);
+            return Err(SessionError::Internal(
+                "host sessions cannot receive upgrades".into(),
+            ));
         }
 
         // The sender must be the session's host.
@@ -1870,6 +1883,18 @@ impl Registry {
         })
         .expect("UpgradePayload is infallible to serialize");
 
+        // Synthetic, non-persisted event: `Seq::ZERO`, no `store.append`,
+        // and excluded from replay (see the `UPGRADE_ACTION` skip in the
+        // subscribe path). It is delivered live only.
+        //
+        // INVARIANT: upgrades are *not* replayable. A joiner that misses
+        // this live event (e.g. restarts between broadcast and process)
+        // does not recover it from the log — it relies on the host
+        // re-delivering on reconnect (the `Event::PeerJoined` handler in
+        // `artel-fs`'s `cap_listener` re-issues `DeliverUpgrade`). If
+        // upgrades ever need to survive a joiner restart on their own
+        // (e.g. offline promotion), this must become a sequenced,
+        // persisted message instead.
         let message = SessionMessage::new(
             Seq::ZERO,
             0,
@@ -2277,10 +2302,7 @@ mod tests {
         let r = registry();
         let (id, _) = r.host_rw(peer(1, "alice"), None).await.unwrap();
 
-        let ticket = r
-            .issue_ticket(id, Capability::Read, 0)
-            .await
-            .unwrap();
+        let ticket = r.issue_ticket(id, Capability::Read, 0).await.unwrap();
         let decoded = ticket::decode(ticket.as_str()).unwrap();
         assert_eq!(decoded.session_id, id);
         assert_eq!(decoded.granted_cap, Capability::Read);
@@ -2306,10 +2328,7 @@ mod tests {
     async fn issue_ticket_for_unknown_session_returns_error() {
         let r = registry();
         let fake = SessionId::from_bytes([0xde; 16]);
-        let err = r
-            .issue_ticket(fake, Capability::Read, 0)
-            .await
-            .unwrap_err();
+        let err = r.issue_ticket(fake, Capability::Read, 0).await.unwrap_err();
         assert_eq!(err, SessionError::UnknownSession(fake));
     }
 
@@ -2330,10 +2349,7 @@ mod tests {
                 .await
                 .insert(id, Arc::new(Mutex::new(session)));
         }
-        let err = r2
-            .issue_ticket(id, Capability::Read, 0)
-            .await
-            .unwrap_err();
+        let err = r2.issue_ticket(id, Capability::Read, 0).await.unwrap_err();
         assert_eq!(err, SessionError::NotHost);
     }
 
@@ -2685,7 +2701,9 @@ mod tests {
         // Admit the joiner first so the membership check passes —
         // this test pins the verify-before-append property, not the
         // membership path.
-        r.ensure_member(id, claimed_peer.clone(), None).await.unwrap();
+        r.ensure_member(id, claimed_peer.clone(), None)
+            .await
+            .unwrap();
 
         let err = r
             .send(

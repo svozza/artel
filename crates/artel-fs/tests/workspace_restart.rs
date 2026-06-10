@@ -25,24 +25,8 @@ use artel_fs::{
 use artel_protocol::{Event, MessageKind, Request, Response, SessionId};
 use iroh::test_utils::DnsPkarrServer;
 use iroh_docs::DocTicket;
-use iroh_relay::server::Server as RelayServer;
 use tempfile::TempDir;
-use tokio::sync::OnceCell;
 use tokio::time::timeout;
-
-static SHARED_RELAY: OnceCell<(RelayServer, String)> = OnceCell::const_new();
-
-async fn shared_relay_url() -> &'static str {
-    &SHARED_RELAY
-        .get_or_init(|| async {
-            let (_relay_map, relay_url, server) = iroh::test_utils::run_relay_server()
-                .await
-                .expect("run_relay_server for workspace-restart tests");
-            (server, relay_url.to_string())
-        })
-        .await
-        .1
-}
 
 use common::{
     DaemonPaths, LocalDaemon, Pair, daemon_testing_setup, fresh_state, spawn_daemon_at,
@@ -667,7 +651,7 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
     let bob_root = TempDir::new().unwrap();
     let bob_wstate = TempDir::new().unwrap();
 
-    let relay_url: iroh::RelayUrl = shared_relay_url().await.parse().unwrap();
+    let relay_url: iroh::RelayUrl = common::shared_relay_url().await.parse().unwrap();
     let alice_daemon = phase(
         "spawn alice daemon (initial)",
         spawn_daemon_at(

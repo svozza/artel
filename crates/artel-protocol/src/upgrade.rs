@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::SessionId;
+use crate::{PeerId, SessionId};
 
 /// ALPN for the direct-stream upgrade protocol.
 pub const UPGRADE_ALPN: &[u8] = b"artel/upgrade/1";
@@ -21,6 +21,21 @@ pub const UPGRADE_ACK: u8 = 0x01;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpgradeFrame {
     pub session_id: SessionId,
+    #[serde(with = "serde_bytes")]
+    pub namespace_secret: [u8; 32],
+}
+
+/// Payload of the synthetic `workspace.upgrade` system message the
+/// joiner daemon injects into its session event stream once it has
+/// received the `NamespaceSecret` over the direct stream.
+///
+/// The daemon serializes this with postcard; `artel-fs`'s
+/// `cap_listener` deserializes it to learn which peer was promoted and
+/// the secret to import. Shared here so the two crates can't drift on
+/// field order or type without a compile break.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpgradePayload {
+    pub target_peer: PeerId,
     #[serde(with = "serde_bytes")]
     pub namespace_secret: [u8; 32],
 }
@@ -66,5 +81,16 @@ mod tests {
     #[test]
     fn upgrade_ack_value() {
         assert_eq!(UPGRADE_ACK, 0x01);
+    }
+
+    #[test]
+    fn upgrade_payload_postcard_round_trip() {
+        let payload = UpgradePayload {
+            target_peer: PeerId::from_bytes([0x11; 32]),
+            namespace_secret: [0x42; 32],
+        };
+        let bytes = postcard::to_allocvec(&payload).unwrap();
+        let back: UpgradePayload = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(payload, back);
     }
 }

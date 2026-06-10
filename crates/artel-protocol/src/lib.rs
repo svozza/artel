@@ -50,5 +50,5 @@ pub use rpc::{
     SignedSendPayload, WireMessage,
 };
 pub use ticket::{SessionTicket, TICKET_PREFIX, TICKET_VERSION, TicketError, WireEndpointAddr};
-pub use upgrade::{UPGRADE_ACK, UPGRADE_ALPN, UpgradeFrame};
+pub use upgrade::{UPGRADE_ACK, UPGRADE_ALPN, UpgradeFrame, UpgradePayload};
 pub use version::{PROTOCOL_VERSION, ProtocolVersion, VersionMismatch};

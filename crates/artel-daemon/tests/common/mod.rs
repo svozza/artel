@@ -26,6 +26,7 @@ use artel_daemon::shutdown::Shutdown;
 use artel_daemon::{Daemon, DaemonConfig, EndpointSetup};
 use artel_protocol::PeerId;
 use iroh::test_utils::DnsPkarrServer;
+use iroh_relay::server::Server as RelayServer;
 use tempfile::TempDir;
 use tokio::sync::OnceCell;
 use tokio::time::timeout;
@@ -59,6 +60,24 @@ async fn shared_dns_pkarr() -> Arc<DnsPkarrServer> {
         })
         .await
         .clone()
+}
+
+/// Per-binary shared localhost relay server. Keeps the `RelayServer`
+/// alive for the test binary's lifetime; all binary-spawn tests reuse
+/// the same relay URL so the spawned daemon subprocess can reach a
+/// relay without touching n0's public TLS-fronted infra.
+static SHARED_RELAY: OnceCell<(RelayServer, String)> = OnceCell::const_new();
+
+pub async fn shared_relay_url() -> &'static str {
+    &SHARED_RELAY
+        .get_or_init(|| async {
+            let (_relay_map, relay_url, server) = iroh::test_utils::run_relay_server()
+                .await
+                .expect("run_relay_server for binary-spawn tests");
+            (server, relay_url.to_string())
+        })
+        .await
+        .1
 }
 
 pub struct State {

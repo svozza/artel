@@ -865,8 +865,7 @@ async fn handle_inbound_frame(
             };
             let registry_weak = bridge.registry.lock().await.clone();
             if let Some(registry) = registry_weak.upgrade()
-                && let Err(err) =
-                    registry.ensure_member(session, peer, Some(cap_claim)).await
+                && let Err(err) = registry.ensure_member(session, peer, Some(cap_claim)).await
             {
                 warn!(?err, "join_announcement: ensure_member failed");
             }

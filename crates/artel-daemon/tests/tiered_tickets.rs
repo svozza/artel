@@ -1,6 +1,6 @@
 //! Phase 4B daemon-level e2e tests for tiered tickets:
 //! - Read-only ticket joiners cannot send.
-//! - RW ticket joiners (default from HostSession) can send.
+//! - RW ticket joiners (default from `HostSession`) can send.
 //! - Expired tickets are rejected at admission.
 //! - Direct-stream upgrade delivers secret only to the target peer.
 
@@ -288,6 +288,7 @@ async fn expired_ticket_rejected_at_admission() {
 // =============================================================
 
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
 async fn direct_stream_upgrade_delivers_secret() {
     let dns_pkarr = std::sync::Arc::new(
         iroh::test_utils::DnsPkarrServer::run()
@@ -422,10 +423,10 @@ async fn direct_stream_upgrade_delivers_secret() {
             let Some(ev) = carol_events.recv().await else {
                 return false;
             };
-            if let Event::Message { message, .. } = ev {
-                if message.action == UPGRADE_ACTION {
-                    return true;
-                }
+            if let Event::Message { message, .. } = ev
+                && message.action == UPGRADE_ACTION
+            {
+                return true;
             }
         }
     })
@@ -454,16 +455,19 @@ async fn wait_for_peer_joined(
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        assert!(!remaining.is_zero(), "{label}: PeerJoined({peer_id}) never arrived");
+        assert!(
+            !remaining.is_zero(),
+            "{label}: PeerJoined({peer_id}) never arrived"
+        );
         let event = match timeout(remaining, events.recv()).await {
             Ok(Some(ev)) => ev,
             Ok(None) => panic!("{label}: events channel closed"),
             Err(_) => continue,
         };
-        if let Event::PeerJoined { peer, .. } = event {
-            if peer.id == peer_id {
-                return;
-            }
+        if let Event::PeerJoined { peer, .. } = event
+            && peer.id == peer_id
+        {
+            return;
         }
     }
 }
@@ -481,10 +485,10 @@ async fn wait_for_upgrade_event(
             Ok(None) => panic!("{label}: events channel closed"),
             Err(_) => continue,
         };
-        if let Event::Message { message, .. } = event {
-            if message.action == UPGRADE_ACTION {
-                return message;
-            }
+        if let Event::Message { message, .. } = event
+            && message.action == UPGRADE_ACTION
+        {
+            return message;
         }
     }
 }

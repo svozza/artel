@@ -25,7 +25,7 @@ use std::time::Duration;
 use artel_client::{Client, ClientError};
 use artel_protocol::{
     Event, JoinTicket, MessageKind, PeerId, ProtocolError, Request, Response, SendPayload,
-    SessionId,
+    SessionId, UpgradePayload,
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -69,13 +69,6 @@ pub const TICKET_ACTION: &str = "workspace.ticket";
 pub const NODE_ID_ACTION: &str = "workspace.node_id";
 
 use artel_protocol::UPGRADE_ACTION;
-
-/// Payload for the `workspace.upgrade` system message.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct UpgradePayload {
-    target_peer: PeerId,
-    namespace_secret: [u8; 32],
-}
 
 /// Capacity of the [`Workspace::events`] channel. Modest cap so a
 /// stuck consumer back-pressures the watcher rather than letting

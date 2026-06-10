@@ -13,8 +13,8 @@
 
 use std::sync::Arc;
 
-use artel_protocol::upgrade::{UPGRADE_ACK, UPGRADE_ALPN, UpgradeFrame};
 use artel_protocol::PeerId;
+use artel_protocol::upgrade::{UPGRADE_ACK, UPGRADE_ALPN, UpgradeFrame};
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use tracing::warn;
@@ -101,9 +101,8 @@ impl ProtocolHandler for UpgradeProtocol {
             warn!(error = %e, "upgrade_protocol: failed to send ACK");
             AcceptError::from_err(std::io::Error::other(e.to_string()))
         })?;
-        send.finish().map_err(|e| {
-            AcceptError::from_err(std::io::Error::other(e.to_string()))
-        })?;
+        send.finish()
+            .map_err(|e| AcceptError::from_err(std::io::Error::other(e.to_string())))?;
         // Wait until the remote has received all data. Without this,
         // returning from `accept` drops the Connection and the ACK byte
         // may not reach the sender.

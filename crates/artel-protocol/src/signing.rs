@@ -513,7 +513,10 @@ pub fn sign_ticket_cap(
     expiry_ms: u64,
 ) -> SigBytes {
     key.sign(&ticket_cap_canonical_bytes(
-        ticket_id, session_id, granted_cap, expiry_ms,
+        ticket_id,
+        session_id,
+        granted_cap,
+        expiry_ms,
     ))
     .to_bytes()
 }
@@ -1381,8 +1384,15 @@ mod tests {
         let sig = sign_ticket_cap(&key, tid, sid, Capability::Read, 0);
         let other_tid = TicketId::from_bytes([0x02; 16]);
         assert_eq!(
-            verify_ticket_cap(&host_pubkey(&key), other_tid, sid, Capability::Read, 0, &sig)
-                .unwrap_err(),
+            verify_ticket_cap(
+                &host_pubkey(&key),
+                other_tid,
+                sid,
+                Capability::Read,
+                0,
+                &sig
+            )
+            .unwrap_err(),
             VerifyError::BadSig,
         );
     }
@@ -1415,15 +1425,8 @@ mod tests {
         let sid = sample_session_id();
         let sig = sign_ticket_cap(&key, tid, sid, Capability::Read, 0);
         assert_eq!(
-            verify_ticket_cap(
-                &host_pubkey(&key),
-                tid,
-                sid,
-                Capability::ReadWrite,
-                0,
-                &sig
-            )
-            .unwrap_err(),
+            verify_ticket_cap(&host_pubkey(&key), tid, sid, Capability::ReadWrite, 0, &sig)
+                .unwrap_err(),
             VerifyError::BadSig,
         );
     }

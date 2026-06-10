@@ -41,27 +41,11 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use iroh_gossip::api::Event as GossipEvent;
 use iroh_gossip::proto::TopicId;
-use iroh_relay::server::Server as RelayServer;
 use pretty_assertions::assert_eq;
-use tokio::sync::OnceCell;
 use tokio::time::timeout;
 
-static SHARED_RELAY: OnceCell<(RelayServer, String)> = OnceCell::const_new();
-
-async fn shared_relay_url() -> &'static str {
-    &SHARED_RELAY
-        .get_or_init(|| async {
-            let (_relay_map, relay_url, server) = iroh::test_utils::run_relay_server()
-                .await
-                .expect("run_relay_server for auth-b5 tests");
-            (server, relay_url.to_string())
-        })
-        .await
-        .1
-}
-
 async fn custom_relay_setup() -> EndpointSetup {
-    let relay_url: iroh::RelayUrl = shared_relay_url().await.parse().unwrap();
+    let relay_url: iroh::RelayUrl = common::shared_relay_url().await.parse().unwrap();
     EndpointSetup::ProductionCustomRelay { relay_url }
 }
 

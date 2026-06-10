@@ -314,7 +314,10 @@ impl Daemon {
                 crate::upgrade_protocol::UpgradeProtocol::new(Arc::clone(&registry));
             let router = iroh::protocol::Router::builder(iroh.endpoint.clone())
                 .accept(iroh_gossip::ALPN, iroh.gossip.clone())
-                .accept(crate::upgrade_protocol::UpgradeProtocol::alpn(), upgrade_proto)
+                .accept(
+                    crate::upgrade_protocol::UpgradeProtocol::alpn(),
+                    upgrade_proto,
+                )
                 .spawn();
             iroh.router = Some(router);
         }
@@ -706,9 +709,7 @@ async fn dispatch(
         }
         #[cfg(not(feature = "iroh"))]
         Request::DeliverUpgrade { .. } => Response::Error {
-            error: ProtocolError::Internal(
-                "DeliverUpgrade requires the iroh feature".into(),
-            ),
+            error: ProtocolError::Internal("DeliverUpgrade requires the iroh feature".into()),
         },
     }
 }
@@ -727,7 +728,10 @@ async fn dispatch_host(
         id: registry.daemon_peer_id(),
         display_name,
     };
-    match registry.host(peer.clone(), session, Capability::ReadWrite, 0).await {
+    match registry
+        .host(peer.clone(), session, Capability::ReadWrite, 0)
+        .await
+    {
         Ok((session, ticket)) => {
             memberships.insert(session, peer);
             Response::HostSession { session, ticket }
@@ -839,7 +843,12 @@ async fn dispatch_deliver_upgrade(
             error: ProtocolError::Internal(format!("write frame failed: {e}")),
         };
     }
-    let _ = send.finish();
+    if let Err(e) = send.finish() {
+        warn!(error = %e, "deliver_upgrade: finish failed");
+        return Response::Error {
+            error: ProtocolError::Internal(format!("stream finish failed: {e}")),
+        };
+    }
 
     // Read ACK.
     let mut ack_buf = [0u8; 1];
