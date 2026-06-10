@@ -5,7 +5,13 @@ intermittently. Treat "flaky" as a label for "real bug we haven't
 diagnosed yet" — never as a reason to ignore, retry, or just bump
 timeouts. Concrete examples in this doc come from the
 `iroh_docs_smoke` and `host_restart_*` investigations on
-`emdash/stable-id-jx4uy`; the recipe generalises.
+`emdash/stable-id-jx4uy`; the recipe generalises. (Those test files
+were since consolidated into multi-section bins — see "Examples from
+this codebase" at the bottom for where each lives now.)
+
+The `flake-detective` agent (`.claude/agents/flake-detective.md`)
+automates this recipe; point it at a flaky test rather than
+re-deriving the process by hand.
 
 ## The recipe
 
@@ -79,8 +85,9 @@ failure makes this trivial:
 ```bash
 rm -f /tmp/iter_*.log
 for i in $(seq 1 50); do
-  cargo test -p $crate --test $name -- --nocapture > /tmp/iter_$i.log 2>&1
-  if grep -q FAILED /tmp/iter_$i.log; then
+  cargo nextest run -p $crate --test $bin -E "test($name)" --no-capture \
+    > /tmp/iter_$i.log 2>&1
+  if [ $? -ne 0 ]; then
     echo "FAIL iter=$i log=/tmp/iter_$i.log"
     break
   else
@@ -88,6 +95,11 @@ for i in $(seq 1 50); do
   fi
 done
 ```
+
+For Tier C (`*_n0`) tests, add `--profile n0` — the default profile
+filters them out — and space the iterations: n0 rate-limits under
+back-to-back load, so a tight loop manufactures failures that look
+like the bug but are just throttling.
 
 Then read the failing log end-to-end. The truth is in there. The
 `>>> phase begin:` and `<<< phase end:` markers tell you the
@@ -120,12 +132,17 @@ healthy:
   localhost-fast, no n0 rate-limit exposure. Most cross-peer
   tests in this repo run on this fixture.
 - **Real-n0 tests** (the production canary —
-  `EndpointSetup::Production`, files often suffixed `_n0.rs`):
-  exercise n0's real pkarr/DNS infrastructure end-to-end. Catch
-  infrastructure-layer bugs the localhost fixture can't see
-  (relay session takeover for stable `EndpointId`s, propagation
-  windows under load, n0 rate limits). Slower and occasionally
-  flakier than the DnsPkarrServer tier; that's by design.
+  `EndpointSetup::Production` or `ProductionCustomRelay`, test
+  **fn names** suffixed `_n0` so the default nextest profile
+  filters them and the `n0` profile selects them — see
+  `.config/nextest.toml`): exercise n0's real pkarr/DNS
+  infrastructure end-to-end. Catch infrastructure-layer bugs the
+  localhost fixture can't see (relay session takeover for stable
+  `EndpointId`s, propagation windows under load, n0 rate limits).
+  Slower and occasionally flakier than the DnsPkarrServer tier;
+  that's by design. Run via `make test-n0`; they need real
+  pkarr+DNS reachability and are useless on restricted networks
+  (plane/cafe wifi) even when the relay is localhost.
 
 The pair is the diagnostic signal: when both fail, the bug is in
 our substrate or in iroh. When only the n0 sibling fails, it's
@@ -141,12 +158,16 @@ that took an in-memory address book; tests that used it short-
 circuited too much of the production discovery path to catch real
 bugs (`host_restart_ungraceful_n0`'s relay-rejection bug
 reproduced only under real n0; the MemoryLookup sibling passed
-silently). The migration to `DnsPkarrServer` happened in
-2026-05; the `EndpointSetup` enum shape now has only `Production`
-and `Testing { dns_pkarr }` variants. Don't reintroduce
-MemoryLookup. **Don't conflate "passes under a hermetic fixture"
-with "works in production"** — that's the insight DnsPkarrServer
-preserves and MemoryLookup didn't.
+silently). The migration to `DnsPkarrServer` happened in 2026-05.
+The `EndpointSetup` enum has since grown beyond
+`Production`/`Testing` (e.g. `TestingUnreachableRelay` for the
+typed relay-error contract, `ProductionCustomRelay` for real-n0
+discovery against a localhost relay) — every variant still runs
+the real discovery code path; none reintroduces an in-memory
+short-circuit. Don't reintroduce MemoryLookup. **Don't conflate
+"passes under a hermetic fixture" with "works in production"** —
+that's the insight DnsPkarrServer preserves and MemoryLookup
+didn't.
 
 When investigating *any* cross-process or cross-peer regression,
 run the real-n0 variant before declaring a fix complete.
@@ -227,22 +248,30 @@ isolation. The diagnosis chain, recorded here because the verdict is
 
 ## Examples from this codebase
 
-- `crates/artel-fs/tests/iroh_docs_smoke.rs` — production
-  discovery + retry loop on dial failure. Demonstrates the
-  pkarr-propagation race and how to handle it as a real consumer
-  would.
-- `crates/artel-fs/tests/iroh_docs_smoke_pkarr.rs` — same
-  property as the n0 sibling above, run against
-  `iroh::test_utils::DnsPkarrServer`. Deterministic and fast;
-  the production canary's reliable counterpart per the two-tier
-  pyramid in §5.
-- `crates/artel-fs/tests/host_restart_live_writes_n0.rs` —
-  graceful-shutdown variant of the host-restart property over
-  real n0. Pins that the substrate works correctly across a
-  host restart with `Workspace::shutdown` properly called.
+(Paths updated after the 2026-05-29 test-consolidation plan merged
+the old per-file bins into multi-section bins.)
+
+- `crates/artel-fs/tests/iroh_internals.rs` —
+  `doc_ticket_round_trips_without_manual_address_seeding_n0`:
+  production discovery + retry loop on dial failure; demonstrates
+  the pkarr-propagation race and how to handle it as a real
+  consumer would. Its deterministic sibling
+  `doc_ticket_round_trips_via_localhost_pkarr_dns` runs the same
+  property against `iroh::test_utils::DnsPkarrServer` — the
+  two-tier pyramid of §5 inside one bin. (Formerly
+  `iroh_docs_smoke.rs` / `iroh_docs_smoke_pkarr.rs`.)
+- `crates/artel-fs/tests/workspace_restart.rs` —
+  `alice_post_restart_writes_reach_bob_real_n0` and its Tier-B
+  sibling `alice_post_restart_writes_reach_bob`: host-restart
+  live-writes property with `Workspace::shutdown` properly
+  called. (Formerly `host_restart_live_writes_n0.rs`.)
 - `crates/artel-fs/tests/drop_bomb.rs` — pins the `Workspace::Drop`
   contract using a child process to capture stderr
   deterministically. Replaces the older `_ungraceful_n0` test
   (deleted 2026-05); the contract is "the substrate makes
   ungraceful drops loud," and a child-process stderr capture
   asserts that without the n0 round-trip.
+- `crates/artel-daemon/src/pidfile.rs` —
+  `concurrent_acquires_settle_on_exactly_one_winner`: regression
+  trap for the 2026-06-10 orphan-leak case study above; an
+  8-thread barrier race that the pre-flock protocol fails.
