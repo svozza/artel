@@ -187,6 +187,44 @@ answer all of:
   "n0 rate limits" for an entire slice; the actual cause was two
   unrelated bugs (one ours, one upstream's missing retry).
 
+## Case study: the auto-spawn timeout flakes (2026-06-10)
+
+The `sessions.rs` auto-spawn tests (`happy_path_cold_dir_spawns_daemon`
+and siblings) intermittently failed at the 5s
+`DEFAULT_SPAWN_TIMEOUT` under full-suite runs, while passing 17/17 in
+isolation. The diagnosis chain, recorded here because the verdict is
+**not** airtight and may need reopening:
+
+- **Root cause found (and fixed, `9a1a773`):** `PidFile::acquire` was
+  check-then-write; two daemons racing a cold start could both "win",
+  and the pidfile could end up naming the dead loser. The orphaned
+  winner was then unkillable via pidfile-based teardown.
+  `parallel_calls_settle_on_one_daemon` leaked exactly one daemon per
+  full-suite run (3/3 reproductions, stderr captured). ~120 orphaned
+  daemons had accumulated on the dev machine, each spinning on
+  relay-reconnects forever (there is no post-startup relay-death exit
+  path) and pkarr-publishing to real n0 DNS.
+- **The herd was the suspected load source for the timeouts.** Direct
+  CPU contention was ruled out by measurement: idle spawn→connectable
+  is ~56ms, and even 12 saturated cores + 6 concurrent daemon spawns
+  only reached ~77ms — nowhere near 5s.
+- **Honest caveat: the original 4-test failure never reproduced in a
+  clean environment** (6+ full-suite runs green, including relink-first
+  and synthetic-herd variants). Herd-as-cause is strong circumstantial
+  evidence — mechanism + correlation — not a smoking gun. **If those
+  tests ever flake again with zero orphans present
+  (`pgrep -fl artel-daemon`), the suspect list reopens.** Next suspect:
+  macOS first-exec assessment storms — first exec of a freshly-linked
+  binary inode costs ~800ms, and concurrent first-execs serialize
+  globally (measured escalating 0.7s → 6.7s across 12 fresh inodes,
+  with a daemon spawn racing the storm taking 7.3s). A `make test`
+  right after a default↔all-features relink recreates exactly that
+  shape.
+- **Census the environment before blaming load.** Orphans whose
+  `--state-dir` no longer exists (deleted tempdir) are provably leaked.
+  A herd of them is invisible background load that surfaces as
+  unrelated-looking timeout flakes days later.
+
 ## Examples from this codebase
 
 - `crates/artel-fs/tests/iroh_docs_smoke.rs` — production
