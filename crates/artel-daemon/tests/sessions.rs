@@ -111,12 +111,18 @@ struct AutoSpawned {
 
 impl AutoSpawned {
     /// SIGTERM the spawned daemon (looked up via the PID file) and
-    /// wait for it to exit.
+    /// wait for it to exit. Panics if the daemon can't be signalled or
+    /// doesn't exit — a swallowed failure here orphans a daemon that
+    /// outlives the whole test run (and its relay), then spins on
+    /// relay reconnects forever. That herd of orphans is exactly the
+    /// background load that made these spawn-timeout tests flaky.
     async fn shutdown(self) {
         let Self {
             _tempdir, pid_path, ..
         } = self;
-        let _ = sigterm_pidfile(&pid_path).await;
+        sigterm_pidfile(&pid_path)
+            .await
+            .expect("auto-spawned daemon failed to shut down cleanly");
     }
 }
 
