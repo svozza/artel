@@ -310,6 +310,10 @@ impl Session {
             log: self.log.clone(),
             kind: self.kind,
             host_epoch: self.host_epoch,
+            // INTERIM (revocation slice 2): Session doesn't hold the
+            // ledger yet; slice 3 adds `Session.tickets` and threads
+            // it through here.
+            tickets: Vec::new(),
         }
     }
 
@@ -2178,6 +2182,7 @@ mod tests {
             log: log.clone(),
             kind: SessionKind::Local,
             host_epoch: 0,
+            tickets: Vec::new(),
         };
         store.create(&record).await.unwrap();
         let r = Registry::load(
@@ -2232,6 +2237,7 @@ mod tests {
             log: Vec::new(),
             kind: SessionKind::Local,
             host_epoch: 0,
+            tickets: Vec::new(),
         };
         store.create(&record).await.unwrap();
         let r = Registry::load(
@@ -2275,6 +2281,7 @@ mod tests {
             log: Vec::new(),
             kind: SessionKind::Remote,
             host_epoch: 0,
+            tickets: Vec::new(),
         };
         store.create(&record).await.unwrap();
         let r = Registry::load(
@@ -3321,6 +3328,7 @@ mod tests {
             log,
             kind: SessionKind::Local,
             host_epoch: 0,
+            tickets: Vec::new(),
         };
         let s = Session::from_record(record);
         assert!(s.can_write(host.id), "host root preserved");
@@ -3904,6 +3912,7 @@ mod tests {
             log: Vec::new(),
             kind: SessionKind::Remote,
             host_epoch: 0,
+            tickets: Vec::new(),
         };
         store.create(&record).await.unwrap();
 
@@ -3968,6 +3977,7 @@ mod tests {
             log: Vec::new(),
             kind: SessionKind::Remote,
             host_epoch: 0,
+            tickets: Vec::new(),
         };
         store.create(&record).await.unwrap();
 
@@ -4237,6 +4247,7 @@ mod tests {
             log: Vec::new(),
             kind: SessionKind::Remote,
             host_epoch: 0,
+            tickets: Vec::new(),
         };
         store.create(&record).await.unwrap();
         let r = Registry::load(
@@ -4279,6 +4290,7 @@ mod tests {
             log: Vec::new(),
             kind: SessionKind::Remote,
             host_epoch: 0,
+            tickets: Vec::new(),
         };
         store.create(&record).await.unwrap();
         let r = Registry::load(

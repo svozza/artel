@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::Mutex;
 
-use artel_protocol::{PeerId, PeerInfo, SessionId, SessionMessage};
+use artel_protocol::{PeerId, PeerInfo, SessionId, SessionMessage, TicketEntry};
 use async_trait::async_trait;
 
 #[cfg(test)]
@@ -83,6 +83,15 @@ impl SessionStore for MemoryStore {
         if let Some(entry) = guard.get_mut(&session) {
             entry.record.host_epoch = epoch;
         }
+        Ok(())
+    }
+
+    async fn put_tickets(&self, session: SessionId, tickets: &[TicketEntry]) -> io::Result<()> {
+        let mut guard = self.inner.lock().expect("poisoned");
+        let entry = guard
+            .get_mut(&session)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown session"))?;
+        entry.record.tickets = tickets.to_vec();
         Ok(())
     }
 
@@ -183,6 +192,7 @@ mod tests {
             log: Vec::new(),
             kind: SessionKind::Local,
             host_epoch: 0,
+            tickets: Vec::new(),
         }
     }
 
@@ -266,6 +276,63 @@ mod tests {
         let loaded = store.load_all().await.unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].kind, SessionKind::Remote);
+    }
+
+    // ---- ticket ledger (revocation slice) ----
+
+    fn ticket_entry(id_byte: u8) -> artel_protocol::TicketEntry {
+        artel_protocol::TicketEntry {
+            ticket_id: artel_protocol::TicketId::from_bytes([id_byte; 16]),
+            granted_cap: artel_protocol::Capability::Read,
+            expiry_ms: 0,
+            issued_at_ms: 1_700_000_000_000,
+            status: artel_protocol::TicketStatus::Active,
+            used_by: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn put_tickets_then_load_round_trips() {
+        let store = MemoryStore::new();
+        store.create(&record()).await.unwrap();
+        let ledger = vec![ticket_entry(1), ticket_entry(2)];
+        store.put_tickets(record().id, &ledger).await.unwrap();
+        assert_eq!(store.load_all().await.unwrap()[0].tickets, ledger);
+    }
+
+    #[tokio::test]
+    async fn put_tickets_for_unknown_session_errors_not_found() {
+        let store = MemoryStore::new();
+        let err = store
+            .put_tickets(SessionId::from_bytes([9; 16]), &[ticket_entry(1)])
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn put_tickets_rewrite_replaces_previous_ledger() {
+        let store = MemoryStore::new();
+        store.create(&record()).await.unwrap();
+        store
+            .put_tickets(record().id, &[ticket_entry(1)])
+            .await
+            .unwrap();
+        let after = vec![ticket_entry(2)];
+        store.put_tickets(record().id, &after).await.unwrap();
+        assert_eq!(store.load_all().await.unwrap()[0].tickets, after);
+    }
+
+    #[tokio::test]
+    async fn delete_cascades_tickets_with_session() {
+        let store = MemoryStore::new();
+        store.create(&record()).await.unwrap();
+        store
+            .put_tickets(record().id, &[ticket_entry(1)])
+            .await
+            .unwrap();
+        store.delete(record().id).await.unwrap();
+        assert!(store.load_all().await.unwrap().is_empty());
     }
 
     // ---- attachments ----

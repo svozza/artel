@@ -5,8 +5,9 @@
 //! ```text
 //! sessions_dir/
 //!   <session-uuid>/
-//!     meta.json   — host, members, head
-//!     log         — length-prefixed postcard frames of SessionMessage
+//!     meta.json    — host, members, head
+//!     log          — length-prefixed postcard frames of SessionMessage
+//!     tickets.json — issued-ticket ledger (host sessions; absent ⇒ empty)
 //! ```
 //!
 //! `meta.json` is small enough to overwrite atomically (write to
@@ -25,7 +26,7 @@ use std::io::{self, ErrorKind, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use artel_protocol::{PeerId, PeerInfo, Seq, SessionId, SessionMessage};
+use artel_protocol::{PeerId, PeerInfo, Seq, SessionId, SessionMessage, TicketEntry};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -41,6 +42,10 @@ const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 const META_FILE: &str = "meta.json";
 /// Per-session log file name.
 const LOG_FILE: &str = "log";
+/// Per-session issued-ticket ledger file name (ticket-revocation
+/// slice). Written only when the session mints tickets; absent ⇒
+/// empty ledger on load.
+const TICKETS_FILE: &str = "tickets.json";
 /// Per-session subdirectory for opaque consumer attachments.
 const ATTACHMENTS_DIR: &str = "attachments";
 /// Suffix on attachment files; the prefix is the kind, hex-encoded.
@@ -123,6 +128,14 @@ impl SessionStore for FsLogStore {
             chmod(&log_path, FILE_MODE)?;
 
             write_meta(&dir.join(META_FILE), &Meta::from_record(&record))?;
+            // Fold the initial ticket ledger into create so the
+            // host's first mint and the session record land together
+            // (no window where the ticket exists but the ledger
+            // doesn't). Empty ledgers write no file — absent ⇒ empty
+            // on load, and Remote mirrors never mint.
+            if !record.tickets.is_empty() {
+                write_tickets(&dir.join(TICKETS_FILE), &record.tickets)?;
+            }
             // We don't write the in-memory log here; create() is for a
             // fresh session and Registry::host() always passes an empty
             // log.
@@ -166,6 +179,26 @@ impl SessionStore for FsLogStore {
             meta.host_epoch = epoch;
             write_meta(&meta_path, &meta)?;
             Ok(())
+        })
+        .await
+        .map_err(|e| join_to_io(&e))?
+    }
+
+    async fn put_tickets(&self, session: SessionId, tickets: &[TicketEntry]) -> io::Result<()> {
+        let dir = self.session_dir(session);
+        let tickets = tickets.to_vec();
+        tokio::task::spawn_blocking(move || -> io::Result<()> {
+            // Unknown session must surface (trait contract): the
+            // ledger gates admission, so a write that lands nowhere
+            // is a correctness bug, not a no-op. The dir check is the
+            // same existence proxy `create` uses.
+            if !dir.is_dir() {
+                return Err(io::Error::new(
+                    ErrorKind::NotFound,
+                    format!("no session dir at {}", dir.display()),
+                ));
+            }
+            write_tickets(&dir.join(TICKETS_FILE), &tickets)
         })
         .await
         .map_err(|e| join_to_io(&e))?
@@ -492,6 +525,12 @@ fn load_one(dir: &Path) -> io::Result<SessionRecord> {
     // drop its own log; an iroh daemon signs every frame and must
     // reject tampered / sentinel ones. See `read_log`.
     let log = read_log(&dir.join(LOG_FILE), id, cfg!(feature = "iroh"))?;
+    // Ticket ledger: absent file is the empty ledger (fresh dir, or a
+    // Remote mirror that never mints). A *corrupt* file fails the
+    // load loudly instead — issued-only admission makes the ledger
+    // load-bearing, and silently treating corruption as empty would
+    // brick every outstanding ticket with no diagnostic.
+    let tickets = read_tickets(&dir.join(TICKETS_FILE))?;
     Ok(SessionRecord {
         id,
         host: meta.host,
@@ -500,6 +539,7 @@ fn load_one(dir: &Path) -> io::Result<SessionRecord> {
         log,
         kind: meta.kind,
         host_epoch: meta.host_epoch,
+        tickets,
     })
 }
 
@@ -644,6 +684,40 @@ fn is_attachment_tmp(name: &str) -> bool {
 }
 
 /// Atomic write: `path.tmp` + fsync + rename.
+/// Atomic full rewrite of the ticket ledger — same tmp+rename+chmod
+/// dance as [`write_meta`]. The deterministic tmp name is safe here
+/// for the same reason as meta's: all callers hold the per-session
+/// `Mutex<Session>`, so two writers never race on one session's file.
+fn write_tickets(path: &Path, tickets: &[TicketEntry]) -> io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(tickets)
+        .map_err(|e| io::Error::new(ErrorKind::InvalidData, format!("tickets json: {e}")))?;
+    let tmp = path.with_extension("json.tmp");
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
+    chmod(&tmp, FILE_MODE)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Read the ticket ledger sidecar. Absent ⇒ empty (see `load_one` for
+/// why corrupt ≠ absent).
+fn read_tickets(path: &Path) -> io::Result<Vec<TicketEntry>> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    serde_json::from_slice(&bytes)
+        .map_err(|e| io::Error::new(ErrorKind::InvalidData, format!("tickets json: {e}")))
+}
+
 fn write_meta(path: &Path, meta: &Meta) -> io::Result<()> {
     let bytes = serde_json::to_vec_pretty(meta)
         .map_err(|e| io::Error::new(ErrorKind::InvalidData, format!("meta json: {e}")))?;
@@ -946,6 +1020,7 @@ mod tests {
             log: Vec::new(),
             kind: SessionKind::Local,
             host_epoch: 0,
+            tickets: Vec::new(),
         }
     }
 
@@ -1026,6 +1101,149 @@ mod tests {
 
         store.delete(record(1).id).await.unwrap();
         assert!(!session_dir.exists());
+    }
+
+    // ---- ticket ledger (revocation slice) ----
+
+    fn entry(id_byte: u8, status: artel_protocol::TicketStatus) -> TicketEntry {
+        TicketEntry {
+            ticket_id: artel_protocol::TicketId::from_bytes([id_byte; 16]),
+            granted_cap: artel_protocol::Capability::ReadWrite,
+            expiry_ms: 0,
+            issued_at_ms: 1_700_000_000_000,
+            status,
+            used_by: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn put_tickets_then_load_round_trips() {
+        use artel_protocol::TicketStatus;
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+
+        let ledger = vec![entry(1, TicketStatus::Active), entry(2, TicketStatus::Revoked)];
+        store.put_tickets(record(1).id, &ledger).await.unwrap();
+
+        let loaded = store.load_all().await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].tickets, ledger);
+    }
+
+    #[tokio::test]
+    async fn put_tickets_rewrite_replaces_previous_ledger() {
+        use artel_protocol::TicketStatus;
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+
+        store
+            .put_tickets(record(1).id, &[entry(1, TicketStatus::Active)])
+            .await
+            .unwrap();
+        // Same entry flipped to Revoked + a second mint: full rewrite.
+        let after = vec![entry(1, TicketStatus::Revoked), entry(2, TicketStatus::Active)];
+        store.put_tickets(record(1).id, &after).await.unwrap();
+
+        assert_eq!(store.load_all().await.unwrap()[0].tickets, after);
+    }
+
+    #[tokio::test]
+    async fn put_tickets_for_unknown_session_errors_not_found() {
+        use artel_protocol::TicketStatus;
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        let err = store
+            .put_tickets(SessionId::from_bytes([9; 16]), &[entry(1, TicketStatus::Active)])
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn absent_tickets_file_loads_as_empty_ledger() {
+        // Pre-slice session dir: meta + log but no tickets.json.
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+        assert!(!dir.path().join(record(1).id.to_string()).join(TICKETS_FILE).exists());
+
+        let loaded = store.load_all().await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].tickets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn corrupt_tickets_file_fails_load_loudly() {
+        use artel_protocol::TicketStatus;
+        // Issued-only admission makes the ledger load-bearing:
+        // corruption must skip the session with a warning (load_all
+        // contract), not silently load an empty ledger that would
+        // brick every outstanding ticket with no diagnostic.
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+        store
+            .put_tickets(record(1).id, &[entry(1, TicketStatus::Active)])
+            .await
+            .unwrap();
+        std::fs::write(
+            dir.path().join(record(1).id.to_string()).join(TICKETS_FILE),
+            b"{not json",
+        )
+        .unwrap();
+
+        // load_all skips-and-warns per session; the corrupted session
+        // must not surface (with any ledger shape) rather than
+        // surfacing with tickets: [].
+        let loaded = store.load_all().await.unwrap();
+        assert!(loaded.is_empty(), "corrupt ledger must fail the session load");
+    }
+
+    #[tokio::test]
+    async fn create_persists_initial_ledger_with_record() {
+        use artel_protocol::TicketStatus;
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        let mut r = record(1);
+        r.tickets = vec![entry(7, TicketStatus::Active)];
+        store.create(&r).await.unwrap();
+
+        let loaded = store.load_all().await.unwrap();
+        assert_eq!(loaded[0].tickets, r.tickets);
+    }
+
+    #[tokio::test]
+    async fn delete_cascades_tickets_file_with_session_dir() {
+        use artel_protocol::TicketStatus;
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+        store
+            .put_tickets(record(1).id, &[entry(1, TicketStatus::Active)])
+            .await
+            .unwrap();
+        let tickets_path = dir.path().join(record(1).id.to_string()).join(TICKETS_FILE);
+        assert!(tickets_path.exists());
+
+        store.delete(record(1).id).await.unwrap();
+        assert!(!tickets_path.exists());
+    }
+
+    #[tokio::test]
+    async fn tickets_file_mode_is_0600() {
+        use artel_protocol::TicketStatus;
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+        store
+            .put_tickets(record(1).id, &[entry(1, TicketStatus::Active)])
+            .await
+            .unwrap();
+        let tickets_path = dir.path().join(record(1).id.to_string()).join(TICKETS_FILE);
+        let mode = std::os::unix::fs::MetadataExt::mode(&std::fs::metadata(&tickets_path).unwrap());
+        assert_eq!(mode & 0o777, FILE_MODE);
     }
 
     #[tokio::test]

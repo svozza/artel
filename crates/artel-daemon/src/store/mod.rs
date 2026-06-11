@@ -37,7 +37,7 @@ pub(crate) use record::{SessionKind, SessionRecord};
 use std::io;
 use std::sync::Arc;
 
-use artel_protocol::{PeerId, PeerInfo, SessionId, SessionMessage};
+use artel_protocol::{PeerId, PeerInfo, SessionId, SessionMessage, TicketEntry};
 
 /// Storage operations the [`super::session::Registry`] needs.
 ///
@@ -60,6 +60,16 @@ pub(crate) trait SessionStore: Send + Sync + std::fmt::Debug {
     /// `Registry::host`'s resume branch after bumping the in-memory
     /// epoch. A no-op (returning `Ok(())`) for an unknown session.
     async fn bump_host_epoch(&self, session: SessionId, epoch: u64) -> io::Result<()>;
+
+    /// Persist the full issued-ticket ledger for `session`, replacing
+    /// any previous contents (ticket-revocation slice). Full rewrite
+    /// per mutation — mint, revoke, and `used_by` appends all route
+    /// through here; ledgers are small (bounded by tickets minted per
+    /// session lifetime) so the `meta.json`-style rewrite idiom fits.
+    /// Errors `NotFound` if the session is unknown — the ledger is
+    /// load-bearing for issued-only admission, so a write that lands
+    /// nowhere must surface, not vanish.
+    async fn put_tickets(&self, session: SessionId, tickets: &[TicketEntry]) -> io::Result<()>;
 
     /// Add a peer to a session's member set.
     async fn add_member(&self, session: SessionId, peer: &PeerInfo) -> io::Result<()>;

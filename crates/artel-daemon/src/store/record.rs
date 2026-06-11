@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 
-use artel_protocol::{PeerId, Seq, SessionId, SessionMessage};
+use artel_protocol::{PeerId, Seq, SessionId, SessionMessage, TicketEntry};
 use serde::{Deserialize, Serialize};
 
 /// Whether this daemon owns the authoritative log for the session
@@ -60,4 +60,12 @@ pub(crate) struct SessionRecord {
     ///   must meet (`host_epoch >= watermark`) to be accepted.
     #[serde(default)]
     pub(crate) host_epoch: u64,
+    /// Issued-ticket ledger (ticket-revocation slice). `Local`
+    /// sessions: every ticket this host has minted, in mint order —
+    /// the authoritative set for issued-only admission. `Remote`
+    /// mirrors never mint, so this stays empty. Persisted as a
+    /// `tickets.json` sidecar by the fs store (absent file ⇒ empty);
+    /// updated by full rewrite on mint / revoke / admission.
+    #[serde(default)]
+    pub(crate) tickets: Vec<TicketEntry>,
 }
