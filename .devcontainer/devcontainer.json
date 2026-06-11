@@ -12,20 +12,27 @@
     "source=artel-cargo-registry,target=/usr/local/cargo/registry,type=volume",
     "source=artel-target,target=${containerWorkspaceFolder}/target,type=volume",
 
-    // Claude Code state. The host ~/.claude is shared read-write so
-    // settings, agents, skills, and per-project memory follow you
-    // into the container (and memory written inside persists out).
-    // CLI state (~/.claude.json) is NOT shared — it's seeded once by
-    // on-create.sh into the mounted dir and the container keeps its
-    // own copy via CLAUDE_CONFIG_DIR.
-    "source=${localEnv:HOME}/.claude,target=/home/vscode/.claude,type=bind",
+    // Claude Code state lives in a named VOLUME, deliberately NOT a
+    // bind mount of the host ~/.claude. Agent sessions in the
+    // container often run with permission checks bypassed; a
+    // writable mount would let them edit host settings (which can
+    // carry hooks that execute shell commands on the host) — a clean
+    // sandbox escape. Instead host-init.sh stages a snapshot of the
+    // developer's config (settings, agents, skills — symlinks
+    // dereferenced — and this project's memory) and on-create.sh
+    // seeds the volume once. Copy-in, never out. Container-side
+    // state (trust answers, memory, logins) survives rebuilds in the
+    // volume; remove the volume to re-seed from the host.
+    "source=artel-claude-config,target=/home/vscode/.claude,type=volume",
 
     // Host-staged artifacts from host-init.sh (initializeCommand):
-    // short-lived AWS credentials (the host profile resolves creds
-    // via internal host-only tooling that can't run in Linux) and
-    // the Claude CLI state seed. Gitignored; recreated on the host
-    // at every container start.
-    "source=${localWorkspaceFolder}/.devcontainer/.local,target=/opt/host,type=bind"
+    // short-lived AWS credentials (host profiles may resolve creds
+    // via host-only tooling that can't run in Linux), the Claude
+    // config snapshot, and the CLI state seed. Read-only: the
+    // container consumes credentials and seeds from here, and must
+    // not be able to write back to the host. Gitignored; recreated
+    // on the host at every container start.
+    "source=${localWorkspaceFolder}/.devcontainer/.local,target=/opt/host,type=bind,readonly"
   ],
 
   "containerEnv": {

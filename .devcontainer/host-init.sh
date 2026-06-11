@@ -2,9 +2,9 @@
 # Host-side staging for the devcontainer (wired as initializeCommand,
 # so it runs on the HOST before every container create/start).
 #
-# Two jobs, both writing into .devcontainer/.local/ (gitignored, and
+# Three jobs, all writing into .devcontainer/.local/ (gitignored, and
 # self-ignored via the .gitignore written below), which is
-# bind-mounted into the container at /opt/host:
+# bind-mounted read-only into the container at /opt/host:
 #
 # 1. AWS credentials, if the developer routes Claude through an AWS
 #    profile (e.g. Bedrock). The profile name is read from the `env`
@@ -21,10 +21,19 @@
 #
 #        bash .devcontainer/host-init.sh
 #
-# 2. A one-time seed copy of ~/.claude.json (CLI state: onboarding,
-#    project trust, user-scoped MCP servers). The container keeps its
-#    own copy under the mounted ~/.claude (via CLAUDE_CONFIG_DIR) so
-#    host and container never fight over the same file.
+# 2. A snapshot of the developer's Claude config (settings, CLAUDE.md,
+#    agents, skills, statusline, plugins) plus this project's memory.
+#    The container's ~/.claude is a named VOLUME seeded once from this
+#    snapshot by on-create.sh — deliberately NOT a bind mount of the
+#    host ~/.claude: agent sessions in the container often run with
+#    permission checks bypassed, and a writable mount would let them
+#    edit host settings (which can carry hooks that execute on the
+#    host). Copy-in/never-out keeps the container a real sandbox.
+#    Symlinked skills are dereferenced into real directories — host
+#    symlink targets don't exist in the container.
+#
+# 3. A one-time seed copy of ~/.claude.json (CLI state: onboarding,
+#    project trust, user-scoped MCP servers).
 #
 # Everything is best-effort: contributors with no AWS profile in
 # their Claude settings, no AWS CLI, or no Claude at all still get a
@@ -32,19 +41,16 @@
 
 set -uo pipefail
 
-STAGE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.local"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STAGE="$SCRIPT_DIR/.local"
 mkdir -p "$STAGE/aws"
 
 # Never let staged credentials become committable, even if the
 # repo-level .gitignore entry is ever lost.
 printf '*\n' > "$STAGE/.gitignore"
 
-# Guarantee bind-mount sources exist so container start never fails
-# on a missing host path.
-mkdir -p "$HOME/.claude"
+# --- 1. AWS credentials ------------------------------------------------
 
-# Resolve the AWS profile: explicit override first, then the env
-# block of the developer's own Claude settings.
 PROFILE="${CLAUDE_BEDROCK_PROFILE:-}"
 REGION="${AWS_REGION:-}"
 SETTINGS="$HOME/.claude/settings.json"
@@ -90,6 +96,39 @@ EOF
 else
   echo "host-init: no AWS profile configured; skipping credential export" >&2
 fi
+
+# --- 2. Claude config snapshot -----------------------------------------
+
+if [ -d "$HOME/.claude" ]; then
+  rm -rf "$STAGE/claude-config"
+  mkdir -p "$STAGE/claude-config"
+  # Allowlist of config worth carrying in; -L dereferences symlinks
+  # (skills are often symlinked into shared dirs like ~/.agents that
+  # won't exist in the container). State/noise (cache, sessions,
+  # history, shell-snapshots, ...) deliberately stays behind.
+  for item in CLAUDE.md settings.json keybindings.json agents skills \
+      statusline plugins; do
+    if [ -e "$HOME/.claude/$item" ]; then
+      cp -RL "$HOME/.claude/$item" "$STAGE/claude-config/$item" 2> /dev/null \
+        || echo "host-init: WARNING: failed to copy $item (dangling symlink?)" >&2
+    fi
+  done
+
+  # This project's memory, re-keyed for the container workspace path.
+  # Claude keys per-project dirs by absolute path with '/' -> '-':
+  # the host checkout maps to one key, /workspaces/<name> to another.
+  WORKSPACE_NAME="$(basename "$(cd "$SCRIPT_DIR/.." && pwd)")"
+  HOST_KEY="$(cd "$SCRIPT_DIR/.." && pwd | tr '/.' '--')"
+  HOST_MEM="$HOME/.claude/projects/$HOST_KEY/memory"
+  if [ -d "$HOST_MEM" ]; then
+    mkdir -p "$STAGE/claude-config/projects/-workspaces-$WORKSPACE_NAME"
+    cp -RL "$HOST_MEM" "$STAGE/claude-config/projects/-workspaces-$WORKSPACE_NAME/memory"
+    echo "host-init: staged project memory ($HOST_KEY -> -workspaces-$WORKSPACE_NAME)" >&2
+  fi
+  echo "host-init: staged Claude config snapshot" >&2
+fi
+
+# --- 3. Claude CLI state seed ------------------------------------------
 
 if [ -f "$HOME/.claude.json" ]; then
   cp "$HOME/.claude.json" "$STAGE/claude-state.json"
