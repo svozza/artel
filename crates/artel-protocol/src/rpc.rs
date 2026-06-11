@@ -447,6 +447,23 @@ pub enum Response {
         ticket_id: crate::ids::TicketId,
     },
 
+    /// Reply to [`Request::DeliverUpgrade`]. Confirms the target peer
+    /// received and acknowledged the namespace secret.
+    UpgradeDelivered,
+
+    /// Any request may produce this in place of its expected variant.
+    ///
+    /// Must stay at postcard variant index 12: the version handshake
+    /// delivers [`ProtocolError::VersionMismatch`] through this
+    /// variant to clients of *other* protocol versions, so its wire
+    /// position is the one part of `Response` that cannot move. New
+    /// variants are appended below, never inserted above — see the
+    /// `handshake_postcard_indices_are_pinned` test.
+    Error {
+        /// Wire-representable error.
+        error: ProtocolError,
+    },
+
     /// Reply to [`Request::RevokeTicket`] (success, including the
     /// idempotent already-revoked case).
     TicketRevoked,
@@ -455,16 +472,6 @@ pub enum Response {
     Tickets {
         /// Every ticket issued for the session, mint order.
         entries: Vec<crate::ticket::TicketEntry>,
-    },
-
-    /// Reply to [`Request::DeliverUpgrade`]. Confirms the target peer
-    /// received and acknowledged the namespace secret.
-    UpgradeDelivered,
-
-    /// Any request may produce this in place of its expected variant.
-    Error {
-        /// Wire-representable error.
-        error: ProtocolError,
     },
 }
 
@@ -945,6 +952,54 @@ mod tests {
         );
         let back: Attachment = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(attachment, back);
+    }
+
+    #[test]
+    fn handshake_postcard_indices_are_pinned() {
+        // The version handshake is the one IPC exchange that happens
+        // BEFORE versions are known to agree: any client build must be
+        // able to send Hello to any daemon build and decode the
+        // daemon's Hello-or-Error reply (version.rs documents that
+        // clients surface VersionMismatch to the user). Postcard
+        // encodes enum variants by declaration index, so these
+        // variants must keep their wire positions across protocol
+        // versions — everything else is gated behind the handshake
+        // and may move freely on a PROTOCOL_VERSION bump.
+        let hello_req = Request::Hello {
+            client_version: PROTOCOL_VERSION,
+        };
+        assert_eq!(
+            postcard::to_allocvec(&hello_req).unwrap()[0],
+            0,
+            "Request::Hello must stay at variant index 0",
+        );
+
+        let hello_resp = Response::Hello {
+            daemon_version: PROTOCOL_VERSION,
+            daemon_peer_id: PeerId::from_bytes([1; 32]),
+        };
+        assert_eq!(
+            postcard::to_allocvec(&hello_resp).unwrap()[0],
+            0,
+            "Response::Hello must stay at variant index 0",
+        );
+
+        // Index 12 is Error's position since PROTOCOL_VERSION 7 — the
+        // last release whose clients are told "upgrade or restart the
+        // daemon" via a decodable VersionMismatch reply. New Response
+        // variants are appended after Error, never inserted before it.
+        let err_resp = Response::Error {
+            error: ProtocolError::VersionMismatch(VersionMismatch {
+                client: ProtocolVersion::new(7),
+                daemon: PROTOCOL_VERSION,
+            }),
+        };
+        assert_eq!(
+            postcard::to_allocvec(&err_resp).unwrap()[0],
+            12,
+            "Response::Error must stay at variant index 12 so \
+             pre-v8 clients can decode the VersionMismatch reply",
+        );
     }
 
     #[test]
