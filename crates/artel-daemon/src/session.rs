@@ -21,7 +21,7 @@ use artel_protocol::capability::{Capability, CapabilityAction};
 use artel_protocol::ids::TicketId;
 use artel_protocol::message::{MESSAGE_FORMAT, SIGNATURE_UNSIGNED, SigBytes};
 use artel_protocol::signing::{self, verify_reason};
-use artel_protocol::ticket::{self, SessionTicket, WireEndpointAddr};
+use artel_protocol::ticket::{self, SessionTicket, TicketEntry, TicketStatus, WireEndpointAddr};
 use artel_protocol::{
     Event, JoinTicket, MessageKind, PeerId, PeerInfo, Seq, SessionId, SessionMessage,
     SessionSummary, UpgradePayload,
@@ -152,6 +152,27 @@ pub enum SessionError {
     /// key). The string carries a diagnostic reason.
     #[error("invalid cap claim: {0}")]
     InvalidCapClaim(String),
+
+    /// The claim's `ticket_id` is not admissible against the host's
+    /// issued-ticket ledger: either explicitly revoked, or absent
+    /// (issued-only, fail closed — a sig-valid claim whose id the
+    /// ledger never saw means a pre-cutover ticket, a rolled-back
+    /// ledger, or a forge with a stolen signing key; all reject), or
+    /// present but disagreeing with the claimed cap/expiry. One
+    /// variant for all three on purpose: it maps to the joiner-opaque
+    /// [`artel_protocol::ProtocolError::InvalidTicket`], and
+    /// distinguishing them for the bearer would oracle ledger
+    /// contents to anyone holding a leaked ticket.
+    #[error("ticket not admissible")]
+    TicketNotAdmissible,
+
+    /// `revoke_ticket` named an id that was never issued for the
+    /// session. Host-operator-facing (maps to
+    /// [`artel_protocol::ProtocolError::UnknownTicket`]): reporting
+    /// success would falsely reassure the caller a leaked ticket is
+    /// dead.
+    #[error("ticket {0} was never issued for this session")]
+    UnknownTicket(TicketId),
 }
 
 // io::Error doesn't impl PartialEq, so we hand-roll one for the
@@ -189,9 +210,11 @@ impl PartialEq for SessionError {
                     needed: b_needed,
                 },
             ) => a_peer == b_peer && a_had == b_had && a_needed == b_needed,
+            (Self::UnknownTicket(a), Self::UnknownTicket(b)) => a == b,
             (Self::InvalidTicket, Self::InvalidTicket)
             | (Self::NotHost, Self::NotHost)
-            | (Self::TicketExpired, Self::TicketExpired) => true,
+            | (Self::TicketExpired, Self::TicketExpired)
+            | (Self::TicketNotAdmissible, Self::TicketNotAdmissible) => true,
             _ => false,
         }
     }
@@ -246,6 +269,14 @@ pub struct Session {
     /// `Read`-only ("absent ⇒ Read" floor). See
     /// `artel_protocol::capability`.
     caps: HashMap<PeerId, Capability>,
+    /// Issued-ticket ledger (revocation slice). `Local` sessions:
+    /// every ticket minted for this session, mint order — the
+    /// authoritative set for issued-only admission. `Remote` mirrors
+    /// never mint; stays empty. **Persisted state** (unlike the
+    /// derived `caps`): round-trips through `record`/`from_record`
+    /// and is rewritten via `SessionStore::put_tickets` on every
+    /// mutation, store-before-memory.
+    tickets: Vec<TicketEntry>,
     events_tx: broadcast::Sender<Event>,
 }
 
@@ -271,6 +302,7 @@ impl Session {
             head: Seq::ZERO,
             host_epoch: 0,
             caps,
+            tickets: Vec::new(),
             events_tx,
         }
     }
@@ -296,6 +328,7 @@ impl Session {
             head: record.head,
             host_epoch: record.host_epoch,
             caps,
+            tickets: record.tickets,
             events_tx,
         }
     }
@@ -310,10 +343,7 @@ impl Session {
             log: self.log.clone(),
             kind: self.kind,
             host_epoch: self.host_epoch,
-            // INTERIM (revocation slice 2): Session doesn't hold the
-            // ledger yet; slice 3 adds `Session.tickets` and threads
-            // it through here.
-            tickets: Vec::new(),
+            tickets: self.tickets.clone(),
         }
     }
 
@@ -346,6 +376,27 @@ impl Session {
         self.caps
             .get(&peer)
             .is_some_and(|c| Capability::permits_write(*c))
+    }
+
+    /// Issued-only ledger gate (revocation slice): may a bearer of
+    /// `claim` be admitted? The claim's id must be present in the
+    /// ledger and `Active`, and the claimed cap/expiry must match
+    /// what was minted — absence, revocation, and mismatch are all
+    /// inadmissible, and the caller maps all three to ONE
+    /// joiner-opaque error (the bearer must not learn which). Only
+    /// `Local` sessions enforce: a Remote mirror has no ledger (it
+    /// never mints) and is not the admission authority for anyone.
+    #[cfg(feature = "iroh")]
+    fn ticket_admissible(&self, claim: &CapClaim) -> bool {
+        if self.kind != SessionKind::Local {
+            return true;
+        }
+        self.tickets.iter().any(|t| {
+            t.ticket_id == claim.ticket_id
+                && t.status == TicketStatus::Active
+                && t.granted_cap == claim.granted_cap
+                && t.expiry_ms == claim.expiry_ms
+        })
     }
 
     /// Apply a single `Capability` message to the incremental cap set,
@@ -654,7 +705,7 @@ impl Registry {
         requested_id: Option<SessionId>,
         granted_cap: Capability,
         expiry_ms: u64,
-    ) -> Result<(SessionId, JoinTicket), SessionError> {
+    ) -> Result<(SessionId, JoinTicket, TicketId), SessionError> {
         // Resume path: caller supplied an id and we already have a
         // matching local-host record. Reuse the in-memory session
         // verbatim and re-stamp the ticket with the current addr.
@@ -671,21 +722,33 @@ impl Registry {
                 // `SessionClosed` signed at the old epoch is rejected
                 // against a joiner whose beacon-advanced watermark has
                 // moved past it. A fresh create (below) leaves epoch 0.
-                let host_epoch = {
+                let (ticket, ticket_id) = self.mint_ticket(id, granted_cap, expiry_ms);
+                let (host_epoch, tickets) = {
                     let mut s = arc.lock().await;
                     if s.host != host_peer.id || s.kind != SessionKind::Local {
                         return Err(SessionError::SessionConflict(id));
                     }
                     s.host_epoch = s.host_epoch.saturating_add(1);
-                    s.host_epoch
+                    // Every resume re-mints, so every resume appends a
+                    // ledger entry (deliberate — the bearer string just
+                    // handed back genuinely admits and must be
+                    // revocable; entries are tiny and session-scoped).
+                    s.tickets
+                        .push(Self::ledger_entry(ticket_id, granted_cap, expiry_ms));
+                    (s.host_epoch, s.tickets.clone())
                 };
-                let ticket = self.mint_ticket(id, granted_cap, expiry_ms);
                 // Persist the bumped epoch (targeted write — no full
                 // record rewrite). On store failure, surface it: a
                 // resume that can't durably record its new epoch would
-                // re-emit a stale epoch after the next restart.
+                // re-emit a stale epoch after the next restart. Same
+                // for the ledger: an unpersisted entry would brick the
+                // ticket we are about to return (issued-only).
                 self.store
                     .bump_host_epoch(id, host_epoch)
+                    .await
+                    .map_err(SessionError::Storage)?;
+                self.store
+                    .put_tickets(id, &tickets)
                     .await
                     .map_err(SessionError::Storage)?;
 
@@ -709,15 +772,21 @@ impl Registry {
                     bridge.publish_epoch_beacon(id, host_epoch).await;
                 }
 
-                return Ok((id, ticket));
+                return Ok((id, ticket, ticket_id));
             }
         }
 
         // Create path. Either no `requested_id` (mint random) or
         // `Some(id)` whose entry doesn't exist locally yet.
         let session_id = requested_id.unwrap_or_else(SessionId::new_random);
-        let ticket = self.mint_ticket(session_id, granted_cap, expiry_ms);
-        let session = Session::new(session_id, &host_peer, SessionKind::Local);
+        let (ticket, ticket_id) = self.mint_ticket(session_id, granted_cap, expiry_ms);
+        let mut session = Session::new(session_id, &host_peer, SessionKind::Local);
+        // Seed the ledger before record(): create() persists the
+        // initial entry together with the session, so there is no
+        // window where the ticket exists but its ledger entry doesn't.
+        session
+            .tickets
+            .push(Self::ledger_entry(ticket_id, granted_cap, expiry_ms));
         let record = session.record();
         self.store
             .create(&record)
@@ -739,7 +808,7 @@ impl Registry {
             tracing::warn!(?err, ?session_id, "gossip host_session failed");
         }
 
-        Ok((session_id, ticket))
+        Ok((session_id, ticket, ticket_id))
     }
 
     /// Issue an additional ticket for an existing locally-hosted session.
@@ -753,7 +822,7 @@ impl Registry {
         session: SessionId,
         granted_cap: Capability,
         expiry_ms: u64,
-    ) -> Result<JoinTicket, SessionError> {
+    ) -> Result<(JoinTicket, TicketId), SessionError> {
         let arc = {
             let guard = self.sessions.read().await;
             guard
@@ -761,21 +830,101 @@ impl Registry {
                 .cloned()
                 .ok_or(SessionError::UnknownSession(session))?
         };
+        let (ticket, ticket_id) = self.mint_ticket(session, granted_cap, expiry_ms);
         {
-            let s = arc.lock().await;
+            let mut s = arc.lock().await;
             if s.kind != SessionKind::Local {
                 return Err(SessionError::NotHost);
             }
+            // Store-before-memory: if the ledger write fails, the
+            // mint fails and no unrevocable ticket leaves the daemon
+            // (issued-only would reject it anyway — fail loudly here
+            // instead of handing out a dead ticket).
+            let mut tickets = s.tickets.clone();
+            tickets.push(Self::ledger_entry(ticket_id, granted_cap, expiry_ms));
+            self.store
+                .put_tickets(session, &tickets)
+                .await
+                .map_err(SessionError::Storage)?;
+            s.tickets = tickets;
         }
-        Ok(self.mint_ticket(session, granted_cap, expiry_ms))
+        Ok((ticket, ticket_id))
     }
 
+    /// Revoke a previously issued ticket so it no longer admits
+    /// bearers (revocation slice). Authority mirrors
+    /// [`Registry::issue_ticket`]: only the hosting daemon of a
+    /// `SessionKind::Local` session. Idempotent on an
+    /// already-revoked ticket; an id never issued for this session is
+    /// [`SessionError::UnknownTicket`] (success would falsely
+    /// reassure the operator a leaked ticket is dead).
+    ///
+    /// Ticket-only: an already-admitted bearer keeps membership and
+    /// caps — revocation gates *future admissions*. Use a capability
+    /// revoke for the peer; `list_tickets`' `used_by` names them.
+    pub async fn revoke_ticket(
+        &self,
+        session: SessionId,
+        ticket_id: TicketId,
+    ) -> Result<(), SessionError> {
+        let arc = {
+            let guard = self.sessions.read().await;
+            guard
+                .get(&session)
+                .cloned()
+                .ok_or(SessionError::UnknownSession(session))?
+        };
+        let mut s = arc.lock().await;
+        if s.kind != SessionKind::Local {
+            return Err(SessionError::NotHost);
+        }
+        let Some(idx) = s.tickets.iter().position(|t| t.ticket_id == ticket_id) else {
+            return Err(SessionError::UnknownTicket(ticket_id));
+        };
+        if s.tickets[idx].status == TicketStatus::Revoked {
+            return Ok(());
+        }
+        // Store-before-memory, same shape as every other mutation.
+        let mut tickets = s.tickets.clone();
+        tickets[idx].status = TicketStatus::Revoked;
+        self.store
+            .put_tickets(session, &tickets)
+            .await
+            .map_err(SessionError::Storage)?;
+        s.tickets = tickets;
+        drop(s);
+        Ok(())
+    }
+
+    /// Snapshot of the issued-ticket ledger (revocation slice).
+    /// Metadata only — the encoded bearer strings are never stored,
+    /// so they cannot be returned. Authority as `revoke_ticket`.
+    pub async fn list_tickets(&self, session: SessionId) -> Result<Vec<TicketEntry>, SessionError> {
+        let arc = {
+            let guard = self.sessions.read().await;
+            guard
+                .get(&session)
+                .cloned()
+                .ok_or(SessionError::UnknownSession(session))?
+        };
+        let s = arc.lock().await;
+        if s.kind != SessionKind::Local {
+            return Err(SessionError::NotHost);
+        }
+        Ok(s.tickets.clone())
+    }
+
+    /// Mint a bearer ticket. Pure: generates the id, signs, encodes —
+    /// does NOT touch the ledger. Every caller must record a
+    /// [`TicketEntry`] for the returned id (issued-only admission
+    /// rejects ledger-absent ids, so a mint whose entry is never
+    /// recorded produces a ticket that can never admit).
     fn mint_ticket(
         &self,
         session_id: SessionId,
         granted_cap: Capability,
         expiry_ms: u64,
-    ) -> JoinTicket {
+    ) -> (JoinTicket, TicketId) {
         let tid = TicketId::new_random();
         let cap_sig = self.signing_key.as_ref().map_or(SIGNATURE_UNSIGNED, |key| {
             signing::sign_ticket_cap(
@@ -786,7 +935,7 @@ impl Registry {
                 expiry_ms,
             )
         });
-        JoinTicket::from(ticket::encode(&SessionTicket {
+        let ticket = JoinTicket::from(ticket::encode(&SessionTicket {
             ticket_id: tid,
             session_id,
             host_peer_id: self.daemon_peer_id,
@@ -794,7 +943,20 @@ impl Registry {
             granted_cap,
             expiry_ms,
             cap_sig,
-        }))
+        }));
+        (ticket, tid)
+    }
+
+    /// Build the ledger entry for a just-minted ticket.
+    fn ledger_entry(ticket_id: TicketId, granted_cap: Capability, expiry_ms: u64) -> TicketEntry {
+        TicketEntry {
+            ticket_id,
+            granted_cap,
+            expiry_ms,
+            issued_at_ms: now_ms(),
+            status: TicketStatus::Active,
+            used_by: Vec::new(),
+        }
     }
 
     /// Join an existing session via its ticket. Returns the session id
@@ -1197,6 +1359,15 @@ impl Registry {
         let session_kind;
         {
             let mut s = session_arc.lock().await;
+            // Issued-only ledger gate (revocation slice), after expiry
+            // and cap-sig above so an unauthenticated forger can't
+            // oracle ledger contents, and BEFORE the already-member
+            // early return, same as the other claim checks.
+            if let Some(ref claim) = cap_claim
+                && !s.ticket_admissible(claim)
+            {
+                return Err(SessionError::TicketNotAdmissible);
+            }
             if s.members.contains(&peer.id) {
                 return Ok(());
             }
@@ -1209,6 +1380,26 @@ impl Registry {
                 .await
                 .map_err(SessionError::Storage)?;
             s.members.insert(peer.id);
+            // Record the admission on the ticket's ledger entry
+            // (advisory `used_by` metadata — names peers an operator
+            // may also want to cap-revoke after revoking a used
+            // ticket). Persist failure must NOT fail the admission:
+            // membership is already durable, and used_by is a hint,
+            // not a gate.
+            if let Some(ref claim) = cap_claim
+                && session_kind == SessionKind::Local
+                && let Some(entry) = s
+                    .tickets
+                    .iter_mut()
+                    .find(|t| t.ticket_id == claim.ticket_id)
+                && !entry.used_by.contains(&peer.id)
+            {
+                entry.used_by.push(peer.id);
+                let tickets = s.tickets.clone();
+                if let Err(err) = self.store.put_tickets(session, &tickets).await {
+                    tracing::warn!(?session, ?err, "persisting used_by failed (advisory)");
+                }
+            }
             let events_tx = s.events_tx.clone();
             // Drop the session guard BEFORE the PeerJoined send and,
             // crucially, before the auto-grant `Registry::send` below —
@@ -2084,6 +2275,7 @@ mod tests {
         ) -> Result<(SessionId, JoinTicket), SessionError> {
             self.host(host_peer, requested_id, Capability::ReadWrite, 0)
                 .await
+                .map(|(id, ticket, _tid)| (id, ticket))
         }
     }
 
@@ -2114,7 +2306,7 @@ mod tests {
     #[tokio::test]
     async fn host_with_read_cap_produces_read_ticket() {
         let r = registry();
-        let (_, ticket) = r
+        let (_, ticket, _) = r
             .host(peer(1, "alice"), None, Capability::Read, 0)
             .await
             .unwrap();
@@ -2127,7 +2319,7 @@ mod tests {
     async fn host_with_expiry_produces_ticket_with_expiry_ms() {
         let r = registry();
         let expiry = 1_700_000_000_000u64;
-        let (_, ticket) = r
+        let (_, ticket, _) = r
             .host(peer(1, "alice"), None, Capability::ReadWrite, expiry)
             .await
             .unwrap();
@@ -2309,7 +2501,7 @@ mod tests {
         let r = registry();
         let (id, _) = r.host_rw(peer(1, "alice"), None).await.unwrap();
 
-        let ticket = r.issue_ticket(id, Capability::Read, 0).await.unwrap();
+        let (ticket, _) = r.issue_ticket(id, Capability::Read, 0).await.unwrap();
         let decoded = ticket::decode(ticket.as_str()).unwrap();
         assert_eq!(decoded.session_id, id);
         assert_eq!(decoded.granted_cap, Capability::Read);
@@ -2322,7 +2514,7 @@ mod tests {
         let (id, _) = r.host_rw(peer(1, "alice"), None).await.unwrap();
 
         let expiry = 1_700_000_000_000u64;
-        let ticket = r
+        let (ticket, _) = r
             .issue_ticket(id, Capability::ReadWrite, expiry)
             .await
             .unwrap();
@@ -4411,6 +4603,10 @@ mod tests {
 
     // ---- cap_claim verification (tiered tickets Phase 2A) ----
 
+    /// A sig-valid claim whose ticket id was NEVER minted by the
+    /// registry. Pre-issued-only this admitted; now only the checks
+    /// that fire before the ledger (expiry, cap-sig) can pass it.
+    /// Tests that need an *admissible* claim use [`minted_cap_claim`].
     #[cfg(feature = "iroh")]
     fn valid_cap_claim(
         host_key: &iroh::SecretKey,
@@ -4435,13 +4631,45 @@ mod tests {
         }
     }
 
+    /// Decode a just-minted ticket into the `CapClaim` its bearer
+    /// would announce at join time.
+    #[cfg(feature = "iroh")]
+    fn claim_of(ticket: &JoinTicket) -> CapClaim {
+        let decoded = ticket::decode(ticket.as_str()).unwrap();
+        CapClaim {
+            ticket_id: decoded.ticket_id,
+            granted_cap: decoded.granted_cap,
+            expiry_ms: decoded.expiry_ms,
+            cap_sig: decoded.cap_sig,
+        }
+    }
+
+    /// Mint a real ticket through the registry (recording it in the
+    /// ledger) and shape it into the `CapClaim` its bearer would
+    /// announce. The issued-only admission path accepts exactly these.
+    #[cfg(feature = "iroh")]
+    async fn minted_cap_claim(
+        r: &Registry,
+        session: SessionId,
+        granted_cap: Capability,
+        expiry_ms: u64,
+    ) -> CapClaim {
+        let (ticket, ticket_id) = r
+            .issue_ticket(session, granted_cap, expiry_ms)
+            .await
+            .unwrap();
+        let claim = claim_of(&ticket);
+        assert_eq!(claim.ticket_id, ticket_id);
+        claim
+    }
+
     #[cfg(feature = "iroh")]
     #[tokio::test]
     async fn ensure_member_with_valid_rw_claim_grants_rw() {
-        let (r, host, key) = registry_with_signing_seed(0x50);
+        let (r, host, _key) = registry_with_signing_seed(0x50);
         let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
         let bob = peer(2, "bob");
-        let claim = valid_cap_claim(&key, id, Capability::ReadWrite, 0);
+        let claim = minted_cap_claim(&r, id, Capability::ReadWrite, 0).await;
         r.ensure_member(id, bob.clone(), Some(claim)).await.unwrap();
 
         // Bob can write.
@@ -4461,10 +4689,10 @@ mod tests {
     #[cfg(feature = "iroh")]
     #[tokio::test]
     async fn ensure_member_with_valid_read_claim_grants_read() {
-        let (r, host, key) = registry_with_signing_seed(0x51);
+        let (r, host, _key) = registry_with_signing_seed(0x51);
         let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
         let bob = peer(2, "bob");
-        let claim = valid_cap_claim(&key, id, Capability::Read, 0);
+        let claim = minted_cap_claim(&r, id, Capability::Read, 0).await;
         r.ensure_member(id, bob.clone(), Some(claim)).await.unwrap();
 
         // Bob cannot write — cap is Read.
@@ -4548,5 +4776,419 @@ mod tests {
             )
             .await;
         assert!(sent.is_ok(), "None-claim peer gets RW: {sent:?}");
+    }
+
+    // ---- ticket revocation (issued-ticket ledger) ----
+
+    #[tokio::test]
+    async fn revoke_is_idempotent_and_persists_status() {
+        let r = registry();
+        let (id, _) = r.host_rw(peer(1, "alice"), None).await.unwrap();
+        let (_, tid) = r.issue_ticket(id, Capability::Read, 0).await.unwrap();
+
+        r.revoke_ticket(id, tid).await.unwrap();
+        // Second revoke of the same id is Ok, not an error.
+        r.revoke_ticket(id, tid).await.unwrap();
+
+        let entry = r
+            .list_tickets(id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.ticket_id == tid)
+            .unwrap();
+        assert_eq!(entry.status, TicketStatus::Revoked);
+        // The store saw the flip, not just memory.
+        let persisted = r.store.load_all().await.unwrap()[0]
+            .tickets
+            .iter()
+            .find(|t| t.ticket_id == tid)
+            .unwrap()
+            .status;
+        assert_eq!(persisted, TicketStatus::Revoked);
+    }
+
+    #[tokio::test]
+    async fn revoke_never_issued_ticket_is_unknown_ticket() {
+        let r = registry();
+        let (id, _) = r.host_rw(peer(1, "alice"), None).await.unwrap();
+        let bogus = TicketId::from_bytes([0xEE; 16]);
+        let err = r.revoke_ticket(id, bogus).await.unwrap_err();
+        assert_eq!(err, SessionError::UnknownTicket(bogus));
+    }
+
+    #[tokio::test]
+    async fn revoke_and_list_on_unknown_session_error() {
+        let r = registry();
+        let fake = SessionId::from_bytes([0xDE; 16]);
+        let tid = TicketId::from_bytes([0xEE; 16]);
+        assert_eq!(
+            r.revoke_ticket(fake, tid).await.unwrap_err(),
+            SessionError::UnknownSession(fake),
+        );
+        assert_eq!(
+            r.list_tickets(fake).await.unwrap_err(),
+            SessionError::UnknownSession(fake),
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_and_list_on_remote_mirror_return_not_host() {
+        // Same mirror-seeding shape as
+        // `issue_ticket_for_remote_session_returns_not_host`.
+        let r = registry();
+        let host = peer(1, "alice");
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
+        let r2 = registry_with_peer(PeerId::from_bytes([0xAA; 32]));
+        {
+            let session = Session::new(id, &host, SessionKind::Remote);
+            r2.sessions
+                .write()
+                .await
+                .insert(id, Arc::new(Mutex::new(session)));
+        }
+        let tid = TicketId::from_bytes([0xEE; 16]);
+        assert_eq!(
+            r2.revoke_ticket(id, tid).await.unwrap_err(),
+            SessionError::NotHost,
+        );
+        assert_eq!(
+            r2.list_tickets(id).await.unwrap_err(),
+            SessionError::NotHost
+        );
+    }
+
+    #[tokio::test]
+    async fn all_three_mint_sites_write_ledger_entries() {
+        // Create, explicit issue, and resume must each append exactly
+        // one entry — under issued-only a mint site that forgets its
+        // ledger write produces a ticket that can never admit.
+        let r = registry();
+        let alice = peer(1, "alice");
+        let (id, _ticket, create_tid) = r
+            .host(alice.clone(), None, Capability::ReadWrite, 0)
+            .await
+            .unwrap();
+        let ledger = r.list_tickets(id).await.unwrap();
+        assert_eq!(ledger.len(), 1, "create path records its mint");
+        assert_eq!(ledger[0].ticket_id, create_tid);
+
+        let (_, issue_tid) = r.issue_ticket(id, Capability::Read, 0).await.unwrap();
+        assert_eq!(r.list_tickets(id).await.unwrap().len(), 2);
+
+        // Resume re-mints a fresh random id — a NEW entry, not a
+        // dedup (the bearer string just handed back genuinely admits
+        // and must be independently revocable).
+        let (_, _ticket, resume_tid) = r
+            .host(alice.clone(), Some(id), Capability::ReadWrite, 0)
+            .await
+            .unwrap();
+        let ledger = r.list_tickets(id).await.unwrap();
+        assert_eq!(ledger.len(), 3, "resume appends, never dedups");
+        assert_ne!(resume_tid, create_tid);
+        assert_ne!(resume_tid, issue_tid);
+
+        // All three landed in the store, not just memory.
+        assert_eq!(r.store.load_all().await.unwrap()[0].tickets.len(), 3);
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn revoked_ticket_rejected_while_sibling_ticket_admits() {
+        let (r, host, _key) = registry_with_signing_seed(0x60);
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
+        let claim_a = minted_cap_claim(&r, id, Capability::ReadWrite, 0).await;
+        let claim_b = minted_cap_claim(&r, id, Capability::ReadWrite, 0).await;
+
+        r.revoke_ticket(id, claim_a.ticket_id).await.unwrap();
+
+        let err = r
+            .ensure_member(id, peer(2, "bob"), Some(claim_a))
+            .await
+            .unwrap_err();
+        assert_eq!(err, SessionError::TicketNotAdmissible);
+        // Revocation is per-ticket: the sibling still admits.
+        r.ensure_member(id, peer(3, "carol"), Some(claim_b))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn expired_and_revoked_claim_reports_expiry() {
+        // Check-order pin: expiry fires before the ledger gate, so a
+        // claim that is both expired and revoked surfaces
+        // TicketExpired (the pre-revocation behaviour an
+        // unauthenticated bearer could already observe).
+        let (r, host, _key) = registry_with_signing_seed(0x61);
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
+        let claim = minted_cap_claim(&r, id, Capability::ReadWrite, 1).await;
+        r.revoke_ticket(id, claim.ticket_id).await.unwrap();
+
+        let err = r
+            .ensure_member(id, peer(2, "bob"), Some(claim))
+            .await
+            .unwrap_err();
+        assert_eq!(err, SessionError::TicketExpired);
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn admissions_append_used_by_in_order() {
+        async fn used_by(r: &Registry, id: SessionId, tid: TicketId) -> Vec<PeerId> {
+            r.list_tickets(id)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|t| t.ticket_id == tid)
+                .unwrap()
+                .used_by
+        }
+
+        let (r, host, _key) = registry_with_signing_seed(0x62);
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
+        let claim = minted_cap_claim(&r, id, Capability::ReadWrite, 0).await;
+        let bob = peer(2, "bob");
+        let carol = peer(3, "carol");
+
+        r.ensure_member(id, bob.clone(), Some(claim.clone()))
+            .await
+            .unwrap();
+        assert_eq!(used_by(&r, id, claim.ticket_id).await, vec![bob.id]);
+
+        // Multi-use bearer token: a second peer on the same ticket is
+        // legal and both admissions are listed, in order.
+        r.ensure_member(id, carol.clone(), Some(claim.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            used_by(&r, id, claim.ticket_id).await,
+            vec![bob.id, carol.id],
+        );
+
+        // Re-announcement from an existing member doesn't duplicate.
+        r.ensure_member(id, bob.clone(), Some(claim.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            used_by(&r, id, claim.ticket_id).await,
+            vec![bob.id, carol.id],
+        );
+
+        // used_by is persisted, not memory-only.
+        let persisted = r.store.load_all().await.unwrap()[0]
+            .tickets
+            .iter()
+            .find(|t| t.ticket_id == claim.ticket_id)
+            .unwrap()
+            .used_by
+            .clone();
+        assert_eq!(persisted, vec![bob.id, carol.id]);
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn revoke_is_ticket_only_admitted_peer_keeps_membership() {
+        let (r, host, _key) = registry_with_signing_seed(0x63);
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
+        let claim = minted_cap_claim(&r, id, Capability::ReadWrite, 0).await;
+        let bob = peer(2, "bob");
+        r.ensure_member(id, bob.clone(), Some(claim.clone()))
+            .await
+            .unwrap();
+
+        r.revoke_ticket(id, claim.ticket_id).await.unwrap();
+
+        // Bob was admitted before the revoke: membership and caps are
+        // untouched (ticket-only revocation gates future admissions).
+        let sent = r
+            .send(
+                id,
+                bob.clone(),
+                MessageKind::Chat,
+                "hi".into(),
+                b"still here".to_vec(),
+                Authoring::Local,
+            )
+            .await;
+        assert!(sent.is_ok(), "admitted peer survives revoke: {sent:?}");
+
+        // A NEW bearer of the same (leaked) ticket is rejected.
+        let err = r
+            .ensure_member(id, peer(3, "mallory"), Some(claim))
+            .await
+            .unwrap_err();
+        assert_eq!(err, SessionError::TicketNotAdmissible);
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn rejoin_after_leave_with_revoked_ticket_is_rejected() {
+        // The rejoin hole: admission → leave → revoke. The peer's
+        // re-join re-runs announcement → ensure_member, where the
+        // ledger gate now rejects — the member-set early-return no
+        // longer shields them.
+        let (r, host, _key) = registry_with_signing_seed(0x64);
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
+        let claim = minted_cap_claim(&r, id, Capability::ReadWrite, 0).await;
+        let bob = peer(2, "bob");
+        r.ensure_member(id, bob.clone(), Some(claim.clone()))
+            .await
+            .unwrap();
+
+        r.leave(id, bob.id).await.unwrap();
+        r.revoke_ticket(id, claim.ticket_id).await.unwrap();
+
+        let err = r
+            .ensure_member(id, bob.clone(), Some(claim))
+            .await
+            .unwrap_err();
+        assert_eq!(err, SessionError::TicketNotAdmissible);
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn issued_only_rejects_ledger_absent_claim_even_with_valid_sig() {
+        // The stolen-signing-key / ledger-rollback case: expiry and
+        // cap-sig both pass, but the ledger never saw this id.
+        // Fail closed, with the SAME error as a revoked ticket so the
+        // bearer can't distinguish (both map to the joiner-opaque
+        // ProtocolError::InvalidTicket).
+        let (r, host, key) = registry_with_signing_seed(0x65);
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
+        let forged = valid_cap_claim(&key, id, Capability::ReadWrite, 0);
+
+        let err = r
+            .ensure_member(id, peer(2, "mallory"), Some(forged))
+            .await
+            .unwrap_err();
+        assert_eq!(err, SessionError::TicketNotAdmissible);
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn claim_disagreeing_with_ledger_entry_is_rejected() {
+        // Ledger cross-check of cap/expiry. The cap-sig already binds
+        // these for a signing host, so exercise the ledger's own
+        // check through an unsigned registry (sig verification
+        // skipped when no signing key is configured).
+        let r = registry();
+        let (id, _) = r.host_rw(peer(1, "alice"), None).await.unwrap();
+        let far_future = now_ms() + 3_600_000;
+        let (_, tid) = r
+            .issue_ticket(id, Capability::Read, far_future)
+            .await
+            .unwrap();
+
+        // Cap escalation: ledger says Read, claim says ReadWrite.
+        let escalated = CapClaim {
+            ticket_id: tid,
+            granted_cap: Capability::ReadWrite,
+            expiry_ms: far_future,
+            cap_sig: SIGNATURE_UNSIGNED,
+        };
+        assert_eq!(
+            r.ensure_member(id, peer(2, "bob"), Some(escalated))
+                .await
+                .unwrap_err(),
+            SessionError::TicketNotAdmissible,
+        );
+
+        // Expiry stretch: ledger says far_future, claim says never.
+        let stretched = CapClaim {
+            ticket_id: tid,
+            granted_cap: Capability::Read,
+            expiry_ms: 0,
+            cap_sig: SIGNATURE_UNSIGNED,
+        };
+        assert_eq!(
+            r.ensure_member(id, peer(2, "bob"), Some(stretched))
+                .await
+                .unwrap_err(),
+            SessionError::TicketNotAdmissible,
+        );
+
+        // The honest claim still admits.
+        let honest = CapClaim {
+            ticket_id: tid,
+            granted_cap: Capability::Read,
+            expiry_ms: far_future,
+            cap_sig: SIGNATURE_UNSIGNED,
+        };
+        r.ensure_member(id, peer(2, "bob"), Some(honest))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn tickets_minted_at_each_site_admit() {
+        // Mint → admit round-trip per site: guards against a mint
+        // site forgetting its ledger write, which under issued-only
+        // would brick that ticket.
+        let (r, host, _key) = registry_with_signing_seed(0x66);
+
+        // Site 1: create.
+        let (id, ticket, _) = r
+            .host(host.clone(), None, Capability::ReadWrite, 0)
+            .await
+            .unwrap();
+        r.ensure_member(id, peer(2, "bob"), Some(claim_of(&ticket)))
+            .await
+            .unwrap();
+
+        // Site 2: explicit issue.
+        let (ticket, _) = r.issue_ticket(id, Capability::Read, 0).await.unwrap();
+        r.ensure_member(id, peer(3, "carol"), Some(claim_of(&ticket)))
+            .await
+            .unwrap();
+
+        // Site 3: resume.
+        let (_, ticket, _) = r
+            .host(host.clone(), Some(id), Capability::ReadWrite, 0)
+            .await
+            .unwrap();
+        r.ensure_member(id, peer(4, "dave"), Some(claim_of(&ticket)))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn fs_store_revocation_survives_registry_reload() {
+        // Persistence-first rule: a revoke that only lived in memory
+        // would silently re-admit after a daemon restart.
+        let dir = tempfile::tempdir().unwrap();
+        let store: DynStore =
+            Arc::new(crate::store::FsLogStore::open(dir.path().join("sessions")).unwrap());
+        let (r, host, secret) = registry_with_signing_seed_over(0x67, Arc::clone(&store));
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
+        let claim = minted_cap_claim(&r, id, Capability::ReadWrite, 0).await;
+        r.revoke_ticket(id, claim.ticket_id).await.unwrap();
+        drop(r);
+
+        let r2 = Registry::load(
+            host.id,
+            WireEndpointAddr::id_only(host.id),
+            Arc::clone(&store),
+            None,
+            Some(secret),
+            None,
+        )
+        .await
+        .unwrap();
+        let err = r2
+            .ensure_member(id, peer(2, "bob"), Some(claim.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(err, SessionError::TicketNotAdmissible);
+        let entry = r2
+            .list_tickets(id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.ticket_id == claim.ticket_id)
+            .unwrap();
+        assert_eq!(entry.status, TicketStatus::Revoked);
     }
 }

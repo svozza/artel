@@ -688,12 +688,7 @@ async fn dispatch(
                 };
             }
             match registry.issue_ticket(session, granted_cap, expiry_ms).await {
-                Ok(ticket) => {
-                    // INTERIM (slice 1): decode for the id; slice 3
-                    // returns it from `Registry::issue_ticket`.
-                    let ticket_id = ticket_id_of(&ticket);
-                    Response::IssuedTicket { ticket, ticket_id }
-                }
+                Ok((ticket, ticket_id)) => Response::IssuedTicket { ticket, ticket_id },
                 Err(err) => Response::Error {
                     error: session_error_to_protocol(&err),
                 },
@@ -750,12 +745,8 @@ async fn dispatch_host(
         .host(peer.clone(), session, Capability::ReadWrite, 0)
         .await
     {
-        Ok((session, ticket)) => {
+        Ok((session, ticket, ticket_id)) => {
             memberships.insert(session, peer);
-            // INTERIM (ticket-revocation slice 1): recover the id by
-            // decoding the just-minted ticket. Slice 3 changes
-            // `Registry::host` to return it directly.
-            let ticket_id = ticket_id_of(&ticket);
             Response::HostSession {
                 session,
                 ticket,
@@ -766,15 +757,6 @@ async fn dispatch_host(
             error: session_error_to_protocol(&err),
         },
     }
-}
-
-/// Extract the embedded [`TicketId`] from a ticket this daemon just
-/// minted. Infallible on our own output; a decode failure would mean
-/// `mint_ticket` produced a ticket the daemon itself can't parse.
-fn ticket_id_of(ticket: &artel_protocol::JoinTicket) -> artel_protocol::TicketId {
-    artel_protocol::ticket::decode(ticket.as_str())
-        .expect("daemon-minted ticket must decode")
-        .ticket_id
 }
 
 /// Stamp the daemon's authenticated `PeerId` and route to
@@ -1206,7 +1188,12 @@ fn session_error_to_protocol(err: &SessionError) -> ProtocolError {
     match err {
         SessionError::UnknownSession(s) => ProtocolError::UnknownSession(*s),
         SessionError::NotMember(_) => ProtocolError::Internal("not a member".into()),
-        SessionError::InvalidTicket | SessionError::TicketExpired => ProtocolError::InvalidTicket,
+        // TicketNotAdmissible is joiner-opaque on purpose: revoked,
+        // never-issued, and mint-mismatch all collapse to
+        // InvalidTicket so a bearer can't oracle the host's ledger.
+        SessionError::InvalidTicket
+        | SessionError::TicketExpired
+        | SessionError::TicketNotAdmissible => ProtocolError::InvalidTicket,
         SessionError::Storage(io_err) => ProtocolError::Internal(format!("storage: {io_err}")),
         SessionError::InvalidAddr(msg) => ProtocolError::Internal(format!("invalid addr: {msg}")),
         SessionError::Internal(msg) => ProtocolError::Internal(msg.clone()),
@@ -1230,6 +1217,8 @@ fn session_error_to_protocol(err: &SessionError) -> ProtocolError {
         SessionError::InvalidCapClaim(reason) => {
             ProtocolError::Internal(format!("invalid cap claim: {reason}"))
         }
+        // Host-operator-facing (RevokeTicket of a never-issued id).
+        SessionError::UnknownTicket(t) => ProtocolError::UnknownTicket(*t),
     }
 }
 

@@ -1185,7 +1185,13 @@ fn session_error_to_wire(err: &SessionError) -> ProtocolError {
     match err {
         SessionError::UnknownSession(s) => ProtocolError::UnknownSession(*s),
         SessionError::NotMember(_) => ProtocolError::Internal("not a member".into()),
-        SessionError::InvalidTicket | SessionError::TicketExpired => ProtocolError::InvalidTicket,
+        // TicketNotAdmissible is joiner-opaque on purpose (revocation
+        // slice): revoked, never-issued, and mint-mismatch all
+        // collapse to InvalidTicket so a bearer can't oracle the
+        // host's ledger.
+        SessionError::InvalidTicket
+        | SessionError::TicketExpired
+        | SessionError::TicketNotAdmissible => ProtocolError::InvalidTicket,
         SessionError::Storage(io_err) => ProtocolError::Internal(format!("storage: {io_err}")),
         // The bridge currently doesn't surface InvalidAddr to the
         // wire layer (it fails the local join only), but keep the
@@ -1219,6 +1225,10 @@ fn session_error_to_wire(err: &SessionError) -> ProtocolError {
         SessionError::InvalidCapClaim(reason) => {
             ProtocolError::Internal(format!("invalid cap claim: {reason}"))
         }
+        // Host-operator-facing; never reaches the gossip wire (only
+        // the IPC RevokeTicket path can produce it) but map it
+        // faithfully rather than panicking on a future code motion.
+        SessionError::UnknownTicket(t) => ProtocolError::UnknownTicket(*t),
     }
 }
 
