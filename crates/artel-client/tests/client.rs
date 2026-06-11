@@ -235,7 +235,7 @@ async fn events_stream_delivers_message_events() {
         .await
         .unwrap();
     let (session_id, ticket) = match resp {
-        Response::HostSession { session, ticket } => (session, ticket),
+        Response::HostSession { session, ticket, .. } => (session, ticket),
         other => panic!("got {other:?}"),
     };
     let _ = alice_client

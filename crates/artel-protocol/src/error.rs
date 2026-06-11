@@ -68,6 +68,14 @@ pub enum ProtocolError {
     #[error("capability denied: {0}")]
     Capability(String),
 
+    /// `RevokeTicket` named a ticket id that was never issued for the
+    /// session. Distinct from [`Self::InvalidTicket`], which is the
+    /// joiner-facing (deliberately opaque) rejection; this variant is
+    /// host-operator-facing — reporting success for an unknown id
+    /// would falsely reassure the caller a leaked ticket is dead.
+    #[error("ticket {0} was never issued for this session")]
+    UnknownTicket(crate::ids::TicketId),
+
     /// Catch-all for daemon-side failures the client cannot otherwise
     /// distinguish. The string is for diagnostics only.
     #[error("internal daemon error: {0}")]
@@ -89,6 +97,7 @@ impl ProtocolError {
             Self::SessionConflict(_) => "session_conflict",
             Self::Signature(_) => "signature",
             Self::Capability(_) => "capability",
+            Self::UnknownTicket(_) => "unknown_ticket",
             Self::Internal(_) => "internal",
         }
     }
@@ -139,6 +148,10 @@ mod tests {
             ProtocolError::Capability("read only".into()).slug(),
             "capability"
         );
+        assert_eq!(
+            ProtocolError::UnknownTicket(crate::ids::TicketId::from_bytes([2; 16])).slug(),
+            "unknown_ticket"
+        );
         assert_eq!(ProtocolError::Internal("x".into()).slug(), "internal");
     }
 
@@ -154,6 +167,7 @@ mod tests {
             ProtocolError::SessionConflict(s),
             ProtocolError::Signature("zero sentinel".into()),
             ProtocolError::Capability("had Read, needs ReadWrite".into()),
+            ProtocolError::UnknownTicket(crate::ids::TicketId::from_bytes([2; 16])),
             ProtocolError::Internal("disk full".into()),
         ];
         for c in cases {
@@ -215,6 +229,8 @@ mod tests {
                 .prop_map(|b| ProtocolError::SessionConflict(SessionId::from_bytes(b))),
             "[\\PC]{0,64}".prop_map(ProtocolError::Signature),
             "[\\PC]{0,64}".prop_map(ProtocolError::Capability),
+            any::<[u8; 16]>()
+                .prop_map(|b| ProtocolError::UnknownTicket(crate::ids::TicketId::from_bytes(b))),
             "[\\PC]{0,64}".prop_map(ProtocolError::Internal),
         ]
     }

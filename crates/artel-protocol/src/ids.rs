@@ -70,11 +70,12 @@ impl From<Uuid> for SessionId {
 /// Globally-unique identifier for an issued join ticket.
 ///
 /// Backed by a v4 UUID, identical in shape to [`SessionId`]. Carried in
-/// the ticket wire form (Auth Slice C, `TICKET_VERSION` 3) so a future
-/// revocation layer can name a specific ticket. In v1 it is *carried* but
-/// never *enforced* — the field exists now so v2 needn't re-bump the
-/// ticket version. See `crate::ticket` and
-/// `docs/plans/2026-06-03-auth-slice-c-l2-capabilities-plan.md`.
+/// the ticket wire form since `TICKET_VERSION` 3 (Auth Slice C) so the
+/// revocation layer could later name a specific ticket without a wire
+/// bump — which is what happened: the ticket-revocation slice enforces
+/// it at admission against the host's issued-ticket ledger
+/// (issued-only, fail closed). See `crate::ticket::TicketEntry` and
+/// `docs/plans/2026-06-11-ticket-revocation-plan.md`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct TicketId(Uuid);

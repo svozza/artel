@@ -216,7 +216,7 @@ async fn join_succeeds_within_tight_budget_real_n0() {
         .await
         .unwrap();
     let (session_id, ticket) = match host_resp {
-        Response::HostSession { session, ticket } => (session, ticket),
+        Response::HostSession { session, ticket, .. } => (session, ticket),
         other => panic!("expected HostSession, got {other:?}"),
     };
 
@@ -382,7 +382,7 @@ async fn addr_hint_survives_daemon_restart_via_on_disk_cache() {
     .await
     .unwrap();
     let (session_id, ticket) = match host_resp {
-        Response::HostSession { session, ticket } => (session, ticket),
+        Response::HostSession { session, ticket, .. } => (session, ticket),
         other => panic!("expected HostSession, got {other:?}"),
     };
 

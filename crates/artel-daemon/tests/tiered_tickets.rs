@@ -36,7 +36,7 @@ async fn read_ticket_joiner_cannot_send() {
         .await
         .unwrap();
     let (session_id, _ticket) = match host_resp {
-        Response::HostSession { session, ticket } => (session, ticket),
+        Response::HostSession { session, ticket, .. } => (session, ticket),
         other => panic!("expected HostSession, got {other:?}"),
     };
 
@@ -59,7 +59,7 @@ async fn read_ticket_joiner_cannot_send() {
         .await
         .unwrap();
     let read_ticket = match issue_resp {
-        Response::IssuedTicket { ticket } => ticket,
+        Response::IssuedTicket { ticket, .. } => ticket,
         other => panic!("expected IssuedTicket, got {other:?}"),
     };
 
@@ -131,7 +131,7 @@ async fn rw_ticket_joiner_can_send() {
         .await
         .unwrap();
     let (session_id, ticket) = match host_resp {
-        Response::HostSession { session, ticket } => (session, ticket),
+        Response::HostSession { session, ticket, .. } => (session, ticket),
         other => panic!("expected HostSession, got {other:?}"),
     };
 
@@ -209,7 +209,7 @@ async fn expired_ticket_rejected_at_admission() {
         .await
         .unwrap();
     let (session_id, _ticket) = match host_resp {
-        Response::HostSession { session, ticket } => (session, ticket),
+        Response::HostSession { session, ticket, .. } => (session, ticket),
         other => panic!("expected HostSession, got {other:?}"),
     };
 
@@ -233,7 +233,7 @@ async fn expired_ticket_rejected_at_admission() {
         .await
         .unwrap();
     let expired_ticket = match issue_resp {
-        Response::IssuedTicket { ticket } => ticket,
+        Response::IssuedTicket { ticket, .. } => ticket,
         other => panic!("expected IssuedTicket, got {other:?}"),
     };
 
@@ -330,7 +330,7 @@ async fn direct_stream_upgrade_delivers_secret() {
         .await
         .unwrap();
     let (session_id, ticket) = match host_resp {
-        Response::HostSession { session, ticket } => (session, ticket),
+        Response::HostSession { session, ticket, .. } => (session, ticket),
         other => panic!("expected HostSession, got {other:?}"),
     };
     alice
@@ -368,7 +368,7 @@ async fn direct_stream_upgrade_delivers_secret() {
         .await
         .unwrap()
     {
-        Response::IssuedTicket { ticket } => ticket,
+        Response::IssuedTicket { ticket, .. } => ticket,
         other => panic!("expected IssuedTicket, got {other:?}"),
     };
     let carol = Client::connect(&daemon_c.socket).await.unwrap();

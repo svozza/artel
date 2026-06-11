@@ -432,7 +432,7 @@ async fn host_session_without_workspace() -> JoinerSetup {
         .await
         .unwrap()
     {
-        Response::HostSession { session, ticket } => (session, ticket),
+        Response::HostSession { session, ticket, .. } => (session, ticket),
         other => panic!("HostSession: got {other:?}"),
     };
     // Deliberately *do not* call `Workspace::host` on alice — we
@@ -612,7 +612,7 @@ async fn read_only_joiner_write_does_not_propagate() {
         .await
         .unwrap();
     let read_ticket = match issue_resp {
-        Response::IssuedTicket { ticket: t } => t,
+        Response::IssuedTicket { ticket: t, .. } => t,
         other => panic!("expected IssuedTicket, got {other:?}"),
     };
 

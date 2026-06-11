@@ -998,7 +998,7 @@ async fn joiner_rejects_old_shape_doc_ticket_payload() {
         .await
         .unwrap()
     {
-        Response::HostSession { session, ticket } => (session, ticket),
+        Response::HostSession { session, ticket, .. } => (session, ticket),
         other => panic!("HostSession: got {other:?}"),
     };
 

@@ -49,6 +49,9 @@ pub use rpc::{
     Attachment, Event, JoinTicket, Request, RequestId, Response, SendPayload, SessionSummary,
     SignedSendPayload, WireMessage,
 };
-pub use ticket::{SessionTicket, TICKET_PREFIX, TICKET_VERSION, TicketError, WireEndpointAddr};
+pub use ticket::{
+    SessionTicket, TICKET_PREFIX, TICKET_VERSION, TicketEntry, TicketError, TicketStatus,
+    WireEndpointAddr,
+};
 pub use upgrade::{UPGRADE_ACK, UPGRADE_ALPN, UpgradeFrame, UpgradePayload};
 pub use version::{PROTOCOL_VERSION, ProtocolVersion, VersionMismatch};

@@ -242,6 +242,37 @@ pub enum Request {
         expiry_ms: u64,
     },
 
+    /// Revoke a previously issued ticket so it no longer admits
+    /// bearers. Only the host of a `SessionKind::Local` session may
+    /// revoke; returns [`ProtocolError::NotHost`] otherwise.
+    ///
+    /// Idempotent on an already-revoked ticket. A `ticket_id` that was
+    /// never issued for this session is rejected with
+    /// [`ProtocolError::UnknownTicket`] — reporting success for an
+    /// unknown id would falsely reassure the caller a leaked ticket is
+    /// dead. Revocation gates *future admissions only*: a peer already
+    /// admitted via this ticket keeps its membership and capabilities
+    /// (use a capability revoke for that — see
+    /// [`Response::Tickets`]' `used_by`).
+    RevokeTicket {
+        /// Session the ticket was issued for.
+        session: SessionId,
+        /// Id of the ticket to revoke, as returned by
+        /// [`Response::IssuedTicket`] / [`Response::HostSession`] or
+        /// listed by [`Request::ListTickets`].
+        ticket_id: crate::ids::TicketId,
+    },
+
+    /// List every ticket issued for a hosted session — id, tier,
+    /// expiry, status, and which peers were admitted with it. Only
+    /// the host of a `SessionKind::Local` session may list; returns
+    /// [`ProtocolError::NotHost`] otherwise. The encoded bearer
+    /// strings are never returned.
+    ListTickets {
+        /// Session whose ledger to list.
+        session: SessionId,
+    },
+
     /// Deliver the `NamespaceSecret` directly to a target peer via a
     /// dedicated QUIC stream. Only the host of a `SessionKind::Local`
     /// session may call this.
@@ -353,6 +384,9 @@ pub enum Response {
         session: SessionId,
         /// Ticket the host distributes out-of-band to invitees.
         ticket: JoinTicket,
+        /// Id of the minted ticket, for later
+        /// [`Request::RevokeTicket`] without decoding `ticket`.
+        ticket_id: crate::ids::TicketId,
     },
 
     /// Reply to [`Request::JoinSession`].
@@ -408,6 +442,19 @@ pub enum Response {
     IssuedTicket {
         /// The newly minted ticket.
         ticket: JoinTicket,
+        /// Id of the minted ticket, for later
+        /// [`Request::RevokeTicket`] without decoding `ticket`.
+        ticket_id: crate::ids::TicketId,
+    },
+
+    /// Reply to [`Request::RevokeTicket`] (success, including the
+    /// idempotent already-revoked case).
+    TicketRevoked,
+
+    /// Reply to [`Request::ListTickets`].
+    Tickets {
+        /// Every ticket issued for the session, mint order.
+        entries: Vec<crate::ticket::TicketEntry>,
     },
 
     /// Reply to [`Request::DeliverUpgrade`]. Confirms the target peer
@@ -787,6 +834,7 @@ mod tests {
         let resp = Response::HostSession {
             session: SessionId::from_bytes([3; 16]),
             ticket: JoinTicket::from("xyz"),
+            ticket_id: crate::ids::TicketId::from_bytes([7; 16]),
         };
         let bytes = postcard::to_allocvec(&resp).unwrap();
         let back: Response = postcard::from_bytes(&bytes).unwrap();
@@ -903,6 +951,7 @@ mod tests {
     fn issued_ticket_response_round_trip() {
         let resp = Response::IssuedTicket {
             ticket: JoinTicket::from("artel:some-ticket-data"),
+            ticket_id: crate::ids::TicketId::from_bytes([8; 16]),
         };
         let bytes = postcard::to_allocvec(&resp).unwrap();
         let back: Response = postcard::from_bytes(&bytes).unwrap();
@@ -911,6 +960,79 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         let back: Response = serde_json::from_str(&json).unwrap();
         assert_eq!(resp, back);
+    }
+
+    #[test]
+    fn revoke_ticket_request_round_trip() {
+        let req = Request::RevokeTicket {
+            session: SessionId::from_bytes([5; 16]),
+            ticket_id: crate::ids::TicketId::from_bytes([6; 16]),
+        };
+        let bytes = postcard::to_allocvec(&req).unwrap();
+        let back: Request = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(req, back);
+
+        let json = serde_json::to_string(&req).unwrap();
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn list_tickets_request_round_trip() {
+        let req = Request::ListTickets {
+            session: SessionId::from_bytes([5; 16]),
+        };
+        let bytes = postcard::to_allocvec(&req).unwrap();
+        let back: Request = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn ticket_revoked_response_round_trip() {
+        let resp = Response::TicketRevoked;
+        let bytes = postcard::to_allocvec(&resp).unwrap();
+        let back: Response = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(resp, back);
+        // Unit-shaped: JSON renders as a bare snake_case string.
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(json, "\"ticket_revoked\"");
+    }
+
+    #[test]
+    fn tickets_response_round_trip_empty_and_populated() {
+        use crate::ticket::{TicketEntry, TicketStatus};
+        for entries in [
+            Vec::<TicketEntry>::new(),
+            vec![
+                TicketEntry {
+                    ticket_id: crate::ids::TicketId::from_bytes([1; 16]),
+                    granted_cap: crate::capability::Capability::ReadWrite,
+                    expiry_ms: 0,
+                    issued_at_ms: 1_700_000_000_000,
+                    status: TicketStatus::Active,
+                    used_by: vec![],
+                },
+                TicketEntry {
+                    ticket_id: crate::ids::TicketId::from_bytes([2; 16]),
+                    granted_cap: crate::capability::Capability::Read,
+                    expiry_ms: 1_800_000_000_000,
+                    issued_at_ms: 1_700_000_000_001,
+                    status: TicketStatus::Revoked,
+                    used_by: vec![PeerId::from_bytes([3; 32]), PeerId::from_bytes([4; 32])],
+                },
+            ],
+        ] {
+            let resp = Response::Tickets {
+                entries: entries.clone(),
+            };
+            let bytes = postcard::to_allocvec(&resp).unwrap();
+            let back: Response = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(resp, back);
+
+            let json = serde_json::to_string(&resp).unwrap();
+            let back: Response = serde_json::from_str(&json).unwrap();
+            assert_eq!(resp, back);
+        }
     }
 
     #[test]

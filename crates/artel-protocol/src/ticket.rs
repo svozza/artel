@@ -49,12 +49,58 @@ pub const TICKET_VERSION: u8 = 4;
 /// strings easy to reject.
 pub const TICKET_PREFIX: &str = "artel:";
 
+/// Lifecycle state of an issued ticket in the host's ledger.
+///
+/// Admission requires `Active`; `Revoked` (and ledger *absence* —
+/// issued-only, fail closed) reject. There is no un-revoke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TicketStatus {
+    /// Ticket admits bearers (subject to expiry and cap-sig checks).
+    Active,
+    /// Ticket was revoked by the host; bearers are rejected at
+    /// admission. Entry is retained for listing until session close.
+    Revoked,
+}
+
+/// One entry in the host's issued-ticket ledger.
+///
+/// The ledger is the host-side record of every ticket minted for a
+/// session — the authoritative answer to both "may this ticket admit?"
+/// (status must be `Active`) and "what can I revoke?". It holds
+/// *metadata only*: the encoded bearer string is never stored or
+/// returned. Carried on the IPC wire by `Response::Tickets`; persisted
+/// by the daemon next to the session log. Host-local — never crosses
+/// the gossip wire (issuance metadata would leak to all members for
+/// zero enforcement benefit; the host is the sole admission gate).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketEntry {
+    /// Id of the issued ticket (also embedded in the bearer string).
+    pub ticket_id: TicketId,
+    /// Capability tier the ticket grants. Cross-checked against the
+    /// bearer's claim at admission.
+    pub granted_cap: Capability,
+    /// Expiry in ms since Unix epoch (`0` = none). Cross-checked
+    /// against the bearer's claim at admission.
+    pub expiry_ms: u64,
+    /// When the host minted this ticket, ms since Unix epoch.
+    pub issued_at_ms: u64,
+    /// Current lifecycle state.
+    pub status: TicketStatus,
+    /// Peers admitted via this ticket, in admission order. Advisory
+    /// metadata (tickets are multi-use bearer tokens): tells the
+    /// operator a revoke of an already-used ticket may also warrant a
+    /// peer-level `CapabilityAction::Revoke`.
+    pub used_by: Vec<PeerId>,
+}
+
 /// Decoded form of an artel join ticket.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionTicket {
-    /// Unique id naming this issued ticket. Carried for a future
-    /// revocation layer (Auth Slice C); *carried* but not *enforced* in
-    /// v1. See [`TicketId`].
+    /// Unique id naming this issued ticket. Enforced at admission
+    /// against the host's issued-ticket ledger (issued-only, fail
+    /// closed): the id must be present and [`TicketStatus::Active`].
+    /// See [`TicketId`] and [`TicketEntry`].
     pub ticket_id: TicketId,
     /// The host session's id. Joiners use this to identify which
     /// session they're joining.
@@ -381,7 +427,40 @@ mod tests {
 
     #[test]
     fn ticket_version_is_four() {
+        // Deliberately unchanged by the revocation slice: TicketId has
+        // been on the wire since v3, so enforcement needs no bump.
         assert_eq!(TICKET_VERSION, 4);
+    }
+
+    #[test]
+    fn ticket_entry_round_trips_postcard_and_json() {
+        let entry = TicketEntry {
+            ticket_id: TicketId::from_bytes([0x11; 16]),
+            granted_cap: Capability::Read,
+            expiry_ms: 1_800_000_000_000,
+            issued_at_ms: 1_700_000_000_000,
+            status: TicketStatus::Revoked,
+            used_by: vec![PeerId::from_bytes([0x22; 32])],
+        };
+        let bytes = postcard::to_stdvec(&entry).unwrap();
+        let back: TicketEntry = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back, entry);
+
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: TicketEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, entry);
+    }
+
+    #[test]
+    fn ticket_status_json_is_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&TicketStatus::Active).unwrap(),
+            "\"active\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TicketStatus::Revoked).unwrap(),
+            "\"revoked\""
+        );
     }
 
     #[test]

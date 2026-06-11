@@ -205,7 +205,7 @@ async fn host_sends_message_joiner_observes_via_gossip() {
         .await
         .unwrap();
     let (session_id, ticket) = match host_resp {
-        Response::HostSession { session, ticket } => (session, ticket),
+        Response::HostSession { session, ticket, .. } => (session, ticket),
         other => panic!("expected HostSession, got {other:?}"),
     };
 
@@ -295,7 +295,7 @@ async fn joiner_announces_membership_without_sending() {
         .await
         .unwrap();
     let (session_id, ticket) = match host_resp {
-        Response::HostSession { session, ticket } => (session, ticket),
+        Response::HostSession { session, ticket, .. } => (session, ticket),
         other => panic!("expected HostSession, got {other:?}"),
     };
     alice_client
@@ -388,7 +388,7 @@ async fn joiner_send_round_trips_through_host() {
         .await
         .unwrap();
     let (session_id, ticket) = match host_resp {
-        Response::HostSession { session, ticket } => (session, ticket),
+        Response::HostSession { session, ticket, .. } => (session, ticket),
         other => panic!("expected HostSession, got {other:?}"),
     };
 
@@ -496,7 +496,7 @@ async fn capability_lifecycle_join_grant_write_revoke_reject() {
         .await
         .unwrap();
     let (session_id, ticket) = match host_resp {
-        Response::HostSession { session, ticket } => (session, ticket),
+        Response::HostSession { session, ticket, .. } => (session, ticket),
         other => panic!("expected HostSession, got {other:?}"),
     };
 
@@ -620,7 +620,7 @@ async fn joiner_send_after_host_closes_surfaces_unknown_session() {
         .await
         .unwrap();
     let (session_id, ticket) = match host_resp {
-        Response::HostSession { session, ticket } => (session, ticket),
+        Response::HostSession { session, ticket, .. } => (session, ticket),
         other => panic!("expected HostSession, got {other:?}"),
     };
 
@@ -719,7 +719,7 @@ async fn host_close_propagates_session_closed_to_joiner() {
         .await
         .unwrap();
     let (session_id, ticket) = match host_resp {
-        Response::HostSession { session, ticket } => (session, ticket),
+        Response::HostSession { session, ticket, .. } => (session, ticket),
         other => panic!("expected HostSession, got {other:?}"),
     };
 
@@ -804,7 +804,7 @@ async fn joiner_replays_messages_sent_before_join() {
         .await
         .unwrap();
     let (session_id, ticket) = match host_resp {
-        Response::HostSession { session, ticket } => (session, ticket),
+        Response::HostSession { session, ticket, .. } => (session, ticket),
         other => panic!("expected HostSession, got {other:?}"),
     };
 
@@ -928,7 +928,7 @@ async fn joiner_replays_system_message_after_daemon_restart() {
         .await
         .unwrap();
     let (session_id, ticket) = match host_resp {
-        Response::HostSession { session, ticket } => (session, ticket),
+        Response::HostSession { session, ticket, .. } => (session, ticket),
         other => panic!("expected HostSession, got {other:?}"),
     };
 

@@ -688,10 +688,28 @@ async fn dispatch(
                 };
             }
             match registry.issue_ticket(session, granted_cap, expiry_ms).await {
-                Ok(ticket) => Response::IssuedTicket { ticket },
+                Ok(ticket) => {
+                    // INTERIM (slice 1): decode for the id; slice 3
+                    // returns it from `Registry::issue_ticket`.
+                    let ticket_id = ticket_id_of(&ticket);
+                    Response::IssuedTicket { ticket, ticket_id }
+                }
                 Err(err) => Response::Error {
                     error: session_error_to_protocol(&err),
                 },
+            }
+        }
+        // INTERIM (ticket-revocation slice 1): wire surface exists so
+        // PROTOCOL_VERSION 8 is honest; registry backing lands in
+        // slices 2-3 and these arms are completed in slice 4.
+        Request::RevokeTicket { session, .. } | Request::ListTickets { session } => {
+            if !memberships.contains_key(&session) {
+                return Response::Error {
+                    error: ProtocolError::NotSubscribed(session),
+                };
+            }
+            Response::Error {
+                error: ProtocolError::Internal("ticket ledger not yet wired (slice 4)".into()),
             }
         }
         #[cfg(feature = "iroh")]
@@ -734,12 +752,29 @@ async fn dispatch_host(
     {
         Ok((session, ticket)) => {
             memberships.insert(session, peer);
-            Response::HostSession { session, ticket }
+            // INTERIM (ticket-revocation slice 1): recover the id by
+            // decoding the just-minted ticket. Slice 3 changes
+            // `Registry::host` to return it directly.
+            let ticket_id = ticket_id_of(&ticket);
+            Response::HostSession {
+                session,
+                ticket,
+                ticket_id,
+            }
         }
         Err(err) => Response::Error {
             error: session_error_to_protocol(&err),
         },
     }
+}
+
+/// Extract the embedded [`TicketId`] from a ticket this daemon just
+/// minted. Infallible on our own output; a decode failure would mean
+/// `mint_ticket` produced a ticket the daemon itself can't parse.
+fn ticket_id_of(ticket: &artel_protocol::JoinTicket) -> artel_protocol::TicketId {
+    artel_protocol::ticket::decode(ticket.as_str())
+        .expect("daemon-minted ticket must decode")
+        .ticket_id
 }
 
 /// Stamp the daemon's authenticated `PeerId` and route to
