@@ -544,9 +544,7 @@ fn load_one(dir: &Path) -> io::Result<SessionRecord> {
 }
 
 fn read_meta(path: &Path) -> io::Result<Meta> {
-    let bytes = std::fs::read(path)?;
-    serde_json::from_slice(&bytes)
-        .map_err(|e| io::Error::new(ErrorKind::InvalidData, format!("meta json: {e}")))
+    read_json(path, "meta")
 }
 
 /// Filename for `(kind)`: lowercase-hex(utf8(kind)) + `.bin`.
@@ -683,14 +681,17 @@ fn is_attachment_tmp(name: &str) -> bool {
         .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
 }
 
-/// Atomic write: `path.tmp` + fsync + rename.
-/// Atomic full rewrite of the ticket ledger — same tmp+rename+chmod
-/// dance as [`write_meta`]. The deterministic tmp name is safe here
-/// for the same reason as meta's: all callers hold the per-session
-/// `Mutex<Session>`, so two writers never race on one session's file.
-fn write_tickets(path: &Path, tickets: &[TicketEntry]) -> io::Result<()> {
-    let bytes = serde_json::to_vec_pretty(tickets)
-        .map_err(|e| io::Error::new(ErrorKind::InvalidData, format!("tickets json: {e}")))?;
+/// Atomic JSON write: pretty-serialize to `<path minus extension>.json.tmp`,
+/// fsync, chmod 0o600, rename onto `path`. `label` names the document
+/// in error messages ("meta", "tickets").
+///
+/// The deterministic tmp name is safe only while writes to one `path`
+/// never race: every caller holds the per-session `Mutex<Session>`
+/// across the write. A writer outside that lock needs
+/// [`unique_tmp_path`] instead (see [`write_attachment`]).
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T, label: &str) -> io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(value)
+        .map_err(|e| io::Error::new(ErrorKind::InvalidData, format!("{label} json: {e}")))?;
     let tmp = path.with_extension("json.tmp");
     {
         let mut f = std::fs::OpenOptions::new()
@@ -704,36 +705,34 @@ fn write_tickets(path: &Path, tickets: &[TicketEntry]) -> io::Result<()> {
     chmod(&tmp, FILE_MODE)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// Counterpart of [`write_json_atomic`]: read + parse, mapping parse
+/// failures to `InvalidData` tagged with `label`. I/O errors (notably
+/// `NotFound`) pass through untouched so callers can layer their own
+/// absent-file policy.
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path, label: &str) -> io::Result<T> {
+    let bytes = std::fs::read(path)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| io::Error::new(ErrorKind::InvalidData, format!("{label} json: {e}")))
+}
+
+/// Atomic full rewrite of the ticket ledger.
+fn write_tickets(path: &Path, tickets: &[TicketEntry]) -> io::Result<()> {
+    write_json_atomic(path, &tickets, "tickets")
 }
 
 /// Read the ticket ledger sidecar. Absent ⇒ empty (see `load_one` for
 /// why corrupt ≠ absent).
 fn read_tickets(path: &Path) -> io::Result<Vec<TicketEntry>> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(err),
-    };
-    serde_json::from_slice(&bytes)
-        .map_err(|e| io::Error::new(ErrorKind::InvalidData, format!("tickets json: {e}")))
+    match read_json(path, "tickets") {
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(Vec::new()),
+        other => other,
+    }
 }
 
 fn write_meta(path: &Path, meta: &Meta) -> io::Result<()> {
-    let bytes = serde_json::to_vec_pretty(meta)
-        .map_err(|e| io::Error::new(ErrorKind::InvalidData, format!("meta json: {e}")))?;
-    let tmp = path.with_extension("json.tmp");
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp)?;
-        f.write_all(&bytes)?;
-        f.sync_all()?;
-    }
-    chmod(&tmp, FILE_MODE)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    write_json_atomic(path, meta, "meta")
 }
 
 /// Append a [`SessionMessage`] as `[u32 BE length][postcard]`, then
