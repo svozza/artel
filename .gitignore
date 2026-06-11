@@ -5,6 +5,10 @@
 .vscode
 .claude/settings.local.json
 
+# Host-staged devcontainer artifacts (short-lived AWS credentials,
+# Claude CLI state seed) — written by .devcontainer/host-init.sh.
+.devcontainer/.local/
+
 # Throwaway test harnesses that aren't part of the public surface.
 # Live inside the worktree so they can pull `{ workspace = true }`
 # deps without restating versions; kept out of git so the public

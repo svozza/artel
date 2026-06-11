@@ -1,0 +1,103 @@
+{
+  "name": "artel",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+
+  // Persist the cargo registry and the workspace target dir across
+  // rebuilds so dependency downloads and compiled artifacts survive
+  // container recreation (a cold `cargo build` of the iroh tree is
+  // expensive). Named volumes are faster than bind mounts for these.
+  "mounts": [
+    "source=artel-cargo-registry,target=/usr/local/cargo/registry,type=volume",
+    "source=artel-target,target=${containerWorkspaceFolder}/target,type=volume",
+
+    // Claude Code state. The host ~/.claude is shared read-write so
+    // settings, agents, skills, and per-project memory follow you
+    // into the container (and memory written inside persists out).
+    // CLI state (~/.claude.json) is NOT shared — it's seeded once by
+    // on-create.sh into the mounted dir and the container keeps its
+    // own copy via CLAUDE_CONFIG_DIR.
+    "source=${localEnv:HOME}/.claude,target=/home/vscode/.claude,type=bind",
+
+    // Host-staged artifacts from host-init.sh (initializeCommand):
+    // short-lived AWS credentials (the host profile resolves creds
+    // via internal host-only tooling that can't run in Linux) and
+    // the Claude CLI state seed. Gitignored; recreated on the host
+    // at every container start.
+    "source=${localWorkspaceFolder}/.devcontainer/.local,target=/opt/host,type=bind"
+  ],
+
+  "containerEnv": {
+    "RUST_BACKTRACE": "1",
+    "CARGO_TERM_COLOR": "always",
+    // Cap build parallelism inside the container. An all-features
+    // debug build of the iroh tree links several large static
+    // binaries at once; each linker can hit ~2 GiB, so an
+    // unconstrained `cargo build --all-features` OOM-kills `ld` on a
+    // memory-tight VM. 4 keeps peak RAM bounded while still using the
+    // 4 vCPUs. Scoped to the container via containerEnv — deliberately
+    // NOT in a committed .cargo/config.toml, which would also throttle
+    // every contributor's host build. Override per-shell if you have
+    // headroom: `CARGO_BUILD_JOBS=8 cargo build`.
+    "CARGO_BUILD_JOBS": "4",
+
+    // AWS_CONFIG_FILE points at the host-staged config (see
+    // host-init.sh): if the developer's own Claude settings name an
+    // AWS profile (e.g. for Bedrock), short-lived credentials are
+    // exported there at container start. No profile configured → the
+    // file simply doesn't exist, which AWS SDKs treat as "no
+    // profiles" — a no-op for contributors who don't use AWS.
+    // Keeping it under /opt/host (not ~/.aws) means the container's
+    // AWS surface is exactly one profile with temporary credentials;
+    // none of the host's other profiles are visible. Personal
+    // provider routing (CLAUDE_CODE_USE_BEDROCK, AWS_PROFILE, region)
+    // deliberately lives in each developer's own ~/.claude/settings
+    // env block — mounted above — not in this committed file.
+    "AWS_CONFIG_FILE": "/opt/host/aws/config",
+    "CLAUDE_CONFIG_DIR": "/home/vscode/.claude"
+  },
+
+  // VS Code-specific hints. Ignored by Zed / CLI clients, so they
+  // cost nothing for non-VS-Code users while giving VS Code users a
+  // working rust-analyzer setup out of the box.
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "vadimcn.vscode-lldb",
+        "fill-labs.dependi"
+      ],
+      "settings": {
+        "rust-analyzer.check.command": "clippy",
+        "editor.formatOnSave": true,
+        "[rust]": {
+          "editor.defaultFormatter": "rust-lang.rust-analyzer"
+        }
+      }
+    }
+  },
+
+  // Run as the base image's built-in non-root user (uid 1000, with
+  // passwordless sudo). This is just a Unix account named "vscode" —
+  // not editor-specific — and is the devcontainer convention every
+  // client (Zed, VS Code, CLI) expects. Running non-root keeps
+  // files created under the bind-mounted workspace owned by a normal
+  // user rather than root on the host.
+  "remoteUser": "vscode",
+
+  // Host-side staging before every container create/start: if the
+  // developer's Claude settings name an AWS profile, exports
+  // short-lived credentials for it (host profiles may resolve creds
+  // via host-only tooling that can't run in Linux) and stages a
+  // Claude CLI state seed. See host-init.sh. Rerun it manually to
+  // refresh credentials in a live container.
+  "initializeCommand": "bash .devcontainer/host-init.sh",
+
+  // In-container setup at create time: chown the root-owned named
+  // volumes to vscode and seed Claude CLI state. Then warm the
+  // dependency cache so the first build doesn't pay the download cost.
+  "onCreateCommand": "bash .devcontainer/on-create.sh ${containerWorkspaceFolder}",
+  "postCreateCommand": "cargo fetch"
+}
