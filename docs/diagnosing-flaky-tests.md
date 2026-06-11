@@ -246,6 +246,105 @@ isolation. The diagnosis chain, recorded here because the verdict is
   A herd of them is invisible background load that surfaces as
   unrelated-looking timeout flakes days later.
 
+## Case study: the relay-vs-direct handshake poisoning (2026-06-11)
+
+`alice_post_restart_writes_reach_bob_real_n0` went from "intermittent"
+(two captured failures on the orphan-polluted machine, 2026-06-09/10)
+to **0/12 hard-fail on a clean machine** — zero orphans, pkarr publish
+and DNS resolution verified working in-log. The deterministic sibling
+stayed green throughout. The chain that found it, and the verdict:
+
+- **The handoff doc's hypothesis was wrong, in a useful way.** It
+  blamed "production DNS/relay timing variance." A `noq_proto=trace`
+  run showed discovery and transport both *succeeding* — the failure
+  was downstream of everything the hypothesis pointed at. Lesson
+  re-learned from §"What NOT to do": re-derive, don't inherit.
+- **Mechanism (upstream, noq-proto 0.17.0).** The joiner seeds the
+  host's ticket addrs (relay URL + direct addrs) and dials. Same
+  machine, so the Initial packet arrives at the host **twice**: via
+  the relay transport (synthetic remote `fd15…:12345`, local IP never
+  set) and via direct UDP (real remote, real local IP). The relay
+  copy creates the server-side path; the direct copy is discarded as
+  off-path — but not before `update_network_path_or_discard`
+  (noq-proto 0.17.0 `connection/mod.rs:2309`) **learns its local IP
+  onto the relay path**. The path is now a hybrid four-tuple
+  `(local: real-interface-IP, remote: fd15…)` that no future packet
+  can equal. The handshake-phase check (`mod.rs:4117`) compares
+  four-tuples strictly, so every further relay-delivered handshake
+  packet logs `discarding packet with unexpected remote during
+  handshake` (35–99 per failing run) and the server-side handshake
+  never completes. The dialer side completes ITS handshake, opens
+  streams, and waits forever — which is why the failure surfaces as
+  whatever timeout guards that phase.
+- **One mechanism, many costumes.** Captured failure phases: gossip
+  `JOIN_READY_TIMEOUT` (the original "Failure A"), iroh-docs
+  `initial sync did not complete in 30s`, `grant_rw_and_wait` upgrade
+  probe never reaching the host, daemon shutdown hang. Which costume
+  you get depends on which connection (gossip / sync / upgrade) loses
+  the relay-vs-direct race first. The original "Failure B" (9
+  NeighborUps then post-restart stall) was this too — that run's
+  gossip conns anchored direct-first and survived; a later conn
+  didn't.
+- **Why it changed character on 2026-06-10:** commit `44a4f8b` moved
+  these tests from n0's public relay to an in-process localhost
+  relay. Against the public relay, the same-machine direct packet
+  always beat the cross-internet relay packet → poisoning was rare →
+  "flaky". Against a localhost relay the relay copy reliably wins →
+  deterministic failure. The test got *more* honest, not more broken.
+- **Confirmation experiment (the causal flip):** temporarily seeding
+  the dial with relay-URL-only (no direct addrs) in
+  `wire_addr_to_iroh` flipped the gossip-join phase from 0/12 to
+  passing — and the failure *moved downstream* to iroh-docs sync,
+  whose connections iroh dials from its own addr book (relay + direct
+  learned via discovery), outside our control. 2/9 full passes, 7/9
+  failed at later phases with the same discard signature on the
+  host's sync/gossip accepts. That ruled out the workaround AND
+  triple-confirmed the mechanism: any iroh-internal dial that knows
+  both transports can poison its accept path. Experiment reverted.
+- **Layer verdict: upstream, fixed in iroh 1.0.0-rc.** noq-proto
+  1.0.0-rc.1 changes the handshake comparison to
+  `is_probably_same_path` (a path with no local IP matches any local
+  IP) and gates local-IP learning on `is_handshake_confirmed()` —
+  both verified present in the released rc crate source. See iroh
+  PRs #4273/#4281 (four-tuple rework, called out in the rc1 blog
+  post). No artel-side fix is correct: the substrate never gets to
+  run, and per the gossip-only memory we don't want to re-plumb
+  dialing.
+- **Blast radius: the whole localhost-relay slice of the n0 tier.**
+  A full-tier `--no-fail-fast` run confirmed 4 failures, all
+  two-peer dials through the in-process relay
+  (`alice_post_restart_writes_reach_bob_real_n0`,
+  `capability_survives_host_restart_n0`,
+  `legit_host_frames_accepted_n0`,
+  `join_succeeds_within_tight_budget_real_n0` — the last one's
+  "waiting on pkarr/DNS propagation" panic message was a
+  mis-attribution; the addr hint worked, the acceptor's handshake
+  was wedged). Every public-relay test (`crash_recovery_*_n0`,
+  `doc_ticket_*_n0`) passed: against a cross-internet relay the
+  same-machine direct packet always wins the race, keeping the bug
+  dormant. `forged_session_closed_dropped_n0` passed once by winning
+  that race — expect it intermittent, not safe.
+- **Interim resolution (until iroh 1.0 stable + companion crates;
+  iroh-docs/gossip/blobs currently pin `=1.0.0-rc.1`):** the `_n0`
+  two-peer tests dial through n0's **public** relay
+  (`EndpointSetup::Production`) again, restoring their coverage.
+  This re-adds a Tier C dependency on n0's relay, but Tier C already
+  depends on n0's DNS/pkarr by definition; Tier A+B stay fully
+  hermetic on the localhost relay. Each touched test carries an
+  INTERIM comment; when the iroh 1.0 upgrade lands, grep for
+  `INTERIM (iroh 0.98.2)` and revert them to
+  `common::shared_relay_url()` + `ProductionCustomRelay`, then
+  re-run the tier 10×. If a reverted test still fails, that's a real
+  regression: investigate, don't ignore.
+- **Portable lessons:** (1) a flake that becomes deterministic after
+  an environment change is a *gift* — diff the environments before
+  diffing the code; (2) when a passing side thinks a connection is
+  open and the accepting side never fires its callback, trace the
+  **accepting side's transport layer** before suspecting the
+  protocol library above it; (3) `RUST_LOG=noq_proto=trace` is the
+  tool of last resort that actually ends arguments — packet-level
+  discard logs named the exact line.
+
 ## Examples from this codebase
 
 (Paths updated after the 2026-05-29 test-consolidation plan merged

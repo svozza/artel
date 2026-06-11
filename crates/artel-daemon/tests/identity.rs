@@ -45,6 +45,23 @@ async fn custom_relay_setup() -> EndpointSetup {
     EndpointSetup::ProductionCustomRelay { relay_url }
 }
 
+// INTERIM (iroh 0.98.2): `join_succeeds_within_tight_budget_real_n0`
+// dials through n0's public relay (`Production`) instead of the
+// localhost shared relay. noq-proto 0.17.0 has a handshake
+// path-poisoning bug: when a dialer knows both a relay URL and
+// same-machine direct addrs, the relay copy of the Initial packet
+// wins the race to a localhost relay and wedges the acceptor's
+// handshake (gossip JOIN_READY timeouts). Against the public relay
+// the direct packet always wins, so the bug stays dormant. Fixed
+// upstream in noq-proto 1.0.0-rc. When the iroh 1.0 upgrade lands,
+// revert that test to `custom_relay_setup` so Tier C stops depending
+// on n0's relay. The other tests here keep `custom_relay_setup`:
+// they're single-daemon (no peer dial), so the bug can't bite.
+// Full writeup: docs/diagnosing-flaky-tests.md case study 2026-06-11.
+const fn n0_relay_setup() -> EndpointSetup {
+    EndpointSetup::Production
+}
+
 // =============================================================
 // `EndpointId` is stable across daemon restarts when the iroh secret
 // key file persists.
@@ -187,7 +204,7 @@ async fn join_succeeds_within_tight_budget_real_n0() {
     // after alice has issued her HostSession — that way bob's daemon
     // is freshly born with an empty DNS cache when it immediately
     // needs to resolve alice.
-    let alice = common::spawn_daemon(alice_state, custom_relay_setup().await).await;
+    let alice = common::spawn_daemon(alice_state, n0_relay_setup()).await;
 
     // Alice hosts immediately.
     let alice_client = Client::connect(&alice.socket).await.unwrap();
@@ -207,7 +224,7 @@ async fn join_succeeds_within_tight_budget_real_n0() {
     // `wait_for_endpoint` gating, no artificial delay. Bob's daemon
     // has an empty DNS cache and must dial alice by EndpointId. That
     // dial races alice's pkarr publish-loop on the n0 network.
-    let bob = common::spawn_daemon(bob_state, custom_relay_setup().await).await;
+    let bob = common::spawn_daemon(bob_state, n0_relay_setup()).await;
     let bob_client = Client::connect(&bob.socket).await.unwrap();
 
     let started = Instant::now();
