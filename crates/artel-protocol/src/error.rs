@@ -68,18 +68,23 @@ pub enum ProtocolError {
     #[error("capability denied: {0}")]
     Capability(String),
 
+    /// Catch-all for daemon-side failures the client cannot otherwise
+    /// distinguish. The string is for diagnostics only.
+    #[error("internal daemon error: {0}")]
+    Internal(String),
+
     /// `RevokeTicket` named a ticket id that was never issued for the
     /// session. Distinct from [`Self::InvalidTicket`], which is the
     /// joiner-facing (deliberately opaque) rejection; this variant is
     /// host-operator-facing — reporting success for an unknown id
     /// would falsely reassure the caller a leaked ticket is dead.
+    ///
+    /// Declared after [`Self::Internal`]: this enum crosses the
+    /// inter-daemon gossip wire (postcard, index = declaration order),
+    /// so new variants are appended, never inserted — see the
+    /// `postcard_variant_indices_are_pinned` test.
     #[error("ticket {0} was never issued for this session")]
     UnknownTicket(crate::ids::TicketId),
-
-    /// Catch-all for daemon-side failures the client cannot otherwise
-    /// distinguish. The string is for diagnostics only.
-    #[error("internal daemon error: {0}")]
-    Internal(String),
 }
 
 impl ProtocolError {
@@ -233,6 +238,52 @@ mod tests {
                 .prop_map(|b| ProtocolError::UnknownTicket(crate::ids::TicketId::from_bytes(b))),
             "[\\PC]{0,64}".prop_map(ProtocolError::Internal),
         ]
+    }
+
+    #[test]
+    fn postcard_variant_indices_are_pinned() {
+        // ProtocolError rides the inter-daemon gossip wire inside
+        // `GossipBody::SendAck { result: Err(..) }`, which is NOT
+        // covered by the IPC PROTOCOL_VERSION handshake — daemons of
+        // different builds decode each other's frames as long as
+        // GOSSIP_WIRE_VERSION matches. Postcard encodes enum variants
+        // by declaration index, so variants must only ever be
+        // APPENDED. This pins every index at its wire value; if it
+        // fails, you inserted a variant mid-enum — move it to the end
+        // (and if removal is ever needed, that's a GOSSIP_WIRE_VERSION
+        // bump, not a re-pin).
+        let s = sample_session();
+        let tid = crate::ids::TicketId::from_bytes([2; 16]);
+        let cases: [(ProtocolError, u8); 11] = [
+            (
+                ProtocolError::VersionMismatch(VersionMismatch {
+                    client: ProtocolVersion::new(1),
+                    daemon: ProtocolVersion::new(2),
+                }),
+                0,
+            ),
+            (ProtocolError::UnknownSession(s), 1),
+            (ProtocolError::NotSubscribed(s), 2),
+            (ProtocolError::InvalidTicket, 3),
+            (ProtocolError::NotReady, 4),
+            (ProtocolError::NotHost, 5),
+            (ProtocolError::SessionConflict(s), 6),
+            (ProtocolError::Signature("x".into()), 7),
+            (ProtocolError::Capability("x".into()), 8),
+            // Pre-revocation (PROTOCOL_VERSION 7) wire index — pinned
+            // so mixed-build meshes keep decoding each other's
+            // Internal acks.
+            (ProtocolError::Internal("x".into()), 9),
+            // Revocation slice: appended, never inserted.
+            (ProtocolError::UnknownTicket(tid), 10),
+        ];
+        for (err, index) in cases {
+            let bytes = postcard::to_allocvec(&err).unwrap();
+            assert_eq!(
+                bytes[0], index,
+                "postcard index for {err:?} moved — variants must only be appended",
+            );
+        }
     }
 
     proptest! {
