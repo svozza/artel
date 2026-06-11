@@ -1123,7 +1123,10 @@ mod tests {
         let store = FsLogStore::open(dir.path()).unwrap();
         store.create(&record(1)).await.unwrap();
 
-        let ledger = vec![entry(1, TicketStatus::Active), entry(2, TicketStatus::Revoked)];
+        let ledger = vec![
+            entry(1, TicketStatus::Active),
+            entry(2, TicketStatus::Revoked),
+        ];
         store.put_tickets(record(1).id, &ledger).await.unwrap();
 
         let loaded = store.load_all().await.unwrap();
@@ -1143,7 +1146,10 @@ mod tests {
             .await
             .unwrap();
         // Same entry flipped to Revoked + a second mint: full rewrite.
-        let after = vec![entry(1, TicketStatus::Revoked), entry(2, TicketStatus::Active)];
+        let after = vec![
+            entry(1, TicketStatus::Revoked),
+            entry(2, TicketStatus::Active),
+        ];
         store.put_tickets(record(1).id, &after).await.unwrap();
 
         assert_eq!(store.load_all().await.unwrap()[0].tickets, after);
@@ -1155,7 +1161,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = FsLogStore::open(dir.path()).unwrap();
         let err = store
-            .put_tickets(SessionId::from_bytes([9; 16]), &[entry(1, TicketStatus::Active)])
+            .put_tickets(
+                SessionId::from_bytes([9; 16]),
+                &[entry(1, TicketStatus::Active)],
+            )
             .await
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::NotFound);
@@ -1167,7 +1176,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = FsLogStore::open(dir.path()).unwrap();
         store.create(&record(1)).await.unwrap();
-        assert!(!dir.path().join(record(1).id.to_string()).join(TICKETS_FILE).exists());
+        assert!(
+            !dir.path()
+                .join(record(1).id.to_string())
+                .join(TICKETS_FILE)
+                .exists()
+        );
 
         let loaded = store.load_all().await.unwrap();
         assert_eq!(loaded.len(), 1);
@@ -1198,7 +1212,10 @@ mod tests {
         // must not surface (with any ledger shape) rather than
         // surfacing with tickets: [].
         let loaded = store.load_all().await.unwrap();
-        assert!(loaded.is_empty(), "corrupt ledger must fail the session load");
+        assert!(
+            loaded.is_empty(),
+            "corrupt ledger must fail the session load"
+        );
     }
 
     #[tokio::test]

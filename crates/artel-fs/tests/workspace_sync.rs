@@ -432,7 +432,9 @@ async fn host_session_without_workspace() -> JoinerSetup {
         .await
         .unwrap()
     {
-        Response::HostSession { session, ticket, .. } => (session, ticket),
+        Response::HostSession {
+            session, ticket, ..
+        } => (session, ticket),
         other => panic!("HostSession: got {other:?}"),
     };
     // Deliberately *do not* call `Workspace::host` on alice — we

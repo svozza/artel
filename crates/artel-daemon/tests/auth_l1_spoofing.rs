@@ -61,7 +61,9 @@ async fn host_drops_send_request_with_spoofed_peer_id() {
         .await
         .unwrap();
     let (session_id, ticket) = match host_resp {
-        Response::HostSession { session, ticket, .. } => (session, ticket),
+        Response::HostSession {
+            session, ticket, ..
+        } => (session, ticket),
         other => panic!("expected HostSession, got {other:?}"),
     };
     alice_client
@@ -297,7 +299,9 @@ async fn host_accepts_send_request_with_matching_peer_id() {
         .await
         .unwrap();
     let (session_id, ticket) = match host_resp {
-        Response::HostSession { session, ticket, .. } => (session, ticket),
+        Response::HostSession {
+            session, ticket, ..
+        } => (session, ticket),
         other => panic!("expected HostSession, got {other:?}"),
     };
     alice_client
@@ -361,7 +365,9 @@ async fn joiner_outbound_stamps_authenticated_peer_id() {
         .await
         .unwrap();
     let (session_id, ticket) = match host_resp {
-        Response::HostSession { session, ticket, .. } => (session, ticket),
+        Response::HostSession {
+            session, ticket, ..
+        } => (session, ticket),
         other => panic!("expected HostSession, got {other:?}"),
     };
     alice_client

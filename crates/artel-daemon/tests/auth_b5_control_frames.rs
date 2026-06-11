@@ -123,7 +123,9 @@ async fn wire_host_and_join(
         .await
         .unwrap();
     let (session_id, ticket) = match host_resp {
-        Response::HostSession { session, ticket, .. } => (session, ticket),
+        Response::HostSession {
+            session, ticket, ..
+        } => (session, ticket),
         other => panic!("expected HostSession, got {other:?}"),
     };
     alice_client

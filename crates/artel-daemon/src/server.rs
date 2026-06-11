@@ -694,17 +694,30 @@ async fn dispatch(
                 },
             }
         }
-        // INTERIM (ticket-revocation slice 1): wire surface exists so
-        // PROTOCOL_VERSION 8 is honest; registry backing lands in
-        // slices 2-3 and these arms are completed in slice 4.
-        Request::RevokeTicket { session, .. } | Request::ListTickets { session } => {
+        Request::RevokeTicket { session, ticket_id } => {
             if !memberships.contains_key(&session) {
                 return Response::Error {
                     error: ProtocolError::NotSubscribed(session),
                 };
             }
-            Response::Error {
-                error: ProtocolError::Internal("ticket ledger not yet wired (slice 4)".into()),
+            match registry.revoke_ticket(session, ticket_id).await {
+                Ok(()) => Response::TicketRevoked,
+                Err(err) => Response::Error {
+                    error: session_error_to_protocol(&err),
+                },
+            }
+        }
+        Request::ListTickets { session } => {
+            if !memberships.contains_key(&session) {
+                return Response::Error {
+                    error: ProtocolError::NotSubscribed(session),
+                };
+            }
+            match registry.list_tickets(session).await {
+                Ok(entries) => Response::Tickets { entries },
+                Err(err) => Response::Error {
+                    error: session_error_to_protocol(&err),
+                },
             }
         }
         #[cfg(feature = "iroh")]

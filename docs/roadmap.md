@@ -661,10 +661,26 @@ Listed for completeness, no detailed plan yet:
   rather than the gossip topic, so the secret is never broadcast.
   This is the one sanctioned exception to gossip-only inter-daemon
   traffic: a host→peer unicast of session-key material, not session
-  traffic. Ticket *revocation* (invalidating a minted-but-unused
-  ticket) remains future work — today expiry is the only kill
-  switch; peer revocation post-admission is covered by Slice C +
-  PeerFilter. NOTE (memory `reopen-grant-authority-on-readonly-
+  traffic. **Ticket *revocation* DONE** (2026-06-11;
+  `PROTOCOL_VERSION` 7→8, no ticket/gossip wire change). The host
+  records every mint in a per-session issued-ticket **ledger**
+  (`tickets.json` sidecar, full-rewrite idiom, 0600);
+  `Request::RevokeTicket { session, ticket_id }` flips an entry,
+  `Request::ListTickets` returns metadata + `used_by` (never the
+  bearer string), and `IssuedTicket`/`HostSession` responses carry
+  the `ticket_id`. Admission is **issued-only, fail closed**:
+  `ensure_member` requires the claim's id to be present-and-Active
+  in the ledger and cross-checks cap/expiry — absence, revocation,
+  and mismatch all collapse to the joiner-opaque `InvalidTicket`
+  (no ledger oracle; the check runs after expiry + cap-sig).
+  Revocation is ticket-only: already-admitted peers keep membership
+  (use a capability revoke; `used_by` names them). Residuals carried
+  from the brainstorm: a revoked-ticket joiner gets no NAK (same
+  silent-timeout UX as expiry), and a gossip lurker who already
+  learned the topic via a since-revoked ticket's mirror can still
+  listen until kicked — both accepted for v1. CLI
+  `ticket list`/`ticket revoke` subcommands deferred.
+  NOTE (memory `reopen-grant-authority-on-readonly-
   tickets`): now that sub-RW members exist, the L2 "any RW holder
   grants" rule is load-bearing — revisit grant authority if a tier
   between Read and ReadWrite is ever added.

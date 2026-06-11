@@ -70,7 +70,9 @@ async fn host_and_watch(
         .await
         .unwrap();
     let (session, ticket) = match resp {
-        Response::HostSession { session, ticket, .. } => (session, ticket),
+        Response::HostSession {
+            session, ticket, ..
+        } => (session, ticket),
         other => panic!("expected HostSession, got {other:?}"),
     };
     let resp = client

@@ -3,6 +3,9 @@
 //! - RW ticket joiners (default from `HostSession`) can send.
 //! - Expired tickets are rejected at admission.
 //! - Direct-stream upgrade delivers secret only to the target peer.
+//! - Revoked tickets are rejected at admission; `ListTickets`
+//!   reflects status + `used_by`; revocation survives a host
+//!   daemon restart.
 
 #![cfg(feature = "iroh")]
 
@@ -14,6 +17,7 @@ use tokio::time::timeout;
 
 use artel_client::{Client, ClientError};
 use artel_protocol::capability::Capability;
+use artel_protocol::ticket::TicketStatus;
 use artel_protocol::{
     Event, MessageKind, PeerId, ProtocolError, Request, Response, SendPayload, UPGRADE_ACTION,
 };
@@ -36,7 +40,9 @@ async fn read_ticket_joiner_cannot_send() {
         .await
         .unwrap();
     let (session_id, _ticket) = match host_resp {
-        Response::HostSession { session, ticket, .. } => (session, ticket),
+        Response::HostSession {
+            session, ticket, ..
+        } => (session, ticket),
         other => panic!("expected HostSession, got {other:?}"),
     };
 
@@ -131,7 +137,9 @@ async fn rw_ticket_joiner_can_send() {
         .await
         .unwrap();
     let (session_id, ticket) = match host_resp {
-        Response::HostSession { session, ticket, .. } => (session, ticket),
+        Response::HostSession {
+            session, ticket, ..
+        } => (session, ticket),
         other => panic!("expected HostSession, got {other:?}"),
     };
 
@@ -209,7 +217,9 @@ async fn expired_ticket_rejected_at_admission() {
         .await
         .unwrap();
     let (session_id, _ticket) = match host_resp {
-        Response::HostSession { session, ticket, .. } => (session, ticket),
+        Response::HostSession {
+            session, ticket, ..
+        } => (session, ticket),
         other => panic!("expected HostSession, got {other:?}"),
     };
 
@@ -330,7 +340,9 @@ async fn direct_stream_upgrade_delivers_secret() {
         .await
         .unwrap();
     let (session_id, ticket) = match host_resp {
-        Response::HostSession { session, ticket, .. } => (session, ticket),
+        Response::HostSession {
+            session, ticket, ..
+        } => (session, ticket),
         other => panic!("expected HostSession, got {other:?}"),
     };
     alice
@@ -445,6 +457,291 @@ async fn direct_stream_upgrade_delivers_secret() {
     daemon_a.stop().await;
     daemon_b.stop().await;
     daemon_c.stop().await;
+}
+
+// =============================================================
+// Ticket revocation end-to-end: the host revokes one of two
+// tickets; a joiner with the live ticket is admitted and synced,
+// a joiner with the revoked ticket is never admitted (no
+// PeerJoined on the host — same joiner-side UX as expiry). The
+// ledger over IPC reflects status and used_by.
+// =============================================================
+
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn revoked_ticket_rejected_live_ticket_admits() {
+    let dns_pkarr = std::sync::Arc::new(
+        iroh::test_utils::DnsPkarrServer::run()
+            .await
+            .expect("DnsPkarrServer::run"),
+    );
+
+    let fut_a = Box::pin(common::spawn_daemon(
+        common::fresh_state(),
+        common::testing_setup(&dns_pkarr),
+    ));
+    let fut_b = Box::pin(common::spawn_daemon(
+        common::fresh_state(),
+        common::testing_setup(&dns_pkarr),
+    ));
+    let fut_c = Box::pin(common::spawn_daemon(
+        common::fresh_state(),
+        common::testing_setup(&dns_pkarr),
+    ));
+    let (daemon_a, daemon_b, daemon_c) = tokio::join!(fut_a, fut_b, fut_c);
+
+    let (ra, rb, rc) = tokio::join!(
+        dns_pkarr.on_endpoint(&daemon_a.iroh_addr.id, common::PKARR_READY_TIMEOUT),
+        dns_pkarr.on_endpoint(&daemon_b.iroh_addr.id, common::PKARR_READY_TIMEOUT),
+        dns_pkarr.on_endpoint(&daemon_c.iroh_addr.id, common::PKARR_READY_TIMEOUT),
+    );
+    ra.expect("daemon_a pkarr");
+    rb.expect("daemon_b pkarr");
+    rc.expect("daemon_c pkarr");
+
+    // Alice hosts on daemon A.
+    let alice = Client::connect(&daemon_a.socket).await.unwrap();
+    let session_id = match alice
+        .request(Request::HostSession {
+            display_name: "alice".into(),
+            session: None,
+        })
+        .await
+        .unwrap()
+    {
+        Response::HostSession { session, .. } => session,
+        other => panic!("expected HostSession, got {other:?}"),
+    };
+    alice
+        .request(Request::Subscribe {
+            session: session_id,
+            since: None,
+        })
+        .await
+        .unwrap();
+    let mut alice_events = alice.take_events().await.expect("alice events");
+
+    // Two extra tickets: one stays live, one gets revoked.
+    let issue = |cap| {
+        alice.request(Request::IssueTicket {
+            session: session_id,
+            granted_cap: cap,
+            expiry_ms: 0,
+        })
+    };
+    let (live_ticket, live_id) = match issue(Capability::ReadWrite).await.unwrap() {
+        Response::IssuedTicket { ticket, ticket_id } => (ticket, ticket_id),
+        other => panic!("expected IssuedTicket, got {other:?}"),
+    };
+    let (dead_ticket, dead_id) = match issue(Capability::ReadWrite).await.unwrap() {
+        Response::IssuedTicket { ticket, ticket_id } => (ticket, ticket_id),
+        other => panic!("expected IssuedTicket, got {other:?}"),
+    };
+
+    // Revoking an id never issued for this session is an explicit
+    // error (success would falsely reassure the operator).
+    let bogus = artel_protocol::TicketId::from_bytes([0xEE; 16]);
+    match alice
+        .request(Request::RevokeTicket {
+            session: session_id,
+            ticket_id: bogus,
+        })
+        .await
+    {
+        Err(ClientError::Protocol(ProtocolError::UnknownTicket(t))) => assert_eq!(t, bogus),
+        other => panic!("expected UnknownTicket error, got {other:?}"),
+    }
+
+    // Revoke the dead ticket for real.
+    match alice
+        .request(Request::RevokeTicket {
+            session: session_id,
+            ticket_id: dead_id,
+        })
+        .await
+        .unwrap()
+    {
+        Response::TicketRevoked => {}
+        other => panic!("expected TicketRevoked, got {other:?}"),
+    }
+
+    // Bob on daemon B joins with the live ticket: admitted + synced.
+    let bob = Client::connect(&daemon_b.socket).await.unwrap();
+    bob.request(Request::JoinSession {
+        display_name: "bob".into(),
+        ticket: live_ticket,
+    })
+    .await
+    .unwrap();
+    let bob_peer_id = daemon_b.peer_id();
+    wait_for_peer_joined(&mut alice_events, bob_peer_id, "alice sees bob").await;
+
+    // Carol on daemon C joins with the revoked ticket. Her local
+    // JoinSession succeeds (remote mirror materialised) but the host
+    // must never admit her — no PeerJoined, no auto-grant.
+    let carol = Client::connect(&daemon_c.socket).await.unwrap();
+    let join_resp = carol
+        .request(Request::JoinSession {
+            display_name: "carol".into(),
+            ticket: dead_ticket,
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(join_resp, Response::JoinSession { .. }),
+        "local join should succeed: {join_resp:?}",
+    );
+    let carol_peer_id = daemon_c.peer_id();
+    let carol_joined = timeout(Duration::from_secs(5), async {
+        loop {
+            let Some(ev) = alice_events.recv().await else {
+                return false;
+            };
+            if let Event::PeerJoined { peer, .. } = ev
+                && peer.id == carol_peer_id
+            {
+                return true;
+            }
+        }
+    })
+    .await;
+    assert!(
+        carol_joined.is_err() || !carol_joined.unwrap(),
+        "host must NOT admit a peer with a revoked ticket",
+    );
+
+    // The ledger over IPC: three entries (HostSession default + two
+    // issued), the dead one Revoked and unused, the live one Active
+    // with bob in used_by.
+    let entries = match alice
+        .request(Request::ListTickets {
+            session: session_id,
+        })
+        .await
+        .unwrap()
+    {
+        Response::Tickets { entries } => entries,
+        other => panic!("expected Tickets, got {other:?}"),
+    };
+    assert_eq!(entries.len(), 3, "host + 2 issued: {entries:?}");
+    let dead = entries.iter().find(|t| t.ticket_id == dead_id).unwrap();
+    assert_eq!(dead.status, TicketStatus::Revoked);
+    assert!(
+        dead.used_by.is_empty(),
+        "nobody was admitted with the revoked ticket: {dead:?}",
+    );
+    let live = entries.iter().find(|t| t.ticket_id == live_id).unwrap();
+    assert_eq!(live.status, TicketStatus::Active);
+    assert_eq!(live.used_by, vec![bob_peer_id]);
+
+    drop(alice_events);
+    drop(alice);
+    drop(bob);
+    drop(carol);
+    daemon_a.stop().await;
+    daemon_b.stop().await;
+    daemon_c.stop().await;
+}
+
+// =============================================================
+// Revocation survives a host daemon restart: the ledger is
+// rehydrated from tickets.json, the revoked entry stays Revoked,
+// and the resume re-mint appends a fresh Active entry.
+// =============================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revocation_survives_host_restart() {
+    let root = tempfile::TempDir::new().unwrap();
+    let paths = common::RestartState::under(root.path());
+
+    // ---- Incarnation 1: host, issue, revoke the initial ticket ----
+    let daemon1 = common::spawn_local_daemon_at(&paths).await;
+    let client1 = Client::connect(&paths.socket).await.unwrap();
+
+    let (session_id, initial_id) = match client1
+        .request(Request::HostSession {
+            display_name: "alice".into(),
+            session: None,
+        })
+        .await
+        .unwrap()
+    {
+        Response::HostSession {
+            session, ticket_id, ..
+        } => (session, ticket_id),
+        other => panic!("expected HostSession, got {other:?}"),
+    };
+    let issued_id = match client1
+        .request(Request::IssueTicket {
+            session: session_id,
+            granted_cap: Capability::Read,
+            expiry_ms: 0,
+        })
+        .await
+        .unwrap()
+    {
+        Response::IssuedTicket { ticket_id, .. } => ticket_id,
+        other => panic!("expected IssuedTicket, got {other:?}"),
+    };
+    match client1
+        .request(Request::RevokeTicket {
+            session: session_id,
+            ticket_id: initial_id,
+        })
+        .await
+        .unwrap()
+    {
+        Response::TicketRevoked => {}
+        other => panic!("expected TicketRevoked, got {other:?}"),
+    }
+
+    drop(client1);
+    daemon1.stop().await;
+
+    // ---- Incarnation 2: resume at the same paths ----
+    let daemon2 = common::spawn_local_daemon_at(&paths).await;
+    let client2 = Client::connect(&paths.socket).await.unwrap();
+
+    let resume_id = match client2
+        .request(Request::HostSession {
+            display_name: "alice".into(),
+            session: Some(session_id),
+        })
+        .await
+        .unwrap()
+    {
+        Response::HostSession {
+            session, ticket_id, ..
+        } => {
+            assert_eq!(session, session_id, "resume must reuse the id");
+            ticket_id
+        }
+        other => panic!("expected HostSession, got {other:?}"),
+    };
+
+    let entries = match client2
+        .request(Request::ListTickets {
+            session: session_id,
+        })
+        .await
+        .unwrap()
+    {
+        Response::Tickets { entries } => entries,
+        other => panic!("expected Tickets, got {other:?}"),
+    };
+    // initial (Revoked) + issued (Active) + resume re-mint (Active).
+    assert_eq!(entries.len(), 3, "{entries:?}");
+    let status_of = |id| entries.iter().find(|t| t.ticket_id == id).unwrap().status;
+    assert_eq!(
+        status_of(initial_id),
+        TicketStatus::Revoked,
+        "revocation must survive the restart",
+    );
+    assert_eq!(status_of(issued_id), TicketStatus::Active);
+    assert_eq!(status_of(resume_id), TicketStatus::Active);
+
+    drop(client2);
+    daemon2.stop().await;
 }
 
 async fn wait_for_peer_joined(
