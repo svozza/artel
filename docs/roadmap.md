@@ -12,23 +12,27 @@ along the way.
 
 ## Status
 
+(Last refreshed 2026-06-11.)
+
 | Crate | State |
 |---|---|
-| `artel-protocol` | Wire types + Unix-socket transport. Done. `PROTOCOL_VERSION` is now `5` (auth L1 fix #3 — daemon stamps authenticated id, 2026-06-01); `MESSAGE_FORMAT` `2` (auth L3 — per-message signing, 2026-06-02). |
-| `artel-daemon` | Persistent in-memory daemon + `artel-daemon` binary. Done. |
+| `artel-protocol` | Wire types + Unix-socket transport. Done. `PROTOCOL_VERSION` `7`, `MESSAGE_FORMAT` `3`, `TICKET_VERSION` `4` (tiered tickets), `GOSSIP_WIRE_VERSION` `1`. |
+| `artel-daemon` | Persistent daemon + binary + flock-based pidfile (orphan-leak fix `9a1a773`). Done. |
 | `artel-client` | Stateless multiplexed client + `artel` CLI binary + `connect_or_spawn`. Done. |
-| `artel-fs` | Phase 3a (MVP) + 3b-1 (disk-backed persistence) + 3b-3 (crash recovery) shipped. Author identity and configurable filter remain. |
+| `artel-fs` | Phase 3a (MVP) + 3b-1 (persistence) + 3b-3 (crash recovery) + host/join safety + PeerFilter shipped. Author identity (3b-2) and configurable filter (3b-4) remain. |
 
-292 tests passing. fmt + clippy clean in both feature modes (with and
-without `--all-features`). CI runs ubuntu + macos on stable; workspace
-`rust-version` is 1.95.
+622 tests passing on Tier A+B (`make test`), 11 more on Tier C
+(`make test-n0`, real n0). fmt + clippy clean in both feature modes.
+CI runs ubuntu + macos on stable; workspace `rust-version` is 1.95.
 
-The substrate is now a real P2P system: two daemons cross-seed addresses
-over iroh-gossip, host/joiner messaging round-trips through ack-correlated
-gossip frames, sessions persist across restarts, and `artel-fs::Workspace`
-mirrors a directory between peers via its own ticket-handout iroh node
-(per ADR-001 § "Doc handles across IPC"). What's left is hardening
-(persistence for fs, capabilities, observability).
+The substrate is a real P2P system with a complete v1 auth story:
+two daemons cross-seed addresses over iroh-gossip, host/joiner
+messaging round-trips through ack-correlated signed gossip frames,
+sessions persist across restarts, `artel-fs::Workspace` mirrors a
+directory between peers, and hosts can mint capability-scoped
+tickets (Read / ReadWrite, with expiry) whose grants are enforced
+end-to-end. What's left is the iroh 1.0 upgrade, observability, and
+the consumer-driven 3b leftovers.
 
 ## Phase 1: client auto-spawn — DONE
 
@@ -402,12 +406,21 @@ them.
 ## Phase 4: production hardening
 
 Two concrete workstreams that close gaps blocking real consumers
-from using `artel-fs` end-to-end. Both have detailed plans below;
-pick up in either order, but the safety design probably wants to
-land first because it changes the public surface of
-`Workspace::host` / `Workspace::join`.
+from using `artel-fs` end-to-end. Both are now DONE; the original
+design notes are preserved below.
 
-### Workspace host/join safety
+### Workspace host/join safety — DONE
+
+Shipped per `docs/plans/2026-05-22-workspace-host-join-safety-plan.md`:
+clone-of-host's-tree semantics, and an `AttachPolicy { RequireEmpty,
+AllowExisting }` parameter on `Workspace::host` / `Workspace::join`.
+`RequireEmpty` (the safe default for fresh hosts and joiners) refuses
+to attach to a non-empty root, where "empty" is computed at the top
+level only — the state dir, hardcoded-skip paths (`.git/`, `target/`,
+etc.) don't count, and top-level symlinks do. See the `AttachPolicy`
+docs in `crates/artel-fs/src/workspace.rs`.
+
+#### Original problem statement (preserved for reference)
 
 Today `Workspace::host` runs `scan_and_publish_existing` on
 whatever dir it's pointed at, and `Workspace::join` runs
@@ -447,7 +460,10 @@ Until this is designed, do not silently change scan/bulk_export
 behaviour or add piecemeal guards. Existing testing should use
 fresh empty dirs.
 
-### Multi-session resume across daemon restarts
+### Multi-session resume across daemon restarts — DONE
+
+All three sub-items below landed (stable session id, attachment
+registry, resume-in-place via `host_with`). Original notes preserved.
 
 Surfaced 2026-05-20 while smoke-testing two-process sync: when
 either side's CLI dies and restarts pointing at the same
@@ -567,16 +583,22 @@ fixture. It's slow, and any failure must be diagnosed via
 tracing-subscriber + run-until-fail) before being labelled an
 infra issue. "Flaky" is never an acceptable resting state.
 
-Two-tier test pyramid is now:
-- `iroh_docs_smoke_pkarr.rs` (default, deterministic, fast)
-  asserts the `DocTicket`-carries-enough-addressing contract
-  over the localhost fixture.
-- `iroh_docs_smoke.rs` (real n0, kept) asserts the same
+The test pyramid has since grown to three tiers (see the
+faster-cargo-test entry under Future: Tier A unit + Tier B hermetic
+`DnsPkarrServer` / localhost relay + Tier C real-n0 `*_n0` under
+`--profile n0`). The original two-tier example, kept for the
+diagnostic principle:
+- `iroh_internals.rs::doc_ticket_round_trips_via_localhost_pkarr_dns`
+  (default, deterministic, fast) asserts the
+  `DocTicket`-carries-enough-addressing contract over the localhost
+  fixture.
+- `..._without_manual_address_seeding_n0` (real n0) asserts the same
   property over n0's real infrastructure with an
   application-layer retry loop. Both passing → substrate fine.
-  If the n0 sibling fails while the `_pkarr` sibling passes,
+  If the n0 sibling fails while the hermetic sibling passes,
   that's a hypothesis (production-discovery-only bug vs. infra
-  flake) — not a conclusion. Apply the recipe in
+  flake vs. topology-triggered upstream bug — see the 2026-06-11
+  case study) — not a conclusion. Apply the recipe in
   `docs/diagnosing-flaky-tests.md` and confirm before
   labelling.
 
@@ -600,21 +622,56 @@ What's still on the table:
   iroh-gossip topic memberships — is unproven and unmeasured.
   Lower priority than the resume work above.
 
+## Near-term
+
+- **iroh 1.0 upgrade.** iroh 0.98.2's QUIC layer (noq-proto 0.17.0)
+  has a handshake path-poisoning bug that deterministically wedges
+  acceptor-side handshakes when the dialer reaches a localhost relay
+  and same-machine direct addrs simultaneously (diagnosed 2026-06-11;
+  case study in `docs/diagnosing-flaky-tests.md`). Fixed upstream in
+  noq-proto 1.0.0-rc (iroh#4273/#4281 four-tuple rework). Interim:
+  the two-peer `_n0` tests dial n0's public relay (commit `59c7ab5`).
+  The upgrade path is the 1.0 RC line or stable when it lands —
+  companion crates (iroh-docs 0.100 / iroh-gossip 0.100 /
+  iroh-blobs 0.102) pin `=1.0.0-rc.1`, so the whole family moves
+  together. Known breaking changes from the rc1 notes:
+  `IncomingLocalAddr` → `LocalTransportAddr`, `PathEvent`
+  non-exhaustive, `CustomSender::poll_send` gains a `src` arg.
+  After upgrading: grep `INTERIM (iroh 0.98.2)` and revert those
+  sites to the localhost relay, then run the n0 tier 10×. An iroh
+  v2 workshop with the n0 devs is being scheduled (2026-06-05) —
+  check migration guidance before starting.
+
 ## Future
 
 Listed for completeness, no detailed plan yet:
 
-- **Ticket-level capabilities & auth.** Read-only / write-restricted
-  *tickets* (so a host can hand out a join ticket that grants only
-  read access to the doc), signed messages, ticket revocation.
-  ADR-001 § "Auth and capability model" — explicitly deferred.
-  Distinct from per-path read-only **rules**, which are already
-  shipped as `PathRules { Mode::ReadOnly }` on `WorkspaceConfig`
-  (host binds rules at originate-time; rules ride the ticket
-  envelope; watcher / applier / scan / bulk-export all honour
-  them). The future work here is at the *capability* layer
-  (what does possessing a ticket let you do?) not the path-rule
-  layer (which paths in a doc can be written?).
+- **~~Ticket-level capabilities & auth (tiered tickets).~~** DONE
+  (2026-06-05..07; `PROTOCOL_VERSION` 6→7, `TICKET_VERSION` 3→4).
+  Tickets now carry `granted_cap: Capability { Read, ReadWrite }`,
+  `expiry_ms`, and a host signature over `(ticket_id, cap, expiry)`
+  under the `"artel/ticket-cap-v1"` domain, verified at admission.
+  `Request::IssueTicket { session, granted_cap, expiry_ms }` lets a
+  host mint multiple tickets at different tiers for one session.
+  Read-tier joiners consume the broadcast but can't author; a later
+  `CapabilityAction::Grant` to ReadWrite triggers **upgrade
+  delivery** — the `NamespaceSecret` rides a direct QUIC stream
+  (`artel/upgrade/1` ALPN, `UpgradeProtocol` on the daemon Router,
+  shared `UpgradePayload` wire type in `artel-protocol::upgrade`)
+  rather than the gossip topic, so the secret is never broadcast.
+  This is the one sanctioned exception to gossip-only inter-daemon
+  traffic: a host→peer unicast of session-key material, not session
+  traffic. Ticket *revocation* (invalidating a minted-but-unused
+  ticket) remains future work — today expiry is the only kill
+  switch; peer revocation post-admission is covered by Slice C +
+  PeerFilter. NOTE (memory `reopen-grant-authority-on-readonly-
+  tickets`): now that sub-RW members exist, the L2 "any RW holder
+  grants" rule is load-bearing — revisit grant authority if a tier
+  between Read and ReadWrite is ever added.
+  Distinct from per-path read-only **rules**, which shipped earlier
+  as `PathRules { Mode::ReadOnly }` on `WorkspaceConfig` (host binds
+  rules at originate-time; rules ride the ticket envelope; watcher /
+  applier / scan / bulk-export all honour them).
 - **~~Peer-identity authentication.~~** L1 DONE 2026-05-30
   (`PROTOCOL_VERSION` 4). `artel-protocol::PeerId` is now defined as
   the iroh `EndpointId` bytes; host-side `SendRequest` and
@@ -633,7 +690,14 @@ Listed for completeness, no detailed plan yet:
   mirror receive paths verify (`verify_strict`, version floor) and
   reject on failure. See
   `docs/plans/2026-06-02-auth-slice-b-l3-signing-plan.md`.
-  L2 (capability events) remains open as Slice C.
+  **L2 (capability events, Slice C) DONE 2026-06-05**: C.1–C.3
+  shipped capability grant/revoke as host-signed session events,
+  host-only enforcement (host is sole sequencer; joiner-side
+  enforcement deliberately deferred — see memory
+  `l2-host-only-enforcement-v1`), and cap-replay on host restart.
+  The docs-gate + transport-layer `PeerFilter` block revoked peers
+  bidirectionally (`356e8c2`). With B.5 and tiered tickets below,
+  this completed the v1 auth story.
 - **Control-frame & sequence authentication (auth Slice B.5).** DONE
   (2026-06-03; `PROTOCOL_VERSION` 5→6, `MESSAGE_FORMAT` 2→3, `Meta`
   2→3). A code review of the L3 landing surfaced three issues that
@@ -657,7 +721,7 @@ Listed for completeness, no detailed plan yet:
   mirror delete). See
   `docs/plans/2026-06-03-auth-slice-b5-control-frame-auth-plan.md` and
   `docs/brainstorms/2026-06-02-control-frame-auth-slice-b5-brainstorm.md`.
-  L2 (capability events) remains open as Slice C.
+  (L2 / Slice C subsequently landed — see the entry above.)
 - **N-1 protocol-version compatibility.** Today version mismatch is
   fatal. Some scheme that lets a daemon serve clients one version
   behind would smooth upgrades.
