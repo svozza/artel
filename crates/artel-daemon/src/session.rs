@@ -694,11 +694,11 @@ impl Registry {
     ///   [`SessionError::SessionConflict`]. The in-memory state
     ///   is not modified.
     ///
-    /// On store-write failure for the create paths the session is
-    /// **not** added to the in-memory map and the error propagates.
+    /// On store-write failure the in-memory state is not modified
+    /// and the error propagates — the create path doesn't insert the
+    /// session, and the resume path keeps its old epoch and ledger.
     /// This keeps "registry thinks it has session X but disk
-    /// doesn't" from happening. The resume path doesn't write to
-    /// the store at all — the record is already there.
+    /// doesn't" from happening.
     pub async fn host(
         &self,
         host_peer: PeerInfo,
@@ -723,34 +723,39 @@ impl Registry {
                 // against a joiner whose beacon-advanced watermark has
                 // moved past it. A fresh create (below) leaves epoch 0.
                 let (ticket, ticket_id) = self.mint_ticket(id, granted_cap, expiry_ms);
-                let (host_epoch, tickets) = {
+                let host_epoch = {
                     let mut s = arc.lock().await;
                     if s.host != host_peer.id || s.kind != SessionKind::Local {
                         return Err(SessionError::SessionConflict(id));
                     }
-                    s.host_epoch = s.host_epoch.saturating_add(1);
+                    let host_epoch = s.host_epoch.saturating_add(1);
                     // Every resume re-mints, so every resume appends a
                     // ledger entry (deliberate — the bearer string just
                     // handed back genuinely admits and must be
                     // revocable; entries are tiny and session-scoped).
-                    s.tickets
-                        .push(Self::ledger_entry(ticket_id, granted_cap, expiry_ms));
-                    (s.host_epoch, s.tickets.clone())
+                    let mut tickets = s.tickets.clone();
+                    tickets.push(Self::ledger_entry(ticket_id, granted_cap, expiry_ms));
+                    // Store-before-memory, with the lock held across
+                    // the writes like every other ledger mutation
+                    // (write_tickets' deterministic tmp name relies on
+                    // it). On store failure, surface it and leave
+                    // memory untouched: a resume that can't durably
+                    // record its new epoch would re-emit a stale epoch
+                    // after the next restart, and an unpersisted
+                    // ledger entry would brick the ticket we are about
+                    // to return (issued-only).
+                    self.store
+                        .bump_host_epoch(id, host_epoch)
+                        .await
+                        .map_err(SessionError::Storage)?;
+                    self.store
+                        .put_tickets(id, &tickets)
+                        .await
+                        .map_err(SessionError::Storage)?;
+                    s.host_epoch = host_epoch;
+                    s.tickets = tickets;
+                    host_epoch
                 };
-                // Persist the bumped epoch (targeted write — no full
-                // record rewrite). On store failure, surface it: a
-                // resume that can't durably record its new epoch would
-                // re-emit a stale epoch after the next restart. Same
-                // for the ledger: an unpersisted entry would brick the
-                // ticket we are about to return (issued-only).
-                self.store
-                    .bump_host_epoch(id, host_epoch)
-                    .await
-                    .map_err(SessionError::Storage)?;
-                self.store
-                    .put_tickets(id, &tickets)
-                    .await
-                    .map_err(SessionError::Storage)?;
 
                 // Re-open the gossip topic. The bridge tracks per-
                 // session state by id; if the daemon was restarted
@@ -4890,6 +4895,218 @@ mod tests {
 
         // All three landed in the store, not just memory.
         assert_eq!(r.store.load_all().await.unwrap()[0].tickets.len(), 3);
+    }
+
+    /// Delegates to [`MemoryStore`] but lets a test park the resume
+    /// path at its `bump_host_epoch` store write (only the resume
+    /// branch of `host` calls it) and fail the next `put_tickets`.
+    /// Pins the resume path's lock discipline and store-before-memory
+    /// ordering against the other ledger writers.
+    #[derive(Debug)]
+    struct ResumeProbeStore {
+        inner: crate::store::MemoryStore,
+        park_epoch: std::sync::atomic::AtomicBool,
+        epoch_gate: tokio::sync::Semaphore,
+        fail_next_put_tickets: std::sync::atomic::AtomicBool,
+    }
+
+    impl ResumeProbeStore {
+        fn new() -> Self {
+            Self {
+                inner: crate::store::MemoryStore::new(),
+                park_epoch: std::sync::atomic::AtomicBool::new(false),
+                epoch_gate: tokio::sync::Semaphore::new(0),
+                fail_next_put_tickets: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn park_epoch_writes(&self) {
+            self.park_epoch
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn release_epoch_writes(&self) {
+            self.epoch_gate.add_permits(1);
+        }
+
+        fn fail_next_put_tickets(&self) {
+            self.fail_next_put_tickets
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::store::SessionStore for ResumeProbeStore {
+        async fn create(&self, record: &SessionRecord) -> std::io::Result<()> {
+            self.inner.create(record).await
+        }
+
+        async fn append(
+            &self,
+            session: SessionId,
+            message: &SessionMessage,
+        ) -> std::io::Result<()> {
+            self.inner.append(session, message).await
+        }
+
+        async fn bump_host_epoch(&self, session: SessionId, epoch: u64) -> std::io::Result<()> {
+            if self.park_epoch.load(std::sync::atomic::Ordering::SeqCst) {
+                self.epoch_gate
+                    .acquire()
+                    .await
+                    .expect("gate never closed")
+                    .forget();
+            }
+            self.inner.bump_host_epoch(session, epoch).await
+        }
+
+        async fn put_tickets(
+            &self,
+            session: SessionId,
+            tickets: &[TicketEntry],
+        ) -> std::io::Result<()> {
+            if self
+                .fail_next_put_tickets
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(std::io::Error::other("injected put_tickets failure"));
+            }
+            self.inner.put_tickets(session, tickets).await
+        }
+
+        async fn add_member(&self, session: SessionId, peer: &PeerInfo) -> std::io::Result<()> {
+            self.inner.add_member(session, peer).await
+        }
+
+        async fn remove_member(&self, session: SessionId, peer: PeerId) -> std::io::Result<()> {
+            self.inner.remove_member(session, peer).await
+        }
+
+        async fn delete(&self, session: SessionId) -> std::io::Result<()> {
+            self.inner.delete(session).await
+        }
+
+        async fn load_all(&self) -> std::io::Result<Vec<SessionRecord>> {
+            self.inner.load_all().await
+        }
+
+        async fn put_attachment(
+            &self,
+            session: SessionId,
+            kind: &str,
+            payload: &[u8],
+        ) -> std::io::Result<bool> {
+            self.inner.put_attachment(session, kind, payload).await
+        }
+
+        async fn list_attachments(
+            &self,
+            kind_filter: Option<&str>,
+        ) -> std::io::Result<Vec<StoredAttachment>> {
+            self.inner.list_attachments(kind_filter).await
+        }
+
+        async fn delete_attachment(&self, session: SessionId, kind: &str) -> std::io::Result<()> {
+            self.inner.delete_attachment(session, kind).await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_revoke_during_resume_survives_on_disk() {
+        // Lost-update pin: a revoke that commits while a resume is
+        // mid-flight must not be overwritten on disk by the resume's
+        // ledger snapshot. The probe parks the resume at its
+        // bump_host_epoch store write; with the paused clock, the
+        // sleep below only fires once both tasks are blocked, so the
+        // interleaving is deterministic, not timing-luck.
+        let probe = Arc::new(ResumeProbeStore::new());
+        let r = Arc::new(Registry::new(
+            PeerId::from_bytes([0xff; 32]),
+            Arc::clone(&probe) as DynStore,
+        ));
+        let alice = peer(1, "alice");
+        let (id, _, _) = r
+            .host(alice.clone(), None, Capability::ReadWrite, 0)
+            .await
+            .unwrap();
+        let (_, victim) = r.issue_ticket(id, Capability::Read, 0).await.unwrap();
+
+        probe.park_epoch_writes();
+        let resume = tokio::spawn({
+            let r = Arc::clone(&r);
+            let alice = alice.clone();
+            async move { r.host(alice, Some(id), Capability::ReadWrite, 0).await }
+        });
+        let revoke = tokio::spawn({
+            let r = Arc::clone(&r);
+            async move { r.revoke_ticket(id, victim).await }
+        });
+        // Fires once the resume is parked on the gate and the revoke
+        // has run as far as the lock discipline lets it.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        probe.release_epoch_writes();
+        resume.await.unwrap().unwrap();
+        revoke.await.unwrap().unwrap();
+
+        let persisted = r.store.load_all().await.unwrap()[0]
+            .tickets
+            .iter()
+            .find(|t| t.ticket_id == victim)
+            .unwrap()
+            .status;
+        assert_eq!(
+            persisted,
+            TicketStatus::Revoked,
+            "revocation must survive a concurrent resume's ledger rewrite",
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_resume_store_write_leaves_no_phantom_ledger_entry() {
+        // Store-before-memory pin for the resume path: if the ledger
+        // write fails, the failed mint must leave no trace in memory
+        // — no phantom Active entry, no epoch bump — and no later
+        // successful write may resurrect one to disk.
+        let probe = Arc::new(ResumeProbeStore::new());
+        let r = Registry::new(
+            PeerId::from_bytes([0xff; 32]),
+            Arc::clone(&probe) as DynStore,
+        );
+        let alice = peer(1, "alice");
+        let (id, _, create_tid) = r
+            .host(alice.clone(), None, Capability::ReadWrite, 0)
+            .await
+            .unwrap();
+
+        probe.fail_next_put_tickets();
+        let err = r
+            .host(alice.clone(), Some(id), Capability::ReadWrite, 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SessionError::Storage(_)));
+
+        // Memory: only the create-path entry, and no epoch bump.
+        let in_memory = r.list_tickets(id).await.unwrap();
+        assert_eq!(
+            in_memory.iter().map(|t| t.ticket_id).collect::<Vec<_>>(),
+            vec![create_tid],
+            "failed resume must not leave a phantom entry in memory",
+        );
+        let epoch = {
+            let arc = r.sessions.read().await.get(&id).cloned().unwrap();
+            let s = arc.lock().await;
+            s.host_epoch
+        };
+        assert_eq!(epoch, 0, "failed resume must not bump the in-memory epoch");
+
+        // A later successful mutation must not resurrect the phantom.
+        let (_, issued) = r.issue_ticket(id, Capability::Read, 0).await.unwrap();
+        let persisted: Vec<TicketId> = r.store.load_all().await.unwrap()[0]
+            .tickets
+            .iter()
+            .map(|t| t.ticket_id)
+            .collect();
+        assert_eq!(persisted, vec![create_tid, issued]);
     }
 
     #[cfg(feature = "iroh")]
