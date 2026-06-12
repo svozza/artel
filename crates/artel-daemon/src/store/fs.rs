@@ -46,6 +46,11 @@ const LOG_FILE: &str = "log";
 /// slice). Written only when the session mints tickets; absent ⇒
 /// empty ledger on load.
 const TICKETS_FILE: &str = "tickets.json";
+/// Quarantine name for an unreadable [`TICKETS_FILE`] (corruption or
+/// schema skew). The rename preserves the bytes for manual repair
+/// while letting the session load with an empty — fail-closed —
+/// ledger. See [`load_one`].
+const TICKETS_QUARANTINE_FILE: &str = "tickets.json.corrupt";
 /// Per-session subdirectory for opaque consumer attachments.
 const ATTACHMENTS_DIR: &str = "attachments";
 /// Suffix on attachment files; the prefix is the kind, hex-encoded.
@@ -526,11 +531,37 @@ fn load_one(dir: &Path) -> io::Result<SessionRecord> {
     // reject tampered / sentinel ones. See `read_log`.
     let log = read_log(&dir.join(LOG_FILE), id, cfg!(feature = "iroh"))?;
     // Ticket ledger: absent file is the empty ledger (fresh dir, or a
-    // Remote mirror that never mints). A *corrupt* file fails the
-    // load loudly instead — issued-only admission makes the ledger
-    // load-bearing, and silently treating corruption as empty would
-    // brick every outstanding ticket with no diagnostic.
-    let tickets = read_tickets(&dir.join(TICKETS_FILE))?;
+    // Remote mirror that never mints). An *unreadable* file
+    // (corruption or schema skew) must neither be silently treated as
+    // empty in place — the next mint's rewrite would destroy the
+    // evidence — nor fail the whole session load: a skipped session
+    // is unrecoverable through any API (resume falls through to the
+    // create path and dies on AlreadyExists), which is a far larger
+    // blast radius than the ledger itself. Instead, quarantine the
+    // file (rename preserves the bytes for manual repair), warn, and
+    // load with an empty ledger: fail closed — every outstanding
+    // ticket stops admitting until the host re-mints — while the
+    // session's log and membership stay reachable. Only InvalidData
+    // (parse/schema) is quarantined; transient I/O errors still fail
+    // the load so a flaky disk doesn't trigger a spurious rename.
+    let tickets_path = dir.join(TICKETS_FILE);
+    let tickets = match read_tickets(&tickets_path) {
+        Ok(tickets) => tickets,
+        Err(err) if err.kind() == ErrorKind::InvalidData => {
+            let quarantine = dir.join(TICKETS_QUARANTINE_FILE);
+            std::fs::rename(&tickets_path, &quarantine)?;
+            warn!(
+                session = %id,
+                error = %err,
+                quarantine = %quarantine.display(),
+                "unreadable ticket ledger quarantined; loading with an \
+                 empty (fail-closed) ledger — outstanding tickets stop \
+                 admitting until re-minted"
+            );
+            Vec::new()
+        }
+        Err(err) => return Err(err),
+    };
     Ok(SessionRecord {
         id,
         host: meta.host,
@@ -1260,33 +1291,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tickets_file_with_unsupported_version_fails_load() {
+    async fn tickets_file_with_unsupported_version_quarantines_and_fails_closed() {
         // A future-daemon ledger (or a corrupted version field) is
-        // schema skew, not silently-empty: the load must fail the
-        // same way corruption does, naming the version.
+        // schema skew: quarantine like corruption — the bytes are
+        // preserved for a re-upgrade, old tickets stop admitting,
+        // and the session's primary data stays reachable.
         let dir = tempdir().unwrap();
         let store = FsLogStore::open(dir.path()).unwrap();
         store.create(&record(1)).await.unwrap();
+        let session_dir = dir.path().join(record(1).id.to_string());
         std::fs::write(
-            dir.path().join(record(1).id.to_string()).join(TICKETS_FILE),
+            session_dir.join(TICKETS_FILE),
             br#"{"version": 99, "entries": []}"#,
         )
         .unwrap();
 
         let loaded = store.load_all().await.unwrap();
-        assert!(
-            loaded.is_empty(),
-            "unsupported ledger schema version must fail the session load"
-        );
+        assert_eq!(loaded.len(), 1, "schema skew must not drop the session");
+        assert!(loaded[0].tickets.is_empty(), "skewed ledger fails closed");
+        assert!(session_dir.join(TICKETS_QUARANTINE_FILE).exists());
+        assert!(!session_dir.join(TICKETS_FILE).exists());
     }
 
     #[tokio::test]
-    async fn corrupt_tickets_file_fails_load_loudly() {
+    async fn corrupt_tickets_file_quarantines_and_fails_closed() {
         use artel_protocol::TicketStatus;
-        // Issued-only admission makes the ledger load-bearing:
-        // corruption must skip the session with a warning (load_all
-        // contract), not silently load an empty ledger that would
-        // brick every outstanding ticket with no diagnostic.
+        // Issued-only admission makes the ledger load-bearing, but it
+        // is a *sidecar*: corruption must not take the session's
+        // intact log and membership down with it (a skipped session
+        // can never be resumed — host() falls through to the create
+        // path and hits AlreadyExists, with no API able to delete or
+        // repair it). Instead: quarantine the corrupt file so the
+        // bytes survive for manual repair, load the session with an
+        // EMPTY ledger — fail closed, every outstanding ticket stops
+        // admitting — and warn. The next mint writes a fresh ledger.
         let dir = tempdir().unwrap();
         let store = FsLogStore::open(dir.path()).unwrap();
         store.create(&record(1)).await.unwrap();
@@ -1294,20 +1332,22 @@ mod tests {
             .put_tickets(record(1).id, &[entry(1, TicketStatus::Active)])
             .await
             .unwrap();
-        std::fs::write(
-            dir.path().join(record(1).id.to_string()).join(TICKETS_FILE),
-            b"{not json",
-        )
-        .unwrap();
+        let session_dir = dir.path().join(record(1).id.to_string());
+        std::fs::write(session_dir.join(TICKETS_FILE), b"{not json").unwrap();
 
-        // load_all skips-and-warns per session; the corrupted session
-        // must not surface (with any ledger shape) rather than
-        // surfacing with tickets: [].
         let loaded = store.load_all().await.unwrap();
-        assert!(
-            loaded.is_empty(),
-            "corrupt ledger must fail the session load"
+        assert_eq!(loaded.len(), 1, "corrupt ledger must not drop the session");
+        assert_eq!(loaded[0], {
+            let mut expected = record(1);
+            expected.tickets = Vec::new();
+            expected
+        });
+        // The corrupt bytes are preserved, not destroyed.
+        assert_eq!(
+            std::fs::read(session_dir.join(TICKETS_QUARANTINE_FILE)).unwrap(),
+            b"{not json",
         );
+        assert!(!session_dir.join(TICKETS_FILE).exists());
     }
 
     #[tokio::test]
