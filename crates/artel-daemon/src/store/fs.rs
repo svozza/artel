@@ -1276,8 +1276,8 @@ mod tests {
             .await
             .unwrap();
 
-        let raw = std::fs::read(dir.path().join(record(1).id.to_string()).join(TICKETS_FILE))
-            .unwrap();
+        let raw =
+            std::fs::read(dir.path().join(record(1).id.to_string()).join(TICKETS_FILE)).unwrap();
         let doc: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         assert_eq!(
             doc.get("version").and_then(serde_json::Value::as_u64),
