@@ -1177,59 +1177,12 @@ fn now_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
-/// Mirror of `server::session_error_to_protocol` — same translation
-/// rules, but living next to the bridge to avoid a circular
-/// `pub(crate)` dance with the server module. Keep in sync if the
-/// other one grows variants.
+/// Translate session-layer errors into wire errors for the `SendAck`
+/// path. The mapping itself lives on `SessionError` (one shared
+/// `From` impl with the IPC server) so the two wire surfaces cannot
+/// drift.
 fn session_error_to_wire(err: &SessionError) -> ProtocolError {
-    match err {
-        SessionError::UnknownSession(s) => ProtocolError::UnknownSession(*s),
-        SessionError::NotMember(_) => ProtocolError::Internal("not a member".into()),
-        // TicketNotAdmissible is joiner-opaque on purpose (revocation
-        // slice): revoked, never-issued, and mint-mismatch all
-        // collapse to InvalidTicket so a bearer can't oracle the
-        // host's ledger.
-        SessionError::InvalidTicket
-        | SessionError::TicketExpired
-        | SessionError::TicketNotAdmissible => ProtocolError::InvalidTicket,
-        SessionError::Storage(io_err) => ProtocolError::Internal(format!("storage: {io_err}")),
-        // The bridge currently doesn't surface InvalidAddr to the
-        // wire layer (it fails the local join only), but keep the
-        // mapping defensive: if a future code path forwards one
-        // through here we still want it as a generic Internal so
-        // ticket-parser detail doesn't leak.
-        SessionError::InvalidAddr(msg) => ProtocolError::Internal(format!("invalid addr: {msg}")),
-        SessionError::Internal(msg) => ProtocolError::Internal(msg.clone()),
-        SessionError::NotHost => ProtocolError::NotHost,
-        SessionError::SessionConflict(s) => ProtocolError::SessionConflict(*s),
-        // Should never occur on the host side — only joiners
-        // receive HostRejected from `send_remote`. Surface
-        // defensively so a future bug doesn't silently swallow it.
-        SessionError::HostRejected(err) => err.clone(),
-        // Joiner-authored body whose signature didn't verify under
-        // its claimed peer.id. The joiner sees this as
-        // `ProtocolError::Signature` in the SendAck so they can
-        // distinguish a sig failure from a generic Internal.
-        SessionError::SignatureRejected { peer_id, reason } => {
-            ProtocolError::Signature(format!("{peer_id}: {reason}"))
-        }
-        // L2 capability denial (Auth Slice C): a joiner-authored write
-        // (or grant) the host rejected because the author lacked the
-        // required capability at that seq. The joiner sees this as
-        // `ProtocolError::Capability` in the SendAck.
-        SessionError::CapabilityDenied {
-            peer_id,
-            had,
-            needed,
-        } => ProtocolError::Capability(format!("{peer_id}: had {had:?}, needs {needed:?}")),
-        SessionError::InvalidCapClaim(reason) => {
-            ProtocolError::Internal(format!("invalid cap claim: {reason}"))
-        }
-        // Host-operator-facing; never reaches the gossip wire (only
-        // the IPC RevokeTicket path can produce it) but map it
-        // faithfully rather than panicking on a future code motion.
-        SessionError::UnknownTicket(t) => ProtocolError::UnknownTicket(*t),
-    }
+    err.into()
 }
 
 type MessageHandler = Arc<dyn Fn(SessionMessage) + Send + Sync + 'static>;

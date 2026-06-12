@@ -1196,43 +1196,11 @@ async fn send_frame(
     guard.send(frame).await
 }
 
-/// Translate session-layer errors into wire errors.
+/// Translate session-layer errors into wire errors. The mapping
+/// itself lives on `SessionError` (one shared `From` impl with the
+/// gossip bridge) so the two wire surfaces cannot drift.
 fn session_error_to_protocol(err: &SessionError) -> ProtocolError {
-    match err {
-        SessionError::UnknownSession(s) => ProtocolError::UnknownSession(*s),
-        SessionError::NotMember(_) => ProtocolError::Internal("not a member".into()),
-        // TicketNotAdmissible is joiner-opaque on purpose: revoked,
-        // never-issued, and mint-mismatch all collapse to
-        // InvalidTicket so a bearer can't oracle the host's ledger.
-        SessionError::InvalidTicket
-        | SessionError::TicketExpired
-        | SessionError::TicketNotAdmissible => ProtocolError::InvalidTicket,
-        SessionError::Storage(io_err) => ProtocolError::Internal(format!("storage: {io_err}")),
-        SessionError::InvalidAddr(msg) => ProtocolError::Internal(format!("invalid addr: {msg}")),
-        SessionError::Internal(msg) => ProtocolError::Internal(msg.clone()),
-        SessionError::NotHost => ProtocolError::NotHost,
-        SessionError::SessionConflict(s) => ProtocolError::SessionConflict(*s),
-        // Forward the host's verdict verbatim so the IPC client
-        // sees the actual reason (e.g., UnknownSession after a
-        // session close) instead of a generic Internal.
-        SessionError::HostRejected(err) => err.clone(),
-        SessionError::SignatureRejected { peer_id, reason } => {
-            ProtocolError::Signature(format!("{peer_id}: {reason}"))
-        }
-        // L2 capability denial (Auth Slice C): the joiner sees this as
-        // `ProtocolError::Capability` so they can distinguish a cap
-        // failure from a signature failure or a generic Internal.
-        SessionError::CapabilityDenied {
-            peer_id,
-            had,
-            needed,
-        } => ProtocolError::Capability(format!("{peer_id}: had {had:?}, needs {needed:?}")),
-        SessionError::InvalidCapClaim(reason) => {
-            ProtocolError::Internal(format!("invalid cap claim: {reason}"))
-        }
-        // Host-operator-facing (RevokeTicket of a never-issued id).
-        SessionError::UnknownTicket(t) => ProtocolError::UnknownTicket(*t),
-    }
+    err.into()
 }
 
 /// Validate the client's `Hello`. Returns `Ok` when versions match.

@@ -23,8 +23,8 @@ use artel_protocol::message::{MESSAGE_FORMAT, SIGNATURE_UNSIGNED, SigBytes};
 use artel_protocol::signing::{self, verify_reason};
 use artel_protocol::ticket::{self, SessionTicket, TicketEntry, TicketStatus, WireEndpointAddr};
 use artel_protocol::{
-    Event, JoinTicket, MessageKind, PeerId, PeerInfo, Seq, SessionId, SessionMessage,
-    SessionSummary, UpgradePayload,
+    Event, JoinTicket, MessageKind, PeerId, PeerInfo, ProtocolError, Seq, SessionId,
+    SessionMessage, SessionSummary, UpgradePayload,
 };
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, broadcast};
@@ -220,6 +220,59 @@ impl PartialEq for SessionError {
     }
 }
 impl Eq for SessionError {}
+
+/// The one session→wire error translation, used by both the IPC
+/// server (`Response::Error`) and the gossip bridge (`SendAck`).
+/// Living here, next to the error type, keeps the two surfaces
+/// identical by construction — they used to be hand-synced mirrors,
+/// which is one missed edit away from a bearer-visible divergence.
+impl From<&SessionError> for ProtocolError {
+    fn from(err: &SessionError) -> Self {
+        match err {
+            SessionError::UnknownSession(s) => Self::UnknownSession(*s),
+            SessionError::NotMember(_) => Self::Internal("not a member".into()),
+            // TicketNotAdmissible is joiner-opaque on purpose
+            // (revocation slice): revoked, never-issued, and
+            // mint-mismatch all collapse to InvalidTicket so a bearer
+            // can't oracle the host's ledger.
+            SessionError::InvalidTicket
+            | SessionError::TicketExpired
+            | SessionError::TicketNotAdmissible => Self::InvalidTicket,
+            SessionError::Storage(io_err) => Self::Internal(format!("storage: {io_err}")),
+            // Generic Internal so ticket-parser detail doesn't leak.
+            SessionError::InvalidAddr(msg) => Self::Internal(format!("invalid addr: {msg}")),
+            SessionError::Internal(msg) => Self::Internal(msg.clone()),
+            SessionError::NotHost => Self::NotHost,
+            SessionError::SessionConflict(s) => Self::SessionConflict(*s),
+            // Forward the host's verdict verbatim so the caller sees
+            // the actual reason (e.g., UnknownSession after a session
+            // close) instead of a generic Internal. Host-side this
+            // should never occur (only joiners receive HostRejected
+            // from `send_remote`) — surfaced defensively.
+            SessionError::HostRejected(err) => err.clone(),
+            // Distinguishable from a generic Internal so the client
+            // can tell a sig failure from a cap failure.
+            SessionError::SignatureRejected { peer_id, reason } => {
+                Self::Signature(format!("{peer_id}: {reason}"))
+            }
+            // L2 capability denial (Auth Slice C). `had`/`needed`
+            // name the cap gap; never payload bytes.
+            SessionError::CapabilityDenied {
+                peer_id,
+                had,
+                needed,
+            } => Self::Capability(format!("{peer_id}: had {had:?}, needs {needed:?}")),
+            SessionError::InvalidCapClaim(reason) => {
+                Self::Internal(format!("invalid cap claim: {reason}"))
+            }
+            // Host-operator-facing (RevokeTicket of a never-issued
+            // id); never reaches the gossip wire today but mapped
+            // faithfully rather than panicking on a future code
+            // motion.
+            SessionError::UnknownTicket(t) => Self::UnknownTicket(*t),
+        }
+    }
+}
 
 /// Signed capability claim extracted from a `JoinAnnouncement`. The
 /// host verifies this against its own pubkey at admission to grant the
