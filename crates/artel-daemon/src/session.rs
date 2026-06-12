@@ -1360,18 +1360,31 @@ impl Registry {
         out
     }
 
-    /// Ensure `peer` is a member of `session`. No-op if they
-    /// already are. Used by the gossip bridge on the host side to
-    /// admit a remote joiner — typically driven by an inbound
-    /// `JoinAnnouncement` frame, with `SendRequest` as an
-    /// idempotent backstop in case the announcement was lost or
-    /// arrives out of order. Persists the membership change and
-    /// emits [`Event::PeerJoined`] when the peer is newly added.
+    /// Ensure `peer` is a member of `session`. Used by the gossip
+    /// bridge on the host side to admit a remote joiner, driven by an
+    /// inbound `JoinAnnouncement` frame — the *sole* admission path
+    /// (the old `SendRequest` lazy-admission backstop was removed:
+    /// admitting without a claim would bypass ticket verification;
+    /// see `run_host_send` in the bridge). Persists the membership
+    /// change and emits [`Event::PeerJoined`] when the peer is newly
+    /// added.
     ///
-    /// When `cap_claim` is `Some`, the host verifies the ticket's
-    /// capability signature and grants the claimed tier. When `None`
-    /// (the `SendRequest` backstop path), no new grant is emitted —
-    /// the peer was already admitted by a prior `JoinAnnouncement`.
+    /// Mostly idempotent for an existing member: re-announcing with a
+    /// still-admissible claim is a no-op `Ok`. The ledger gate runs
+    /// BEFORE the already-member early return, though, so a duplicate
+    /// announcement carrying a since-revoked claim returns
+    /// `TicketNotAdmissible` even while the peer keeps its membership
+    /// (revocation is ticket-only) — the bridge logs it and moves on.
+    ///
+    /// When `cap_claim` is `Some`, the host verifies expiry, the
+    /// ticket's capability signature, and the issued-ticket ledger,
+    /// then grants the claimed tier. When `None`, **all three checks
+    /// are skipped and the auto-grant defaults to `ReadWrite`** — a
+    /// pre-tiered-tickets compatibility shape that no production
+    /// caller uses (the bridge always passes `Some`; only tests pass
+    /// `None`). Any future admission path MUST carry a claim; wiring
+    /// one through `None` is privilege escalation with zero ticket
+    /// verification and zero revocation.
     ///
     /// Returns `Err(UnknownSession)` if `session` doesn't exist on
     /// this daemon. Other failures surface the underlying

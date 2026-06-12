@@ -339,9 +339,12 @@ impl GossipBridge {
         // Mesh is up (subscribe_inner waits for `joined()` on the
         // joiner path). Announce ourselves so the host's bridge can
         // call `Registry::ensure_member` and emit `PeerJoined`.
-        // Best-effort: a failure here just degrades to lazy
-        // admission on first `SendRequest`, the same shape we had
-        // pre-2c-2d.
+        // Best-effort, but load-bearing: the announcement is the
+        // SOLE admission path — `run_host_send` deliberately does
+        // not admit on `SendRequest` (that would bypass ticket
+        // verification). If this publish is lost, the host rejects
+        // our sends with NotMember until a re-announcement gets
+        // through.
         self.publish_join_announcement(session, joiner, ticket_id, granted_cap, expiry_ms, cap_sig)
             .await;
         // Ask the host to backfill any committed messages we
