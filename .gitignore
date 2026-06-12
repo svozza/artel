@@ -5,6 +5,10 @@
 .vscode
 .claude/settings.local.json
 
+# Handoff docs are local working artifacts (session-to-session
+# context transfer), never committed — per project convention.
+docs/handoff-*.md
+
 # Host-staged devcontainer artifacts (short-lived AWS credentials,
 # Claude CLI state seed) — written by .devcontainer/host-init.sh.
 .devcontainer/.local/
