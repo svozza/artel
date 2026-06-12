@@ -20,7 +20,6 @@ use std::time::{Duration, Instant};
 
 use artel_client::Client;
 use artel_fs::error::WorkspaceError;
-use artel_fs::ticket::TicketEnvelopeError;
 use artel_fs::{
     AttachPolicy, Direction, Mode, PathRule, PathRules, TICKET_ACTION, Workspace, WorkspaceConfig,
     WorkspaceEvent, path_to_key,
@@ -967,23 +966,25 @@ async fn on_removed_does_not_tombstone_read_only_path() {
 }
 
 // =============================================================
-// Joiners hard-reject legacy `workspace.ticket` payloads.
+// Legacy broadcast `workspace.ticket` messages are inert.
 //
-// Earlier hosts shipped the `workspace.ticket` payload as a raw
-// `DocTicket::to_string().into_bytes()`; the current shape is a
-// postcard-encoded [`artel_fs::WorkspaceTicketEnvelope`]. The
-// wire-compat decision is to **hard-reject** old-shape payloads
-// rather than silently fall back — silent fallback re-introduces
-// the wrong-dir hazard `AttachPolicy::RequireEmpty` closes.
+// Pre-fix hosts broadcast the ticket envelope as a System message
+// on the session log; the revoked-lurker fix moved the envelope to
+// host→peer unicast and made the daemon suppress every log-borne
+// `TICKET_ACTION` (live and replayed). A stale host — or a
+// malicious RW member broadcasting a forged envelope via
+// `Request::Send` — must therefore never drive a v2 joiner's
+// `wait_for_ticket`: the broadcast is inert chatter and the joiner
+// times out with NO workspace materialised.
 //
-// This test bypasses `Workspace::host_with` and broadcasts an
-// old-shape payload directly via `Request::Send`, then asserts the
-// joiner surfaces `WorkspaceError::TicketEnvelope(Malformed)` and
-// does not bulk-export.
+// (The old shape of this test asserted the broadcast path's decode
+// behaviour — `TicketEnvelope(Malformed)` on a raw DocTicket
+// payload. That path no longer exists: the payload never reaches
+// the joiner at all, malformed or not.)
 // =============================================================
 
 #[tokio::test(flavor = "multi_thread")]
-async fn joiner_rejects_old_shape_doc_ticket_payload() {
+async fn broadcast_ticket_action_is_inert_for_joiner() {
     let Pair {
         daemon_a,
         daemon_b,
@@ -991,8 +992,11 @@ async fn joiner_rejects_old_shape_doc_ticket_payload() {
     } = spawn_pair().await;
 
     // Alice hosts the artel session but does NOT stand up a
-    // workspace. Instead she broadcasts a raw `DocTicket`-shaped
-    // payload via `Request::Send` to mimic a legacy host.
+    // workspace. She broadcasts a `TICKET_ACTION` payload via
+    // `Request::Send` — mimicking a stale pre-fix host (or a forged
+    // envelope from an RW member). A well-formed envelope would be
+    // the strongest impostor, but any bytes prove the point: the
+    // action is suppressed regardless of payload.
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
     let (session, artel_ticket) = match alice
         .request(Request::HostSession {
@@ -1008,9 +1012,6 @@ async fn joiner_rejects_old_shape_doc_ticket_payload() {
         other => panic!("HostSession: got {other:?}"),
     };
 
-    // The exact bytes don't matter — only that they're not a
-    // postcard-encoded `WorkspaceTicketEnvelope`. Use a base32-ish
-    // string to reflect the historical `DocTicket::to_string()` shape.
     let old_shape_payload = b"docaaa\
         cbbcaa3aacaaaaaaaaaaiiabaaaaaiabarbjzgaaaaaaaaaaaaaaaaaaaaaa"
         .to_vec();
@@ -1031,8 +1032,11 @@ async fn joiner_rejects_old_shape_doc_ticket_payload() {
         other => panic!("Send: got {other:?}"),
     }
 
-    // Bob joins the artel session, then calls `Workspace::join_with`.
-    // The replayed `workspace.ticket` payload fails envelope decode.
+    // Bob joins the artel session, then calls `Workspace::join_with`
+    // with a bounded ticket wait. The broadcast TICKET_ACTION is
+    // suppressed on every joiner-visible surface, so the join times
+    // out — it must NOT decode the payload (the pre-fix behaviour
+    // was a Malformed error from the envelope decode).
     let bob = Client::connect(&daemon_b.socket).await.unwrap();
     let resp = bob
         .request(Request::JoinSession {
@@ -1046,29 +1050,29 @@ async fn joiner_rejects_old_shape_doc_ticket_payload() {
     let bob_dir = tempfile::tempdir().unwrap();
 
     let result = timeout(
-        Duration::from_secs(15),
+        Duration::from_secs(20),
         Workspace::join_with(
             &bob,
             session,
             bob_dir.path().to_path_buf(),
             AttachPolicy::RequireEmpty,
-            WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
+            WorkspaceConfig::default()
+                .with_endpoint_setup(testing_setup(&dns_pkarr))
+                .with_join_ticket_timeout(Some(Duration::from_secs(8))),
         ),
     )
     .await
-    .expect("Workspace::join_with should not hang on a malformed ticket");
+    .expect("Workspace::join_with must resolve via its own ticket timeout");
 
-    let err = result.expect_err("join must fail on old-shape payload");
+    let err = result.expect_err("join must fail — the broadcast is inert");
     match err {
-        WorkspaceError::TicketEnvelope(TicketEnvelopeError::Malformed(_)) => {}
-        other => panic!("expected TicketEnvelope(Malformed), got {other:?}"),
+        WorkspaceError::Iroh(msg) if msg.contains("timed out waiting for workspace.ticket") => {}
+        other => panic!("expected ticket-wait timeout, got {other:?}"),
     }
 
     // Defence in depth: nothing should have been written to bob_dir
-    // beyond the state dir the workspace would normally create. The
-    // `RequireEmpty` policy already runs *before* the envelope decode
-    // (and would have caught a non-empty pre-test dir); here we
-    // simply confirm bulk-export never landed any user file.
+    // beyond the state dir the workspace would normally create —
+    // the broadcast payload must not have driven any materialisation.
     let mut entries = tokio::fs::read_dir(bob_dir.path()).await.unwrap();
     while let Some(entry) = entries.next_entry().await.unwrap() {
         let name = entry.file_name();

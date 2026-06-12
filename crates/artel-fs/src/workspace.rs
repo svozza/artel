@@ -4,11 +4,12 @@
 //! Two modes, one type:
 //! - [`Workspace::host`] creates a fresh `iroh-docs` document, scans
 //!   the supplied directory, publishes its files into the doc, and
-//!   broadcasts the resulting [`DocTicket`] over the artel session
-//!   as a [`MessageKind::System`] message with action
-//!   [`TICKET_ACTION`].
-//! - [`Workspace::join`] listens for the system message, imports the
-//!   ticket, and bulk-exports the doc to its own copy of the
+//!   hands the resulting [`DocTicket`] to its daemon
+//!   (`PublishWorkspaceTicket`), which unicasts it host→peer to each
+//!   admitted member — never over the gossip topic.
+//! - [`Workspace::join`] waits for the daemon's synthetic
+//!   [`TICKET_ACTION`] system message carrying the envelope, imports
+//!   the ticket, and bulk-exports the doc to its own copy of the
 //!   directory.
 //!
 //! Live two-way sync is wired up by [`Workspace::run`], which spawns
@@ -58,10 +59,13 @@ use crate::ticket::{self, WorkspaceTicketEnvelope};
 /// disastrously-wrong dir (e.g. `~`).
 const POLICY_OFFENDING_LIMIT: usize = 5;
 
-/// Action stamped on the `MessageKind::System` ticket-handout
-/// message. Joiners filter on this to find the ticket inside the
-/// session's event stream.
-pub const TICKET_ACTION: &str = "workspace.ticket";
+/// Action stamped on the synthetic `MessageKind::System`
+/// ticket-handout message the joiner's daemon injects from the
+/// unicast-delivered envelope. Joiners filter on this to find the
+/// ticket inside the session's event stream. Re-exported from
+/// `artel-protocol` so the daemon's injector and this consumer can't
+/// drift.
+pub const TICKET_ACTION: &str = artel_protocol::TICKET_ACTION;
 
 /// Action stamped on the `MessageKind::System` message a joiner sends
 /// to announce its workspace `EndpointId` to the host. Payload is the
@@ -457,9 +461,10 @@ impl Workspace {
     ///    authenticated `PeerId` server-side; the IPC caller cannot
     ///    influence it (auth L1, `PROTOCOL_VERSION` 5).
     /// 4. Walk `root`, publish every non-skipped file into the doc.
-    /// 5. Share the doc as a `DocTicket` and broadcast it over the
-    ///    artel session as a [`MessageKind::System`] message with
-    ///    action [`TICKET_ACTION`].
+    /// 5. Share the doc as a `DocTicket` and publish it to the daemon
+    ///    via `PublishWorkspaceTicket`; the daemon persists the
+    ///    envelope and unicasts it host→peer to each admitted member
+    ///    (joiners see it as a synthetic [`TICKET_ACTION`] message).
     ///
     /// Returns the [`Workspace`] handle plus the receiver side of
     /// the [`WorkspaceEvent`] stream. Call [`Self::run`] to start
@@ -695,9 +700,10 @@ impl Workspace {
             iroh_docs::Capability::Read(_) => unreachable!("host always has Write capability"),
         };
 
-        // Broadcast a Read-only ticket. The NamespaceSecret is never
-        // included in the broadcast; RW joiners receive it via the
-        // targeted upgrade path (see spawn_cap_listener / 3D).
+        // Publish a Read-only ticket to the daemon (unicast
+        // distribution — never broadcast). The NamespaceSecret is
+        // never included in the envelope; RW joiners receive it via
+        // the targeted upgrade path (see spawn_cap_listener / 3D).
         let ticket = doc
             .share(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
             .await
@@ -775,10 +781,10 @@ impl Workspace {
     /// workspace internally:
     ///
     /// 1. Spawns its own iroh node.
-    /// 2. Issues `Subscribe { since: None }` so the daemon's replay
-    ///    path surfaces the host's `workspace.ticket` system
-    ///    message even if the joiner arrived after it was
-    ///    originally broadcast.
+    /// 2. Issues `Subscribe { since: None }` so the daemon injects
+    ///    the persisted `workspace.ticket` envelope into the replay —
+    ///    a joiner that attaches after the unicast delivery still
+    ///    picks it up.
     /// 3. Drains events until the ticket arrives (15 s ceiling).
     /// 4. Imports the ticket into the joiner's local doc, runs
     ///    `bulk_export` to seed `root` with whatever's already in
@@ -1516,12 +1522,20 @@ async fn register_workspace_attachment(
     }
 }
 
-/// Broadcast `ticket` + `rules` over `session` as a
-/// `MessageKind::System` message with [`TICKET_ACTION`].
+/// Publish `ticket` + `rules` to the daemon via
+/// [`Request::PublishWorkspaceTicket`] (revoked-lurker fix). The
+/// daemon persists the envelope on the session record and owns its
+/// distribution — host→peer unicast over the direct delivery stream,
+/// to current members on publish and to each peer at admission.
+/// Nothing capability-bearing rides the gossip topic; joiners see the
+/// envelope as the daemon's synthetic [`TICKET_ACTION`] System
+/// message (live + replayed on `Subscribe`).
 ///
-/// Wire shape: postcard-encoded [`WorkspaceTicketEnvelope`]. The
-/// legacy pre-envelope shape (raw `DocTicket::to_string().into_bytes()`)
-/// is hard-rejected by the joiner with
+/// Wire shape inside the envelope bytes: postcard-encoded
+/// [`WorkspaceTicketEnvelope`], byte-stable across host restarts (the
+/// restart contract depends on identical bytes). The legacy
+/// pre-envelope shape (raw `DocTicket::to_string().into_bytes()`) is
+/// hard-rejected by the joiner with
 /// [`TicketEnvelopeError::Malformed`] — see [`crate::ticket`] module
 /// docs for the wire-compat decision.
 pub(crate) async fn publish_ticket(
@@ -1531,21 +1545,17 @@ pub(crate) async fn publish_ticket(
     rules: &PathRules,
 ) -> Result<(), WorkspaceError> {
     let envelope = WorkspaceTicketEnvelope::new(ticket.to_string(), rules.clone());
-    let payload = ticket::encode(&envelope)?;
+    let envelope_bytes = ticket::encode(&envelope)?;
     let resp = client
-        .request(Request::Send {
+        .request(Request::PublishWorkspaceTicket {
             session,
-            payload: SendPayload {
-                kind: MessageKind::System,
-                action: TICKET_ACTION.to_string(),
-                payload,
-            },
+            envelope_bytes,
         })
         .await?;
     match resp {
-        Response::Sent { .. } => Ok(()),
+        Response::WorkspaceTicketPublished => Ok(()),
         other => Err(WorkspaceError::Iroh(format!(
-            "unexpected response to ticket Send: {other:?}",
+            "unexpected response to PublishWorkspaceTicket: {other:?}",
         ))),
     }
 }

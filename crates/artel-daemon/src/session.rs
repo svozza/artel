@@ -1606,9 +1606,16 @@ impl Registry {
         Ok(s.log
             .iter()
             .filter(|m| {
+                // TICKET_ACTION never rides the gossip replay
+                // (revoked-lurker fix): the host doesn't log the
+                // envelope (it is unicast + IPC-replay only), so a
+                // log entry carrying the action is a peer-authored
+                // impostor — re-serving it would put
+                // capability-shaped bytes back on the topic.
                 m.seq > since
                     && m.kind != MessageKind::Capability
-                    && !(m.kind == MessageKind::System && m.action == UPGRADE_ACTION)
+                    && !(m.kind == MessageKind::System
+                        && (m.action == UPGRADE_ACTION || m.action == TICKET_ACTION))
             })
             .cloned()
             .collect())
@@ -2154,7 +2161,21 @@ impl Registry {
         if let Some(envelope) = &s.workspace_ticket {
             replay.push(synthetic_ticket_message(s.host, envelope.clone()));
         }
-        replay.extend(s.log.iter().filter(|m| m.seq > cutoff).cloned());
+        // Log-borne TICKET_ACTION entries are filtered: the synthetic
+        // message above (from the persisted unicast copy) is the only
+        // sanctioned source. A log entry carrying the action is a
+        // peer-authored broadcast — surfacing it would let any RW
+        // member drive a joiner's `wait_for_ticket` with a forged
+        // envelope (revoked-lurker fix, legacy-broadcast hard-reject).
+        replay.extend(
+            s.log
+                .iter()
+                .filter(|m| {
+                    m.seq > cutoff
+                        && !(m.kind == MessageKind::System && m.action == TICKET_ACTION)
+                })
+                .cloned(),
+        );
         let events = s.events_tx.subscribe();
         drop(s);
         Ok(Subscription { replay, events })
@@ -2528,6 +2549,23 @@ async fn apply_inbound_mirror_message(
     s.log.insert(pos, msg.clone());
     if msg.seq > s.head {
         s.head = msg.seq;
+    }
+    // Log-borne TICKET_ACTION is never surfaced live to IPC
+    // subscribers (revoked-lurker fix): the genuine envelope arrives
+    // over the host→peer unicast and is injected from the persisted
+    // copy only; a gossip Message carrying the action is a stale or
+    // forged broadcast and must not drive a joiner's
+    // `wait_for_ticket`. The entry stays in the mirror log (seq
+    // continuity for dedup); `subscribe` applies the same filter, so
+    // it is inert on every joiner-visible surface.
+    if msg.kind == MessageKind::System && msg.action == TICKET_ACTION {
+        tracing::warn!(
+            ?session,
+            seq = ?msg.seq,
+            peer = %msg.peer.id,
+            "suppressing log-borne TICKET_ACTION broadcast (unicast is the only sanctioned source)",
+        );
+        return;
     }
     let _ = s.events_tx.send(Event::Message {
         session,
@@ -3603,6 +3641,65 @@ mod tests {
 
     #[tokio::test]
     #[cfg(feature = "iroh")]
+    async fn mirror_suppresses_log_borne_ticket_action_from_live_events() {
+        // A fully-signed System/TICKET_ACTION gossip Message (an RW
+        // member broadcasting a forged envelope) is appended to the
+        // mirror log (seq continuity) but never reaches the live IPC
+        // event stream — the unicast-delivered synthetic message is
+        // the only sanctioned TICKET_ACTION source.
+        let (host_key, session, author_key, mirror, store) = remote_mirror_fixture();
+        store.create(&mirror.lock().await.record()).await.unwrap();
+
+        let mut events_rx = mirror.lock().await.events_tx.subscribe();
+
+        // Sign a System/TICKET_ACTION message the same way the host
+        // would sequence a member's broadcast.
+        let author = PeerInfo::new(
+            PeerId::from_bytes(author_key.verifying_key().to_bytes()),
+            "mallory",
+        );
+        let timestamp_ms = 1_700_000_000_000u64;
+        let payload = vec![0xAB; 32];
+        let author_sig = artel_protocol::signing::sign_body(
+            &author_key,
+            session,
+            artel_protocol::message::MESSAGE_FORMAT,
+            timestamp_ms,
+            &author,
+            MessageKind::System,
+            TICKET_ACTION,
+            &payload,
+        );
+        let host_sig =
+            artel_protocol::signing::sign_seq(&host_key, session, Seq::new(1), &author_sig);
+        let msg = SessionMessage::new(
+            Seq::new(1),
+            timestamp_ms,
+            author,
+            MessageKind::System,
+            TICKET_ACTION,
+            payload,
+            author_sig,
+            host_sig,
+        );
+
+        apply_inbound_mirror_message(&store, &mirror, session, msg).await;
+        assert_eq!(
+            mirror.lock().await.log.len(),
+            1,
+            "entry persists for seq continuity",
+        );
+        assert!(
+            matches!(
+                events_rx.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ),
+            "log-borne TICKET_ACTION must not surface as a live event",
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "iroh")]
     async fn mirror_dedups_duplicate_seq_without_reverifying() {
         // A duplicate seq is dropped at the dedup gate before any
         // crypto runs — so even a duplicate whose host_sig we corrupt
@@ -4624,6 +4721,79 @@ mod tests {
         let messages = r.log_since(id, Seq::ZERO).await.unwrap();
         let actions: Vec<&str> = messages.iter().map(|m| m.action.as_str()).collect();
         assert_eq!(actions, vec!["hello", "world"]);
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn log_since_never_emits_ticket_action() {
+        // The gossip replay surface must never carry TICKET_ACTION:
+        // the host doesn't log the envelope any more, so any log
+        // entry with the action is a peer-authored impostor (or a
+        // pre-fix relic) and re-serving it would put
+        // capability-shaped bytes back on the topic.
+        let r = registry();
+        let host = peer(1, "alice");
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
+
+        r.send(
+            id,
+            host.clone(),
+            MessageKind::System,
+            TICKET_ACTION.into(),
+            vec![0xAB; 64],
+            Authoring::Local,
+        )
+        .await
+        .unwrap();
+        r.send(
+            id,
+            host,
+            MessageKind::Chat,
+            "hello".into(),
+            vec![],
+            Authoring::Local,
+        )
+        .await
+        .unwrap();
+
+        let messages = r.log_since(id, Seq::ZERO).await.unwrap();
+        let actions: Vec<&str> = messages.iter().map(|m| m.action.as_str()).collect();
+        assert_eq!(actions, vec!["hello"]);
+    }
+
+    #[tokio::test]
+    async fn subscribe_filters_log_borne_ticket_action() {
+        // A TICKET_ACTION System message that somehow landed in the
+        // log (peer broadcast) must not surface via Subscribe — the
+        // synthetic injection from the persisted unicast copy is the
+        // only sanctioned source.
+        let r = registry();
+        let host = peer(1, "alice");
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
+        r.send(
+            id,
+            host.clone(),
+            MessageKind::System,
+            TICKET_ACTION.into(),
+            vec![0xAB; 64],
+            Authoring::Local,
+        )
+        .await
+        .unwrap();
+        r.send(
+            id,
+            host,
+            MessageKind::Chat,
+            "hello".into(),
+            vec![],
+            Authoring::Local,
+        )
+        .await
+        .unwrap();
+
+        let sub = r.subscribe(id, None).await.unwrap();
+        let actions: Vec<&str> = sub.replay.iter().map(|m| m.action.as_str()).collect();
+        assert_eq!(actions, vec!["hello"]);
     }
 
     // ---- workspace ticket: emit (joiner side) ----
