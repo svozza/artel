@@ -53,5 +53,5 @@ pub use ticket::{
     SessionTicket, TICKET_PREFIX, TICKET_VERSION, TicketEntry, TicketError, TicketStatus,
     WireEndpointAddr,
 };
-pub use upgrade::{UPGRADE_ACK, UPGRADE_ALPN, UpgradeFrame, UpgradePayload};
+pub use upgrade::{DeliveryFrame, UPGRADE_ACK, UPGRADE_ALPN, UpgradeFrame, UpgradePayload};
 pub use version::{PROTOCOL_VERSION, ProtocolVersion, VersionMismatch};

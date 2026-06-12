@@ -289,6 +289,26 @@ pub enum Request {
         #[serde(with = "serde_bytes")]
         namespace_secret: [u8; 32],
     },
+
+    /// Publish the workspace's read-capability ticket envelope to the
+    /// daemon, which persists it on the session record and owns its
+    /// distribution: unicast over the direct-stream delivery channel
+    /// to every current member on publish, and to each peer at
+    /// admission. Replaces the host workspace's former broadcast
+    /// `Send` of the `workspace.ticket` System message — nothing
+    /// capability-bearing rides the gossip topic any more
+    /// (revoked-lurker fix, `PROTOCOL_VERSION` 9).
+    ///
+    /// Only the host of a `SessionKind::Local` session may call this.
+    /// Returns [`Response::WorkspaceTicketPublished`] on success.
+    PublishWorkspaceTicket {
+        /// Session the envelope belongs to.
+        session: SessionId,
+        /// postcard-encoded `WorkspaceTicketEnvelope`, opaque to the
+        /// daemon.
+        #[serde(with = "send_payload_bytes")]
+        envelope_bytes: Vec<u8>,
+    },
 }
 
 /// Fields of a [`Request::Send`] that the client supplies.
@@ -473,6 +493,12 @@ pub enum Response {
         /// Every ticket issued for the session, mint order.
         entries: Vec<crate::ticket::TicketEntry>,
     },
+
+    /// Reply to [`Request::PublishWorkspaceTicket`] (success). The
+    /// envelope is durably persisted on the session record;
+    /// per-member unicast delivery is best-effort (offline members
+    /// are covered by admission-redelivery on their re-announce).
+    WorkspaceTicketPublished,
 }
 
 /// One entry in [`Response::Attachments`].
@@ -750,6 +776,32 @@ mod tests {
         assert_eq!(resp, back);
         let json = serde_json::to_string(&resp).unwrap();
         assert_eq!(json, "\"upgrade_delivered\"");
+    }
+
+    #[test]
+    fn publish_workspace_ticket_request_round_trip() {
+        let req = Request::PublishWorkspaceTicket {
+            session: SessionId::from_bytes([0xab; 16]),
+            envelope_bytes: vec![0x42; 512],
+        };
+        let bytes = postcard::to_allocvec(&req).unwrap();
+        let back: Request = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(req, back);
+
+        let json = serde_json::to_string(&req).unwrap();
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn workspace_ticket_published_response_round_trip() {
+        let resp = Response::WorkspaceTicketPublished;
+        let bytes = postcard::to_allocvec(&resp).unwrap();
+        let back: Response = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(resp, back);
+        // Unit-shaped: JSON renders as a bare snake_case string.
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(json, "\"workspace_ticket_published\"");
     }
 
     #[test]
@@ -1270,6 +1322,16 @@ mod tests {
                     namespace_secret: secret,
                 },
             ),
+            (
+                any::<[u8; 16]>(),
+                proptest::collection::vec(any::<u8>(), 0..512),
+            )
+                .prop_map(|(s, envelope_bytes)| {
+                    Request::PublishWorkspaceTicket {
+                        session: SessionId::from_bytes(s),
+                        envelope_bytes,
+                    }
+                }),
         ]
     }
 

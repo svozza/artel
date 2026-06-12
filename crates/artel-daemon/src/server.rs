@@ -737,6 +737,12 @@ async fn dispatch(
         Request::DeliverUpgrade { .. } => Response::Error {
             error: ProtocolError::Internal("DeliverUpgrade requires the iroh feature".into()),
         },
+        // Wired up in the daemon slice of the revoked-lurker fix
+        // (publish → persist + unicast to members). Until then the
+        // verb exists on the wire but the daemon refuses it.
+        Request::PublishWorkspaceTicket { .. } => Response::Error {
+            error: ProtocolError::Internal("PublishWorkspaceTicket not yet wired".into()),
+        },
     }
 }
 
