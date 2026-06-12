@@ -12,16 +12,16 @@ along the way.
 
 ## Status
 
-(Last refreshed 2026-06-11.)
+(Last refreshed 2026-06-12.)
 
 | Crate | State |
 |---|---|
-| `artel-protocol` | Wire types + Unix-socket transport. Done. `PROTOCOL_VERSION` `7`, `MESSAGE_FORMAT` `3`, `TICKET_VERSION` `4` (tiered tickets), `GOSSIP_WIRE_VERSION` `1`. |
-| `artel-daemon` | Persistent daemon + binary + flock-based pidfile (orphan-leak fix `9a1a773`). Done. |
+| `artel-protocol` | Wire types + Unix-socket transport. Done. `PROTOCOL_VERSION` `8` (ticket revocation), `MESSAGE_FORMAT` `3`, `TICKET_VERSION` `4` (tiered tickets), `GOSSIP_WIRE_VERSION` `1`. |
+| `artel-daemon` | Persistent daemon + binary + flock-based pidfile (orphan-leak fix `9a1a773`) + issued-ticket ledger with revocation. Done. |
 | `artel-client` | Stateless multiplexed client + `artel` CLI binary + `connect_or_spawn`. Done. |
-| `artel-fs` | Phase 3a (MVP) + 3b-1 (persistence) + 3b-3 (crash recovery) + host/join safety + PeerFilter shipped. Author identity (3b-2) and configurable filter (3b-4) remain. |
+| `artel-fs` | Phase 3a (MVP) + 3b-1 (persistence) + 3b-3 (crash recovery) + host/join safety + PeerFilter shipped. Watcher new-subtree rescan landed (`e8244fe`, closes the inotify backfill race). Author identity (3b-2) and configurable filter (3b-4) remain. |
 
-622 tests passing on Tier A+B (`make test`), 11 more on Tier C
+663 tests passing on Tier A+B (`make test`), 11 more on Tier C
 (`make test-n0`, real n0). fmt + clippy clean in both feature modes.
 CI runs ubuntu + macos on stable; workspace `rust-version` is 1.95.
 
