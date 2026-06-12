@@ -869,18 +869,22 @@ impl Registry {
         Ok((session_id, ticket, ticket_id))
     }
 
-    /// Issue an additional ticket for an existing locally-hosted session.
+    /// Acquire the per-session lock for a locally-hosted session —
+    /// the shared authority gate of the ticket-ledger operations
+    /// (`issue_ticket` / `revoke_ticket` / `list_tickets`).
     ///
-    /// Only sessions with `SessionKind::Local` whose host matches the
-    /// daemon's own peer id may issue tickets. Returns
-    /// `SessionError::NotHost` if the session is remote, and
-    /// `SessionError::UnknownSession` if it doesn't exist.
-    pub async fn issue_ticket(
+    /// `SessionError::UnknownSession` if the id isn't known,
+    /// `SessionError::NotHost` if the session is a `Remote` mirror.
+    /// `kind == Local` is the whole check: the L1 invariant (the IPC
+    /// server stamps every caller with the daemon's own identity)
+    /// already guarantees a Local session is one this daemon hosts —
+    /// there is no separate host-id comparison here, so if ledger
+    /// authority ever needs to be finer than "this daemon" (e.g.
+    /// sub-RW members), this is the single place to grow it.
+    async fn lock_local_session(
         &self,
         session: SessionId,
-        granted_cap: Capability,
-        expiry_ms: u64,
-    ) -> Result<(JoinTicket, TicketId), SessionError> {
+    ) -> Result<tokio::sync::OwnedMutexGuard<Session>, SessionError> {
         let arc = {
             let guard = self.sessions.read().await;
             guard
@@ -888,24 +892,40 @@ impl Registry {
                 .cloned()
                 .ok_or(SessionError::UnknownSession(session))?
         };
-        let (ticket, ticket_id) = self.mint_ticket(session, granted_cap, expiry_ms);
-        {
-            let mut s = arc.lock().await;
-            if s.kind != SessionKind::Local {
-                return Err(SessionError::NotHost);
-            }
-            // Store-before-memory: if the ledger write fails, the
-            // mint fails and no unrevocable ticket leaves the daemon
-            // (issued-only would reject it anyway — fail loudly here
-            // instead of handing out a dead ticket).
-            let mut tickets = s.tickets.clone();
-            tickets.push(Self::ledger_entry(ticket_id, granted_cap, expiry_ms));
-            self.store
-                .put_tickets(session, &tickets)
-                .await
-                .map_err(SessionError::Storage)?;
-            s.tickets = tickets;
+        let s = arc.lock_owned().await;
+        if s.kind != SessionKind::Local {
+            return Err(SessionError::NotHost);
         }
+        Ok(s)
+    }
+
+    /// Issue an additional ticket for an existing locally-hosted session.
+    ///
+    /// Authority: [`Self::lock_local_session`]. Returns
+    /// `SessionError::NotHost` if the session is a remote mirror, and
+    /// `SessionError::UnknownSession` if it doesn't exist.
+    pub async fn issue_ticket(
+        &self,
+        session: SessionId,
+        granted_cap: Capability,
+        expiry_ms: u64,
+    ) -> Result<(JoinTicket, TicketId), SessionError> {
+        let mut s = self.lock_local_session(session).await?;
+        let (ticket, ticket_id) = self.mint_ticket(session, granted_cap, expiry_ms);
+        // Store-before-memory: if the ledger write fails, the
+        // mint fails and no unrevocable ticket leaves the daemon
+        // (issued-only would reject it anyway — fail loudly here
+        // instead of handing out a dead ticket).
+        let mut tickets = s.tickets.clone();
+        tickets.push(Self::ledger_entry(ticket_id, granted_cap, expiry_ms));
+        self.store
+            .put_tickets(session, &tickets)
+            .await
+            .map_err(SessionError::Storage)?;
+        s.tickets = tickets;
+        // Lint-mandated (significant_drop_tightening): release before
+        // building the return value.
+        drop(s);
         Ok((ticket, ticket_id))
     }
 
@@ -925,17 +945,7 @@ impl Registry {
         session: SessionId,
         ticket_id: TicketId,
     ) -> Result<(), SessionError> {
-        let arc = {
-            let guard = self.sessions.read().await;
-            guard
-                .get(&session)
-                .cloned()
-                .ok_or(SessionError::UnknownSession(session))?
-        };
-        let mut s = arc.lock().await;
-        if s.kind != SessionKind::Local {
-            return Err(SessionError::NotHost);
-        }
+        let mut s = self.lock_local_session(session).await?;
         let Some(idx) = s.tickets.iter().position(|t| t.ticket_id == ticket_id) else {
             return Err(SessionError::UnknownTicket(ticket_id));
         };
@@ -950,6 +960,7 @@ impl Registry {
             .await
             .map_err(SessionError::Storage)?;
         s.tickets = tickets;
+        // Lint-mandated (significant_drop_tightening).
         drop(s);
         Ok(())
     }
@@ -958,17 +969,7 @@ impl Registry {
     /// Metadata only — the encoded bearer strings are never stored,
     /// so they cannot be returned. Authority as `revoke_ticket`.
     pub async fn list_tickets(&self, session: SessionId) -> Result<Vec<TicketEntry>, SessionError> {
-        let arc = {
-            let guard = self.sessions.read().await;
-            guard
-                .get(&session)
-                .cloned()
-                .ok_or(SessionError::UnknownSession(session))?
-        };
-        let s = arc.lock().await;
-        if s.kind != SessionKind::Local {
-            return Err(SessionError::NotHost);
-        }
+        let s = self.lock_local_session(session).await?;
         Ok(s.tickets.clone())
     }
 
