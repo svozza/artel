@@ -278,6 +278,214 @@ async fn replay_from_non_member_is_refused() {
 }
 
 // =============================================================
+// Two frame kinds, one channel: an RW joiner receives BOTH the
+// workspace ticket envelope and the NamespaceSecret over the same
+// delivery stream.
+// =============================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rw_joiner_receives_envelope_and_secret_on_one_channel() {
+    let (daemon_a, daemon_b, _dns_pkarr) = common::spawn_pair().await;
+
+    let alice = Client::connect(&daemon_a.socket).await.unwrap();
+    let (session, ticket) = host_session(&alice).await;
+    alice
+        .request(Request::Subscribe {
+            session,
+            since: None,
+        })
+        .await
+        .unwrap();
+    let mut alice_events = alice.take_events().await.expect("alice events");
+    publish_envelope(&alice, session).await;
+
+    let bob = Client::connect(&daemon_b.socket).await.unwrap();
+    bob.request(Request::JoinSession {
+        display_name: "bob".into(),
+        ticket,
+    })
+    .await
+    .unwrap();
+    bob.request(Request::Subscribe {
+        session,
+        since: None,
+    })
+    .await
+    .unwrap();
+    let mut bob_events = bob.take_events().await.expect("bob events");
+
+    // Wait for admission, then push the secret to Bob.
+    let bob_peer_id = daemon_b.peer_id();
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let ev = alice_events.recv().await.expect("alice events closed");
+            if let Event::PeerJoined { peer, .. } = ev
+                && peer.id == bob_peer_id
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("alice never saw bob join");
+
+    match alice
+        .request(Request::DeliverUpgrade {
+            session,
+            target_peer: bob_peer_id,
+            namespace_secret: [0x42; 32],
+        })
+        .await
+        .unwrap()
+    {
+        Response::UpgradeDelivered => {}
+        other => panic!("expected UpgradeDelivered, got {other:?}"),
+    }
+
+    // Bob sees both synthetic messages.
+    let mut saw_ticket = false;
+    let mut saw_upgrade = false;
+    timeout(Duration::from_secs(20), async {
+        while !(saw_ticket && saw_upgrade) {
+            let ev = bob_events.recv().await.expect("bob events closed");
+            if let Event::Message { message, .. } = ev
+                && message.kind == MessageKind::System
+            {
+                if message.action == TICKET_ACTION {
+                    assert_eq!(message.payload, ENVELOPE_FIXTURE);
+                    saw_ticket = true;
+                } else if message.action == artel_protocol::UPGRADE_ACTION {
+                    saw_upgrade = true;
+                }
+            }
+        }
+    })
+    .await
+    .expect("bob never saw both delivery kinds");
+
+    drop(alice_events);
+    drop(bob_events);
+    drop(alice);
+    drop(bob);
+    daemon_a.stop().await;
+    daemon_b.stop().await;
+}
+
+// =============================================================
+// Joiner daemon restart: the envelope persisted on the mirror
+// survives, and a fresh Subscribe replays it with no host
+// re-publish (extends the
+// gossip.rs::joiner_replays_system_message_after_daemon_restart
+// shape onto the unicast-sourced envelope).
+// =============================================================
+
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::used_underscore_binding)]
+async fn joiner_restart_replays_envelope_without_host_republish() {
+    let (daemon_a, mut daemon_b, dns_pkarr) = common::spawn_pair().await;
+
+    let alice = Client::connect(&daemon_a.socket).await.unwrap();
+    let (session, ticket) = host_session(&alice).await;
+    publish_envelope(&alice, session).await;
+
+    // Bob joins; the admission delivery lands the envelope in his
+    // mirror. Confirm receipt before restarting.
+    let bob1 = Client::connect(&daemon_b.socket).await.unwrap();
+    bob1.request(Request::JoinSession {
+        display_name: "bob".into(),
+        ticket: ticket.clone(),
+    })
+    .await
+    .unwrap();
+    bob1.request(Request::Subscribe {
+        session,
+        since: None,
+    })
+    .await
+    .unwrap();
+    let mut bob1_events = bob1.take_events().await.expect("bob events");
+    expect_ticket_message(&mut bob1_events, "bob (pre-restart)").await;
+
+    // Restart bob's daemon at the same paths.
+    drop(bob1_events);
+    drop(bob1);
+    let bob_state_2 = daemon_b._state.take().expect("state present");
+    daemon_b.shutdown.trigger();
+    timeout(Duration::from_secs(10), daemon_b.join)
+        .await
+        .expect("bob daemon stop")
+        .expect("bob daemon join")
+        .expect("bob daemon io");
+    let daemon_b_2 = common::spawn_daemon(bob_state_2, common::testing_setup(&dns_pkarr)).await;
+
+    // A fresh Subscribe replays the envelope from the persisted
+    // mirror record — no host re-publish happened.
+    let bob2 = Client::connect(&daemon_b_2.socket).await.unwrap();
+    bob2.request(Request::Subscribe {
+        session,
+        since: None,
+    })
+    .await
+    .unwrap();
+    let mut bob2_events = bob2.take_events().await.expect("bob2 events");
+    expect_ticket_message(&mut bob2_events, "bob (post-restart replay)").await;
+
+    drop(bob2_events);
+    drop(bob2);
+    daemon_b_2.stop().await;
+    drop(alice);
+    daemon_a.stop().await;
+}
+
+// =============================================================
+// Host daemon restart: the envelope reloads with the session
+// record; a Subscribe on the resumed session replays the exact
+// bytes with no workspace re-publish.
+// =============================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn host_restart_reloads_envelope_byte_stable() {
+    let root = tempfile::TempDir::new().unwrap();
+    let paths = common::RestartState::under(root.path());
+
+    // Incarnation 1: host + publish.
+    let daemon1 = common::spawn_local_daemon_at(&paths).await;
+    let client1 = Client::connect(&paths.socket).await.unwrap();
+    let (session, _ticket) = host_session(&client1).await;
+    publish_envelope(&client1, session).await;
+    drop(client1);
+    daemon1.stop().await;
+
+    // Incarnation 2: resume; the envelope must come back from disk.
+    let daemon2 = common::spawn_local_daemon_at(&paths).await;
+    let client2 = Client::connect(&paths.socket).await.unwrap();
+    match client2
+        .request(Request::HostSession {
+            display_name: "alice".into(),
+            session: Some(session),
+        })
+        .await
+        .unwrap()
+    {
+        Response::HostSession { session: id, .. } => assert_eq!(id, session),
+        other => panic!("expected HostSession resume, got {other:?}"),
+    }
+    client2
+        .request(Request::Subscribe {
+            session,
+            since: None,
+        })
+        .await
+        .unwrap();
+    let mut events = client2.take_events().await.expect("events");
+    expect_ticket_message(&mut events, "host (post-restart, byte-stable)").await;
+
+    drop(events);
+    drop(client2);
+    daemon2.stop().await;
+}
+
+// =============================================================
 // IPC authority: PublishWorkspaceTicket is host-only — a joiner's
 // daemon (Remote mirror) refuses with NotHost.
 // =============================================================
