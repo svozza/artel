@@ -717,18 +717,61 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path, label: &str) -> io::Re
         .map_err(|e| io::Error::new(ErrorKind::InvalidData, format!("{label} json: {e}")))
 }
 
+/// On-disk envelope for the ticket ledger — same idiom as [`Meta`]:
+/// a schema version of its own, kept distinct from the wire
+/// [`TicketEntry`] shape so the two can evolve independently and a
+/// future daemon's ledger reads as explicit schema skew, not as
+/// corruption or (worse) an empty ledger.
+#[derive(Debug, Serialize, Deserialize)]
+struct TicketsFile {
+    /// Schema version for forward-compat. Increment on incompatible
+    /// changes.
+    version: u32,
+    entries: Vec<TicketEntry>,
+}
+
+impl TicketsFile {
+    /// On-disk schema version for `tickets.json`. `1` is the
+    /// versioned-envelope cutover (ticket-revocation slice shipped a
+    /// bare `Vec<TicketEntry>` for a few days; no released build wrote
+    /// that shape).
+    const CURRENT_VERSION: u32 = 1;
+}
+
 /// Atomic full rewrite of the ticket ledger.
 fn write_tickets(path: &Path, tickets: &[TicketEntry]) -> io::Result<()> {
-    write_json_atomic(path, &tickets, "tickets")
+    /// Write-side view of [`TicketsFile`] — borrows the entries so a
+    /// ledger rewrite doesn't clone the whole Vec just to serialize.
+    #[derive(Serialize)]
+    struct TicketsFileRef<'a> {
+        version: u32,
+        entries: &'a [TicketEntry],
+    }
+    let doc = TicketsFileRef {
+        version: TicketsFile::CURRENT_VERSION,
+        entries: tickets,
+    };
+    write_json_atomic(path, &doc, "tickets")
 }
 
 /// Read the ticket ledger sidecar. Absent ⇒ empty (see `load_one` for
 /// why corrupt ≠ absent).
 fn read_tickets(path: &Path) -> io::Result<Vec<TicketEntry>> {
-    match read_json(path, "tickets") {
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(Vec::new()),
-        other => other,
+    let doc: TicketsFile = match read_json(path, "tickets") {
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        other => other?,
+    };
+    if doc.version != TicketsFile::CURRENT_VERSION {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "unsupported tickets version {} (expected {})",
+                doc.version,
+                TicketsFile::CURRENT_VERSION
+            ),
+        ));
     }
+    Ok(doc.entries)
 }
 
 fn write_meta(path: &Path, meta: &Meta) -> io::Result<()> {
@@ -1185,6 +1228,56 @@ mod tests {
         let loaded = store.load_all().await.unwrap();
         assert_eq!(loaded.len(), 1);
         assert!(loaded[0].tickets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tickets_file_is_version_enveloped() {
+        use artel_protocol::TicketStatus;
+        // The ledger sidecar follows the Meta idiom: a versioned
+        // envelope, not a bare serialization of the wire TicketEntry
+        // type — so disk-schema skew is distinguishable from
+        // corruption and the wire shape can evolve independently.
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+        store
+            .put_tickets(record(1).id, &[entry(1, TicketStatus::Active)])
+            .await
+            .unwrap();
+
+        let raw = std::fs::read(dir.path().join(record(1).id.to_string()).join(TICKETS_FILE))
+            .unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(
+            doc.get("version").and_then(serde_json::Value::as_u64),
+            Some(u64::from(TicketsFile::CURRENT_VERSION)),
+            "tickets.json must carry a schema version",
+        );
+        assert!(
+            doc.get("entries").is_some_and(serde_json::Value::is_array),
+            "ledger entries must live under an envelope key",
+        );
+    }
+
+    #[tokio::test]
+    async fn tickets_file_with_unsupported_version_fails_load() {
+        // A future-daemon ledger (or a corrupted version field) is
+        // schema skew, not silently-empty: the load must fail the
+        // same way corruption does, naming the version.
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+        std::fs::write(
+            dir.path().join(record(1).id.to_string()).join(TICKETS_FILE),
+            br#"{"version": 99, "entries": []}"#,
+        )
+        .unwrap();
+
+        let loaded = store.load_all().await.unwrap();
+        assert!(
+            loaded.is_empty(),
+            "unsupported ledger schema version must fail the session load"
+        );
     }
 
     #[tokio::test]
