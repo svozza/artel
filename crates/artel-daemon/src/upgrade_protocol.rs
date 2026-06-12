@@ -1,11 +1,11 @@
-//! Receiving side of the direct-stream upgrade protocol.
+//! Receiving side of the direct-stream delivery protocol.
 //!
-//! The host daemon sends an [`UpgradeFrame`] over a dedicated QUIC
+//! The host daemon sends a [`DeliveryFrame`] over a dedicated QUIC
 //! stream (ALPN [`UPGRADE_ALPN`]). This module implements the
 //! [`ProtocolHandler`] that accepts such connections, validates the
-//! frame, emits a synthetic [`Event::Message`] into the session's
-//! broadcast channel (so the existing `cap_listener` picks it up),
-//! and returns a 1-byte ACK.
+//! frame, dispatches by payload kind — `Secret` → the session's
+//! upgrade event, `WorkspaceTicket` → persist + synthetic
+//! `TICKET_ACTION` System message — and returns a 1-byte ACK.
 
 // Crate-private module: pair `unreachable_pub` with the
 // crate-visibility lint so they stop fighting (see memory).
@@ -14,12 +14,19 @@
 use std::sync::Arc;
 
 use artel_protocol::PeerId;
-use artel_protocol::upgrade::{UPGRADE_ACK, UPGRADE_ALPN, UpgradeFrame};
+use artel_protocol::upgrade::{DeliveryFrame, UPGRADE_ACK, UPGRADE_ALPN};
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use tracing::warn;
 
 use crate::session::Registry;
+
+/// Read cap on an inbound delivery frame. Raised from the
+/// secret-only 1 KiB when `WorkspaceTicket` joined the channel —
+/// envelopes carry user-authored `PathRules` globs. A frame larger
+/// than this is misconfiguration or attack; reject before
+/// allocating.
+const MAX_DELIVERY_FRAME: usize = 64 * 1024;
 
 /// Protocol handler registered on the daemon's [`iroh::protocol::Router`]
 /// under [`UPGRADE_ALPN`]. Accepts inbound direct-stream upgrade
@@ -58,13 +65,11 @@ impl ProtocolHandler for UpgradeProtocol {
         })?;
         let len = u32::from_le_bytes(len_buf) as usize;
 
-        // Sanity cap: an UpgradeFrame is ~48 bytes; reject anything
-        // unreasonably large to avoid allocating on attacker input.
-        if len > 1024 {
+        if len > MAX_DELIVERY_FRAME {
             warn!(len, "upgrade_protocol: frame length exceeds cap");
             return Err(AcceptError::from_err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "upgrade frame too large",
+                "delivery frame too large",
             )));
         }
 
@@ -74,27 +79,39 @@ impl ProtocolHandler for UpgradeProtocol {
             AcceptError::from_err(std::io::Error::other(e.to_string()))
         })?;
 
-        let frame: UpgradeFrame = postcard::from_bytes(&buf).map_err(|e| {
-            warn!(error = %e, "upgrade_protocol: failed to decode UpgradeFrame");
+        let frame: DeliveryFrame = postcard::from_bytes(&buf).map_err(|e| {
+            warn!(error = %e, "upgrade_protocol: failed to decode DeliveryFrame");
             AcceptError::from_err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 e.to_string(),
             ))
         })?;
 
-        // Emit the upgrade into the session's event channel. The
-        // registry validates that the session exists, is Remote, and
-        // that remote_peer is the host.
-        self.registry
-            .emit_upgrade(frame.session_id, remote_peer, frame.namespace_secret)
-            .await
-            .map_err(|e| {
-                warn!(error = %e, session = %frame.session_id, "upgrade_protocol: emit_upgrade rejected");
-                AcceptError::from_err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    e.to_string(),
-                ))
-            })?;
+        // Dispatch into the registry, which validates that the
+        // session exists, is Remote, and that remote_peer is the
+        // session's host — for both payload kinds.
+        let result = match frame {
+            DeliveryFrame::Secret(upgrade) => {
+                self.registry
+                    .emit_upgrade(upgrade.session_id, remote_peer, upgrade.namespace_secret)
+                    .await
+            }
+            DeliveryFrame::WorkspaceTicket {
+                session_id,
+                envelope_bytes,
+            } => {
+                self.registry
+                    .emit_workspace_ticket(session_id, remote_peer, envelope_bytes)
+                    .await
+            }
+        };
+        result.map_err(|e| {
+            warn!(error = %e, "upgrade_protocol: delivery rejected");
+            AcceptError::from_err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                e.to_string(),
+            ))
+        })?;
 
         // ACK: single byte back to the host.
         send.write_all(&[UPGRADE_ACK]).await.map_err(|e| {

@@ -845,6 +845,16 @@ async fn handle_inbound_frame(
         // `ensure_member` is idempotent, so a duplicate announcement
         // (or one that races with the lazy-admission path inside
         // run_host_send) is harmless.
+        //
+        // On success, immediately replay the backlog for the freshly
+        // admitted (or re-announcing) peer. With `Replay` now
+        // membership-gated, the joiner's own post-announce `Replay`
+        // can race its admission and be dropped — this
+        // admission-triggered replay closes that race structurally:
+        // the new member always needs the backlog, so the host serves
+        // it the moment admission lands, no joiner retries, no
+        // timers. Re-announces re-serve the backlog too; the joiner
+        // mirror dedups by seq.
         (
             SessionRole::Host,
             GossipBody::JoinAnnouncement {
@@ -867,10 +877,11 @@ async fn handle_inbound_frame(
                 cap_sig,
             };
             let registry_weak = bridge.registry.lock().await.clone();
-            if let Some(registry) = registry_weak.upgrade()
-                && let Err(err) = registry.ensure_member(session, peer, Some(cap_claim)).await
-            {
-                warn!(?err, "join_announcement: ensure_member failed");
+            if let Some(registry) = registry_weak.upgrade() {
+                match registry.ensure_member(session, peer, Some(cap_claim)).await {
+                    Ok(()) => run_host_replay(bridge, session, Seq::ZERO).await,
+                    Err(err) => warn!(?err, "join_announcement: ensure_member failed"),
+                }
             }
         }
         // Joiner receives the host's "I am closing this session"
@@ -924,12 +935,34 @@ async fn handle_inbound_frame(
                 warn!(?err, "session_closed: host_closed_session failed");
             }
         }
-        // Host receives a joiner's `Replay` request — fetch the
-        // log entries with seq > since and re-broadcast each as
-        // a `Message` frame. Other joiners on the topic see the
-        // replay traffic too and dedup-skip it; that's wasteful
-        // but correct (see `GossipBody::Replay` doc-comment).
+        // Host receives a `Replay` request — fetch the log entries
+        // with seq > since and re-broadcast each as a `Message`
+        // frame. Membership-gated (revoked-lurker fix): the topic
+        // subscription is unauthenticated, so an un-admitted bearer
+        // of a revoked/expired ticket can publish a `Replay` — it
+        // must get nothing. `delivered_from` is the trustworthy id
+        // (same L1 topology assumption as `drop_if_spoofed`: in the
+        // star topology the host hears joiners directly). A fresh
+        // joiner whose admission is still in flight is covered by
+        // the admission-triggered replay in the JoinAnnouncement arm
+        // above; this arm serves the already-member resubscribe.
+        // Other members on the topic see the replay traffic too and
+        // dedup-skip it; that's wasteful but correct (see
+        // `GossipBody::Replay` doc-comment).
         (SessionRole::Host, GossipBody::Replay { since }) => {
+            let requester = PeerId::from_bytes(*delivered_from.as_bytes());
+            let registry_weak = bridge.registry.lock().await.clone();
+            let Some(registry) = registry_weak.upgrade() else {
+                return;
+            };
+            if registry.is_member(session, requester).await != Some(true) {
+                warn!(
+                    ?session,
+                    peer = %requester,
+                    "dropping Replay from non-member",
+                );
+                return;
+            }
             track_authenticated_peer(bridge, delivered_from);
             run_host_replay(bridge, session, since).await;
         }

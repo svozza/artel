@@ -65,6 +65,15 @@ pub const SIGNATURE_UNSIGNED: SigBytes = [0u8; 64];
 /// and the FS layer's publisher/consumer must agree on this value.
 pub const UPGRADE_ACTION: &str = "workspace.upgrade";
 
+/// Action string for the FS-layer workspace-ticket message that
+/// delivers the read-capability `WorkspaceTicketEnvelope` to joiners
+/// (revoked-lurker fix). The daemon stamps it on the synthetic System
+/// message it injects from the unicast-delivered envelope (live on
+/// receipt + replayed on `Subscribe`), and filters it out of every
+/// log-derived surface so a peer-authored broadcast with this action
+/// is inert. The FS layer's `wait_for_ticket` matches on it.
+pub const TICKET_ACTION: &str = "workspace.ticket";
+
 /// Identity of the peer that authored a message.
 ///
 /// Includes a human-readable display name distinct from the cryptographic

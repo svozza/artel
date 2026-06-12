@@ -40,7 +40,7 @@ use crate::store::{DynStore, SessionKind, SessionRecord, StoredAttachment};
 /// one slow subscriber.
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
-use artel_protocol::UPGRADE_ACTION;
+use artel_protocol::{TICKET_ACTION, UPGRADE_ACTION};
 
 /// Wall-clock millis since the Unix epoch. The `Local` arm of
 /// [`Authoring`] stamps this onto every body it signs.
@@ -1439,6 +1439,8 @@ impl Registry {
                 .ok_or(SessionError::UnknownSession(session))?
         };
         let session_kind;
+        let newly_admitted;
+        let workspace_ticket;
         {
             let mut s = session_arc.lock().await;
             // Issued-only ledger gate (revocation slice), after expiry
@@ -1450,58 +1452,68 @@ impl Registry {
             {
                 return Err(SessionError::TicketNotAdmissible);
             }
-            if s.members.contains(&peer.id) {
-                return Ok(());
-            }
             session_kind = s.kind;
-            // Persist before mutating in-memory state — same shape as
-            // `Registry::join`. If the store fails, the registry stays
-            // consistent with disk.
-            self.store
-                .add_member(session, &peer)
-                .await
-                .map_err(SessionError::Storage)?;
-            s.members.insert(peer.id);
-            // Record the admission on the ticket's ledger entry
-            // (advisory `used_by` metadata — names peers an operator
-            // may also want to cap-revoke after revoking a used
-            // ticket). Persist failure must NOT fail the admission:
-            // membership is already durable, and used_by is a hint,
-            // not a gate.
-            if let Some(ref claim) = cap_claim
-                && session_kind == SessionKind::Local
-                && let Some(entry) = s
-                    .tickets
-                    .iter_mut()
-                    .find(|t| t.ticket_id == claim.ticket_id)
-                && !entry.used_by.contains(&peer.id)
-            {
-                entry.used_by.push(peer.id);
-                let tickets = s.tickets.clone();
-                if let Err(err) = self.store.put_tickets(session, &tickets).await {
-                    tracing::warn!(?session, ?err, "persisting used_by failed (advisory)");
+            // Snapshot for the post-admission envelope delivery
+            // (revoked-lurker fix) — taken for both the fresh and the
+            // re-announce path: a joiner whose local state was wiped
+            // re-announces while still in our member set and needs the
+            // envelope re-delivered (its receive path is idempotent).
+            workspace_ticket = s.workspace_ticket.clone();
+            if s.members.contains(&peer.id) {
+                newly_admitted = false;
+            } else {
+                newly_admitted = true;
+                // Persist before mutating in-memory state — same shape as
+                // `Registry::join`. If the store fails, the registry stays
+                // consistent with disk.
+                self.store
+                    .add_member(session, &peer)
+                    .await
+                    .map_err(SessionError::Storage)?;
+                s.members.insert(peer.id);
+                // Record the admission on the ticket's ledger entry
+                // (advisory `used_by` metadata — names peers an operator
+                // may also want to cap-revoke after revoking a used
+                // ticket). Persist failure must NOT fail the admission:
+                // membership is already durable, and used_by is a hint,
+                // not a gate.
+                if let Some(ref claim) = cap_claim
+                    && session_kind == SessionKind::Local
+                    && let Some(entry) = s
+                        .tickets
+                        .iter_mut()
+                        .find(|t| t.ticket_id == claim.ticket_id)
+                    && !entry.used_by.contains(&peer.id)
+                {
+                    entry.used_by.push(peer.id);
+                    let tickets = s.tickets.clone();
+                    if let Err(err) = self.store.put_tickets(session, &tickets).await {
+                        tracing::warn!(?session, ?err, "persisting used_by failed (advisory)");
+                    }
                 }
+                let events_tx = s.events_tx.clone();
+                // Drop the session guard BEFORE the PeerJoined send and,
+                // crucially, before the auto-grant `Registry::send` below —
+                // `send` re-acquires this same per-session lock, so holding
+                // it here would deadlock. Mirrors the existing drop(s)
+                // discipline. (Auth Slice C, the one non-obvious hazard.)
+                drop(s);
+                let _ = events_tx.send(Event::PeerJoined {
+                    session,
+                    peer: peer.clone(),
+                });
             }
-            let events_tx = s.events_tx.clone();
-            // Drop the session guard BEFORE the PeerJoined send and,
-            // crucially, before the auto-grant `Registry::send` below —
-            // `send` re-acquires this same per-session lock, so holding
-            // it here would deadlock. Mirrors the existing drop(s)
-            // discipline. (Auth Slice C, the one non-obvious hazard.)
-            drop(s);
-            let _ = events_tx.send(Event::PeerJoined {
-                session,
-                peer: peer.clone(),
-            });
         }
 
         // Auto-grant on join (Auth Slice C / L2): grant the capability
         // tier the ticket claims (or RW if no claim is present — the
         // `SendRequest` backstop path for pre-tiered-ticket joiners).
-        // Emit only for a `Local` session — we are its host. See the
-        // original comment block in the pre-tiered version for the full
-        // rationale re: HOST-PRIVATE (D3) delivery.
-        if session_kind == SessionKind::Local {
+        // Emit only for a `Local` session — we are its host, and only
+        // on a fresh admission — re-announces must not spam the cap
+        // log with duplicate grants. See the original comment block in
+        // the pre-tiered version for the full rationale re:
+        // HOST-PRIVATE (D3) delivery.
+        if session_kind == SessionKind::Local && newly_admitted {
             let granted_cap = cap_claim
                 .as_ref()
                 .map_or(Capability::ReadWrite, |c| c.granted_cap);
@@ -1526,6 +1538,33 @@ impl Registry {
                     peer = %peer.id,
                     ?err,
                     "auto-grant on join failed",
+                );
+            }
+        }
+
+        // Workspace ticket delivery at admission (revoked-lurker
+        // fix): a peer the host just admitted (or re-admitted via
+        // re-announce) gets the persisted envelope over the direct
+        // stream. This trigger — not a joiner-side retry or timer —
+        // is what closes the publish-before-admission race: the
+        // moment a peer becomes a member, the host backfills it.
+        // Best-effort: a failed dial is covered by the peer's next
+        // re-announce.
+        if session_kind == SessionKind::Local
+            && peer.id != self.daemon_peer_id
+            && let Some(envelope_bytes) = workspace_ticket
+            && let Some(endpoint) = self.endpoint()
+        {
+            let frame = artel_protocol::upgrade::DeliveryFrame::WorkspaceTicket {
+                session_id: session,
+                envelope_bytes,
+            };
+            if let Err(err) = crate::server::deliver_frame(endpoint, peer.id, &frame).await {
+                tracing::warn!(
+                    ?session,
+                    peer = %peer.id,
+                    %err,
+                    "workspace ticket delivery at admission failed",
                 );
             }
         }
@@ -2085,6 +2124,17 @@ impl Registry {
 
     /// Subscribe to live events for `session`, optionally backfilling
     /// every message with `seq > since` first.
+    ///
+    /// When the session holds a persisted workspace ticket envelope
+    /// (revoked-lurker fix), a synthetic `TICKET_ACTION` System
+    /// message reconstructed from it is **prepended** to the replay
+    /// set — this is what makes late attach and joiner-daemon restart
+    /// work (`Workspace::join_with` issues `Subscribe { since: None }`
+    /// and drains for `TICKET_ACTION`; the live unicast may have
+    /// happened before the workspace attached). IPC-subscribe only:
+    /// the envelope never enters [`Self::log_since`] (the gossip
+    /// replay surface) — re-broadcasting the capability on the topic
+    /// is exactly the leak this slice closes.
     pub async fn subscribe(
         &self,
         session: SessionId,
@@ -2100,8 +2150,11 @@ impl Registry {
 
         let s = session_arc.lock().await;
         let cutoff = since.unwrap_or(Seq::ZERO);
-        let replay: Vec<SessionMessage> =
-            s.log.iter().filter(|m| m.seq > cutoff).cloned().collect();
+        let mut replay: Vec<SessionMessage> = Vec::with_capacity(s.log.len() + 1);
+        if let Some(envelope) = &s.workspace_ticket {
+            replay.push(synthetic_ticket_message(s.host, envelope.clone()));
+        }
+        replay.extend(s.log.iter().filter(|m| m.seq > cutoff).cloned());
         let events = s.events_tx.subscribe();
         drop(s);
         Ok(Subscription { replay, events })
@@ -2191,6 +2244,162 @@ impl Registry {
 
         Ok(())
     }
+
+    /// Accept a workspace ticket envelope delivered host→peer over
+    /// the direct stream (revoked-lurker fix): persist it on the
+    /// mirror record, then emit a **live** synthetic `TICKET_ACTION`
+    /// System message — the same construction [`Self::emit_upgrade`]
+    /// uses for `UPGRADE_ACTION`, but persisted, so [`Self::subscribe`]
+    /// also replays it (late attach / joiner restart).
+    ///
+    /// Validates like `emit_upgrade`:
+    /// - Session exists locally.
+    /// - Session is `Remote` (we are a joiner, not the host).
+    /// - `sender_peer` matches the session's host.
+    ///
+    /// Idempotent on a re-delivery of identical bytes (admission
+    /// redelivery, leave-then-rejoin): the persist and the re-emit
+    /// are both skipped, so the joiner's event stream isn't spammed.
+    #[cfg(feature = "iroh")]
+    pub(crate) async fn emit_workspace_ticket(
+        &self,
+        session: SessionId,
+        sender_peer: PeerId,
+        envelope_bytes: Vec<u8>,
+    ) -> Result<(), SessionError> {
+        let session_arc = {
+            let guard = self.sessions.read().await;
+            guard
+                .get(&session)
+                .cloned()
+                .ok_or(SessionError::UnknownSession(session))?
+        };
+
+        let mut s = session_arc.lock().await;
+
+        if s.kind != SessionKind::Remote {
+            return Err(SessionError::Internal(
+                "host sessions cannot receive workspace tickets".into(),
+            ));
+        }
+
+        if sender_peer != s.host {
+            return Err(SessionError::Internal(format!(
+                "workspace ticket sender {sender_peer} is not the session host {}",
+                s.host,
+            )));
+        }
+
+        if s.workspace_ticket.as_deref() == Some(envelope_bytes.as_slice()) {
+            // Identical re-delivery; already persisted and already
+            // surfaced (live or via Subscribe replay). Ack quietly.
+            return Ok(());
+        }
+
+        // Store-before-memory, holding the per-session lock across
+        // the write like every other record mutation.
+        self.store
+            .put_workspace_ticket(session, &envelope_bytes)
+            .await
+            .map_err(SessionError::Storage)?;
+        s.workspace_ticket = Some(envelope_bytes.clone());
+
+        let message = synthetic_ticket_message(s.host, envelope_bytes);
+        let events_tx = s.events_tx.clone();
+        drop(s);
+
+        // Best-effort: if no subscribers are listening (workspace
+        // not attached yet), the persisted copy serves them on their
+        // eventual Subscribe.
+        let _ = events_tx.send(Event::Message { session, message });
+
+        Ok(())
+    }
+
+    /// Persist the host workspace's ticket envelope and deliver it to
+    /// every current member over the direct stream (revoked-lurker
+    /// fix, host side). `Local`-only — a mirror returns `NotHost`.
+    ///
+    /// Per-member delivery is best-effort (warn on failure): an
+    /// offline member is covered by admission-redelivery the moment
+    /// its re-announce runs [`Self::ensure_member`].
+    #[cfg(feature = "iroh")]
+    pub(crate) async fn publish_workspace_ticket(
+        &self,
+        session: SessionId,
+        envelope_bytes: Vec<u8>,
+    ) -> Result<(), SessionError> {
+        let members = {
+            let mut s = self.lock_local_session(session).await?;
+            // Store-before-memory under the session lock.
+            self.store
+                .put_workspace_ticket(session, &envelope_bytes)
+                .await
+                .map_err(SessionError::Storage)?;
+            s.workspace_ticket = Some(envelope_bytes.clone());
+            let members: Vec<PeerId> = s.members.iter().copied().collect();
+            drop(s);
+            members
+        };
+
+        let Some(endpoint) = self.endpoint() else {
+            // No iroh runtime (unit tests): persisted, nothing to
+            // deliver over the wire.
+            return Ok(());
+        };
+        let frame = artel_protocol::upgrade::DeliveryFrame::WorkspaceTicket {
+            session_id: session,
+            envelope_bytes,
+        };
+        for member in members {
+            if member == self.daemon_peer_id {
+                continue;
+            }
+            if let Err(err) = crate::server::deliver_frame(endpoint, member, &frame).await {
+                tracing::warn!(
+                    ?session,
+                    peer = %member,
+                    %err,
+                    "workspace ticket delivery failed; admission redelivery covers re-announce",
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `peer` is currently a member of `session`. `None` if
+    /// the session is unknown. Read-only accessor for the gossip
+    /// bridge's membership-gated `Replay` (mirrors
+    /// [`Self::is_local_session`]'s lock discipline).
+    #[cfg(feature = "iroh")]
+    pub(crate) async fn is_member(&self, session: SessionId, peer: PeerId) -> Option<bool> {
+        let session_arc = {
+            let guard = self.sessions.read().await;
+            guard.get(&session)?.clone()
+        };
+        let s = session_arc.lock().await;
+        Some(s.members.contains(&peer))
+    }
+}
+
+/// Build the synthetic `TICKET_ACTION` System message that surfaces a
+/// unicast-delivered workspace ticket envelope to the IPC subscriber.
+/// Host-stamped (`PeerInfo::new(host, "host")` — `wait_for_ticket`
+/// reads `message.peer.id` as the host's daemon id), `Seq::ZERO`,
+/// unsigned: it is not a log entry, exists only on the IPC surface,
+/// and must never ride the gossip topic. Shared by the live emit
+/// (`emit_workspace_ticket`) and the `Subscribe` replay injection.
+fn synthetic_ticket_message(host: PeerId, envelope_bytes: Vec<u8>) -> SessionMessage {
+    SessionMessage::new(
+        Seq::ZERO,
+        0,
+        PeerInfo::new(host, "host"),
+        MessageKind::System,
+        TICKET_ACTION,
+        envelope_bytes,
+        SIGNATURE_UNSIGNED,
+        SIGNATURE_UNSIGNED,
+    )
 }
 
 /// Parse an artel join ticket. Phase 2b: returns the session id; the
@@ -4415,6 +4624,259 @@ mod tests {
         let messages = r.log_since(id, Seq::ZERO).await.unwrap();
         let actions: Vec<&str> = messages.iter().map(|m| m.action.as_str()).collect();
         assert_eq!(actions, vec!["hello", "world"]);
+    }
+
+    // ---- workspace ticket: emit (joiner side) ----
+
+    /// Remote-kind mirror registry: store pre-seeded with a Remote
+    /// record, no bridge. Returns (registry, session_id, host_peer).
+    #[cfg(feature = "iroh")]
+    async fn remote_mirror_registry() -> (Registry, SessionId, PeerInfo) {
+        let daemon_peer = PeerId::from_bytes([7; 32]);
+        let remote_host = peer(1, "alice");
+        let session_id = SessionId::from_bytes([0xaa; 16]);
+        let me = peer(2, "bob");
+
+        let store = Arc::new(crate::store::MemoryStore::new());
+        let record = SessionRecord {
+            id: session_id,
+            host: remote_host.id,
+            members: HashSet::from([remote_host.id, me.id]),
+            head: Seq::ZERO,
+            log: Vec::new(),
+            kind: SessionKind::Remote,
+            host_epoch: 0,
+            tickets: Vec::new(),
+            workspace_ticket: None,
+        };
+        store.create(&record).await.unwrap();
+
+        let r = Registry::load(
+            daemon_peer,
+            WireEndpointAddr::id_only(daemon_peer),
+            store,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        (r, session_id, remote_host)
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn emit_workspace_ticket_persists_and_emits_live() {
+        let (r, session_id, remote_host) = remote_mirror_registry().await;
+        let mut sub = r.subscribe(session_id, None).await.unwrap();
+        assert!(sub.replay.is_empty(), "no envelope yet");
+
+        let envelope = vec![0xEE; 128];
+        r.emit_workspace_ticket(session_id, remote_host.id, envelope.clone())
+            .await
+            .unwrap();
+
+        // Live event arrives on the pre-existing subscription.
+        let ev = timeout(Duration::from_secs(1), sub.events.recv())
+            .await
+            .expect("live event in time")
+            .expect("channel open");
+        match ev {
+            Event::Message { message, .. } => {
+                assert_eq!(message.kind, MessageKind::System);
+                assert_eq!(message.action, TICKET_ACTION);
+                assert_eq!(message.payload, envelope);
+                assert_eq!(message.peer.id, remote_host.id, "host-stamped");
+                assert_eq!(message.seq, Seq::ZERO);
+            }
+            other => panic!("expected Message, got {other:?}"),
+        }
+
+        // Persisted: a fresh Subscribe replays the envelope first.
+        let sub2 = r.subscribe(session_id, None).await.unwrap();
+        assert_eq!(sub2.replay.len(), 1);
+        assert_eq!(sub2.replay[0].action, TICKET_ACTION);
+        assert_eq!(sub2.replay[0].payload, envelope);
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn emit_workspace_ticket_rejects_non_host_sender() {
+        let (r, session_id, _remote_host) = remote_mirror_registry().await;
+        let imposter = peer(9, "mallory");
+        let err = r
+            .emit_workspace_ticket(session_id, imposter.id, vec![1, 2, 3])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, SessionError::Internal(msg) if msg.contains("not the session host")),
+            "got {err:?}",
+        );
+        // Nothing persisted.
+        let sub = r.subscribe(session_id, None).await.unwrap();
+        assert!(sub.replay.is_empty());
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn emit_workspace_ticket_rejects_local_session() {
+        let r = registry();
+        let host = peer(1, "alice");
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
+        let err = r
+            .emit_workspace_ticket(id, host.id, vec![1])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, SessionError::Internal(msg) if msg.contains("host sessions")),
+            "got {err:?}",
+        );
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn emit_workspace_ticket_unknown_session_errors() {
+        let (r, _session_id, remote_host) = remote_mirror_registry().await;
+        let bogus = SessionId::new_random();
+        let err = r
+            .emit_workspace_ticket(bogus, remote_host.id, vec![1])
+            .await
+            .unwrap_err();
+        assert_eq!(err, SessionError::UnknownSession(bogus));
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn emit_workspace_ticket_identical_redelivery_is_idempotent() {
+        let (r, session_id, remote_host) = remote_mirror_registry().await;
+        let envelope = vec![0xEE; 64];
+        r.emit_workspace_ticket(session_id, remote_host.id, envelope.clone())
+            .await
+            .unwrap();
+
+        // Re-delivery of identical bytes: no second live emit.
+        let mut sub = r.subscribe(session_id, None).await.unwrap();
+        assert_eq!(sub.replay.len(), 1, "one replayed envelope");
+        r.emit_workspace_ticket(session_id, remote_host.id, envelope.clone())
+            .await
+            .unwrap();
+        let second = timeout(Duration::from_millis(300), sub.events.recv()).await;
+        assert!(
+            second.is_err(),
+            "identical re-delivery must not re-emit: {second:?}",
+        );
+
+        // Changed bytes DO re-persist + re-emit (host re-published a
+        // genuinely different envelope).
+        let envelope2 = vec![0xDD; 64];
+        r.emit_workspace_ticket(session_id, remote_host.id, envelope2.clone())
+            .await
+            .unwrap();
+        let ev = timeout(Duration::from_secs(1), sub.events.recv())
+            .await
+            .expect("changed envelope re-emits")
+            .expect("channel open");
+        match ev {
+            Event::Message { message, .. } => assert_eq!(message.payload, envelope2),
+            other => panic!("expected Message, got {other:?}"),
+        }
+    }
+
+    // ---- workspace ticket: subscribe replay injection ----
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn subscribe_replays_persisted_envelope_before_log() {
+        // The synthetic ticket message must be FIRST in the replay
+        // set so a draining joiner can't give up before reaching it.
+        let r = registry();
+        let host = peer(1, "alice");
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
+        r.send(
+            id,
+            host.clone(),
+            MessageKind::Chat,
+            "chatter".into(),
+            vec![],
+            Authoring::Local,
+        )
+        .await
+        .unwrap();
+
+        r.publish_workspace_ticket(id, vec![0xAB; 32]).await.unwrap();
+
+        let sub = r.subscribe(id, None).await.unwrap();
+        let actions: Vec<&str> = sub.replay.iter().map(|m| m.action.as_str()).collect();
+        assert_eq!(actions, vec![TICKET_ACTION, "chatter"]);
+        assert_eq!(sub.replay[0].payload, vec![0xAB; 32]);
+        assert_eq!(sub.replay[0].peer.id, host.id, "host-stamped");
+    }
+
+    #[tokio::test]
+    async fn subscribe_without_envelope_has_no_ticket_message() {
+        let r = registry();
+        let host = peer(1, "alice");
+        let (id, _) = r.host_rw(host, None).await.unwrap();
+        let sub = r.subscribe(id, None).await.unwrap();
+        assert!(
+            !sub.replay.iter().any(|m| m.action == TICKET_ACTION),
+            "no envelope persisted ⇒ no synthetic ticket message",
+        );
+    }
+
+    // ---- workspace ticket: publish (host side) ----
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn publish_workspace_ticket_is_local_only() {
+        let (r, session_id, _host) = remote_mirror_registry().await;
+        let err = r
+            .publish_workspace_ticket(session_id, vec![1])
+            .await
+            .unwrap_err();
+        assert_eq!(err, SessionError::NotHost);
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn publish_workspace_ticket_unknown_session_errors() {
+        let r = registry();
+        let bogus = SessionId::new_random();
+        let err = r
+            .publish_workspace_ticket(bogus, vec![1])
+            .await
+            .unwrap_err();
+        assert_eq!(err, SessionError::UnknownSession(bogus));
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn publish_workspace_ticket_persists_on_host_record() {
+        let r = registry();
+        let host = peer(1, "alice");
+        let (id, _) = r.host_rw(host, None).await.unwrap();
+        r.publish_workspace_ticket(id, vec![0xCD; 48]).await.unwrap();
+        // Round-trips through the record (restart shape).
+        let sub = r.subscribe(id, None).await.unwrap();
+        assert_eq!(sub.replay[0].action, TICKET_ACTION);
+        assert_eq!(sub.replay[0].payload, vec![0xCD; 48]);
+    }
+
+    // ---- is_member accessor ----
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn is_member_reflects_membership() {
+        let r = registry();
+        let host = peer(1, "alice");
+        let outsider = peer(9, "mallory");
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
+        assert_eq!(r.is_member(id, host.id).await, Some(true));
+        assert_eq!(r.is_member(id, outsider.id).await, Some(false));
+        assert_eq!(
+            r.is_member(SessionId::new_random(), host.id).await,
+            None,
+        );
     }
 
     #[cfg(feature = "iroh")]

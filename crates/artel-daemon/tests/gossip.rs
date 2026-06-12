@@ -914,16 +914,17 @@ async fn joiner_replays_messages_sent_before_join() {
 // its incoming gossip messages to disk so a daemon restart at the
 // same `state_dir` can replay them via `Subscribe { since: None }`.
 //
-// Real-world consequence the test pins:
-// `artel-fs::Workspace::join_with` waits for the host's
-// `workspace.ticket` System message via `wait_for_ticket`. On a
-// joiner-side daemon restart that wait hangs forever without
-// persistence; with it, the message replays from disk and the
-// workspace stands up cleanly.
+// The fixture action is a neutral System verb on purpose: the
+// historical `workspace.ticket` fixture is now suppressed on every
+// joiner-visible surface (revoked-lurker fix — the envelope rides
+// the host→peer unicast, never the log), and the workspace-ticket
+// restart story is pinned by its own persistence path
+// (`workspace-ticket.bin` + the artel-fs joiner-restart test). This
+// test pins the general log persistence contract.
 // =============================================================
 
-const SYSTEM_PAYLOAD: &[u8] = b"workspace-ticket-fixture-bytes";
-const SYSTEM_ACTION: &str = "workspace.ticket";
+const SYSTEM_PAYLOAD: &[u8] = b"system-fixture-bytes";
+const SYSTEM_ACTION: &str = "workspace.fixture";
 
 // `used_underscore_binding`: rebuild a fresh `State` from
 // `RunningDaemon._state` to give the second daemon the same on-disk
@@ -971,8 +972,7 @@ async fn joiner_replays_system_message_after_daemon_restart() {
         .unwrap();
     let mut bob_events_1 = bob_client_1.take_events().await.expect("events");
 
-    // Alice sends the System message (the fixture for what `artel-fs`
-    // would publish as `workspace.ticket`).
+    // Alice sends the System fixture message.
     alice_client
         .request(Request::Send {
             session: session_id,
