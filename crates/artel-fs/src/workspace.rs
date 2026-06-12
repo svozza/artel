@@ -60,11 +60,12 @@ use crate::ticket::{self, WorkspaceTicketEnvelope};
 const POLICY_OFFENDING_LIMIT: usize = 5;
 
 /// Action stamped on the synthetic `MessageKind::System`
-/// ticket-handout message the joiner's daemon injects from the
-/// unicast-delivered envelope. Joiners filter on this to find the
-/// ticket inside the session's event stream. Re-exported from
-/// `artel-protocol` so the daemon's injector and this consumer can't
-/// drift.
+/// ticket-handout message.
+///
+/// The joiner's daemon injects it from the unicast-delivered
+/// envelope; joiners filter on this to find the ticket inside the
+/// session's event stream. Re-exported from `artel-protocol` so the
+/// daemon's injector and this consumer can't drift.
 pub const TICKET_ACTION: &str = artel_protocol::TICKET_ACTION;
 
 /// Action stamped on the `MessageKind::System` message a joiner sends

@@ -18,9 +18,7 @@ use std::time::{Duration, Instant};
 
 use artel_client::Client;
 use artel_protocol::gossip::{self, GossipBody};
-use artel_protocol::{
-    Event, MessageKind, Request, Response, Seq, SessionId, TICKET_ACTION,
-};
+use artel_protocol::{Event, MessageKind, Request, Response, Seq, SessionId, TICKET_ACTION};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use iroh_gossip::api::Event as GossipEvent;
@@ -28,7 +26,7 @@ use iroh_gossip::proto::TopicId;
 use tokio::time::timeout;
 
 /// Mirrors `gossip_bridge::topic_for`, which is private (same shape
-/// as the auth_l1_spoofing helper).
+/// as the `auth_l1_spoofing` helper).
 fn topic_for(session: SessionId) -> TopicId {
     let mut bytes = [0u8; 32];
     bytes[..16].copy_from_slice(session.as_bytes());
@@ -123,21 +121,22 @@ async fn envelope_published_before_join_reaches_joiner_at_admission() {
 
     // The mirror persisted it: a second Subscribe replays the
     // envelope without any further host activity.
-    let bob2 = Client::connect(&daemon_b.socket).await.unwrap();
-    bob2.request(Request::Subscribe {
-        session,
-        since: None,
-    })
-    .await
-    .unwrap();
-    let mut bob2_events = bob2.take_events().await.expect("bob2 events");
-    expect_ticket_message(&mut bob2_events, "bob (replayed from mirror)").await;
+    let second_client = Client::connect(&daemon_b.socket).await.unwrap();
+    second_client
+        .request(Request::Subscribe {
+            session,
+            since: None,
+        })
+        .await
+        .unwrap();
+    let mut second_events = second_client.take_events().await.expect("second events");
+    expect_ticket_message(&mut second_events, "bob (replayed from mirror)").await;
 
     drop(bob_events);
-    drop(bob2_events);
+    drop(second_events);
     drop(alice);
     drop(bob);
-    drop(bob2);
+    drop(second_client);
     daemon_a.stop().await;
     daemon_b.stop().await;
 }

@@ -142,7 +142,7 @@ impl LurkerScenario {
 
 /// Drive the full lurk flow on `daemon_c` with `bad_ticket` and
 /// assert the bearer ends with nothing: no `workspace.ticket`
-/// envelope (join_with times out), no file content on disk, and no
+/// envelope (`join_with` times out), no file content on disk, and no
 /// doc replica in its docs store.
 async fn assert_lurker_gets_nothing(scenario: &LurkerScenario, bad_ticket: JoinTicket) {
     // The lurker's local daemon accepts the join (it can't know the
@@ -218,7 +218,11 @@ async fn assert_lurker_gets_nothing(scenario: &LurkerScenario, bad_ticket: JoinT
     // same state dir and list its namespaces. The failed join_with
     // rolled its node back, so the docs store is free to reopen.
     // (If join_with succeeded above we already panicked.)
-    let docs_db = carol_dir.path().join(".artel-fs").join("docs").join("docs.redb");
+    let docs_db = carol_dir
+        .path()
+        .join(".artel-fs")
+        .join("docs")
+        .join("docs.redb");
     if docs_db.exists() {
         let mut store =
             iroh_docs::store::Store::persistent(&docs_db).expect("open lurker docs store");
@@ -369,35 +373,37 @@ async fn valid_read_ticket_joiner_late_attach_gets_files() {
 // workspace_restart.rs::alice_post_restart_writes_reach_bob_real_n0.
 // =============================================================
 
+/// Per-phase ceiling for the real-n0 test below; generous because
+/// every phase crosses real relay infrastructure.
+const N0_PHASE_BUDGET: Duration = Duration::from_mins(1);
+
+/// Label + bound one phase of the n0 test so a hang fails fast with
+/// the phase name (per docs/diagnosing-flaky-tests.md).
+async fn n0_phase<F, T>(name: &'static str, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    eprintln!(">>> phase begin: {name}");
+    let res = timeout(N0_PHASE_BUDGET, fut)
+        .await
+        .unwrap_or_else(|_| panic!("phase hung past {N0_PHASE_BUDGET:?}: {name}"));
+    eprintln!("<<< phase end:   {name}");
+    res
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::large_futures)]
 async fn unicast_workspace_ticket_delivery_real_n0() {
     common::init_tracing();
-    const N0_PHASE_BUDGET: Duration = Duration::from_secs(60);
-
-    async fn phase<F, T>(name: &'static str, fut: F) -> T
-    where
-        F: std::future::Future<Output = T>,
-    {
-        eprintln!(">>> phase begin: {name}");
-        let res = timeout(N0_PHASE_BUDGET, fut)
-            .await
-            .unwrap_or_else(|_| panic!("phase hung past {N0_PHASE_BUDGET:?}: {name}"));
-        eprintln!("<<< phase end:   {name}");
-        res
-    }
 
     let alice_state = common::fresh_state();
     let bob_state = common::fresh_state();
-    let alice_daemon = phase(
+    let alice_daemon = n0_phase(
         "spawn alice daemon (production n0)",
-        common::spawn_daemon_with_setup(
-            alice_state,
-            artel_daemon::EndpointSetup::Production,
-        ),
+        common::spawn_daemon_with_setup(alice_state, artel_daemon::EndpointSetup::Production),
     )
     .await;
-    let bob_daemon = phase(
+    let bob_daemon = n0_phase(
         "spawn bob daemon (production n0)",
         common::spawn_daemon_with_setup(bob_state, artel_daemon::EndpointSetup::Production),
     )
@@ -408,7 +414,7 @@ async fn unicast_workspace_ticket_delivery_real_n0() {
     tokio::fs::write(alice_dir.path().join(SEED_FILE), SEED_CONTENT)
         .await
         .unwrap();
-    let (alice_ws, alice_rx) = phase(
+    let (alice_ws, alice_rx) = n0_phase(
         "alice Workspace::host_with",
         Workspace::host_with(
             &alice,
@@ -432,7 +438,7 @@ async fn unicast_workspace_ticket_delivery_real_n0() {
     let alice_handle = Arc::clone(&alice_ws).run().await;
 
     let bob = Client::connect(&bob_daemon.socket).await.unwrap();
-    let resp = phase(
+    let resp = n0_phase(
         "bob JoinSession (real QUIC/relay)",
         bob.request(Request::JoinSession {
             display_name: "bob".into(),
@@ -447,7 +453,7 @@ async fn unicast_workspace_ticket_delivery_real_n0() {
     // from the unicast-delivered envelope across real n0 — then
     // bulk-exports.
     let bob_dir = tempfile::tempdir().unwrap();
-    let (bob_ws, bob_rx) = phase(
+    let (bob_ws, bob_rx) = n0_phase(
         "bob Workspace::join_with (unicast envelope over real QUIC)",
         Workspace::join_with(
             &bob,

@@ -400,10 +400,7 @@ mod tests {
     async fn delete_cascades_workspace_ticket_with_session() {
         let store = MemoryStore::new();
         store.create(&record()).await.unwrap();
-        store
-            .put_workspace_ticket(record().id, &[1])
-            .await
-            .unwrap();
+        store.put_workspace_ticket(record().id, &[1]).await.unwrap();
         store.delete(record().id).await.unwrap();
         assert!(store.load_all().await.unwrap().is_empty());
     }

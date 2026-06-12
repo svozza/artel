@@ -1517,29 +1517,7 @@ impl Registry {
             let granted_cap = cap_claim
                 .as_ref()
                 .map_or(Capability::ReadWrite, |c| c.granted_cap);
-            let host_author = PeerInfo::new(self.daemon_peer_id, "host");
-            let action = CapabilityAction::Grant {
-                peer: peer.id,
-                cap: granted_cap,
-            };
-            if let Err(err) = self
-                .send(
-                    session,
-                    host_author,
-                    MessageKind::Capability,
-                    action.action_str().to_string(),
-                    action.encode(),
-                    Authoring::Local,
-                )
-                .await
-            {
-                tracing::warn!(
-                    ?session,
-                    peer = %peer.id,
-                    ?err,
-                    "auto-grant on join failed",
-                );
-            }
+            self.auto_grant_on_join(session, peer.id, granted_cap).await;
         }
 
         // Workspace ticket delivery at admission (revoked-lurker
@@ -1551,24 +1529,68 @@ impl Registry {
         // Best-effort: a failed dial is covered by the peer's next
         // re-announce.
         if session_kind == SessionKind::Local
-            && peer.id != self.daemon_peer_id
             && let Some(envelope_bytes) = workspace_ticket
-            && let Some(endpoint) = self.endpoint()
         {
-            let frame = artel_protocol::upgrade::DeliveryFrame::WorkspaceTicket {
-                session_id: session,
-                envelope_bytes,
-            };
-            if let Err(err) = crate::server::deliver_frame(endpoint, peer.id, &frame).await {
-                tracing::warn!(
-                    ?session,
-                    peer = %peer.id,
-                    %err,
-                    "workspace ticket delivery at admission failed",
-                );
-            }
+            self.deliver_workspace_ticket_to(session, peer.id, envelope_bytes)
+                .await;
         }
         Ok(())
+    }
+
+    /// Emit the host's auto-grant `Capability` message for a freshly
+    /// admitted peer. Pulled out of [`Self::ensure_member`] so it
+    /// stays under clippy's line cap; warn-and-continue on failure
+    /// (the admission already landed).
+    #[cfg(feature = "iroh")]
+    async fn auto_grant_on_join(&self, session: SessionId, peer: PeerId, cap: Capability) {
+        let host_author = PeerInfo::new(self.daemon_peer_id, "host");
+        let action = CapabilityAction::Grant { peer, cap };
+        if let Err(err) = self
+            .send(
+                session,
+                host_author,
+                MessageKind::Capability,
+                action.action_str().to_string(),
+                action.encode(),
+                Authoring::Local,
+            )
+            .await
+        {
+            tracing::warn!(?session, %peer, ?err, "auto-grant on join failed");
+        }
+    }
+
+    /// Best-effort unicast of `envelope_bytes` to one peer over the
+    /// direct delivery stream. Shared by the admission trigger
+    /// ([`Self::ensure_member`]) and the publish fan-out
+    /// ([`Self::publish_workspace_ticket`]). No-ops on a self-target
+    /// or when no iroh endpoint is wired (unit tests); failures warn —
+    /// admission redelivery covers the peer's next re-announce.
+    #[cfg(feature = "iroh")]
+    async fn deliver_workspace_ticket_to(
+        &self,
+        session: SessionId,
+        target: PeerId,
+        envelope_bytes: Vec<u8>,
+    ) {
+        if target == self.daemon_peer_id {
+            return;
+        }
+        let Some(endpoint) = self.endpoint() else {
+            return;
+        };
+        let frame = artel_protocol::upgrade::DeliveryFrame::WorkspaceTicket {
+            session_id: session,
+            envelope_bytes,
+        };
+        if let Err(err) = crate::server::deliver_frame(endpoint, target, &frame).await {
+            tracing::warn!(
+                ?session,
+                peer = %target,
+                %err,
+                "workspace ticket delivery failed; admission redelivery covers re-announce",
+            );
+        }
     }
 
     /// Snapshot every message in `session`'s log with `seq > since`,
@@ -2171,8 +2193,7 @@ impl Registry {
             s.log
                 .iter()
                 .filter(|m| {
-                    m.seq > cutoff
-                        && !(m.kind == MessageKind::System && m.action == TICKET_ACTION)
+                    m.seq > cutoff && !(m.kind == MessageKind::System && m.action == TICKET_ACTION)
                 })
                 .cloned(),
         );
@@ -2363,27 +2384,9 @@ impl Registry {
             members
         };
 
-        let Some(endpoint) = self.endpoint() else {
-            // No iroh runtime (unit tests): persisted, nothing to
-            // deliver over the wire.
-            return Ok(());
-        };
-        let frame = artel_protocol::upgrade::DeliveryFrame::WorkspaceTicket {
-            session_id: session,
-            envelope_bytes,
-        };
         for member in members {
-            if member == self.daemon_peer_id {
-                continue;
-            }
-            if let Err(err) = crate::server::deliver_frame(endpoint, member, &frame).await {
-                tracing::warn!(
-                    ?session,
-                    peer = %member,
-                    %err,
-                    "workspace ticket delivery failed; admission redelivery covers re-announce",
-                );
-            }
+            self.deliver_workspace_ticket_to(session, member, envelope_bytes.clone())
+                .await;
         }
         Ok(())
     }
@@ -4799,7 +4802,7 @@ mod tests {
     // ---- workspace ticket: emit (joiner side) ----
 
     /// Remote-kind mirror registry: store pre-seeded with a Remote
-    /// record, no bridge. Returns (registry, session_id, host_peer).
+    /// record, no bridge. Returns `(registry, session_id, host_peer)`.
     #[cfg(feature = "iroh")]
     async fn remote_mirror_registry() -> (Registry, SessionId, PeerInfo) {
         let daemon_peer = PeerId::from_bytes([7; 32]);
@@ -4973,7 +4976,9 @@ mod tests {
         .await
         .unwrap();
 
-        r.publish_workspace_ticket(id, vec![0xAB; 32]).await.unwrap();
+        r.publish_workspace_ticket(id, vec![0xAB; 32])
+            .await
+            .unwrap();
 
         let sub = r.subscribe(id, None).await.unwrap();
         let actions: Vec<&str> = sub.replay.iter().map(|m| m.action.as_str()).collect();
@@ -5025,7 +5030,9 @@ mod tests {
         let r = registry();
         let host = peer(1, "alice");
         let (id, _) = r.host_rw(host, None).await.unwrap();
-        r.publish_workspace_ticket(id, vec![0xCD; 48]).await.unwrap();
+        r.publish_workspace_ticket(id, vec![0xCD; 48])
+            .await
+            .unwrap();
         // Round-trips through the record (restart shape).
         let sub = r.subscribe(id, None).await.unwrap();
         assert_eq!(sub.replay[0].action, TICKET_ACTION);
@@ -5043,10 +5050,7 @@ mod tests {
         let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
         assert_eq!(r.is_member(id, host.id).await, Some(true));
         assert_eq!(r.is_member(id, outsider.id).await, Some(false));
-        assert_eq!(
-            r.is_member(SessionId::new_random(), host.id).await,
-            None,
-        );
+        assert_eq!(r.is_member(SessionId::new_random(), host.id).await, None,);
     }
 
     #[cfg(feature = "iroh")]

@@ -16,12 +16,12 @@ along the way.
 
 | Crate | State |
 |---|---|
-| `artel-protocol` | Wire types + Unix-socket transport. Done. `PROTOCOL_VERSION` `8` (ticket revocation), `MESSAGE_FORMAT` `3`, `TICKET_VERSION` `4` (tiered tickets), `GOSSIP_WIRE_VERSION` `1`. |
+| `artel-protocol` | Wire types + Unix-socket transport. Done. `PROTOCOL_VERSION` `9` (workspace-ticket unicast), `MESSAGE_FORMAT` `3`, `TICKET_VERSION` `4` (tiered tickets), `GOSSIP_WIRE_VERSION` `1`, upgrade ALPN `artel/upgrade/2`. |
 | `artel-daemon` | Persistent daemon + binary + flock-based pidfile (orphan-leak fix `9a1a773`) + issued-ticket ledger with revocation. Done. |
 | `artel-client` | Stateless multiplexed client + `artel` CLI binary + `connect_or_spawn`. Done. |
 | `artel-fs` | Phase 3a (MVP) + 3b-1 (persistence) + 3b-3 (crash recovery) + host/join safety + PeerFilter shipped. Watcher new-subtree rescan landed (`e8244fe`, closes the inotify backfill race). Author identity (3b-2) and configurable filter (3b-4) remain. |
 
-663 tests passing on Tier A+B (`make test`), 11 more on Tier C
+708 tests passing on Tier A+B (`make test`), 12 more on Tier C
 (`make test-n0`, real n0). fmt + clippy clean in both feature modes.
 CI runs ubuntu + macos on stable; workspace `rust-version` is 1.95.
 
@@ -653,15 +653,18 @@ Listed for completeness, no detailed plan yet:
   under the `"artel/ticket-cap-v1"` domain, verified at admission.
   `Request::IssueTicket { session, granted_cap, expiry_ms }` lets a
   host mint multiple tickets at different tiers for one session.
-  Read-tier joiners consume the broadcast but can't author; a later
-  `CapabilityAction::Grant` to ReadWrite triggers **upgrade
-  delivery** — the `NamespaceSecret` rides a direct QUIC stream
-  (`artel/upgrade/1` ALPN, `UpgradeProtocol` on the daemon Router,
-  shared `UpgradePayload` wire type in `artel-protocol::upgrade`)
+  Read-tier joiners receive the unicast-delivered workspace ticket
+  but can't author; a later `CapabilityAction::Grant` to ReadWrite
+  triggers **upgrade delivery** — the `NamespaceSecret` rides a
+  direct QUIC stream (`artel/upgrade/2` ALPN since the lurker fix,
+  `UpgradeProtocol` on the daemon Router, `DeliveryFrame` /
+  `UpgradePayload` wire types in `artel-protocol::upgrade`)
   rather than the gossip topic, so the secret is never broadcast.
   This is the one sanctioned exception to gossip-only inter-daemon
-  traffic: a host→peer unicast of session-key material, not session
-  traffic. **Ticket *revocation* DONE** (2026-06-11;
+  traffic — host→peer unicast of session-key material, not session
+  traffic; since 2026-06-12 it carries two payload kinds: the RW
+  `NamespaceSecret` and the read-capability workspace ticket
+  envelope. **Ticket *revocation* DONE** (2026-06-11;
   `PROTOCOL_VERSION` 7→8, no ticket/gossip wire change). The host
   records every mint in a per-session issued-ticket **ledger**
   (`tickets.json` sidecar, full-rewrite idiom, 0600);
@@ -674,12 +677,37 @@ Listed for completeness, no detailed plan yet:
   and mismatch all collapse to the joiner-opaque `InvalidTicket`
   (no ledger oracle; the check runs after expiry + cap-sig).
   Revocation is ticket-only: already-admitted peers keep membership
-  (use a capability revoke; `used_by` names them). Residuals carried
-  from the brainstorm: a revoked-ticket joiner gets no NAK (same
-  silent-timeout UX as expiry), and a gossip lurker who already
-  learned the topic via a since-revoked ticket's mirror can still
-  listen until kicked — both accepted for v1. CLI
+  (use a capability revoke; `used_by` names them). One residual
+  carried from the brainstorm: a revoked-ticket joiner gets no NAK
+  (same silent-timeout UX as expiry) — accepted for v1. CLI
   `ticket list`/`ticket revoke` subcommands deferred.
+  **Gossip-lurker capability leak CLOSED** (2026-06-12;
+  `PROTOCOL_VERSION` 8→9, upgrade ALPN `/1`→`/2`): the
+  demo-proven hole where a revoked/expired-ticket bearer could
+  subscribe to the (unauthenticated) session topic, have
+  `run_host_replay` serve it the backlog, and import the broadcast
+  read-capability `WorkspaceTicketEnvelope` into a live file
+  replica. Fix: nothing capability-bearing rides the gossip topic
+  any more. The host workspace publishes the envelope ONCE over IPC
+  (`Request::PublishWorkspaceTicket`); the daemon persists it
+  (`workspace-ticket.bin` sidecar, 0600) and delivers host→peer
+  over the direct-stream channel (the sanctioned gossip-only
+  exception; `DeliveryFrame` enum now carries both the RW
+  `NamespaceSecret` and the workspace ticket, 64 KiB cap). The
+  joiner daemon persists the envelope in its mirror and injects a
+  synthetic `TICKET_ACTION` System message live + on every
+  `Subscribe` (late attach / joiner restart work by construction).
+  `run_host_replay` is membership-gated, with admission-triggered
+  replay closing the gate-vs-admission race; log-borne
+  `TICKET_ACTION` broadcasts are suppressed on every joiner-visible
+  surface (legacy/forged broadcast = inert). Regression-pinned by
+  `artel-fs/tests/revoked_lurker.rs` (revoked + expired lurkers end
+  with no file content and no doc replica). Carried residuals:
+  replay traffic is still topic-visible to lurkers (capability-free
+  chatter; true privacy = topic-key rotation, § Future), and the
+  DocsGate/PeerFilter deny-list → allow-list flip remains a
+  follow-up (requires resequencing the joiner's NODE_ID announce
+  ahead of initial sync).
   NOTE (memory `reopen-grant-authority-on-readonly-
   tickets`): now that sub-RW members exist, the L2 "any RW holder
   grants" rule is load-bearing — revisit grant authority if a tier
