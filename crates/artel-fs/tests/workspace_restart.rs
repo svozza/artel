@@ -15,7 +15,7 @@ mod common;
 
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 use std::time::Duration;
 
 use artel_client::{Client, EventStream};
@@ -29,8 +29,9 @@ use tempfile::TempDir;
 use tokio::time::timeout;
 
 use common::{
-    DaemonPaths, LocalDaemon, Pair, daemon_testing_setup, fresh_state, spawn_daemon_at,
-    spawn_daemon_with_setup, spawn_pair, testing_setup, wait_for_file, wait_for_missing,
+    DaemonPaths, LocalDaemon, Pair, daemon_testing_setup, fresh_state, init_tracing,
+    spawn_daemon_at, spawn_daemon_with_setup, spawn_pair, testing_setup, wait_for_file,
+    wait_for_missing,
 };
 
 const TICKET_BUDGET: Duration = Duration::from_secs(15);
@@ -82,7 +83,7 @@ async fn capture_ticket(events: &mut EventStream, session: SessionId) -> DocTick
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread")]
 async fn workspace_state_survives_graceful_restart() {
-    init_n0_tracing();
+    init_tracing();
 
     // Workspace state dirs and content roots live in tempdirs that
     // outlive the daemons.
@@ -579,34 +580,6 @@ where
     res
 }
 
-/// One-shot tracing init for this test process. Wide `RUST_LOG`
-/// defaults so a captured failing log surfaces every layer that could
-/// plausibly cause a sync hang. Honours `RUST_LOG`; narrow via env var
-/// when isolating a specific subsystem.
-fn init_n0_tracing() {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| {
-            concat!(
-                "info,",
-                "iroh=debug,",
-                "iroh::discovery=trace,",
-                "iroh_docs=debug,",
-                "iroh_gossip=debug,",
-                "iroh_blobs=debug,",
-                "artel_fs=debug,",
-                "artel_daemon=debug",
-            )
-            .to_string()
-        });
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
-            .with_test_writer()
-            .with_target(true)
-            .try_init();
-    });
-}
-
 /// Real-n0 capture-ticket: same shape as the top-level helper but with
 /// a 30s ticket budget — n0's pkarr+DNS publish has measurably longer
 /// tail-latency than the localhost fixture.
@@ -665,7 +638,7 @@ async fn capture_ticket_n0(events: &mut EventStream, session: SessionId) -> DocT
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::large_futures, clippy::too_many_lines)]
 async fn alice_post_restart_writes_reach_bob_real_n0() {
-    init_n0_tracing();
+    init_tracing();
 
     let alice_daemon_root = TempDir::new().unwrap();
     let alice_paths = DaemonPaths::at(alice_daemon_root.path());

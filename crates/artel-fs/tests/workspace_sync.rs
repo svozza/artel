@@ -772,6 +772,111 @@ async fn live_edit_propagates_host_to_joiner() {
 }
 
 // =============================================================
+// A populated directory renamed INTO the workspace propagates its
+// contents.
+//
+// inotify only reports the rename of the directory itself on the
+// watched parent — the files inside never produce events of their
+// own (they were written while the directory lived outside the
+// watch). The watcher's directory-rescan branch must walk the
+// moved-in subtree and publish each file.
+//
+// This is the deterministic twin of the new-subtree race that made
+// `workspace_filter.rs`'s `first_match_wins_carries_through_wire` /
+// `watcher_blocks_outgoing_read_only_write` flake under load: there,
+// `create_dir` + immediate write occasionally lands the file before
+// notify's watch backfill, so the file event is silently dropped and
+// only the directory's Create event survives. Rename-in produces
+// that exact "directory event only" shape on every run instead of
+// one run in three.
+// =============================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn renamed_in_directory_contents_propagate() {
+    let Pair {
+        daemon_a,
+        daemon_b,
+        dns_pkarr,
+    } = spawn_pair().await;
+
+    let alice = Client::connect(&daemon_a.socket).await.unwrap();
+    let alice_dir = tempfile::tempdir().unwrap();
+    let (alice_ws, _) = Workspace::host_with(
+        &alice,
+        "alice",
+        alice_dir.path().to_path_buf(),
+        AttachPolicy::RequireEmpty,
+        WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
+    )
+    .await
+    .expect("Workspace::host");
+    let session = alice_ws.session_id();
+    let ticket = alice_ws
+        .join_ticket()
+        .expect("host has join_ticket")
+        .clone();
+    let alice_ws = Arc::new(alice_ws);
+    let alice_handle = Arc::clone(&alice_ws).run().await;
+
+    let bob = Client::connect(&daemon_b.socket).await.unwrap();
+    let resp = bob
+        .request(Request::JoinSession {
+            display_name: "bob".into(),
+            ticket,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(resp, Response::JoinSession { .. }), "{resp:?}");
+
+    let bob_dir = tempfile::tempdir().unwrap();
+    let (bob_ws, _) = Workspace::join_with(
+        &bob,
+        session,
+        bob_dir.path().to_path_buf(),
+        AttachPolicy::RequireEmpty,
+        WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
+    )
+    .await
+    .expect("Workspace::join");
+    let bob_ws = Arc::new(bob_ws);
+    let bob_handle = Arc::clone(&bob_ws).run().await;
+
+    // Stage a populated directory OUTSIDE the workspace, then rename
+    // it in. Both tempdirs live under the same filesystem (/tmp), so
+    // this is a true rename — the files inside generate no events.
+    let staging = tempfile::tempdir().unwrap();
+    let staged = staging.path().join("incoming");
+    tokio::fs::create_dir_all(staged.join("nested"))
+        .await
+        .unwrap();
+    tokio::fs::write(staged.join("data.txt"), b"moved in")
+        .await
+        .unwrap();
+    tokio::fs::write(staged.join("nested/deep.txt"), b"deep moved in")
+        .await
+        .unwrap();
+    tokio::fs::rename(&staged, alice_dir.path().join("incoming"))
+        .await
+        .unwrap();
+
+    common::wait_for_file(&bob_dir.path().join("incoming/data.txt"), b"moved in").await;
+    common::wait_for_file(
+        &bob_dir.path().join("incoming/nested/deep.txt"),
+        b"deep moved in",
+    )
+    .await;
+
+    alice_ws.shutdown().await.expect("shutdown");
+    bob_ws.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), alice_handle).await;
+    let _ = timeout(Duration::from_secs(5), bob_handle).await;
+    drop(alice);
+    drop(bob);
+    daemon_a.stop().await;
+    daemon_b.stop().await;
+}
+
+// =============================================================
 // Full round-trip test.
 //
 // Two daemons + two `Workspace`s on the same artel session exercise

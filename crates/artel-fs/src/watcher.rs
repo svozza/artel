@@ -15,6 +15,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use notify::EventKind;
 use notify_debouncer_full::DebounceEventResult;
+use walkdir::WalkDir;
 
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
@@ -177,6 +178,23 @@ async fn on_modified(
         FilterDecision::Include => {}
     }
 
+    // Directory events get a subtree rescan instead of a publish.
+    // inotify attaches one watch per directory and notify backfills
+    // watches for a freshly created subtree only after it processes
+    // the parent's CREATE event — a file written into the new
+    // directory before that backfill produces no event, ever, and
+    // under load the gap stretches past the debounce window. The
+    // event for the directory itself IS reliable (the already-watched
+    // parent reports it), so use it as the cue to walk the subtree
+    // and replay each file through this same pipeline. Idempotent:
+    // per-file filter/rule checks re-run, and the echo guard's
+    // last-published hash skips files whose bytes already made it
+    // into the doc.
+    if tokio::fs::metadata(&path).await.is_ok_and(|m| m.is_dir()) {
+        rescan_dir(workspace, filter, guard, &path).await;
+        return;
+    }
+
     // Rule check sits before the file read so a `ReadOnly` path
     // doesn't even hit the disk. `strip_prefix` shouldn't fail since
     // the watcher only reports paths under `workspace.root`, but
@@ -260,6 +278,38 @@ async fn on_modified(
             );
         }
     }
+}
+
+/// Replay every file under `dir` through [`on_modified`].
+///
+/// Closes the new-subtree inotify race (see the call site in
+/// [`on_modified`]): a file that landed before notify's watch
+/// backfill produces no event of its own, so the directory's event
+/// is the only signal it exists. Walking is bounded by the workspace
+/// filter at each file (hardcoded skips, gitignore, size cap), and
+/// the echo guard's last-published hash turns the common "file's own
+/// event already published it" case into a no-op.
+async fn rescan_dir(
+    workspace: &Arc<Workspace>,
+    filter: &WorkspaceFilter,
+    guard: &EchoGuard,
+    dir: &Path,
+) {
+    debug!(target: "artel_fs::watcher", dir = %dir.display(), "rescan_dir entered");
+    let mut files = 0usize;
+    for entry in WalkDir::new(dir).follow_links(false).into_iter().flatten() {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        files += 1;
+        // Box the recursion: on_modified -> rescan_dir -> on_modified
+        // would otherwise be an infinitely-sized future. The cycle is
+        // bounded in practice — a walked entry only re-enters the
+        // directory branch if it turned into a directory between the
+        // walk and the call.
+        Box::pin(on_modified(workspace, filter, guard, entry.into_path())).await;
+    }
+    debug!(target: "artel_fs::watcher", dir = %dir.display(), files, "rescan_dir complete");
 }
 
 async fn on_removed(workspace: &Arc<Workspace>, path: PathBuf) {

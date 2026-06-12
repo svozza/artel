@@ -32,7 +32,9 @@ use iroh_docs::store::Query;
 use pretty_assertions::assert_eq;
 use tokio::time::{sleep, timeout};
 
-use common::{Pair, doc_has_key, spawn_pair, testing_setup, wait_for_file, wait_for_missing};
+use common::{
+    Pair, doc_has_key, init_tracing, spawn_pair, testing_setup, wait_for_file, wait_for_missing,
+};
 
 // =============================================================
 // Default-permissive `PathRules` (the implicit case for every
@@ -170,6 +172,7 @@ async fn poll_for(path: &Path, budget: Duration) -> bool {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn first_match_wins_carries_through_wire() {
+    init_tracing();
     // Phase 1: broad ReadWrite rule precedes narrow ReadOnly. The
     // narrow rule is unreachable; `docs/secret/foo.txt` propagates.
     // Drive timing positively — poll for the secret on Bob's side.
@@ -505,6 +508,7 @@ async fn applier_drops_incoming_read_only_insert() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn watcher_blocks_outgoing_read_only_write() {
+    init_tracing();
     let Pair {
         daemon_a,
         daemon_b,

@@ -41,6 +41,36 @@ use tempfile::TempDir;
 use tokio::sync::OnceCell;
 use tokio::time::{sleep, timeout};
 
+/// One-shot tracing init for a test process. Wide `RUST_LOG`
+/// defaults so a captured failing log surfaces every layer that
+/// could plausibly cause a sync hang. Honours `RUST_LOG`; narrow via
+/// env var when isolating a specific subsystem. See
+/// `docs/diagnosing-flaky-tests.md`.
+pub fn init_tracing() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| {
+            concat!(
+                "info,",
+                "iroh=debug,",
+                "iroh::discovery=trace,",
+                "iroh_docs=debug,",
+                "iroh_gossip=debug,",
+                "iroh_blobs=debug,",
+                "artel_fs=debug,",
+                "artel_daemon=debug",
+            )
+            .to_string()
+        });
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+            .with_test_writer()
+            .with_target(true)
+            .try_init();
+    });
+}
+
 /// Default poll interval used by [`wait_for_file`] / [`wait_for_missing`].
 pub const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Default deadline budget. 15s covers notify debounce (300ms) +
