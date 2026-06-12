@@ -95,6 +95,15 @@ impl SessionStore for MemoryStore {
         Ok(())
     }
 
+    async fn put_workspace_ticket(&self, session: SessionId, envelope: &[u8]) -> io::Result<()> {
+        let mut guard = self.inner.lock().expect("poisoned");
+        let entry = guard
+            .get_mut(&session)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown session"))?;
+        entry.record.workspace_ticket = Some(envelope.to_vec());
+        Ok(())
+    }
+
     async fn add_member(&self, session: SessionId, peer: &PeerInfo) -> io::Result<()> {
         let mut guard = self.inner.lock().expect("poisoned");
         let entry = guard
@@ -193,6 +202,7 @@ mod tests {
             kind: SessionKind::Local,
             host_epoch: 0,
             tickets: Vec::new(),
+            workspace_ticket: None,
         }
     }
 
@@ -329,6 +339,69 @@ mod tests {
         store.create(&record()).await.unwrap();
         store
             .put_tickets(record().id, &[ticket_entry(1)])
+            .await
+            .unwrap();
+        store.delete(record().id).await.unwrap();
+        assert!(store.load_all().await.unwrap().is_empty());
+    }
+
+    // ---- workspace ticket envelope (revoked-lurker fix) ----
+
+    #[tokio::test]
+    async fn put_workspace_ticket_then_load_round_trips() {
+        let store = MemoryStore::new();
+        store.create(&record()).await.unwrap();
+        store
+            .put_workspace_ticket(record().id, &[0xab; 64])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.load_all().await.unwrap()[0].workspace_ticket,
+            Some(vec![0xab; 64]),
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_ticket_defaults_to_none() {
+        let store = MemoryStore::new();
+        store.create(&record()).await.unwrap();
+        assert_eq!(store.load_all().await.unwrap()[0].workspace_ticket, None);
+    }
+
+    #[tokio::test]
+    async fn put_workspace_ticket_rewrite_replaces_previous() {
+        let store = MemoryStore::new();
+        store.create(&record()).await.unwrap();
+        store
+            .put_workspace_ticket(record().id, &[1, 2, 3])
+            .await
+            .unwrap();
+        store
+            .put_workspace_ticket(record().id, &[9, 9])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.load_all().await.unwrap()[0].workspace_ticket,
+            Some(vec![9, 9]),
+        );
+    }
+
+    #[tokio::test]
+    async fn put_workspace_ticket_for_unknown_session_errors_not_found() {
+        let store = MemoryStore::new();
+        let err = store
+            .put_workspace_ticket(SessionId::from_bytes([9; 16]), &[1])
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn delete_cascades_workspace_ticket_with_session() {
+        let store = MemoryStore::new();
+        store.create(&record()).await.unwrap();
+        store
+            .put_workspace_ticket(record().id, &[1])
             .await
             .unwrap();
         store.delete(record().id).await.unwrap();

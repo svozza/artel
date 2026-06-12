@@ -330,6 +330,13 @@ pub struct Session {
     /// and is rewritten via `SessionStore::put_tickets` on every
     /// mutation, store-before-memory.
     tickets: Vec<TicketEntry>,
+    /// Workspace ticket envelope (revoked-lurker fix). Opaque bytes,
+    /// **persisted state** like `tickets`: round-trips through
+    /// `record`/`from_record` and is rewritten via
+    /// `SessionStore::put_workspace_ticket`, store-before-memory.
+    /// One slot, kind-dependent meaning — see
+    /// [`SessionRecord::workspace_ticket`].
+    workspace_ticket: Option<Vec<u8>>,
     events_tx: broadcast::Sender<Event>,
 }
 
@@ -356,6 +363,7 @@ impl Session {
             host_epoch: 0,
             caps,
             tickets: Vec::new(),
+            workspace_ticket: None,
             events_tx,
         }
     }
@@ -382,6 +390,7 @@ impl Session {
             host_epoch: record.host_epoch,
             caps,
             tickets: record.tickets,
+            workspace_ticket: record.workspace_ticket,
             events_tx,
         }
     }
@@ -397,6 +406,7 @@ impl Session {
             kind: self.kind,
             host_epoch: self.host_epoch,
             tickets: self.tickets.clone(),
+            workspace_ticket: self.workspace_ticket.clone(),
         }
     }
 
@@ -2447,6 +2457,7 @@ mod tests {
             kind: SessionKind::Local,
             host_epoch: 0,
             tickets: Vec::new(),
+            workspace_ticket: None,
         };
         store.create(&record).await.unwrap();
         let r = Registry::load(
@@ -2502,6 +2513,7 @@ mod tests {
             kind: SessionKind::Local,
             host_epoch: 0,
             tickets: Vec::new(),
+            workspace_ticket: None,
         };
         store.create(&record).await.unwrap();
         let r = Registry::load(
@@ -2546,6 +2558,7 @@ mod tests {
             kind: SessionKind::Remote,
             host_epoch: 0,
             tickets: Vec::new(),
+            workspace_ticket: None,
         };
         store.create(&record).await.unwrap();
         let r = Registry::load(
@@ -3593,6 +3606,7 @@ mod tests {
             kind: SessionKind::Local,
             host_epoch: 0,
             tickets: Vec::new(),
+            workspace_ticket: None,
         };
         let s = Session::from_record(record);
         assert!(s.can_write(host.id), "host root preserved");
@@ -4177,6 +4191,7 @@ mod tests {
             kind: SessionKind::Remote,
             host_epoch: 0,
             tickets: Vec::new(),
+            workspace_ticket: None,
         };
         store.create(&record).await.unwrap();
 
@@ -4242,6 +4257,7 @@ mod tests {
             kind: SessionKind::Remote,
             host_epoch: 0,
             tickets: Vec::new(),
+            workspace_ticket: None,
         };
         store.create(&record).await.unwrap();
 
@@ -4512,6 +4528,7 @@ mod tests {
             kind: SessionKind::Remote,
             host_epoch: 0,
             tickets: Vec::new(),
+            workspace_ticket: None,
         };
         store.create(&record).await.unwrap();
         let r = Registry::load(
@@ -4555,6 +4572,7 @@ mod tests {
             kind: SessionKind::Remote,
             host_epoch: 0,
             tickets: Vec::new(),
+            workspace_ticket: None,
         };
         store.create(&record).await.unwrap();
         let r = Registry::load(
@@ -5039,6 +5057,14 @@ mod tests {
                 return Err(std::io::Error::other("injected put_tickets failure"));
             }
             self.inner.put_tickets(session, tickets).await
+        }
+
+        async fn put_workspace_ticket(
+            &self,
+            session: SessionId,
+            envelope: &[u8],
+        ) -> std::io::Result<()> {
+            self.inner.put_workspace_ticket(session, envelope).await
         }
 
         async fn add_member(&self, session: SessionId, peer: &PeerInfo) -> std::io::Result<()> {

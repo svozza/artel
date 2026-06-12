@@ -5,9 +5,10 @@
 //! ```text
 //! sessions_dir/
 //!   <session-uuid>/
-//!     meta.json    — host, members, head
-//!     log          — length-prefixed postcard frames of SessionMessage
-//!     tickets.json — issued-ticket ledger (host sessions; absent ⇒ empty)
+//!     meta.json            — host, members, head
+//!     log                  — length-prefixed postcard frames of SessionMessage
+//!     tickets.json         — issued-ticket ledger (host sessions; absent ⇒ empty)
+//!     workspace-ticket.bin — workspace ticket envelope (absent ⇒ none)
 //! ```
 //!
 //! `meta.json` is small enough to overwrite atomically (write to
@@ -51,6 +52,16 @@ const TICKETS_FILE: &str = "tickets.json";
 /// while letting the session load with an empty — fail-closed —
 /// ledger. See [`load_one`].
 const TICKETS_QUARANTINE_FILE: &str = "tickets.json.corrupt";
+/// Per-session workspace ticket envelope sidecar (revoked-lurker
+/// fix). Raw postcard `WorkspaceTicketEnvelope` bytes, opaque to the
+/// daemon, `0600` (capability-bearing — a read `DocTicket` rides
+/// inside, same sensitivity as `tickets.json`). Absent ⇒ no envelope.
+const WORKSPACE_TICKET_FILE: &str = "workspace-ticket.bin";
+/// Upper bound accepted when loading [`WORKSPACE_TICKET_FILE`].
+/// Matches the 64 KiB direct-stream delivery cap — a larger sidecar
+/// can only be corruption, and loading it would hand the joiner's
+/// workspace a payload the wire would never have produced.
+const WORKSPACE_TICKET_MAX: u64 = 64 * 1024;
 /// Per-session subdirectory for opaque consumer attachments.
 const ATTACHMENTS_DIR: &str = "attachments";
 /// Suffix on attachment files; the prefix is the kind, hex-encoded.
@@ -141,6 +152,11 @@ impl SessionStore for FsLogStore {
             if !record.tickets.is_empty() {
                 write_tickets(&dir.join(TICKETS_FILE), &record.tickets)?;
             }
+            // Same create-folds-the-sidecar shape for the workspace
+            // ticket envelope: absent ⇒ no file.
+            if let Some(envelope) = &record.workspace_ticket {
+                write_workspace_ticket(&dir.join(WORKSPACE_TICKET_FILE), envelope)?;
+            }
             // We don't write the in-memory log here; create() is for a
             // fresh session and Registry::host() always passes an empty
             // log.
@@ -204,6 +220,26 @@ impl SessionStore for FsLogStore {
                 ));
             }
             write_tickets(&dir.join(TICKETS_FILE), &tickets)
+        })
+        .await
+        .map_err(|e| join_to_io(&e))?
+    }
+
+    async fn put_workspace_ticket(&self, session: SessionId, envelope: &[u8]) -> io::Result<()> {
+        let dir = self.session_dir(session);
+        let envelope = envelope.to_vec();
+        tokio::task::spawn_blocking(move || -> io::Result<()> {
+            // Unknown session must surface, same contract as
+            // put_tickets: the envelope is what a joiner's late
+            // attach depends on; a write that lands nowhere is a
+            // correctness bug, not a no-op.
+            if !dir.is_dir() {
+                return Err(io::Error::new(
+                    ErrorKind::NotFound,
+                    format!("no session dir at {}", dir.display()),
+                ));
+            }
+            write_workspace_ticket(&dir.join(WORKSPACE_TICKET_FILE), &envelope)
         })
         .await
         .map_err(|e| join_to_io(&e))?
@@ -562,6 +598,14 @@ fn load_one(dir: &Path) -> io::Result<SessionRecord> {
         }
         Err(err) => return Err(err),
     };
+    // Workspace ticket envelope: absent ⇒ None (fresh dir, session
+    // without a workspace). A present-but-unreadable sidecar fails
+    // the session load loudly (Meta posture, not the ledger's
+    // quarantine): silently loading `None` would leave a joiner's
+    // late attach hanging in `wait_for_ticket` forever with no
+    // recovery path — the capability the workspace depends on would
+    // have vanished without a trace.
+    let workspace_ticket = read_workspace_ticket(&dir.join(WORKSPACE_TICKET_FILE))?;
     Ok(SessionRecord {
         id,
         host: meta.host,
@@ -571,6 +615,7 @@ fn load_one(dir: &Path) -> io::Result<SessionRecord> {
         kind: meta.kind,
         host_epoch: meta.host_epoch,
         tickets,
+        workspace_ticket,
     })
 }
 
@@ -807,6 +852,50 @@ fn read_tickets(path: &Path) -> io::Result<Vec<TicketEntry>> {
 
 fn write_meta(path: &Path, meta: &Meta) -> io::Result<()> {
     write_json_atomic(path, meta, "meta")
+}
+
+/// Atomic full rewrite of the workspace ticket envelope sidecar:
+/// raw bytes via the deterministic tmp+rename idiom (single writer —
+/// the registry holds the per-session lock across the call, same as
+/// `write_meta` / `write_tickets`), `0600` because the envelope is
+/// capability-bearing.
+fn write_workspace_ticket(path: &Path, envelope: &[u8]) -> io::Result<()> {
+    let tmp = path.with_extension("bin.tmp");
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)?;
+        f.write_all(envelope)?;
+        f.sync_all()?;
+    }
+    chmod(&tmp, FILE_MODE)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Read the workspace ticket envelope sidecar. Absent ⇒ `None`.
+/// Oversized (> [`WORKSPACE_TICKET_MAX`]) is `InvalidData` — the
+/// wire never produces it, so it can only be corruption, and the
+/// caller fails the session load loudly rather than dropping the
+/// capability silently.
+fn read_workspace_ticket(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    if meta.len() > WORKSPACE_TICKET_MAX {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "workspace ticket sidecar too large: {} bytes (max {WORKSPACE_TICKET_MAX})",
+                meta.len(),
+            ),
+        ));
+    }
+    Ok(Some(std::fs::read(path)?))
 }
 
 /// Append a [`SessionMessage`] as `[u32 BE length][postcard]`, then
@@ -1094,6 +1183,7 @@ mod tests {
             kind: SessionKind::Local,
             host_epoch: 0,
             tickets: Vec::new(),
+            workspace_ticket: None,
         }
     }
 
@@ -1393,6 +1483,134 @@ mod tests {
         let tickets_path = dir.path().join(record(1).id.to_string()).join(TICKETS_FILE);
         let mode = std::os::unix::fs::MetadataExt::mode(&std::fs::metadata(&tickets_path).unwrap());
         assert_eq!(mode & 0o777, FILE_MODE);
+    }
+
+    // ---- workspace ticket envelope sidecar (revoked-lurker fix) ----
+
+    #[tokio::test]
+    async fn put_workspace_ticket_then_load_round_trips() {
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+        let envelope = vec![0xab; 256];
+        store
+            .put_workspace_ticket(record(1).id, &envelope)
+            .await
+            .unwrap();
+        let loaded = FsLogStore::open(dir.path())
+            .unwrap()
+            .load_all()
+            .await
+            .unwrap();
+        assert_eq!(loaded[0].workspace_ticket, Some(envelope));
+    }
+
+    #[tokio::test]
+    async fn absent_workspace_ticket_file_loads_as_none() {
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+        let loaded = store.load_all().await.unwrap();
+        assert_eq!(loaded[0].workspace_ticket, None);
+    }
+
+    #[tokio::test]
+    async fn put_workspace_ticket_rewrite_replaces_previous() {
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+        store
+            .put_workspace_ticket(record(1).id, &[1, 2, 3])
+            .await
+            .unwrap();
+        store
+            .put_workspace_ticket(record(1).id, &[9, 9])
+            .await
+            .unwrap();
+        let loaded = store.load_all().await.unwrap();
+        assert_eq!(loaded[0].workspace_ticket, Some(vec![9, 9]));
+    }
+
+    #[tokio::test]
+    async fn put_workspace_ticket_for_unknown_session_errors_not_found() {
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        let err = store
+            .put_workspace_ticket(SessionId::from_bytes([9; 16]), &[1])
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn workspace_ticket_round_trips_through_create() {
+        // create() folds a populated slot into the fresh session dir
+        // (host-restart path persists via put_, but a future caller
+        // creating with the field set must not silently drop it).
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        let mut r = record(1);
+        r.workspace_ticket = Some(vec![0xcd; 64]);
+        store.create(&r).await.unwrap();
+        let loaded = store.load_all().await.unwrap();
+        assert_eq!(loaded[0].workspace_ticket, r.workspace_ticket);
+    }
+
+    #[tokio::test]
+    async fn delete_cascades_workspace_ticket_file_with_session_dir() {
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+        store
+            .put_workspace_ticket(record(1).id, &[1, 2, 3])
+            .await
+            .unwrap();
+        let sidecar = dir
+            .path()
+            .join(record(1).id.to_string())
+            .join(WORKSPACE_TICKET_FILE);
+        assert!(sidecar.exists());
+
+        store.delete(record(1).id).await.unwrap();
+        assert!(!sidecar.exists());
+    }
+
+    #[tokio::test]
+    async fn workspace_ticket_file_mode_is_0600() {
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+        store
+            .put_workspace_ticket(record(1).id, &[0xee; 32])
+            .await
+            .unwrap();
+        let sidecar = dir
+            .path()
+            .join(record(1).id.to_string())
+            .join(WORKSPACE_TICKET_FILE);
+        let mode = std::os::unix::fs::MetadataExt::mode(&std::fs::metadata(&sidecar).unwrap());
+        assert_eq!(mode & 0o777, FILE_MODE);
+    }
+
+    #[tokio::test]
+    async fn oversized_workspace_ticket_sidecar_fails_session_load_loudly() {
+        // An over-cap sidecar can only be corruption (the wire caps
+        // delivery at 64 KiB). Posture matches Meta, not the ledger's
+        // quarantine: silently loading None would strand a joiner's
+        // late attach with no recovery, so the whole session load
+        // fails and load_all skips-and-warns.
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+        let session_dir = dir.path().join(record(1).id.to_string());
+        let oversized = vec![0u8; usize::try_from(WORKSPACE_TICKET_MAX).unwrap() + 1];
+        std::fs::write(session_dir.join(WORKSPACE_TICKET_FILE), &oversized).unwrap();
+
+        let loaded = store.load_all().await.unwrap();
+        assert!(
+            loaded.is_empty(),
+            "session with corrupt envelope sidecar must be skipped loudly",
+        );
     }
 
     #[tokio::test]

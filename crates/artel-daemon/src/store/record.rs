@@ -68,4 +68,20 @@ pub(crate) struct SessionRecord {
     /// updated by full rewrite on mint / revoke / admission.
     #[serde(default)]
     pub(crate) tickets: Vec<TicketEntry>,
+    /// Workspace ticket envelope (revoked-lurker fix). Opaque
+    /// postcard-encoded `WorkspaceTicketEnvelope` bytes — the daemon
+    /// never decodes them. **One slot, kind-dependent meaning:**
+    /// - `Local` (host): the envelope this host's workspace published
+    ///   via `PublishWorkspaceTicket`, so it survives a host-daemon
+    ///   restart and re-delivers at admission without the workspace
+    ///   re-publishing.
+    /// - `Remote` (mirror): the envelope the joiner received over the
+    ///   host→peer unicast, replayed to the workspace as a synthetic
+    ///   `TICKET_ACTION` System message on every `Subscribe`.
+    ///
+    /// Capability-bearing (a read `DocTicket` rides inside) — the fs
+    /// store keeps it in a `0600` sidecar, same sensitivity posture
+    /// as `tickets.json`. Absent ⇒ `None`.
+    #[serde(default)]
+    pub(crate) workspace_ticket: Option<Vec<u8>>,
 }

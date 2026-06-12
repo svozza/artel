@@ -71,6 +71,17 @@ pub(crate) trait SessionStore: Send + Sync + std::fmt::Debug {
     /// nowhere must surface, not vanish.
     async fn put_tickets(&self, session: SessionId, tickets: &[TicketEntry]) -> io::Result<()>;
 
+    /// Persist the workspace ticket envelope for `session`, replacing
+    /// any previous value (revoked-lurker fix). Full rewrite of the
+    /// one slot, mirroring [`Self::put_tickets`]. Errors `NotFound`
+    /// on an unknown session — the envelope is the capability a
+    /// joiner's late attach depends on, so a write that lands nowhere
+    /// must surface. The bytes are opaque to the store
+    /// (postcard-encoded `WorkspaceTicketEnvelope`); disk-backed
+    /// implementations keep them `0600` — capability-bearing, same
+    /// posture as `tickets.json`.
+    async fn put_workspace_ticket(&self, session: SessionId, envelope: &[u8]) -> io::Result<()>;
+
     /// Add a peer to a session's member set.
     async fn add_member(&self, session: SessionId, peer: &PeerInfo) -> io::Result<()>;
 
