@@ -96,6 +96,16 @@ impl SessionStore for MemoryStore {
     }
 
     async fn put_workspace_ticket(&self, session: SessionId, envelope: &[u8]) -> io::Result<()> {
+        // Same cap the disk impl enforces (and the wire enforces on
+        // delivery) so the test baseline can't accept an envelope the
+        // production store would reject — see `FsLogStore`'s
+        // `write_workspace_ticket`.
+        if envelope.len() > artel_protocol::upgrade::WORKSPACE_TICKET_ENVELOPE_MAX {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "workspace ticket envelope too large",
+            ));
+        }
         let mut guard = self.inner.lock().expect("poisoned");
         let entry = guard
             .get_mut(&session)

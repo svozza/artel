@@ -26,6 +26,29 @@ pub const UPGRADE_ALPN: &[u8] = b"artel/upgrade/2";
 /// Single-byte ACK sent from target → host after successful import.
 pub const UPGRADE_ACK: u8 = 0x01;
 
+/// Cap on one encoded [`DeliveryFrame`] (postcard bytes, excluding
+/// the 4-byte length prefix).
+///
+/// Shared by the sender and the receiving protocol handler so the two
+/// can't drift: a frame one side will emit, the other will accept.
+/// Raised from the secret-only 1 KiB when `WorkspaceTicket` joined the
+/// channel — envelopes carry user-authored `PathRules` globs.
+pub const MAX_DELIVERY_FRAME: usize = 64 * 1024;
+
+/// Cap on the raw `WorkspaceTicketEnvelope` bytes accepted anywhere
+/// they flow.
+///
+/// Enforced at producer encode (`artel-fs`), publish ingress, store
+/// persistence, and unicast delivery. Strictly smaller than
+/// [`MAX_DELIVERY_FRAME`] — the 64-byte headroom covers the
+/// [`DeliveryFrame::WorkspaceTicket`] framing (variant tag + 16-byte
+/// session id + length varint), so an envelope that passes this cap
+/// is deliverable by construction. One constant for all sites: a
+/// persisted envelope the wire would reject, or a published envelope
+/// the store would refuse to load back, are both bugs this shared
+/// bound makes unrepresentable.
+pub const WORKSPACE_TICKET_ENVELOPE_MAX: usize = MAX_DELIVERY_FRAME - 64;
+
 /// Frame sent from host → target over the direct stream.
 ///
 /// Serialized with postcard, length-prefixed (4-byte LE) on the wire.
@@ -194,6 +217,25 @@ mod tests {
             bytes.len() <= 32,
             "encoded frame longer than expected ({} bytes)",
             bytes.len(),
+        );
+    }
+
+    #[test]
+    fn envelope_cap_leaves_room_for_delivery_framing() {
+        // An envelope at the producer/store cap must still fit inside
+        // a DeliveryFrame under the receiver's MAX_DELIVERY_FRAME —
+        // otherwise an envelope that persists and loads fine could
+        // never be delivered. Encode the worst case (max-size
+        // envelope) and assert the framed bytes clear the wire cap.
+        let frame = DeliveryFrame::WorkspaceTicket {
+            session_id: SessionId::from_bytes([0xcd; 16]),
+            envelope_bytes: vec![0u8; WORKSPACE_TICKET_ENVELOPE_MAX],
+        };
+        let encoded = postcard::to_allocvec(&frame).unwrap();
+        assert!(
+            encoded.len() <= MAX_DELIVERY_FRAME,
+            "max envelope ({WORKSPACE_TICKET_ENVELOPE_MAX}) frames to {} bytes, over the {MAX_DELIVERY_FRAME} wire cap",
+            encoded.len(),
         );
     }
 

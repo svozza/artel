@@ -14,19 +14,12 @@
 use std::sync::Arc;
 
 use artel_protocol::PeerId;
-use artel_protocol::upgrade::{DeliveryFrame, UPGRADE_ACK, UPGRADE_ALPN};
+use artel_protocol::upgrade::{DeliveryFrame, MAX_DELIVERY_FRAME, UPGRADE_ACK, UPGRADE_ALPN};
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use tracing::warn;
 
 use crate::session::Registry;
-
-/// Read cap on an inbound delivery frame. Raised from the
-/// secret-only 1 KiB when `WorkspaceTicket` joined the channel —
-/// envelopes carry user-authored `PathRules` globs. A frame larger
-/// than this is misconfiguration or attack; reject before
-/// allocating.
-const MAX_DELIVERY_FRAME: usize = 64 * 1024;
 
 /// Protocol handler registered on the daemon's [`iroh::protocol::Router`]
 /// under [`UPGRADE_ALPN`]. Accepts inbound direct-stream upgrade

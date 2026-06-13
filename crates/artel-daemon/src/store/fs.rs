@@ -57,11 +57,14 @@ const TICKETS_QUARANTINE_FILE: &str = "tickets.json.corrupt";
 /// daemon, `0600` (capability-bearing — a read `DocTicket` rides
 /// inside, same sensitivity as `tickets.json`). Absent ⇒ no envelope.
 const WORKSPACE_TICKET_FILE: &str = "workspace-ticket.bin";
-/// Upper bound accepted when loading [`WORKSPACE_TICKET_FILE`].
-/// Matches the 64 KiB direct-stream delivery cap — a larger sidecar
-/// can only be corruption, and loading it would hand the joiner's
-/// workspace a payload the wire would never have produced.
-const WORKSPACE_TICKET_MAX: u64 = 64 * 1024;
+/// Upper bound accepted when loading [`WORKSPACE_TICKET_FILE`], and
+/// enforced symmetrically on write (see [`write_workspace_ticket`]).
+/// The shared [`artel_protocol::upgrade::WORKSPACE_TICKET_ENVELOPE_MAX`]
+/// — every site the envelope flows through (producer encode, publish
+/// ingress, store write, unicast delivery) uses the one constant, so
+/// a put the store accepts is one the loader and the wire accept too.
+/// A larger sidecar can only be corruption.
+const WORKSPACE_TICKET_MAX: u64 = artel_protocol::upgrade::WORKSPACE_TICKET_ENVELOPE_MAX as u64;
 /// Per-session subdirectory for opaque consumer attachments.
 const ATTACHMENTS_DIR: &str = "attachments";
 /// Suffix on attachment files; the prefix is the kind, hex-encoded.
@@ -860,6 +863,21 @@ fn write_meta(path: &Path, meta: &Meta) -> io::Result<()> {
 /// `write_meta` / `write_tickets`), `0600` because the envelope is
 /// capability-bearing.
 fn write_workspace_ticket(path: &Path, envelope: &[u8]) -> io::Result<()> {
+    // Reject at write time what the loader would reject at read time
+    // (and the wire would reject at delivery). Persisting an envelope
+    // larger than this would brick the whole session at the next
+    // restart: `read_workspace_ticket` returns `InvalidData`,
+    // `load_one` fails, and `load_all` skips-and-warns the entire
+    // session dir — log, members, and ledger included.
+    if envelope.len() > artel_protocol::upgrade::WORKSPACE_TICKET_ENVELOPE_MAX {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "workspace ticket envelope too large: {} bytes (max {WORKSPACE_TICKET_MAX})",
+                envelope.len(),
+            ),
+        ));
+    }
     let tmp = path.with_extension("bin.tmp");
     {
         let mut f = std::fs::OpenOptions::new()
@@ -1590,6 +1608,79 @@ mod tests {
             .join(WORKSPACE_TICKET_FILE);
         let mode = std::os::unix::fs::MetadataExt::mode(&std::fs::metadata(&sidecar).unwrap());
         assert_eq!(mode & 0o777, FILE_MODE);
+    }
+
+    #[tokio::test]
+    async fn put_workspace_ticket_rejects_over_cap_envelope() {
+        // Write-side counterpart of the load cap: an envelope the
+        // loader would refuse must be rejected at put time, not
+        // persisted and discovered as "corruption" at the next
+        // restart (which skips the whole session).
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+        let oversized = vec![0u8; artel_protocol::upgrade::WORKSPACE_TICKET_ENVELOPE_MAX + 1];
+        let err = store
+            .put_workspace_ticket(record(1).id, &oversized)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        // A rejected put leaves no partial state behind.
+        assert!(
+            !dir.path()
+                .join(record(1).id.to_string())
+                .join(WORKSPACE_TICKET_FILE)
+                .exists(),
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_workspace_ticket_put_never_bricks_the_session() {
+        // Cap-mismatch repro: the publish ingress used to accept any
+        // size (IPC frames go up to 16 MiB) while the loader rejects
+        // > 64 KiB and load_all then skips the ENTIRE session — log,
+        // members, ledger all gone at the next daemon restart. The
+        // invariant: a put the store accepts must round-trip; a put
+        // it could not load back must be rejected at write time.
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+        let oversized = vec![0u8; 64 * 1024 + 1];
+        let put = store.put_workspace_ticket(record(1).id, &oversized).await;
+        let loaded = FsLogStore::open(dir.path())
+            .unwrap()
+            .load_all()
+            .await
+            .unwrap();
+        assert_eq!(
+            loaded.len(),
+            1,
+            "session bricked: an accepted put failed the next load",
+        );
+        if put.is_ok() {
+            assert_eq!(loaded[0].workspace_ticket, Some(oversized));
+        }
+    }
+
+    #[tokio::test]
+    async fn at_cap_workspace_ticket_round_trips_through_restart() {
+        // The largest envelope the write path accepts must survive a
+        // restart — pins write cap <= load cap.
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+        let max = vec![0xab; artel_protocol::upgrade::WORKSPACE_TICKET_ENVELOPE_MAX];
+        store
+            .put_workspace_ticket(record(1).id, &max)
+            .await
+            .unwrap();
+        let loaded = FsLogStore::open(dir.path())
+            .unwrap()
+            .load_all()
+            .await
+            .unwrap();
+        assert_eq!(loaded.len(), 1, "session must survive restart");
+        assert_eq!(loaded[0].workspace_ticket, Some(max));
     }
 
     #[tokio::test]

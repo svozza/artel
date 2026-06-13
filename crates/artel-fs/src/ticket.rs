@@ -67,7 +67,21 @@ pub fn encode(env: &WorkspaceTicketEnvelope) -> Result<Vec<u8>, TicketEnvelopeEr
     env.rules
         .validate()
         .map_err(TicketEnvelopeError::PathRules)?;
-    postcard::to_allocvec(env).map_err(|e| TicketEnvelopeError::Malformed(e.to_string()))
+    let bytes =
+        postcard::to_allocvec(env).map_err(|e| TicketEnvelopeError::Malformed(e.to_string()))?;
+    // Reject at the producer what the daemon's store, loader, and
+    // unicast delivery all cap at. Encoding past this bound would
+    // publish an envelope the daemon persists but can never load
+    // back (bricking the session on restart) or deliver (the wire
+    // frame exceeds the receiver's cap) — so fail here, where the
+    // host gets a clear error instead of a silent strand.
+    if bytes.len() > artel_protocol::upgrade::WORKSPACE_TICKET_ENVELOPE_MAX {
+        return Err(TicketEnvelopeError::TooLarge {
+            len: bytes.len(),
+            max: artel_protocol::upgrade::WORKSPACE_TICKET_ENVELOPE_MAX,
+        });
+    }
+    Ok(bytes)
 }
 
 /// Decode `bytes` into a [`WorkspaceTicketEnvelope`].
@@ -104,6 +118,17 @@ pub enum TicketEnvelopeError {
     /// will see this once a v2 envelope ships.
     #[error("workspace ticket envelope: unsupported version {0}")]
     UnsupportedVersion(u8),
+    /// Encoded envelope exceeds the shared delivery/persistence cap
+    /// ([`artel_protocol::upgrade::WORKSPACE_TICKET_ENVELOPE_MAX`]).
+    /// The host authored a `PathRules` set too large to publish; it
+    /// must be trimmed rather than silently stranding joiners.
+    #[error("workspace ticket envelope too large: {len} bytes (max {max})")]
+    TooLarge {
+        /// Encoded length that exceeded the cap.
+        len: usize,
+        /// The cap that was exceeded.
+        max: usize,
+    },
     /// Embedded [`PathRules`] failed validation.
     #[error("workspace ticket envelope: invalid rules: {0}")]
     PathRules(#[from] crate::rules::PathRulesError),
@@ -173,6 +198,43 @@ mod tests {
             matches!(err, TicketEnvelopeError::UnsupportedVersion(99)),
             "got {err:?}",
         );
+    }
+
+    #[test]
+    fn encode_rejects_envelope_over_shared_cap() {
+        // A PathRules set large enough to push the encoded envelope
+        // past the shared cap must be rejected at the producer — the
+        // daemon would otherwise persist bytes it can never load back
+        // (bricking the session) or deliver (over the wire cap).
+        let max = artel_protocol::upgrade::WORKSPACE_TICKET_ENVELOPE_MAX;
+        // ~120 bytes/rule * enough rules to clear the cap.
+        let rules = PathRules {
+            default: Mode::ReadOnly,
+            rules: (0..2000)
+                .map(|i| PathRule {
+                    glob: format!("some/moderately/long/path/segment/dir{i:06}/**/*.rs"),
+                    mode: Mode::ReadWrite,
+                })
+                .collect(),
+        };
+        let env = WorkspaceTicketEnvelope::new("docticket-string".into(), rules);
+        let err = encode(&env).expect_err("oversized envelope must be rejected");
+        match err {
+            TicketEnvelopeError::TooLarge { len, max: m } => {
+                assert!(len > max, "len {len} should exceed cap {max}");
+                assert_eq!(m, max);
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_accepts_envelope_at_or_below_cap() {
+        // A modest rule set encodes well under the cap and round-trips.
+        let env = WorkspaceTicketEnvelope::new("docticket-string".into(), rules_dozen());
+        let bytes = encode(&env).unwrap();
+        assert!(bytes.len() <= artel_protocol::upgrade::WORKSPACE_TICKET_ENVELOPE_MAX);
+        assert_eq!(decode(&bytes).unwrap(), env);
     }
 
     #[test]
