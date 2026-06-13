@@ -2301,6 +2301,51 @@ impl Registry {
         Ok(Subscription { replay, events })
     }
 
+    /// Lock a `Remote` mirror session and verify `sender_peer` is its
+    /// host — the shared validation prologue for both host→peer
+    /// direct-stream deliveries ([`Self::emit_upgrade`],
+    /// [`Self::emit_workspace_ticket`]). `what` names the payload in
+    /// error messages (`"upgrades"`, `"workspace tickets"`).
+    ///
+    /// Returns the locked session so both callers operate on the same
+    /// guard. Keeping this in one place means the two payload kinds of
+    /// the `artel/upgrade/2` channel can't drift in security posture —
+    /// a future hardening of the host-authenticity check lands once.
+    #[cfg(feature = "iroh")]
+    async fn lock_remote_session_from_host(
+        &self,
+        session: SessionId,
+        sender_peer: PeerId,
+        what: &str,
+    ) -> Result<tokio::sync::OwnedMutexGuard<Session>, SessionError> {
+        let session_arc = {
+            let guard = self.sessions.read().await;
+            guard
+                .get(&session)
+                .cloned()
+                .ok_or(SessionError::UnknownSession(session))?
+        };
+        let s = session_arc.lock_owned().await;
+
+        // Only joiners (Remote sessions) should accept deliveries. A
+        // Local session IS the host, so it has nothing to receive —
+        // surface that directly rather than the host-side `NotHost`,
+        // whose message is the semantic opposite of what happened.
+        if s.kind != SessionKind::Remote {
+            return Err(SessionError::Internal(format!(
+                "host sessions cannot receive {what}"
+            )));
+        }
+        // The sender must be the session's host.
+        if sender_peer != s.host {
+            return Err(SessionError::Internal(format!(
+                "{what} sender {sender_peer} is not the session host {}",
+                s.host,
+            )));
+        }
+        Ok(s)
+    }
+
     /// Emit a synthetic upgrade event into a session's broadcast channel.
     ///
     /// Called by [`crate::upgrade_protocol::UpgradeProtocol`] when the
@@ -2309,10 +2354,8 @@ impl Registry {
     /// a postcard-encoded payload matching the `UpgradePayload` shape
     /// that `artel-fs`'s `cap_listener` already processes.
     ///
-    /// Validates:
-    /// - Session exists locally.
-    /// - Session is `Remote` (we are a joiner, not the host).
-    /// - `sender_peer` matches the session's host.
+    /// Validates via [`Self::lock_remote_session_from_host`]: session
+    /// exists, is `Remote`, and `sender_peer` is the host.
     #[cfg(feature = "iroh")]
     pub(crate) async fn emit_upgrade(
         &self,
@@ -2320,33 +2363,9 @@ impl Registry {
         sender_peer: PeerId,
         namespace_secret: [u8; 32],
     ) -> Result<(), SessionError> {
-        let session_arc = {
-            let guard = self.sessions.read().await;
-            guard
-                .get(&session)
-                .cloned()
-                .ok_or(SessionError::UnknownSession(session))?
-        };
-
-        let s = session_arc.lock().await;
-
-        // Only joiners (Remote sessions) should accept upgrades. A
-        // Local session IS the host, so it has nothing to receive —
-        // surface that directly rather than the host-side `NotHost`,
-        // whose message is the semantic opposite of what happened.
-        if s.kind != SessionKind::Remote {
-            return Err(SessionError::Internal(
-                "host sessions cannot receive upgrades".into(),
-            ));
-        }
-
-        // The sender must be the session's host.
-        if sender_peer != s.host {
-            return Err(SessionError::Internal(format!(
-                "upgrade sender {sender_peer} is not the session host {}",
-                s.host,
-            )));
-        }
+        let s = self
+            .lock_remote_session_from_host(session, sender_peer, "upgrades")
+            .await?;
 
         let payload = postcard::to_allocvec(&UpgradePayload {
             target_peer: self.daemon_peer_id,
@@ -2366,16 +2385,7 @@ impl Registry {
         // upgrades ever need to survive a joiner restart on their own
         // (e.g. offline promotion), this must become a sequenced,
         // persisted message instead.
-        let message = SessionMessage::new(
-            Seq::ZERO,
-            0,
-            PeerInfo::new(s.host, "host"),
-            MessageKind::System,
-            UPGRADE_ACTION,
-            payload,
-            SIGNATURE_UNSIGNED,
-            SIGNATURE_UNSIGNED,
-        );
+        let message = synthetic_system_message(s.host, UPGRADE_ACTION, payload);
 
         let events_tx = s.events_tx.clone();
         drop(s);
@@ -2393,10 +2403,8 @@ impl Registry {
     /// uses for `UPGRADE_ACTION`, but persisted, so [`Self::subscribe`]
     /// also replays it (late attach / joiner restart).
     ///
-    /// Validates like `emit_upgrade`:
-    /// - Session exists locally.
-    /// - Session is `Remote` (we are a joiner, not the host).
-    /// - `sender_peer` matches the session's host.
+    /// Validates via [`Self::lock_remote_session_from_host`]: session
+    /// exists, is `Remote`, and `sender_peer` is the host.
     ///
     /// Idempotent on a re-delivery of identical bytes (admission
     /// redelivery, leave-then-rejoin): the persist and the re-emit
@@ -2408,28 +2416,9 @@ impl Registry {
         sender_peer: PeerId,
         envelope_bytes: Vec<u8>,
     ) -> Result<(), SessionError> {
-        let session_arc = {
-            let guard = self.sessions.read().await;
-            guard
-                .get(&session)
-                .cloned()
-                .ok_or(SessionError::UnknownSession(session))?
-        };
-
-        let mut s = session_arc.lock().await;
-
-        if s.kind != SessionKind::Remote {
-            return Err(SessionError::Internal(
-                "host sessions cannot receive workspace tickets".into(),
-            ));
-        }
-
-        if sender_peer != s.host {
-            return Err(SessionError::Internal(format!(
-                "workspace ticket sender {sender_peer} is not the session host {}",
-                s.host,
-            )));
-        }
+        let mut s = self
+            .lock_remote_session_from_host(session, sender_peer, "workspace tickets")
+            .await?;
 
         if s.workspace_ticket.as_deref() == Some(envelope_bytes.as_slice()) {
             // Identical re-delivery; already persisted and already
@@ -2585,24 +2574,32 @@ fn reserved_system_action(action: &str) -> Option<&'static str> {
     }
 }
 
-/// Build the synthetic `TICKET_ACTION` System message that surfaces a
-/// unicast-delivered workspace ticket envelope to the IPC subscriber.
-/// Host-stamped (`PeerInfo::new(host, "host")` — `wait_for_ticket`
-/// reads `message.peer.id` as the host's daemon id), `Seq::ZERO`,
-/// unsigned: it is not a log entry, exists only on the IPC surface,
-/// and must never ride the gossip topic. Shared by the live emit
-/// (`emit_workspace_ticket`) and the `Subscribe` replay injection.
-fn synthetic_ticket_message(host: PeerId, envelope_bytes: Vec<u8>) -> SessionMessage {
+/// Build a synthetic, host-stamped System message for a host→peer
+/// direct-stream delivery: `Seq::ZERO`, host-stamped
+/// (`PeerInfo::new(host, "host")` — consumers read `message.peer.id`
+/// as the host's daemon id), unsigned. It is not a log entry, exists
+/// only on the IPC surface, and must never ride the gossip topic.
+/// Shared by both delivery kinds (`UPGRADE_ACTION`, `TICKET_ACTION`)
+/// so their on-the-wire shape can't drift.
+fn synthetic_system_message(host: PeerId, action: &str, payload: Vec<u8>) -> SessionMessage {
     SessionMessage::new(
         Seq::ZERO,
         0,
         PeerInfo::new(host, "host"),
         MessageKind::System,
-        TICKET_ACTION,
-        envelope_bytes,
+        action,
+        payload,
         SIGNATURE_UNSIGNED,
         SIGNATURE_UNSIGNED,
     )
+}
+
+/// The [`TICKET_ACTION`] synthetic message: a [`synthetic_system_message`]
+/// carrying the unicast-delivered workspace ticket envelope. Shared by
+/// the live emit (`emit_workspace_ticket`) and the `Subscribe` replay
+/// injection.
+fn synthetic_ticket_message(host: PeerId, envelope_bytes: Vec<u8>) -> SessionMessage {
+    synthetic_system_message(host, TICKET_ACTION, envelope_bytes)
 }
 
 /// Parse an artel join ticket. Phase 2b: returns the session id; the
