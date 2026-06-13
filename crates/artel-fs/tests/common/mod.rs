@@ -539,3 +539,20 @@ pub async fn grant_rw_and_wait(
         );
     }
 }
+
+/// Wrap one phase of a test with begin/end stderr markers and an outer
+/// `budget` timeout, so a captured failing log shows exactly which step
+/// hung (per `docs/diagnosing-flaky-tests.md`). Panics with the phase
+/// name on timeout. `budget` is a parameter because call sites differ
+/// (a quick local reconcile vs. a real-n0 relay round-trip).
+pub async fn phase_budgeted<F, T>(name: &'static str, budget: Duration, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    eprintln!(">>> phase begin: {name} (budget {budget:?})");
+    let res = timeout(budget, fut)
+        .await
+        .unwrap_or_else(|_| panic!("phase hung past {budget:?}: {name}"));
+    eprintln!("<<< phase end:   {name}");
+    res
+}

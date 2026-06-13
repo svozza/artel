@@ -74,19 +74,7 @@ async fn n0_phase<F, T>(name: &'static str, fut: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
-    n0_phase_budgeted(name, N0_PHASE_BUDGET, fut).await
-}
-
-async fn n0_phase_budgeted<F, T>(name: &'static str, budget: Duration, fut: F) -> T
-where
-    F: std::future::Future<Output = T>,
-{
-    eprintln!(">>> phase begin: {name} (budget {budget:?})");
-    let res = timeout(budget, fut)
-        .await
-        .unwrap_or_else(|_| panic!("phase hung past {budget:?}: {name}"));
-    eprintln!("<<< phase end:   {name}");
-    res
+    common::phase_budgeted(name, N0_PHASE_BUDGET, fut).await
 }
 
 fn init_n0_tracing() {
@@ -213,7 +201,7 @@ async fn doc_ticket_round_trips_without_manual_address_seeding_n0() {
 
     let mut events = joiner_doc.subscribe().await.expect("subscribe");
 
-    let entry_hash = n0_phase_budgeted(
+    let entry_hash = common::phase_budgeted(
         "joiner: wait for entry + ContentReady",
         N0_DISCOVERY_BUDGET,
         async {
@@ -287,7 +275,7 @@ async fn pkarr_phase<F, T>(name: &'static str, fut: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
-    n0_phase_budgeted(name, PKARR_PHASE_BUDGET, fut).await
+    common::phase_budgeted(name, PKARR_PHASE_BUDGET, fut).await
 }
 
 /// One full iroh node bound against `presets::Empty + Minimal` plus

@@ -383,12 +383,7 @@ async fn n0_phase<F, T>(name: &'static str, fut: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
-    eprintln!(">>> phase begin: {name}");
-    let res = timeout(N0_PHASE_BUDGET, fut)
-        .await
-        .unwrap_or_else(|_| panic!("phase hung past {N0_PHASE_BUDGET:?}: {name}"));
-    eprintln!("<<< phase end:   {name}");
-    res
+    common::phase_budgeted(name, N0_PHASE_BUDGET, fut).await
 }
 
 #[tokio::test(flavor = "multi_thread")]

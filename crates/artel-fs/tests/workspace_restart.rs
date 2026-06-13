@@ -565,19 +565,12 @@ async fn alice_post_restart_writes_reach_bob() {
 
 const PHASE_BUDGET: Duration = Duration::from_secs(45);
 
-/// Wrap a future with begin/end stderr markers + an outer timeout so a
-/// captured failing log shows exactly which step hung. Panics with the
-/// phase name on timeout. See `docs/diagnosing-flaky-tests.md`.
+/// Bound one phase of the restart test (see `common::phase_budgeted`).
 async fn phase<F, T>(name: &'static str, fut: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
-    eprintln!(">>> phase begin: {name}");
-    let res = timeout(PHASE_BUDGET, fut)
-        .await
-        .unwrap_or_else(|_| panic!("phase hung past {PHASE_BUDGET:?}: {name}"));
-    eprintln!("<<< phase end:   {name}");
-    res
+    common::phase_budgeted(name, PHASE_BUDGET, fut).await
 }
 
 /// Real-n0 capture-ticket: same shape as the top-level helper but with
