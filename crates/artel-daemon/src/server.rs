@@ -38,7 +38,7 @@ use crate::shutdown::{Shutdown, ShutdownToken};
 const HOME_RELAY_BUDGET: Duration = Duration::from_secs(30);
 
 /// Whole-operation deadline for one direct-stream
-/// [`deliver_frame`] delivery (dial → open_bi → write → ACK).
+/// [`deliver_frame`] delivery (dial → `open_bi` → write → ACK).
 ///
 /// Capability deliveries are awaited on latency-sensitive paths —
 /// the per-session gossip forwarder (admission delivery) and the IPC
@@ -908,7 +908,7 @@ pub(crate) async fn deliver_frame(
 /// point pins [`DELIVER_FRAME_TIMEOUT`]; tests pass a short budget).
 ///
 /// The deadline spans the whole operation. Every step of
-/// [`deliver_frame_inner`] — dial, open_bi, write, ACK read — can
+/// [`deliver_frame_inner`] — dial, `open_bi`, write, ACK read — can
 /// block indefinitely against an undialable peer (failed holepunch at
 /// mesh-up is the common case right at admission), and the callers
 /// await this on latency-sensitive paths: the per-session gossip
@@ -923,10 +923,12 @@ async fn deliver_frame_with_timeout(
     frame: &artel_protocol::upgrade::DeliveryFrame,
     deadline: Duration,
 ) -> Result<(), String> {
-    match tokio::time::timeout(deadline, deliver_frame_inner(endpoint, target, frame)).await {
-        Ok(result) => result,
-        Err(_) => Err(format!("delivery to {target} timed out after {deadline:?}")),
-    }
+    let Ok(result) =
+        tokio::time::timeout(deadline, deliver_frame_inner(endpoint, target, frame)).await
+    else {
+        return Err(format!("delivery to {target} timed out after {deadline:?}"));
+    };
+    result
 }
 
 /// The unbounded body of [`deliver_frame`]; always driven under a
@@ -1354,8 +1356,8 @@ mod tests {
     /// `deliver_frame` must bound its own runtime: a dial to an
     /// undialable peer returns a timeout error within the deadline
     /// rather than blocking the caller indefinitely. Before the fix
-    /// there was no timeout on the connect/open_bi/ACK path, so this
-    /// would hang for iroh's full (unbounded) connect timeout and
+    /// there was no timeout on the `connect`/`open_bi`/ACK path, so
+    /// this would hang for iroh's full (unbounded) connect timeout and
     /// stall the gossip forwarder / IPC dispatch behind it.
     #[tokio::test]
     async fn deliver_frame_times_out_against_undialable_peer() {
