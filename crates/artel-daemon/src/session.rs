@@ -173,6 +173,19 @@ pub enum SessionError {
     /// dead.
     #[error("ticket {0} was never issued for this session")]
     UnknownTicket(TicketId),
+
+    /// A `Send` carried a reserved daemon-injected System action
+    /// (`workspace.ticket` / `workspace.upgrade`). These actions are
+    /// minted only by the daemon as synthetic, unsigned, off-log
+    /// messages from unicast-delivered capability material — they are
+    /// never authored by a member. Rejecting at the single sequencing
+    /// chokepoint (`Registry::send`) keeps a forged broadcast off the
+    /// log entirely, so it can't reach the host's live IPC fan-out (a
+    /// co-located joiner-mode workspace would otherwise import it) nor
+    /// any log-derived replay surface. The `&'static str` is the
+    /// rejected action for diagnostics.
+    #[error("reserved system action may not be sent by a member: {0}")]
+    ReservedAction(&'static str),
 }
 
 // io::Error doesn't impl PartialEq, so we hand-roll one for the
@@ -211,6 +224,7 @@ impl PartialEq for SessionError {
                 },
             ) => a_peer == b_peer && a_had == b_had && a_needed == b_needed,
             (Self::UnknownTicket(a), Self::UnknownTicket(b)) => a == b,
+            (Self::ReservedAction(a), Self::ReservedAction(b)) => a == b,
             (Self::InvalidTicket, Self::InvalidTicket)
             | (Self::NotHost, Self::NotHost)
             | (Self::TicketExpired, Self::TicketExpired)
@@ -270,6 +284,13 @@ impl From<&SessionError> for ProtocolError {
             // faithfully rather than panicking on a future code
             // motion.
             SessionError::UnknownTicket(t) => Self::UnknownTicket(*t),
+            // A member tried to author a reserved daemon-injected
+            // action. It's a protocol misuse (or a forge attempt),
+            // not a capability tier issue — surface it as Internal
+            // with the offending action named.
+            SessionError::ReservedAction(action) => {
+                Self::Internal(format!("reserved system action: {action}"))
+            }
         }
     }
 }
@@ -1758,6 +1779,22 @@ impl Registry {
         payload: Vec<u8>,
         authoring: Authoring,
     ) -> Result<SessionMessage, SessionError> {
+        // Reserved daemon-injected actions are never member-authored:
+        // the genuine `workspace.ticket` / `workspace.upgrade` messages
+        // are synthetic, unsigned, off-log frames the daemon mints from
+        // unicast-delivered capability material. Reject at this single
+        // sequencing chokepoint — shared by the IPC `Send` path and the
+        // gossip `run_host_send` path — so a forged broadcast never
+        // enters the log, never reaches the host's live IPC fan-out,
+        // and never rides a log-derived replay surface. The downstream
+        // log-filter sites stay as defense-in-depth against a stale or
+        // mixed-build host that sequenced one before this gate existed.
+        if kind == MessageKind::System
+            && let Some(reserved) = reserved_system_action(&action)
+        {
+            return Err(SessionError::ReservedAction(reserved));
+        }
+
         let session_arc = {
             let guard = self.sessions.read().await;
             guard
@@ -2406,6 +2443,23 @@ impl Registry {
     }
 }
 
+/// Returns the canonical `&'static str` for `action` if it is a
+/// reserved daemon-injected System action, else `None`.
+///
+/// `workspace.ticket` and `workspace.upgrade` are minted only by the
+/// daemon (synthetic, unsigned, off-log messages built from unicast
+/// capability material); a member must never author them. Returning
+/// the `'static` form lets the rejection name the action without
+/// allocating. This is the single source of truth for "reserved
+/// action" — the log-filter sites match the same two constants.
+fn reserved_system_action(action: &str) -> Option<&'static str> {
+    match action {
+        TICKET_ACTION => Some(TICKET_ACTION),
+        UPGRADE_ACTION => Some(UPGRADE_ACTION),
+        _ => None,
+    }
+}
+
 /// Build the synthetic `TICKET_ACTION` System message that surfaces a
 /// unicast-delivered workspace ticket envelope to the IPC subscriber.
 /// Host-stamped (`PeerInfo::new(host, "host")` — `wait_for_ticket`
@@ -2609,6 +2663,45 @@ mod tests {
                 .await
                 .map(|(id, ticket, _tid)| (id, ticket))
         }
+
+        /// Push a message straight onto a session's in-memory log,
+        /// bypassing `send`. Simulates an entry that reached the log
+        /// without passing the ingress gate — a peer-authored
+        /// broadcast a mixed-build/stale host sequenced, or a pre-fix
+        /// relic — which is exactly what the downstream log filters
+        /// (`log_since`, `subscribe`, `apply_inbound_mirror_message`)
+        /// exist to neutralise. `send` now rejects reserved actions at
+        /// ingress, so tests for those defense-in-depth filters can no
+        /// longer plant their fixtures through `send`.
+        async fn inject_log_entry(&self, session: SessionId, message: SessionMessage) {
+            let session_arc = {
+                let guard = self.sessions.read().await;
+                guard.get(&session).cloned().expect("session exists")
+            };
+            let mut s = session_arc.lock().await;
+            s.head = message.seq;
+            s.log.push(message);
+        }
+    }
+
+    /// Build an unsigned `SessionMessage` fixture for `inject_log_entry`.
+    fn log_fixture(
+        seq: u64,
+        author: &PeerInfo,
+        kind: MessageKind,
+        action: &str,
+        payload: Vec<u8>,
+    ) -> SessionMessage {
+        SessionMessage::new(
+            Seq::new(seq),
+            seq,
+            author.clone(),
+            kind,
+            action,
+            payload,
+            SIGNATURE_UNSIGNED,
+            SIGNATURE_UNSIGNED,
+        )
     }
 
     // ---- host ----
@@ -4688,16 +4781,20 @@ mod tests {
         .await
         .unwrap();
 
-        r.send(
+        // A reserved-action System entry can no longer be sent (the
+        // ingress gate rejects it); inject it directly to exercise the
+        // log_since filter against a stale/impostor log entry.
+        r.inject_log_entry(
             id,
-            host.clone(),
-            MessageKind::System,
-            UPGRADE_ACTION.into(),
-            vec![0xAB; 32],
-            Authoring::Local,
+            log_fixture(
+                2,
+                &host,
+                MessageKind::System,
+                UPGRADE_ACTION,
+                vec![0xAB; 32],
+            ),
         )
-        .await
-        .unwrap();
+        .await;
 
         r.send(
             id,
@@ -4738,16 +4835,14 @@ mod tests {
         let host = peer(1, "alice");
         let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
 
-        r.send(
+        // A peer-authored TICKET_ACTION can't pass the ingress gate;
+        // inject it directly to simulate the impostor log entry the
+        // log_since filter must drop.
+        r.inject_log_entry(
             id,
-            host.clone(),
-            MessageKind::System,
-            TICKET_ACTION.into(),
-            vec![0xAB; 64],
-            Authoring::Local,
+            log_fixture(1, &host, MessageKind::System, TICKET_ACTION, vec![0xAB; 64]),
         )
-        .await
-        .unwrap();
+        .await;
         r.send(
             id,
             host,
@@ -4773,16 +4868,13 @@ mod tests {
         let r = registry();
         let host = peer(1, "alice");
         let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
-        r.send(
+        // Plant the impostor entry directly — the ingress gate would
+        // otherwise reject a member-authored TICKET_ACTION send.
+        r.inject_log_entry(
             id,
-            host.clone(),
-            MessageKind::System,
-            TICKET_ACTION.into(),
-            vec![0xAB; 64],
-            Authoring::Local,
+            log_fixture(1, &host, MessageKind::System, TICKET_ACTION, vec![0xAB; 64]),
         )
-        .await
-        .unwrap();
+        .await;
         r.send(
             id,
             host,
@@ -5037,6 +5129,107 @@ mod tests {
         let sub = r.subscribe(id, None).await.unwrap();
         assert_eq!(sub.replay[0].action, TICKET_ACTION);
         assert_eq!(sub.replay[0].payload, vec![0xCD; 48]);
+    }
+
+    // ---- reserved-action ingress rejection (forged-envelope leak) ----
+
+    #[tokio::test]
+    async fn send_rejects_reserved_ticket_action_and_does_not_emit() {
+        // A member's forged `workspace.ticket` System send must be
+        // rejected at the sequencing chokepoint — never appended,
+        // never live-emitted to the host's IPC subscribers (a
+        // co-located joiner-mode workspace would otherwise import the
+        // forged envelope from the live stream).
+        let r = registry();
+        let host = peer(1, "alice");
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
+        let mut sub = r.subscribe(id, None).await.unwrap();
+
+        let err = r
+            .send(
+                id,
+                host.clone(),
+                MessageKind::System,
+                TICKET_ACTION.to_string(),
+                b"forged-envelope".to_vec(),
+                Authoring::Local,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, SessionError::ReservedAction(TICKET_ACTION));
+
+        // Nothing live-emitted.
+        let got = timeout(Duration::from_millis(300), sub.events.recv()).await;
+        assert!(got.is_err(), "forged TICKET_ACTION must not emit: {got:?}");
+        // Nothing appended: a fresh subscribe sees no such entry.
+        let sub2 = r.subscribe(id, None).await.unwrap();
+        assert!(
+            !sub2.replay.iter().any(|m| m.action == TICKET_ACTION),
+            "forged TICKET_ACTION must not be appended to the log",
+        );
+    }
+
+    #[tokio::test]
+    async fn send_rejects_reserved_upgrade_action() {
+        let r = registry();
+        let host = peer(1, "alice");
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
+        let err = r
+            .send(
+                id,
+                host,
+                MessageKind::System,
+                UPGRADE_ACTION.to_string(),
+                vec![0xAB; 32],
+                Authoring::Local,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, SessionError::ReservedAction(UPGRADE_ACTION));
+    }
+
+    #[tokio::test]
+    async fn send_allows_non_reserved_system_action() {
+        // Legitimate System sends (e.g. artel-fs's node-id announce)
+        // must still pass — only the two reserved actions are blocked.
+        let r = registry();
+        let host = peer(1, "alice");
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
+        let msg = r
+            .send(
+                id,
+                host,
+                MessageKind::System,
+                "workspace.node_id".to_string(),
+                vec![1, 2, 3],
+                Authoring::Local,
+            )
+            .await
+            .expect("non-reserved System action must be accepted");
+        assert_eq!(msg.action, "workspace.node_id");
+    }
+
+    #[tokio::test]
+    async fn send_allows_chat_action_named_like_reserved_with_non_system_kind() {
+        // The gate keys on (System kind AND reserved action). A Chat
+        // message that happens to carry the reserved action string is
+        // not a capability frame and stays allowed — the reserved
+        // names only matter on the System surface the daemon injects.
+        let r = registry();
+        let host = peer(1, "alice");
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
+        let msg = r
+            .send(
+                id,
+                host,
+                MessageKind::Chat,
+                TICKET_ACTION.to_string(),
+                vec![1],
+                Authoring::Local,
+            )
+            .await
+            .expect("non-System kind must be accepted even with reserved action name");
+        assert_eq!(msg.kind, MessageKind::Chat);
     }
 
     // ---- is_member accessor ----

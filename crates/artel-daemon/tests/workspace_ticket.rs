@@ -142,6 +142,72 @@ async fn envelope_published_before_join_reaches_joiner_at_admission() {
 }
 
 // =============================================================
+// Forged-envelope leak: a member's hand-rolled `Send` of a
+// `workspace.ticket` System message must be rejected at the host's
+// sequencing chokepoint — never appended, never surfaced on the
+// host's own live IPC event stream (a co-located joiner-mode
+// workspace draining that stream would otherwise import the forged
+// envelope and drive its `wait_for_ticket`).
+// =============================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn forged_ticket_send_is_rejected_and_not_emitted_live() {
+    let (daemon_a, _daemon_b, _dns_pkarr) = common::spawn_pair().await;
+
+    let alice = Client::connect(&daemon_a.socket).await.unwrap();
+    let (session, _ticket) = host_session(&alice).await;
+    alice
+        .request(Request::Subscribe {
+            session,
+            since: None,
+        })
+        .await
+        .unwrap();
+    let mut alice_events = alice.take_events().await.expect("alice events");
+
+    // Host (a member) forges a workspace.ticket System broadcast. The
+    // client surfaces the daemon's Response::Error as a protocol Err.
+    let result = alice
+        .request(Request::Send {
+            session,
+            payload: artel_protocol::rpc::SendPayload {
+                kind: MessageKind::System,
+                action: TICKET_ACTION.to_string(),
+                payload: b"forged-envelope".to_vec(),
+            },
+        })
+        .await;
+    assert!(
+        result.is_err(),
+        "forged TICKET_ACTION send must be rejected, got {result:?}",
+    );
+
+    // It must not surface on the live event stream.
+    let leaked = timeout(Duration::from_secs(2), async {
+        loop {
+            match alice_events.recv().await {
+                Some(Event::Message { message, .. })
+                    if message.kind == MessageKind::System && message.action == TICKET_ACTION =>
+                {
+                    return true;
+                }
+                Some(_) => {}
+                None => return false,
+            }
+        }
+    })
+    .await;
+    assert!(
+        leaked.is_err() || leaked == Ok(false),
+        "forged TICKET_ACTION leaked to the live IPC surface",
+    );
+
+    drop(alice_events);
+    drop(alice);
+    daemon_a.stop().await;
+}
+
+// =============================================================
 // Publish AFTER the joiner is admitted: deliver-on-publish fans the
 // envelope out to current members.
 // =============================================================

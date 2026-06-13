@@ -966,21 +966,22 @@ async fn on_removed_does_not_tombstone_read_only_path() {
 }
 
 // =============================================================
-// Legacy broadcast `workspace.ticket` messages are inert.
+// Forged broadcast `workspace.ticket` sends are rejected at ingress
+// and never reach a joiner.
 //
 // Pre-fix hosts broadcast the ticket envelope as a System message
 // on the session log; the revoked-lurker fix moved the envelope to
-// host→peer unicast and made the daemon suppress every log-borne
-// `TICKET_ACTION` (live and replayed). A stale host — or a
-// malicious RW member broadcasting a forged envelope via
-// `Request::Send` — must therefore never drive a v2 joiner's
-// `wait_for_ticket`: the broadcast is inert chatter and the joiner
-// times out with NO workspace materialised.
+// host→peer unicast. A malicious RW member (or stale host) that
+// hand-rolls a `Request::Send` of a forged envelope is now rejected
+// at the host's sequencing chokepoint — the impostor never enters
+// the log, so it can't ride any joiner-visible surface. The joiner's
+// `wait_for_ticket` therefore times out with NO workspace
+// materialised.
 //
-// (The old shape of this test asserted the broadcast path's decode
-// behaviour — `TicketEnvelope(Malformed)` on a raw DocTicket
-// payload. That path no longer exists: the payload never reaches
-// the joiner at all, malformed or not.)
+// (Earlier this test asserted the send was accepted-but-suppressed;
+// the ingress gate makes that a stronger property — rejected
+// outright. The downstream log filters remain as defense-in-depth
+// for a mixed-build host that sequenced one before the gate existed.)
 // =============================================================
 
 #[tokio::test(flavor = "multi_thread")]
@@ -992,11 +993,11 @@ async fn broadcast_ticket_action_is_inert_for_joiner() {
     } = spawn_pair().await;
 
     // Alice hosts the artel session but does NOT stand up a
-    // workspace. She broadcasts a `TICKET_ACTION` payload via
-    // `Request::Send` — mimicking a stale pre-fix host (or a forged
-    // envelope from an RW member). A well-formed envelope would be
-    // the strongest impostor, but any bytes prove the point: the
-    // action is suppressed regardless of payload.
+    // workspace. She attempts to broadcast a `TICKET_ACTION` payload
+    // via `Request::Send` — mimicking a stale pre-fix host (or a
+    // forged envelope from an RW member). The host's ingress gate
+    // rejects the reserved action outright, so it never enters the
+    // log.
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
     let (session, artel_ticket) = match alice
         .request(Request::HostSession {
@@ -1016,7 +1017,10 @@ async fn broadcast_ticket_action_is_inert_for_joiner() {
         cbbcaa3aacaaaaaaaaaaiiabaaaaaiabarbjzgaaaaaaaaaaaaaaaaaaaaaa"
         .to_vec();
 
-    match alice
+    // Rejected at the host's sequencing chokepoint — the reserved
+    // action is never member-authored. The client surfaces the
+    // daemon's Response::Error as a protocol Err.
+    let send_result = alice
         .request(Request::Send {
             session,
             payload: SendPayload {
@@ -1025,12 +1029,11 @@ async fn broadcast_ticket_action_is_inert_for_joiner() {
                 payload: old_shape_payload,
             },
         })
-        .await
-        .unwrap()
-    {
-        Response::Sent { .. } => {}
-        other => panic!("Send: got {other:?}"),
-    }
+        .await;
+    assert!(
+        send_result.is_err(),
+        "forged TICKET_ACTION send must be rejected at ingress, got {send_result:?}",
+    );
 
     // Bob joins the artel session, then calls `Workspace::join_with`
     // with a bounded ticket wait. The broadcast TICKET_ACTION is
