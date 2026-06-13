@@ -704,10 +704,26 @@ Listed for completeness, no detailed plan yet:
   `artel-fs/tests/revoked_lurker.rs` (revoked + expired lurkers end
   with no file content and no doc replica). Carried residuals:
   replay traffic is still topic-visible to lurkers (capability-free
-  chatter; true privacy = topic-key rotation, § Future), and the
+  chatter; true privacy = topic-key rotation, § Future); the
   DocsGate/PeerFilter deny-list → allow-list flip remains a
   follow-up (requires resequencing the joiner's NODE_ID announce
-  ahead of initial sync).
+  ahead of initial sync); and **the membership-gated `Replay` arm
+  keys on `delivered_from`**, which iroh-gossip defines as the relay
+  hop, not the frame origin — the same dependence auth Slice B.5
+  deliberately avoided for signed frames (see that entry below). The
+  gate is sound under v1's star topology (the host hears every
+  joiner directly) and is defense-in-depth only — the capability
+  leak it backstops is already closed by moving the envelope off
+  gossip onto host→peer unicast. But `GossipBody::Replay` carries no
+  signed identity, so in a multi-hop mesh a lurker's `Replay`
+  relayed through a member would pass the gate and the host would
+  re-broadcast the backlog (capability-free, but more than the
+  "lurkers see only live chatter" guarantee intends). **MUST become
+  a signed, B.5-style requester identity (or move the gate into
+  `log_since`/`run_host_replay` keyed on a verified peer) as part of
+  the P2P causal-DAG rethink** — see the L2 host-only enforcement
+  note (`l2-host-only-enforcement-v1`); the same topology assumption
+  is what that rethink retires.
   NOTE (memory `reopen-grant-authority-on-readonly-
   tickets`): now that sub-RW members exist, the L2 "any RW holder
   grants" rule is load-bearing — revisit grant authority if a tier
