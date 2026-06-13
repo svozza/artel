@@ -295,3 +295,42 @@ pub async fn expect_message_with_payload(
         }
     }
 }
+
+/// Gossip topic id for `session`, mirroring `gossip_bridge::topic_for`
+/// (private to the daemon crate): the 16-byte session id zero-padded
+/// to the 32-byte topic id. Tests that raw-subscribe to a session's
+/// topic (lurker shapes, replay-gate checks) derive it here.
+pub fn topic_for(session: artel_protocol::SessionId) -> iroh_gossip::proto::TopicId {
+    let mut bytes = [0u8; 32];
+    bytes[..16].copy_from_slice(session.as_bytes());
+    iroh_gossip::proto::TopicId::from_bytes(bytes)
+}
+
+/// Drain `events` until a `PeerJoined` for `peer_id` arrives; panic
+/// after 20 s. Deadline-aware (tolerates spurious per-recv timeouts),
+/// the same loop shape as [`expect_message_with_payload`].
+pub async fn wait_for_peer_joined(
+    events: &mut artel_client::EventStream,
+    peer_id: PeerId,
+    label: &str,
+) {
+    use artel_protocol::Event;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "{label}: PeerJoined({peer_id}) never arrived",
+        );
+        let event = match timeout(remaining, events.recv()).await {
+            Ok(Some(ev)) => ev,
+            Ok(None) => panic!("{label}: events channel closed"),
+            Err(_) => continue,
+        };
+        if let Event::PeerJoined { peer, .. } = event
+            && peer.id == peer_id
+        {
+            return;
+        }
+    }
+}

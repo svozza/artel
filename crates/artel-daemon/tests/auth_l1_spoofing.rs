@@ -19,24 +19,15 @@ use std::time::{Duration, Instant};
 use artel_client::Client;
 use artel_protocol::gossip::{self, GossipBody};
 use artel_protocol::rpc::{SendPayload, SignedSendPayload};
-use artel_protocol::{Event, MessageKind, PeerInfo, Request, Response, SessionId, SessionMessage};
+use artel_protocol::{Event, MessageKind, PeerInfo, Request, Response, SessionMessage};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use iroh_gossip::api::Event as GossipEvent;
-use iroh_gossip::proto::TopicId;
 use pretty_assertions::assert_eq;
 use tokio::time::timeout;
 use uuid::Uuid;
 
-/// Mirrors `gossip_bridge::topic_for`, which is private. Same shape:
-/// session UUID in the high 16 bytes, zeros in the low 16. If the
-/// bridge ever changes the derivation, this helper drifts and the
-/// tests fail loudly — that's the desired signal.
-fn topic_for(session: SessionId) -> TopicId {
-    let mut bytes = [0u8; 32];
-    bytes[..16].copy_from_slice(session.as_bytes());
-    TopicId::from_bytes(bytes)
-}
+use common::topic_for;
 
 // =============================================================
 // Host drops a spoofed `SendRequest` whose body `peer.id` doesn't

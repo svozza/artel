@@ -22,16 +22,9 @@ use artel_protocol::{Event, MessageKind, Request, Response, Seq, SessionId, TICK
 use bytes::Bytes;
 use futures_util::StreamExt;
 use iroh_gossip::api::Event as GossipEvent;
-use iroh_gossip::proto::TopicId;
 use tokio::time::timeout;
 
-/// Mirrors `gossip_bridge::topic_for`, which is private (same shape
-/// as the `auth_l1_spoofing` helper).
-fn topic_for(session: SessionId) -> TopicId {
-    let mut bytes = [0u8; 32];
-    bytes[..16].copy_from_slice(session.as_bytes());
-    TopicId::from_bytes(bytes)
-}
+use common::topic_for;
 
 const ENVELOPE_FIXTURE: &[u8] = b"opaque-workspace-ticket-envelope-fixture";
 
@@ -445,18 +438,7 @@ async fn rw_joiner_receives_envelope_and_secret_on_one_channel() {
 
     // Wait for admission, then push the secret to Bob.
     let bob_peer_id = daemon_b.peer_id();
-    timeout(Duration::from_secs(20), async {
-        loop {
-            let ev = alice_events.recv().await.expect("alice events closed");
-            if let Event::PeerJoined { peer, .. } = ev
-                && peer.id == bob_peer_id
-            {
-                return;
-            }
-        }
-    })
-    .await
-    .expect("alice never saw bob join");
+    common::wait_for_peer_joined(&mut alice_events, bob_peer_id, "alice never saw bob join").await;
 
     match alice
         .request(Request::DeliverUpgrade {

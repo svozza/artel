@@ -19,7 +19,7 @@ use artel_client::{Client, ClientError};
 use artel_protocol::capability::Capability;
 use artel_protocol::ticket::TicketStatus;
 use artel_protocol::{
-    Event, MessageKind, PeerId, ProtocolError, Request, Response, SendPayload, UPGRADE_ACTION,
+    Event, MessageKind, ProtocolError, Request, Response, SendPayload, UPGRADE_ACTION,
 };
 
 // =============================================================
@@ -744,30 +744,7 @@ async fn revocation_survives_host_restart() {
     daemon2.stop().await;
 }
 
-async fn wait_for_peer_joined(
-    events: &mut artel_client::EventStream,
-    peer_id: PeerId,
-    label: &str,
-) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        assert!(
-            !remaining.is_zero(),
-            "{label}: PeerJoined({peer_id}) never arrived"
-        );
-        let event = match timeout(remaining, events.recv()).await {
-            Ok(Some(ev)) => ev,
-            Ok(None) => panic!("{label}: events channel closed"),
-            Err(_) => continue,
-        };
-        if let Event::PeerJoined { peer, .. } = event
-            && peer.id == peer_id
-        {
-            return;
-        }
-    }
-}
+use common::wait_for_peer_joined;
 
 async fn wait_for_upgrade_event(
     events: &mut artel_client::EventStream,

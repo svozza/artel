@@ -40,7 +40,6 @@ use artel_protocol::{
 use bytes::Bytes;
 use futures_util::StreamExt;
 use iroh_gossip::api::Event as GossipEvent;
-use iroh_gossip::proto::TopicId;
 use pretty_assertions::assert_eq;
 use tokio::time::timeout;
 
@@ -59,13 +58,7 @@ const fn n0_relay_setup() -> EndpointSetup {
     EndpointSetup::Production
 }
 
-/// Mirrors `gossip_bridge::topic_for` (private). Session UUID in the
-/// high 16 bytes, zeros in the low 16.
-fn topic_for(session: SessionId) -> TopicId {
-    let mut bytes = [0u8; 32];
-    bytes[..16].copy_from_slice(session.as_bytes());
-    TopicId::from_bytes(bytes)
-}
+use common::topic_for;
 
 /// Re-host the same id (resume → host-epoch bump + signed beacon).
 async fn resume_host(client: &Client, session_id: SessionId) {

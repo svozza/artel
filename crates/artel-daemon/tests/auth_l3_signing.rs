@@ -34,20 +34,12 @@ use artel_protocol::{
 use bytes::Bytes;
 use futures_util::StreamExt;
 use iroh_gossip::api::Event as GossipEvent;
-use iroh_gossip::proto::TopicId;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use tokio::time::timeout;
 use uuid::Uuid;
 
-/// Mirrors `gossip_bridge::topic_for`, which is private. Same shape:
-/// session UUID in the high 16 bytes, zeros in the low 16. Drift is
-/// caught by `auth_l1_spoofing.rs`'s `topic_for` helper too.
-fn topic_for(session: SessionId) -> TopicId {
-    let mut bytes = [0u8; 32];
-    bytes[..16].copy_from_slice(session.as_bytes());
-    TopicId::from_bytes(bytes)
-}
+use common::topic_for;
 
 /// Set up a host (alice) + joiner (bob) over `spawn_pair` and
 /// return the session id, alice's IPC + event handles, and bob's
