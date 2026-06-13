@@ -760,30 +760,38 @@ fn is_attachment_tmp(name: &str) -> bool {
         .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
 }
 
-/// Atomic JSON write: pretty-serialize to `<path minus extension>.json.tmp`,
-/// fsync, chmod 0o600, rename onto `path`. `label` names the document
-/// in error messages ("meta", "tickets").
+/// Crash-safe write of raw `bytes` to `path`: write to
+/// `<path minus extension>.<tmp_ext>`, fsync, chmod [`FILE_MODE`],
+/// rename onto `path`. The rename is atomic, so a reader sees either
+/// the old file or the fully-written new one — never a torn write.
 ///
 /// The deterministic tmp name is safe only while writes to one `path`
 /// never race: every caller holds the per-session `Mutex<Session>`
 /// across the write. A writer outside that lock needs
 /// [`unique_tmp_path`] instead (see [`write_attachment`]).
-fn write_json_atomic<T: Serialize>(path: &Path, value: &T, label: &str) -> io::Result<()> {
-    let bytes = serde_json::to_vec_pretty(value)
-        .map_err(|e| io::Error::new(ErrorKind::InvalidData, format!("{label} json: {e}")))?;
-    let tmp = path.with_extension("json.tmp");
+fn write_bytes_atomic(path: &Path, bytes: &[u8], tmp_ext: &str) -> io::Result<()> {
+    let tmp = path.with_extension(tmp_ext);
     {
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
             .open(&tmp)?;
-        f.write_all(&bytes)?;
+        f.write_all(bytes)?;
         f.sync_all()?;
     }
     chmod(&tmp, FILE_MODE)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// Atomic JSON write: pretty-serialize then [`write_bytes_atomic`] to
+/// `<path minus extension>.json.tmp`. `label` names the document in
+/// error messages ("meta", "tickets").
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T, label: &str) -> io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(value)
+        .map_err(|e| io::Error::new(ErrorKind::InvalidData, format!("{label} json: {e}")))?;
+    write_bytes_atomic(path, &bytes, "json.tmp")
 }
 
 /// Counterpart of [`write_json_atomic`]: read + parse, mapping parse
@@ -857,11 +865,10 @@ fn write_meta(path: &Path, meta: &Meta) -> io::Result<()> {
     write_json_atomic(path, meta, "meta")
 }
 
-/// Atomic full rewrite of the workspace ticket envelope sidecar:
-/// raw bytes via the deterministic tmp+rename idiom (single writer —
-/// the registry holds the per-session lock across the call, same as
-/// `write_meta` / `write_tickets`), `0600` because the envelope is
-/// capability-bearing.
+/// Atomic full rewrite of the workspace ticket envelope sidecar via
+/// [`write_bytes_atomic`] (single writer — the registry holds the
+/// per-session lock across the call, same as `write_meta` /
+/// `write_tickets`), `0600` because the envelope is capability-bearing.
 fn write_workspace_ticket(path: &Path, envelope: &[u8]) -> io::Result<()> {
     // Reject at write time what the loader would reject at read time
     // (and the wire would reject at delivery). Persisting an envelope
@@ -878,19 +885,7 @@ fn write_workspace_ticket(path: &Path, envelope: &[u8]) -> io::Result<()> {
             ),
         ));
     }
-    let tmp = path.with_extension("bin.tmp");
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp)?;
-        f.write_all(envelope)?;
-        f.sync_all()?;
-    }
-    chmod(&tmp, FILE_MODE)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    write_bytes_atomic(path, envelope, "bin.tmp")
 }
 
 /// Read the workspace ticket envelope sidecar. Absent ⇒ `None`.
