@@ -40,6 +40,23 @@ use crate::store::{DynStore, SessionKind, SessionRecord, StoredAttachment};
 /// one slow subscriber.
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
+/// How many times the spawned workspace-ticket delivery retries a
+/// failed dial before giving up. A joiner never re-announces on its
+/// own, so the admission-time delivery is the only path that backfills
+/// its late attach — a single transient holepunch failure must not
+/// strand it in `wait_for_ticket` forever. Each attempt is itself
+/// bounded by the `deliver_frame` timeout; the retries cover a peer
+/// that becomes dialable a moment later.
+#[cfg(feature = "iroh")]
+const WORKSPACE_TICKET_DELIVERY_RETRIES: u32 = 5;
+
+/// Backoff between workspace-ticket delivery attempts. Fixed (not
+/// exponential): the failure mode is "peer not dialable yet", which
+/// resolves on the order of seconds once holepunching completes, so a
+/// steady cadence backfills sooner than a growing one.
+#[cfg(feature = "iroh")]
+const WORKSPACE_TICKET_DELIVERY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(3);
+
 use artel_protocol::{TICKET_ACTION, UPGRADE_ACTION};
 
 /// Wall-clock millis since the Unix epoch. The `Local` arm of
@@ -1552,7 +1569,8 @@ impl Registry {
         if session_kind == SessionKind::Local
             && let Some(envelope_bytes) = workspace_ticket
         {
-            self.deliver_workspace_ticket_to(session, peer.id, envelope_bytes);
+            self.deliver_workspace_ticket_to(session, peer.id, envelope_bytes)
+                .await;
         }
         Ok(())
     }
@@ -1596,10 +1614,22 @@ impl Registry {
     /// members rather than serially.
     ///
     /// No-ops on a self-target or when no iroh endpoint is wired (unit
-    /// tests); failures warn — admission redelivery covers the peer's
-    /// next re-announce.
+    /// tests).
+    ///
+    /// A single dial failing is the common case right at admission (a
+    /// holepunch that hasn't completed yet), and nothing else
+    /// re-triggers delivery — a joiner does not periodically
+    /// re-announce, so without a retry a transient failure would strand
+    /// its late attach in `wait_for_ticket` forever. The spawned task
+    /// therefore retries with backoff up to
+    /// [`WORKSPACE_TICKET_DELIVERY_RETRIES`] times. Before each attempt
+    /// it re-reads the session's live envelope and stops if it changed
+    /// (a newer publish superseded this one and spawned its own
+    /// delivery), the peer left, or the session is gone — so a stale
+    /// envelope can never land after a fresh one and a departed peer
+    /// stops being dialed.
     #[cfg(feature = "iroh")]
-    fn deliver_workspace_ticket_to(
+    async fn deliver_workspace_ticket_to(
         &self,
         session: SessionId,
         target: PeerId,
@@ -1612,19 +1642,37 @@ impl Registry {
             return;
         };
         let endpoint = endpoint.clone();
+        let session_arc = {
+            let guard = self.sessions.read().await;
+            guard.get(&session).cloned()
+        };
+        let Some(session_arc) = session_arc else {
+            return;
+        };
+        let frame = artel_protocol::upgrade::DeliveryFrame::WorkspaceTicket {
+            session_id: session,
+            envelope_bytes: envelope_bytes.clone(),
+        };
         tokio::spawn(async move {
-            let frame = artel_protocol::upgrade::DeliveryFrame::WorkspaceTicket {
-                session_id: session,
-                envelope_bytes,
-            };
-            if let Err(err) = crate::server::deliver_frame(&endpoint, target, &frame).await {
-                tracing::warn!(
-                    ?session,
-                    peer = %target,
-                    %err,
-                    "workspace ticket delivery failed; admission redelivery covers re-announce",
-                );
-            }
+            run_delivery_with_retry(
+                session,
+                target,
+                WORKSPACE_TICKET_DELIVERY_RETRIES,
+                WORKSPACE_TICKET_DELIVERY_BACKOFF,
+                // Still-current check: re-read live state under the lock.
+                || async {
+                    let s = session_arc.lock().await;
+                    delivery_still_current(
+                        &s.members,
+                        s.workspace_ticket.as_deref(),
+                        target,
+                        &envelope_bytes,
+                    )
+                },
+                // One delivery attempt.
+                || crate::server::deliver_frame(&endpoint, target, &frame),
+            )
+            .await;
         });
     }
 
@@ -2436,7 +2484,8 @@ impl Registry {
         };
 
         for member in members {
-            self.deliver_workspace_ticket_to(session, member, envelope_bytes.clone());
+            self.deliver_workspace_ticket_to(session, member, envelope_bytes.clone())
+                .await;
         }
         Ok(())
     }
@@ -2453,6 +2502,69 @@ impl Registry {
         };
         let s = session_arc.lock().await;
         Some(s.members.contains(&peer))
+    }
+}
+
+/// Whether a spawned workspace-ticket (re)delivery to `target` should
+/// still proceed, given the session's current `members` and live
+/// `current_envelope`. Returns `false` — abort the retry loop — when
+/// the peer is no longer a member or the live envelope differs from
+/// the `delivering` bytes (a newer publish superseded this one and
+/// spawned its own delivery). Pure so the staleness rule is unit
+/// testable without a live endpoint.
+#[cfg(feature = "iroh")]
+fn delivery_still_current(
+    members: &HashSet<PeerId>,
+    current_envelope: Option<&[u8]>,
+    target: PeerId,
+    delivering: &[u8],
+) -> bool {
+    members.contains(&target) && current_envelope == Some(delivering)
+}
+
+/// Retry driver for a spawned capability delivery: up to `retries`
+/// attempts, sleeping `backoff` between them, aborting early when
+/// `still_current` reports the delivery has been superseded. Generic
+/// over the still-current check and the per-attempt delivery so the
+/// retry/abort/backoff logic is unit-testable with injected closures
+/// (the production path supplies a session-lock read and
+/// `deliver_frame`). Returns once delivered, exhausted, or aborted.
+#[cfg(feature = "iroh")]
+async fn run_delivery_with_retry<C, CFut, D, DFut>(
+    session: SessionId,
+    target: PeerId,
+    retries: u32,
+    backoff: std::time::Duration,
+    still_current: C,
+    deliver: D,
+) where
+    C: Fn() -> CFut,
+    CFut: std::future::Future<Output = bool>,
+    D: Fn() -> DFut,
+    DFut: std::future::Future<Output = Result<(), String>>,
+{
+    for attempt in 0..retries {
+        if !still_current().await {
+            return;
+        }
+        match deliver().await {
+            Ok(()) => return,
+            Err(err) => {
+                let last = attempt + 1 == retries;
+                tracing::warn!(
+                    ?session,
+                    peer = %target,
+                    attempt = attempt + 1,
+                    %err,
+                    "workspace ticket delivery failed{}",
+                    if last { "; giving up" } else { ", will retry" },
+                );
+                if last {
+                    return;
+                }
+                tokio::time::sleep(backoff).await;
+            }
+        }
     }
 }
 
@@ -5257,6 +5369,141 @@ mod tests {
         assert_eq!(r.is_member(id, host.id).await, Some(true));
         assert_eq!(r.is_member(id, outsider.id).await, Some(false));
         assert_eq!(r.is_member(SessionId::new_random(), host.id).await, None,);
+    }
+
+    // ---- workspace ticket: delivery-retry staleness rule ----
+
+    #[cfg(feature = "iroh")]
+    #[test]
+    fn delivery_still_current_rules() {
+        let target = peer(2, "bob").id;
+        let other = peer(3, "carol").id;
+        let members = HashSet::from([peer(1, "alice").id, target]);
+        let env = vec![0xAB; 16];
+
+        // Member + matching live envelope ⇒ keep retrying.
+        assert!(delivery_still_current(
+            &members,
+            Some(env.as_slice()),
+            target,
+            &env
+        ));
+
+        // Peer left ⇒ stop.
+        let without_target = HashSet::from([peer(1, "alice").id]);
+        assert!(!delivery_still_current(
+            &without_target,
+            Some(env.as_slice()),
+            target,
+            &env
+        ));
+
+        // A newer envelope superseded the one we carry ⇒ stop (the
+        // new publish spawned its own delivery).
+        assert!(!delivery_still_current(
+            &members,
+            Some([0xCD; 16].as_slice()),
+            target,
+            &env
+        ));
+
+        // Envelope cleared entirely ⇒ stop.
+        assert!(!delivery_still_current(&members, None, target, &env));
+
+        // Unrelated peer is irrelevant — only `target`'s membership
+        // matters.
+        let _ = other;
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test(start_paused = true)]
+    async fn delivery_retry_heals_after_transient_failures() {
+        // The first two dials fail, the third succeeds — exactly the
+        // "holepunch not ready yet, then it is" case that used to
+        // strand a joiner forever. The driver must keep retrying and
+        // ultimately deliver. (Paused clock: backoff sleeps advance
+        // instantly.)
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let session = SessionId::from_bytes([1; 16]);
+        let target = peer(2, "bob").id;
+        let attempts = AtomicU32::new(0);
+
+        run_delivery_with_retry(
+            session,
+            target,
+            5,
+            Duration::from_secs(3),
+            || async { true },
+            || async {
+                let n = attempts.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    Err("dial failed".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            3,
+            "should have retried until the third attempt succeeded",
+        );
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test(start_paused = true)]
+    async fn delivery_retry_gives_up_after_exhausting_attempts() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let attempts = AtomicU32::new(0);
+        run_delivery_with_retry(
+            SessionId::from_bytes([1; 16]),
+            peer(2, "bob").id,
+            5,
+            Duration::from_secs(3),
+            || async { true },
+            || async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err("always fails".to_string())
+            },
+        )
+        .await;
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            5,
+            "exactly `retries` attempts"
+        );
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test(start_paused = true)]
+    async fn delivery_retry_aborts_when_superseded() {
+        // still_current goes false after the first failed attempt (a
+        // newer publish superseded this delivery) — no further dials.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let attempts = AtomicU32::new(0);
+        let checks = AtomicU32::new(0);
+        run_delivery_with_retry(
+            SessionId::from_bytes([1; 16]),
+            peer(2, "bob").id,
+            5,
+            Duration::from_secs(3),
+            || async {
+                // current on the first check, stale thereafter.
+                checks.fetch_add(1, Ordering::SeqCst) == 0
+            },
+            || async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err("dial failed".to_string())
+            },
+        )
+        .await;
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "must stop dialing once superseded",
+        );
     }
 
     #[cfg(feature = "iroh")]
