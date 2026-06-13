@@ -267,6 +267,70 @@ async fn envelope_published_after_join_reaches_existing_member() {
 }
 
 // =============================================================
+// Head-of-line blocking: publish_workspace_ticket must not stall the
+// host's IPC dispatch on an unreachable member. The delivery fan-out
+// is spawned + bounded, so the PublishWorkspaceTicket call returns
+// promptly even when a member's daemon is gone and its dial would
+// otherwise hang for the full connect timeout.
+// =============================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn publish_does_not_block_on_unreachable_member() {
+    let (daemon_a, daemon_b, _dns_pkarr) = common::spawn_pair().await;
+
+    let alice = Client::connect(&daemon_a.socket).await.unwrap();
+    let (session, ticket) = host_session(&alice).await;
+    alice
+        .request(Request::Subscribe {
+            session,
+            since: None,
+        })
+        .await
+        .unwrap();
+    let mut alice_events = alice.take_events().await.expect("alice events");
+
+    let bob = Client::connect(&daemon_b.socket).await.unwrap();
+    bob.request(Request::JoinSession {
+        display_name: "bob".into(),
+        ticket,
+    })
+    .await
+    .unwrap();
+
+    // Wait until the host admits Bob, so he's in the member set the
+    // publish fan-out will dial.
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let ev = alice_events.recv().await.expect("alice events closed");
+            if matches!(ev, Event::PeerJoined { .. }) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("alice never saw PeerJoined");
+
+    // Bob's daemon goes away — his addr stays in the host's member
+    // set, but any dial to him will now hang until it times out.
+    drop(bob);
+    daemon_b.stop().await;
+
+    // Publishing must still return promptly: the per-member delivery
+    // is spawned and bounded, not awaited inline on the IPC dispatch.
+    let started = Instant::now();
+    publish_envelope(&alice, session).await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "PublishWorkspaceTicket blocked on the unreachable member: {elapsed:?}",
+    );
+
+    drop(alice_events);
+    drop(alice);
+    daemon_a.stop().await;
+}
+
+// =============================================================
 // Replay gate: a non-member's `GossipBody::Replay` is refused — no
 // Message frames are served in response. (The member case is pinned
 // by gossip.rs::joiner_replays_messages_sent_before_join, which now

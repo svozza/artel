@@ -1552,8 +1552,7 @@ impl Registry {
         if session_kind == SessionKind::Local
             && let Some(envelope_bytes) = workspace_ticket
         {
-            self.deliver_workspace_ticket_to(session, peer.id, envelope_bytes)
-                .await;
+            self.deliver_workspace_ticket_to(session, peer.id, envelope_bytes);
         }
         Ok(())
     }
@@ -1582,13 +1581,25 @@ impl Registry {
     }
 
     /// Best-effort unicast of `envelope_bytes` to one peer over the
-    /// direct delivery stream. Shared by the admission trigger
-    /// ([`Self::ensure_member`]) and the publish fan-out
-    /// ([`Self::publish_workspace_ticket`]). No-ops on a self-target
-    /// or when no iroh endpoint is wired (unit tests); failures warn —
-    /// admission redelivery covers the peer's next re-announce.
+    /// direct delivery stream, spawned onto a detached task. Shared by
+    /// the admission trigger ([`Self::ensure_member`]) and the publish
+    /// fan-out ([`Self::publish_workspace_ticket`]).
+    ///
+    /// Spawning is load-bearing: both callers run on latency-sensitive
+    /// paths (the per-session gossip forwarder awaits `ensure_member`
+    /// inline; the IPC dispatch awaits the publish fan-out), and a dial
+    /// to an undialable peer can take the full [`deliver_frame`]
+    /// timeout. Doing it inline would stall every other peer's traffic
+    /// on that path; detaching keeps the caller responsive while the
+    /// (bounded, best-effort) delivery runs on its own. The fan-out in
+    /// `publish_workspace_ticket` thereby also runs concurrently across
+    /// members rather than serially.
+    ///
+    /// No-ops on a self-target or when no iroh endpoint is wired (unit
+    /// tests); failures warn — admission redelivery covers the peer's
+    /// next re-announce.
     #[cfg(feature = "iroh")]
-    async fn deliver_workspace_ticket_to(
+    fn deliver_workspace_ticket_to(
         &self,
         session: SessionId,
         target: PeerId,
@@ -1600,18 +1611,21 @@ impl Registry {
         let Some(endpoint) = self.endpoint() else {
             return;
         };
-        let frame = artel_protocol::upgrade::DeliveryFrame::WorkspaceTicket {
-            session_id: session,
-            envelope_bytes,
-        };
-        if let Err(err) = crate::server::deliver_frame(endpoint, target, &frame).await {
-            tracing::warn!(
-                ?session,
-                peer = %target,
-                %err,
-                "workspace ticket delivery failed; admission redelivery covers re-announce",
-            );
-        }
+        let endpoint = endpoint.clone();
+        tokio::spawn(async move {
+            let frame = artel_protocol::upgrade::DeliveryFrame::WorkspaceTicket {
+                session_id: session,
+                envelope_bytes,
+            };
+            if let Err(err) = crate::server::deliver_frame(&endpoint, target, &frame).await {
+                tracing::warn!(
+                    ?session,
+                    peer = %target,
+                    %err,
+                    "workspace ticket delivery failed; admission redelivery covers re-announce",
+                );
+            }
+        });
     }
 
     /// Snapshot every message in `session`'s log with `seq > since`,
@@ -2422,8 +2436,7 @@ impl Registry {
         };
 
         for member in members {
-            self.deliver_workspace_ticket_to(session, member, envelope_bytes.clone())
-                .await;
+            self.deliver_workspace_ticket_to(session, member, envelope_bytes.clone());
         }
         Ok(())
     }

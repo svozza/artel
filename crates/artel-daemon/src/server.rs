@@ -37,6 +37,20 @@ use crate::shutdown::{Shutdown, ShutdownToken};
 #[cfg(feature = "iroh")]
 const HOME_RELAY_BUDGET: Duration = Duration::from_secs(30);
 
+/// Whole-operation deadline for one direct-stream
+/// [`deliver_frame`] delivery (dial → open_bi → write → ACK).
+///
+/// Capability deliveries are awaited on latency-sensitive paths —
+/// the per-session gossip forwarder (admission delivery) and the IPC
+/// dispatch loop (publish fan-out) — where an undialable peer would
+/// otherwise block every other peer's traffic for iroh's full,
+/// unbounded connect timeout. A failed delivery is best-effort
+/// (callers warn and rely on re-announce / republish), so bound it
+/// generously enough for a real holepunch yet short enough to keep
+/// head-of-line stalls bounded.
+#[cfg(feature = "iroh")]
+const DELIVER_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Non-routable, non-authenticated id advertised in `Hello` when the
 /// `iroh` feature is disabled at compile time.
 ///
@@ -887,6 +901,42 @@ pub(crate) async fn deliver_frame(
     target: artel_protocol::PeerId,
     frame: &artel_protocol::upgrade::DeliveryFrame,
 ) -> Result<(), String> {
+    deliver_frame_with_timeout(endpoint, target, frame, DELIVER_FRAME_TIMEOUT).await
+}
+
+/// [`deliver_frame`] with an explicit deadline (the production entry
+/// point pins [`DELIVER_FRAME_TIMEOUT`]; tests pass a short budget).
+///
+/// The deadline spans the whole operation. Every step of
+/// [`deliver_frame_inner`] — dial, open_bi, write, ACK read — can
+/// block indefinitely against an undialable peer (failed holepunch at
+/// mesh-up is the common case right at admission), and the callers
+/// await this on latency-sensitive paths: the per-session gossip
+/// forwarder and the IPC dispatch loop. Without a bound, one dead peer
+/// stalls every other peer's traffic on that path. A failed/timed-out
+/// delivery is best-effort anyway (the caller warns); bound it and
+/// move on.
+#[cfg(feature = "iroh")]
+async fn deliver_frame_with_timeout(
+    endpoint: &iroh::Endpoint,
+    target: artel_protocol::PeerId,
+    frame: &artel_protocol::upgrade::DeliveryFrame,
+    deadline: Duration,
+) -> Result<(), String> {
+    match tokio::time::timeout(deadline, deliver_frame_inner(endpoint, target, frame)).await {
+        Ok(result) => result,
+        Err(_) => Err(format!("delivery to {target} timed out after {deadline:?}")),
+    }
+}
+
+/// The unbounded body of [`deliver_frame`]; always driven under a
+/// timeout by [`deliver_frame_with_timeout`].
+#[cfg(feature = "iroh")]
+async fn deliver_frame_inner(
+    endpoint: &iroh::Endpoint,
+    target: artel_protocol::PeerId,
+    frame: &artel_protocol::upgrade::DeliveryFrame,
+) -> Result<(), String> {
     use artel_protocol::upgrade::{UPGRADE_ACK, UPGRADE_ALPN};
 
     // PeerId IS EndpointId (same 32-byte ed25519 key).
@@ -1296,6 +1346,55 @@ mod tests {
         assert_eq!(on_runtime, on_disk.to_bytes());
 
         // Tear down to avoid leaking the iroh router's accept loop.
+        if let Some(router) = runtime.router {
+            router.shutdown().await.expect("router shutdown");
+        }
+    }
+
+    /// `deliver_frame` must bound its own runtime: a dial to an
+    /// undialable peer returns a timeout error within the deadline
+    /// rather than blocking the caller indefinitely. Before the fix
+    /// there was no timeout on the connect/open_bi/ACK path, so this
+    /// would hang for iroh's full (unbounded) connect timeout and
+    /// stall the gossip forwarder / IPC dispatch behind it.
+    #[tokio::test]
+    async fn deliver_frame_times_out_against_undialable_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("iroh.key");
+        let dns_pkarr = Arc::new(DnsPkarrServer::run().await.expect("dns_pkarr server"));
+        let setup = EndpointSetup::Testing {
+            dns_pkarr: Arc::clone(&dns_pkarr),
+        };
+        let (_peer_id, runtime) = resolve_iroh_runtime(Some(&key_path), &setup)
+            .await
+            .expect("runtime");
+
+        // A random, never-bound peer id: discovery will never resolve
+        // an addr for it, so the dial would hang without our bound.
+        let unreachable = artel_protocol::PeerId::from_bytes([0x33; 32]);
+        let frame = artel_protocol::upgrade::DeliveryFrame::WorkspaceTicket {
+            session_id: artel_protocol::SessionId::from_bytes([0xab; 16]),
+            envelope_bytes: vec![0u8; 8],
+        };
+
+        let budget = Duration::from_millis(500);
+        let started = tokio::time::Instant::now();
+        let result =
+            deliver_frame_with_timeout(&runtime.endpoint, unreachable, &frame, budget).await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "delivery to an undialable peer must fail");
+        assert!(
+            result.unwrap_err().contains("timed out"),
+            "must surface as a timeout, not some other error",
+        );
+        // Bounded: returns near the deadline, not after iroh's full
+        // connect timeout (tens of seconds). Generous slack for CI.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "deliver_frame did not honour its deadline: took {elapsed:?}",
+        );
+
         if let Some(router) = runtime.router {
             router.shutdown().await.expect("router shutdown");
         }
