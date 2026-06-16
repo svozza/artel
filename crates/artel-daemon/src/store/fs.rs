@@ -12,9 +12,19 @@
 //! ```
 //!
 //! `meta.json` is small enough to overwrite atomically (write to
-//! `meta.json.tmp`, fsync, rename) on every membership or head change.
-//! The `log` is append-only with `fsync` after each frame so a crash
-//! between the response being acked and the OS flushing is impossible.
+//! `meta.json.tmp`, fsync, rename, fsync the parent dir) on every
+//! membership or head change. The `log` is append-only with `fsync`
+//! after each frame. Every rename/create that a write depends on is
+//! followed by a parent-directory fsync (see [`fsync_dir`]) so the
+//! durability holds across a power loss, not just a process crash —
+//! `fsync(file)` alone leaves the directory entry unflushed.
+//!
+//! Crash-recovery: `meta.head` is a cache of the durable log's tail,
+//! not the source of truth. `append` fsyncs the log frame before the
+//! separate `meta.head` write, so a crash in between can leave
+//! `meta.head` behind the log; [`load_one`] reconciles `head` up to the
+//! max seq actually present in the log. `meta.head` is also written
+//! monotonically so an out-of-order Remote-mirror append can't lower it.
 //!
 //! Recovery: on `load_all`, missing or unparseable `meta.json` makes
 //! the daemon skip that session with a warning. A partial trailing
@@ -180,8 +190,21 @@ impl SessionStore for FsLogStore {
             append_log(&log_path, &message)?;
             // Bump head in meta. Read-modify-write: cheap because
             // meta.json is tiny.
+            //
+            // Monotonic, not an unconditional set: a Remote mirror
+            // applies gossip frames in arbitrary lock order (one task
+            // per inbound frame), so a lower seq can be appended after a
+            // higher one. Lowering `head` here would persist a watermark
+            // behind the durable log — mirroring the in-memory guard
+            // (`if msg.seq > s.head`) that `apply_inbound_mirror_message`
+            // already applies. The host (Local) path only ever appends
+            // an increasing prospective seq, so for it `max` is a no-op.
             let mut meta = read_meta(&meta_path)?;
-            meta.head = message.seq;
+            meta.head = meta.head.max(message.seq);
+            // `write_meta` → `write_bytes_atomic` fsyncs the session
+            // directory after the rename (H2), so both the appended log
+            // frame (fsynced inside `append_log`) and the meta rename are
+            // durable across a power loss, not just a process crash.
             write_meta(&meta_path, &meta)?;
             Ok(())
         })
@@ -609,11 +632,23 @@ fn load_one(dir: &Path) -> io::Result<SessionRecord> {
     // recovery path — the capability the workspace depends on would
     // have vanished without a trace.
     let workspace_ticket = read_workspace_ticket(&dir.join(WORKSPACE_TICKET_FILE))?;
+    // Reconcile `head` against the durable log tail (H1). `append`
+    // fsyncs the log frame BEFORE the separate `meta.head` write, so a
+    // crash (or an `ENOSPC`/`EIO` on the meta write) between the two
+    // leaves the log holding seq N while `meta.head` is still N-1.
+    // Trusting `meta.head` verbatim would make the next host send
+    // compute `prospective = head.next() = N` and write a SECOND frame
+    // at an already-used seq. The durable log is the source of truth
+    // for the head watermark; `meta.head` is a cache of it. Take the
+    // max so a (signature-dropped) sparse log can't lower a legitimately
+    // higher recorded head either.
+    let log_tail = log.iter().map(|m| m.seq).max().unwrap_or(Seq::ZERO);
+    let head = meta.head.max(log_tail);
     Ok(SessionRecord {
         id,
         host: meta.host,
         members: meta.members,
-        head: meta.head,
+        head,
         log,
         kind: meta.kind,
         host_epoch: meta.host_epoch,
@@ -696,6 +731,10 @@ fn write_attachment(path: &Path, payload: &[u8]) -> io::Result<()> {
         }
         chmod(&tmp, FILE_MODE)?;
         std::fs::rename(&tmp, path)?;
+        // Durable rename: fsync the attachments directory (H2).
+        if let Some(parent) = path.parent() {
+            fsync_dir(parent)?;
+        }
         Ok(())
     })();
     if result.is_err() {
@@ -762,8 +801,10 @@ fn is_attachment_tmp(name: &str) -> bool {
 
 /// Crash-safe write of raw `bytes` to `path`: write to
 /// `<path minus extension>.<tmp_ext>`, fsync, chmod [`FILE_MODE`],
-/// rename onto `path`. The rename is atomic, so a reader sees either
-/// the old file or the fully-written new one — never a torn write.
+/// rename onto `path`, then fsync the parent directory. The rename is
+/// atomic, so a reader sees either the old file or the fully-written
+/// new one — never a torn write — and the parent-dir fsync makes that
+/// rename durable across a power loss (see [`fsync_dir`]).
 ///
 /// The deterministic tmp name is safe only while writes to one `path`
 /// never race: every caller holds the per-session `Mutex<Session>`
@@ -782,6 +823,15 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8], tmp_ext: &str) -> io::Result<()
     }
     chmod(&tmp, FILE_MODE)?;
     std::fs::rename(&tmp, path)?;
+    // fsync the parent directory so the rename is durable across a
+    // power loss (H2). `f.sync_all()` flushed the tmp file's contents,
+    // but the directory entry the rename creates is separate metadata:
+    // without this a crash right after the call returns can revert
+    // `path` to its old contents (or leave it absent) even though we
+    // returned `Ok`.
+    if let Some(parent) = path.parent() {
+        fsync_dir(parent)?;
+    }
     Ok(())
 }
 
@@ -1141,6 +1191,16 @@ fn ensure_dir(dir: &Path, mode: u32) -> io::Result<()> {
         Err(err) if err.kind() == ErrorKind::NotFound => {
             std::fs::create_dir_all(dir)?;
             chmod(dir, mode)?;
+            // fsync the parent so the new directory's entry is durable
+            // across a power loss (H2) — otherwise a crash can lose the
+            // whole session dir even after a write into it returned Ok.
+            // `create_dir_all` may have created intermediates too, but
+            // the sessions root (the only multi-level case here) is
+            // created once at daemon open; the parent of the leaf is the
+            // entry a subsequent write depends on.
+            if let Some(parent) = dir.parent() {
+                fsync_dir(parent)?;
+            }
             Ok(())
         }
         Err(err) => Err(err),
@@ -1155,6 +1215,39 @@ fn chmod(path: &Path, mode: u32) -> io::Result<()> {
     perms.set_mode(mode);
     std::fs::set_permissions(path, perms)
 }
+
+/// fsync the *directory* `dir` so a preceding `rename`/`create_new`
+/// into it is durable across a crash (H2).
+///
+/// `fsync(file)` flushes a file's contents but NOT the directory entry
+/// that names it: on ext4/xfs a crash right after `rename` returning
+/// `Ok` can revert the destination to its old contents or lose a
+/// freshly-created file even though the data was flushed. POSIX makes
+/// the rename durable only once the *containing directory* is fsynced.
+/// Open the dir read-only and `sync_all()` it.
+fn fsync_dir(dir: &Path) -> io::Result<()> {
+    // A directory must be opened read-only (O_RDONLY); opening it
+    // writable fails with EISDIR. `File::open` is read-only, which is
+    // exactly what fsync-on-a-dir needs.
+    let result = std::fs::File::open(dir)?.sync_all();
+    #[cfg(test)]
+    if result.is_ok() {
+        // Test-only call counter: lets the suite assert that every
+        // durable write path actually fsyncs its parent directory
+        // (the H2 regression guard). The durability guarantee itself
+        // isn't observable in userspace — a SIGKILL leaves the page
+        // cache intact and the OS flushes anyway; only a power loss
+        // loses an un-fsynced rename — so this counts the call rather
+        // than proving the flush.
+        FSYNC_DIR_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+    result
+}
+
+/// Test-only counter of successful [`fsync_dir`] calls. nextest runs
+/// each test in its own process, so this is effectively per-test.
+#[cfg(test)]
+static FSYNC_DIR_CALLS: AtomicU64 = AtomicU64::new(0);
 
 fn join_to_io(err: &tokio::task::JoinError) -> io::Error {
     io::Error::other(format!("blocking task: {err}"))
@@ -1265,6 +1358,201 @@ mod tests {
         let loaded = store2.load_all().await.unwrap();
         assert_eq!(loaded[0].head, Seq::new(2));
         assert_eq!(loaded[0].log, vec![message(1), message(2)]);
+    }
+
+    // ---- H1: head/log durability reconciliation ----
+
+    /// Simulate the crash window inside `append`: the log frame fsync
+    /// landed (`append_log`) but the daemon died before the separate
+    /// `meta.head` write. The durable log holds seq N while `meta.head`
+    /// is still N-1. `load_one`/`load_all` MUST recover `head` from the
+    /// log tail, not trust the stale meta verbatim — otherwise the next
+    /// host send re-issues seq N and writes a second, distinct frame at
+    /// an already-used seq.
+    #[tokio::test]
+    async fn load_reconciles_head_to_log_tail_when_meta_head_is_stale() {
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+        // First append goes through the normal (atomic-enough) path.
+        store.append(record(1).id, &message(1)).await.unwrap();
+
+        // Now simulate the partial append: write the seq-2 frame to the
+        // log durably, but DO NOT bump meta.head (crash before the meta
+        // write). meta.head stays at 1.
+        let session_dir = dir.path().join(record(1).id.to_string());
+        append_log(&session_dir.join(LOG_FILE), &message(2)).unwrap();
+        let meta = read_meta(&session_dir.join(META_FILE)).unwrap();
+        assert_eq!(meta.head, Seq::new(1), "precondition: meta.head is stale");
+
+        let store2 = FsLogStore::open(dir.path()).unwrap();
+        let loaded = store2.load_all().await.unwrap();
+        assert_eq!(
+            loaded[0].log,
+            vec![message(1), message(2)],
+            "the durable seq-2 frame must load",
+        );
+        assert_eq!(
+            loaded[0].head,
+            Seq::new(2),
+            "head must be reconciled up to the log tail, not left at the stale meta.head",
+        );
+    }
+
+    /// `append` must keep `meta.head` monotonic. A Remote mirror applies
+    /// gossip frames in arbitrary lock order (one task per inbound
+    /// frame), so a lower seq can be appended after a higher one. The
+    /// persisted head must not regress below an already-recorded seq
+    /// (this is the M1 sub-bug; the in-memory path already guards with
+    /// `if msg.seq > s.head`, the store does not).
+    #[tokio::test]
+    async fn append_does_not_regress_persisted_head_on_out_of_order_seq() {
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+
+        // Higher seq lands first, then a lower seq (out-of-order mirror
+        // delivery).
+        store.append(record(1).id, &message(5)).await.unwrap();
+        store.append(record(1).id, &message(3)).await.unwrap();
+
+        let session_dir = dir.path().join(record(1).id.to_string());
+        let meta = read_meta(&session_dir.join(META_FILE)).unwrap();
+        assert_eq!(
+            meta.head,
+            Seq::new(5),
+            "persisted head must stay at the max seq, not regress to the last-appended one",
+        );
+    }
+
+    // ---- H2: parent-directory fsync after rename ----
+    //
+    // NOTE on coverage: true rename durability is a block-layer
+    // property. `fsync(dir)` has no effect observable through the
+    // filesystem API without power-loss injection — and a SIGKILL →
+    // restart test (the shape of our `_n0` crash tests) CANNOT catch
+    // this bug, because SIGKILL leaves the kernel page cache intact and
+    // the OS flushes the dirty pages anyway; only a real power loss /
+    // kernel panic loses an un-fsynced rename. So no userspace test at
+    // any level proves the durability guarantee. What we CAN and do
+    // assert behaviorally is that every durable write path actually
+    // issues the directory fsync (via the test-only FSYNC_DIR_CALLS
+    // counter) — that is the regression we care about: a future edit
+    // dropping or missing a call site. nextest runs each test in its
+    // own process, so the counter is per-test.
+
+    fn fsync_dir_calls() -> u64 {
+        FSYNC_DIR_CALLS.load(Ordering::Relaxed)
+    }
+
+    /// `fsync_dir` opens the directory read-only and syncs it. A
+    /// writable open of a directory fails with EISDIR, which would
+    /// poison every write path — this pins the helper's behavior.
+    #[test]
+    fn fsync_dir_syncs_a_real_directory_and_errors_on_missing() {
+        let dir = tempdir().unwrap();
+        let before = fsync_dir_calls();
+        fsync_dir(dir.path()).expect("fsync of an existing dir should succeed");
+        assert_eq!(fsync_dir_calls(), before + 1);
+
+        let missing = dir.path().join("does-not-exist");
+        assert!(
+            fsync_dir(&missing).is_err(),
+            "fsync of a missing directory should error, not silently pass",
+        );
+    }
+
+    /// `append` must fsync the log's parent directory so the appended
+    /// frame's bytes (already fsynced via `append_log`) AND the meta
+    /// rewrite are durable across a power loss, not just a process
+    /// crash. Red until the call sites are woven in.
+    #[tokio::test]
+    async fn append_fsyncs_the_session_directory() {
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+
+        let before = fsync_dir_calls();
+        store.append(record(1).id, &message(1)).await.unwrap();
+        assert!(
+            fsync_dir_calls() > before,
+            "append must fsync the session directory after writing the log frame + meta",
+        );
+    }
+
+    /// Every atomic full-rewrite (`write_meta` / `write_tickets` /
+    /// `write_workspace_ticket`, all via `write_bytes_atomic`) must
+    /// fsync the destination's parent directory after the rename, or
+    /// the rename can revert on power loss. Red until woven in.
+    #[tokio::test]
+    async fn put_tickets_fsyncs_the_parent_directory() {
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+
+        let before = fsync_dir_calls();
+        store
+            .put_tickets(
+                record(1).id,
+                &[entry(7, artel_protocol::TicketStatus::Active)],
+            )
+            .await
+            .unwrap();
+        assert!(
+            fsync_dir_calls() > before,
+            "put_tickets (write_bytes_atomic + rename) must fsync the parent directory",
+        );
+    }
+
+    /// `create` lays down the new session directory and its files; the
+    /// directory entry for the dir itself (in the sessions root) and
+    /// the files within it must be durable. Red until woven in.
+    #[tokio::test]
+    async fn create_fsyncs_directories() {
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+
+        let before = fsync_dir_calls();
+        store.create(&record(1)).await.unwrap();
+        assert!(
+            fsync_dir_calls() > before,
+            "create must fsync the new session dir (and the sessions root) after laying it down",
+        );
+    }
+
+    /// Regression guard: weaving the parent-dir fsync in must not break
+    /// the write path (a dir handle opened with the wrong flags fails
+    /// with EISDIR). The files must still round-trip and no `.tmp` may
+    /// survive a successful write.
+    #[tokio::test]
+    async fn atomic_writes_round_trip_with_parent_dir_fsync() {
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+        store.append(record(1).id, &message(1)).await.unwrap();
+        store
+            .put_tickets(
+                record(1).id,
+                &[entry(7, artel_protocol::TicketStatus::Active)],
+            )
+            .await
+            .unwrap();
+
+        let store2 = FsLogStore::open(dir.path()).unwrap();
+        let loaded = store2.load_all().await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].log, vec![message(1)]);
+        assert_eq!(loaded[0].tickets.len(), 1);
+        // No stray tmp files survive a successful write.
+        let session_dir = dir.path().join(record(1).id.to_string());
+        for ent in std::fs::read_dir(&session_dir).unwrap() {
+            let name = ent.unwrap().file_name();
+            let name = name.to_string_lossy();
+            assert!(
+                !name.ends_with(".tmp"),
+                "no .tmp file should survive a successful atomic write, found {name}",
+            );
+        }
     }
 
     #[tokio::test]

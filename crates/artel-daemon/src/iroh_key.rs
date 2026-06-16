@@ -101,8 +101,11 @@ fn generate_and_persist(path: &Path) -> Result<SecretKey, KeyError> {
 }
 
 /// Write `bytes` to `path` atomically: write to `path.tmp`, fsync,
-/// chmod 0600, rename. Crash-safe: a partially-written tmp file
-/// never replaces the real one.
+/// chmod 0600, rename, then fsync the parent directory. A
+/// partially-written tmp file never replaces the real one (atomic
+/// rename), and the parent-dir fsync makes the rename durable across a
+/// power loss, not just a process crash — `fsync(file)` alone leaves
+/// the directory entry unflushed.
 fn write_atomic(path: &Path, bytes: &[u8; 32]) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
     {
@@ -114,8 +117,40 @@ fn write_atomic(path: &Path, bytes: &[u8; 32]) -> io::Result<()> {
         fs::set_permissions(&tmp, perms)?;
     }
     fs::rename(&tmp, path)?;
+    // fsync the parent directory so the rename is durable across a
+    // power loss. `sync_all()` flushed the tmp file's bytes, but the
+    // directory entry the rename creates is separate metadata: without
+    // this a crash right after the call returns can lose the freshly
+    // written key, and the daemon regenerates a DIFFERENT EndpointId on
+    // next boot — breaking every ticket and cached addr that named the
+    // old identity.
+    if let Some(parent) = path.parent() {
+        fsync_dir(parent)?;
+    }
     Ok(())
 }
+
+/// fsync the *directory* `dir` so a preceding `rename` into it is
+/// durable across a crash. `fsync(file)` flushes contents but not the
+/// directory entry; without this a crash right after `rename` can lose
+/// the freshly-created key file, regenerating a different `EndpointId`
+/// on the next boot. Open read-only (`O_RDONLY`) — a writable open of a
+/// dir fails with `EISDIR`.
+fn fsync_dir(dir: &Path) -> io::Result<()> {
+    let result = fs::File::open(dir)?.sync_all();
+    #[cfg(test)]
+    if result.is_ok() {
+        FSYNC_DIR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    result
+}
+
+/// Test-only counter of successful [`fsync_dir`] calls, so the suite
+/// can assert the key persist actually fsyncs the parent directory.
+/// Durability across a power loss isn't observable in userspace; this
+/// guards against a future edit dropping the call.
+#[cfg(test)]
+static FSYNC_DIR_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Same shape as `transport::server::ensure_dir` — chmod 0700 on
 /// create, leave existing dirs alone.
@@ -227,6 +262,38 @@ mod tests {
 
         let err = load_or_create(&path).unwrap_err();
         assert!(matches!(err, KeyError::Corrupt { got: 0, .. }), "{err:?}");
+    }
+
+    #[test]
+    fn write_atomic_fsyncs_parent_dir_and_round_trips() {
+        // H2: the key persist must fsync the parent directory after the
+        // rename, or a power loss can lose the freshly-created key and
+        // the daemon regenerates a different EndpointId on next boot.
+        // True durability isn't observable in userspace (SIGKILL leaves
+        // the page cache intact; only power loss loses an un-fsynced
+        // rename), so we assert the fsync_dir call happens via a
+        // test-only counter, plus a round-trip guard that the write
+        // path still works (a dir opened with the wrong flags fails
+        // with EISDIR and would poison the persist).
+        use std::sync::atomic::Ordering;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("iroh.key");
+        let bytes = [7u8; 32];
+
+        let before = FSYNC_DIR_CALLS.load(Ordering::Relaxed);
+        write_atomic(&path, &bytes).expect("atomic key write should succeed");
+        assert!(
+            FSYNC_DIR_CALLS.load(Ordering::Relaxed) > before,
+            "write_atomic must fsync the key's parent directory after the rename",
+        );
+
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        let mode = fs::metadata(&path).unwrap().mode() & 0o777;
+        assert_eq!(mode, KEY_MODE);
+        assert!(
+            !path.with_extension("tmp").exists(),
+            "tmp file should be renamed away on success",
+        );
     }
 
     #[test]
