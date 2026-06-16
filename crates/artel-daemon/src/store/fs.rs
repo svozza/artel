@@ -139,19 +139,22 @@ impl SessionStore for FsLogStore {
         let record = record.clone();
         tokio::task::spawn_blocking(move || -> io::Result<()> {
             ensure_dir(&dir, DIR_MODE)?;
-            // Always start with a meta.json. If a stale log exists from
-            // a previous session at this id (shouldn't happen — uuid),
-            // fail loudly.
+            // Idempotent (trait contract): a second create for the same
+            // id — a host(Some(id)) resume whose in-memory entry was
+            // lost, or recovery of a dir left half-built by a crash
+            // between this log-touch and the meta write — must succeed,
+            // not wedge at AlreadyExists. `create` always (re)writes a
+            // fresh meta below, so adopting an existing log is safe; we
+            // only need the file to exist for later appends to open it.
+            // Registry never reuses a uuid for a *different* session, so
+            // there's no "stale log from an unrelated session" case to
+            // guard against. `create` instead of `create_new` so an
+            // existing (empty, or already-populated-then-recovered) log
+            // is tolerated.
             let log_path = dir.join(LOG_FILE);
-            if log_path.exists() {
-                return Err(io::Error::new(
-                    ErrorKind::AlreadyExists,
-                    format!("log already exists at {}", log_path.display()),
-                ));
-            }
-            // Touch the log so subsequent appends find a file to open.
             std::fs::OpenOptions::new()
-                .create_new(true)
+                .create(true)
+                .truncate(false)
                 .write(true)
                 .open(&log_path)?;
             chmod(&log_path, FILE_MODE)?;
@@ -1752,6 +1755,59 @@ mod tests {
 
         let loaded = store.load_all().await.unwrap();
         assert_eq!(loaded[0].tickets, r.tickets);
+    }
+
+    // ---- H5: create idempotency / partial-failure recovery ----
+
+    #[tokio::test]
+    async fn create_is_idempotent_over_existing_record() {
+        // The trait documents create as idempotent ("writing over an
+        // existing record is fine"). A second create for the same id
+        // must succeed, not fail with AlreadyExists — otherwise a
+        // host(Some(id)) resume whose in-memory entry was lost wedges
+        // forever (the create path is the only fallback).
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+        store
+            .create(&record(1))
+            .await
+            .expect("create over an existing record must be idempotent");
+
+        // Still exactly one well-formed session afterwards.
+        let loaded = store.load_all().await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0], record(1));
+    }
+
+    #[tokio::test]
+    async fn create_recovers_a_half_built_dir() {
+        // Simulate a crash mid-create: the log file was touched but the
+        // meta.json write never landed. The dir is unloadable
+        // (read_meta NotFound → load_all skips it) AND, before the fix,
+        // uncreatable (log_path.exists() → AlreadyExists), so it's
+        // wedged through every API. create must recover it: lay down the
+        // missing meta and succeed.
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        let session_dir = dir.path().join(record(1).id.to_string());
+        ensure_dir(&session_dir, DIR_MODE).unwrap();
+        // A lone, empty log — the half-built state.
+        std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(session_dir.join(LOG_FILE))
+            .unwrap();
+        // Sanity: load skips the meta-less dir.
+        assert!(store.load_all().await.unwrap().is_empty());
+
+        store
+            .create(&record(1))
+            .await
+            .expect("create must recover a half-built (meta-less) session dir");
+        let loaded = store.load_all().await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0], record(1));
     }
 
     #[tokio::test]

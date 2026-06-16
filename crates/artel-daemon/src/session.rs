@@ -1239,39 +1239,29 @@ impl Registry {
                 .ok_or(SessionError::InvalidTicket)?
                 .clone();
 
-            // Persist the new session so a later daemon restart
-            // doesn't lose the membership / log we're about to start
-            // populating from the host. Host field is the *remote*
-            // peer's id, which lets `summary` distinguish remote
-            // sessions in `list` output.
-            let mut session_obj = Session::new(
-                session_id,
-                &PeerInfo::new(*host_peer_id, "remote-host"),
-                SessionKind::Remote,
-            );
-            // The constructor adds the host to `members`; for a
-            // remote session that's right (the host is a member of
-            // its own session) but we'll never see local Send from
-            // them — Sends arrive via gossip and route through the
-            // forwarder.
-            session_obj.host = *host_peer_id;
-            self.store
-                .create(&session_obj.record())
-                .await
-                .map_err(SessionError::Storage)?;
+            // Atomically claim the slot: build + persist + insert the
+            // mirror under the `sessions` write lock, or hand back the
+            // existing arc if a concurrent/prior join already claimed
+            // this id. `fresh` tells us whether WE are the one that must
+            // drive the bridge subscribe — only the claiming caller does,
+            // so two racing joins can't double-subscribe or split-brain
+            // (the registry guard that replaces the FsLogStore O_EXCL
+            // reject now that `create` is idempotent).
+            let (arc, fresh) = self.claim_remote_mirror(session_id, host_peer_id).await?;
+            if !fresh {
+                // A prior/concurrent join owns the mirror and its
+                // subscription; reuse it.
+                return Ok(arc);
+            }
+
             // Seed the host-epoch watermark from the persisted mirror
             // (0 for a fresh join). The bridge's EpochBeacon arm
             // advances this AtomicU64 on each host-signed beacon and
             // persists the advance via `advance_host_epoch_watermark`;
             // the SessionClosed arm reads it to gate replayed closes.
-            let host_epoch_watermark =
-                Arc::new(std::sync::atomic::AtomicU64::new(session_obj.host_epoch));
-
-            let arc = Arc::new(Mutex::new(session_obj));
-            self.sessions
-                .write()
-                .await
-                .insert(session_id, Arc::clone(&arc));
+            let host_epoch_watermark = Arc::new(std::sync::atomic::AtomicU64::new(
+                arc.lock().await.host_epoch,
+            ));
 
             // Hand the bridge a callback that writes into this very
             // mirror. We deliberately keep a strong Arc in the
@@ -1311,7 +1301,7 @@ impl Registry {
             // their resolver. The wire format is re-validated at
             // the bridge boundary; a bad addr surfaces as
             // [`SessionError::InvalidAddr`].
-            bridge
+            if let Err(err) = bridge
                 .join_session(
                     session_id,
                     joiner.clone(),
@@ -1325,14 +1315,106 @@ impl Registry {
                     cap_sig,
                 )
                 .await
-                .map_err(|e| match e {
+            {
+                // The subscribe failed (e.g. the host is offline and
+                // `joined()` timed out). Roll back the claim so we don't
+                // leave a durable, never-subscribed orphan that `join`
+                // would silently reuse forever — and that survives a
+                // restart. After rollback a retry re-materialises cleanly.
+                // (The bridge's own slot self-cleans: its `SlotReservation`
+                // frees on the failed-subscribe drop.)
+                self.rollback_remote_mirror(session_id).await;
+                return Err(match err {
                     crate::gossip_bridge::BridgeError::InvalidAddr(msg) => {
                         SessionError::InvalidAddr(msg)
                     }
                     other => SessionError::Internal(other.to_string()),
-                })?;
+                });
+            }
 
             Ok(arc)
+        }
+    }
+
+    /// Atomically claim the registry slot for a remote mirror.
+    ///
+    /// Under the `sessions` write lock: if `session_id` is already
+    /// present (a concurrent or prior join), return that arc with
+    /// `fresh = false` — the caller must NOT subscribe again. Otherwise
+    /// build a fresh `Remote` [`Session`], persist it, insert it, and
+    /// return `(arc, true)` — the caller drives the gossip subscribe.
+    ///
+    /// Doing the existence check and the insert under one lock hold is
+    /// what prevents two concurrent `join`s from each materialising a
+    /// separate mirror (split-brain: the IPC-visible arc differs from the
+    /// one the live forwarder feeds). `store.create` is idempotent
+    /// ([`SessionStore::create`]), so persisting under the lock is safe
+    /// even if a crash left a half-built dir.
+    #[cfg(feature = "iroh")]
+    async fn claim_remote_mirror(
+        &self,
+        session_id: SessionId,
+        host_peer_id: &PeerId,
+    ) -> Result<(Arc<Mutex<Session>>, bool), SessionError> {
+        // Build the prospective mirror before taking the lock so the
+        // (async) store write happens outside the lock-held window — but
+        // commit the in-memory insert and the existence check together.
+        let mut session_obj = Session::new(
+            session_id,
+            &PeerInfo::new(*host_peer_id, "remote-host"),
+            SessionKind::Remote,
+        );
+        // The constructor adds the host to `members`; for a remote
+        // session that's right (the host is a member of its own session)
+        // but we'll never see local Send from them — Sends arrive via
+        // gossip and route through the forwarder.
+        session_obj.host = *host_peer_id;
+
+        // Fast path: already claimed. A read-lock check avoids a
+        // redundant store write on the common resume/concurrent case.
+        let existing = self.sessions.read().await.get(&session_id).cloned();
+        if let Some(existing) = existing {
+            return Ok((existing, false));
+        }
+
+        // Persist the new session so a later daemon restart doesn't lose
+        // the membership / log we're about to start populating from the
+        // host. Idempotent, so a racing claim that also got here is fine.
+        self.store
+            .create(&session_obj.record())
+            .await
+            .map_err(SessionError::Storage)?;
+
+        // Commit the insert under the write lock, re-checking for a
+        // racer that slipped in between our read-check and here. The
+        // first writer wins; a loser hands back the winner's arc with
+        // `fresh = false` so it doesn't subscribe. The check and insert
+        // share one lock hold so the race can't split-brain.
+        let mut guard = self.sessions.write().await;
+        if let Some(existing) = guard.get(&session_id).cloned() {
+            return Ok((existing, false));
+        }
+        let arc = Arc::new(Mutex::new(session_obj));
+        guard.insert(session_id, Arc::clone(&arc));
+        drop(guard);
+        Ok((arc, true))
+    }
+
+    /// Undo a [`claim_remote_mirror`] whose bridge subscribe failed:
+    /// remove the in-memory entry and delete the persisted record, so no
+    /// durable, never-subscribed orphan survives (which `join` would
+    /// otherwise adopt forever, and which would outlive a restart). Best
+    /// effort on the store delete — a failure is logged, not surfaced,
+    /// since the caller is already returning the original subscribe error.
+    #[cfg(feature = "iroh")]
+    async fn rollback_remote_mirror(&self, session_id: SessionId) {
+        self.sessions.write().await.remove(&session_id);
+        if let Err(err) = self.store.delete(session_id).await {
+            tracing::warn!(
+                ?session_id,
+                error = %err,
+                "rollback_remote_mirror: store delete failed; persisted orphan may remain",
+            );
         }
     }
 
@@ -4948,6 +5030,86 @@ mod tests {
         // Idempotency: a duplicate close broadcast (or one that
         // races with a manual leave) shouldn't surface as an error.
         r.host_closed_session(session_id).await.unwrap();
+    }
+
+    // ---- H4: materialise claim/rollback ----
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn claim_remote_mirror_is_atomic_check_and_insert() {
+        // The first claim builds + persists + inserts the mirror and
+        // reports `fresh = true`. A second claim for the SAME id must
+        // reuse the existing arc (same Arc, `fresh = false`), never
+        // build a second mirror — otherwise two concurrent joins would
+        // split-brain (the IPC-visible session points at one arc while
+        // the live forwarder feeds the other). This is the registry-side
+        // guard that replaces the FsLogStore O_EXCL reject H5 removes.
+        let daemon_peer = PeerId::from_bytes([7; 32]);
+        let host = peer(1, "alice");
+        let session_id = SessionId::from_bytes([0xaa; 16]);
+        let store = Arc::new(crate::store::MemoryStore::new());
+        let r = Registry::load(
+            daemon_peer,
+            WireEndpointAddr::id_only(daemon_peer),
+            store.clone(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (arc1, fresh1) = r.claim_remote_mirror(session_id, &host.id).await.unwrap();
+        assert!(fresh1, "first claim is fresh");
+        let (arc2, fresh2) = r.claim_remote_mirror(session_id, &host.id).await.unwrap();
+        assert!(!fresh2, "second claim reuses the existing mirror");
+        assert!(
+            Arc::ptr_eq(&arc1, &arc2),
+            "both claims must hand back the same Arc — no split-brain",
+        );
+        // Exactly one persisted record + one in-memory entry.
+        assert_eq!(store.load_all().await.unwrap().len(), 1);
+        assert_eq!(r.list().await.len(), 1);
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn rollback_remote_mirror_leaves_no_orphan() {
+        // After a bridge.join_session failure, materialise must undo its
+        // claim so no orphan survives: the in-memory entry is removed AND
+        // the persisted record is deleted, so a retry re-materialises
+        // cleanly rather than join() silently adopting a dead,
+        // never-subscribed mirror forever.
+        let daemon_peer = PeerId::from_bytes([7; 32]);
+        let host = peer(1, "alice");
+        let session_id = SessionId::from_bytes([0xaa; 16]);
+        let store = Arc::new(crate::store::MemoryStore::new());
+        let r = Registry::load(
+            daemon_peer,
+            WireEndpointAddr::id_only(daemon_peer),
+            store.clone(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (_arc, fresh) = r.claim_remote_mirror(session_id, &host.id).await.unwrap();
+        assert!(fresh);
+        assert_eq!(r.list().await.len(), 1, "claimed");
+        assert_eq!(store.load_all().await.unwrap().len(), 1, "persisted");
+
+        r.rollback_remote_mirror(session_id).await;
+
+        assert!(r.list().await.is_empty(), "in-memory entry removed");
+        assert!(
+            store.load_all().await.unwrap().is_empty(),
+            "persisted record deleted — no durable orphan",
+        );
+        // A fresh re-claim succeeds and is fresh again (the slot is free).
+        let (_arc, fresh_again) = r.claim_remote_mirror(session_id, &host.id).await.unwrap();
+        assert!(fresh_again, "rollback frees the slot for a clean retry");
     }
 
     #[cfg(feature = "iroh")]
