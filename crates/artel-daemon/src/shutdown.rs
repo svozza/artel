@@ -14,6 +14,13 @@ use tokio::sync::watch;
 #[derive(Debug)]
 pub struct Shutdown {
     tx: watch::Sender<bool>,
+    /// Handle to the SIGINT/SIGTERM listener spawned by
+    /// [`Self::install_signal_handlers`], if any. Held so it can be
+    /// aborted on `trigger()` / `Drop` rather than leaked: on the
+    /// programmatic-trigger path (tests, embedders) no OS signal ever
+    /// fires, so without this the parked task and its two signal-stream
+    /// registrations would live for the runtime's whole lifetime (L10).
+    signal_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// Cheap handle to the cancellation signal. Cloneable, lightweight.
@@ -27,7 +34,10 @@ impl Shutdown {
     #[must_use]
     pub fn new() -> Self {
         let (tx, _rx) = watch::channel(false);
-        Self { tx }
+        Self {
+            tx,
+            signal_task: std::sync::Mutex::new(None),
+        }
     }
 
     /// Issue a cheap clonable token.
@@ -42,6 +52,15 @@ impl Shutdown {
     pub fn trigger(&self) {
         // send_replace ignores the case where there are no receivers.
         let _ = self.tx.send_replace(true);
+        // Abort the signal listener (L10): its only job is to call
+        // `trigger()`, which has now happened by another route, so it
+        // has nothing left to do. Aborting frees its task + signal
+        // registrations instead of leaving it parked on `recv()` for the
+        // runtime's lifetime. Idempotent: a second trigger finds None.
+        let task = self.signal_task.lock().expect("poisoned").take();
+        if let Some(handle) = task {
+            handle.abort();
+        }
     }
 
     /// Whether shutdown has already been triggered.
@@ -63,8 +82,14 @@ impl Shutdown {
 
         let mut sigint = signal(SignalKind::interrupt())?;
         let mut sigterm = signal(SignalKind::terminate())?;
-        let me = Arc::clone(self);
-        tokio::spawn(async move {
+        // Hold a `Weak`, not an `Arc`: an `Arc` here would be a cycle
+        // (Shutdown → signal_task JoinHandle → task → Arc<Shutdown>) that
+        // keeps the parked task — and `Shutdown` itself — alive forever
+        // if the owner drops without calling `trigger()`. With a `Weak`,
+        // dropping the last real `Arc<Shutdown>` runs `Drop`, which
+        // aborts this task (L10).
+        let me = Arc::downgrade(self);
+        let handle = tokio::spawn(async move {
             tokio::select! {
                 _ = sigint.recv() => {
                     tracing::info!("received SIGINT, shutting down");
@@ -73,9 +98,36 @@ impl Shutdown {
                     tracing::info!("received SIGTERM, shutting down");
                 }
             }
-            me.trigger();
+            if let Some(me) = me.upgrade() {
+                me.trigger();
+            }
         });
+        *self.signal_task.lock().expect("poisoned") = Some(handle);
         Ok(())
+    }
+
+    /// Test-only accessor for the spawned signal-listener handle, so the
+    /// suite can assert it terminates on `trigger()` (L10).
+    #[cfg(test)]
+    fn signal_task_handle(&self) -> Option<tokio::task::AbortHandle> {
+        self.signal_task
+            .lock()
+            .expect("poisoned")
+            .as_ref()
+            .map(tokio::task::JoinHandle::abort_handle)
+    }
+}
+
+impl Drop for Shutdown {
+    fn drop(&mut self) {
+        // Abort the signal listener if it's still parked (e.g. owner
+        // dropped without an explicit `trigger()`), so it doesn't outlive
+        // the daemon it served. The task holds only a `Weak<Shutdown>`,
+        // so reaching this `Drop` is possible while the task is alive.
+        let task = self.signal_task.lock().expect("poisoned").take();
+        if let Some(handle) = task {
+            handle.abort();
+        }
     }
 }
 
@@ -170,6 +222,32 @@ mod tests {
         let mut token = shutdown.token();
         let res = timeout(Duration::from_millis(20), token.cancelled()).await;
         assert!(res.is_err(), "token should not resolve before trigger");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn programmatic_trigger_aborts_the_signal_task() {
+        // L10: the signal-listener task used to be detached and only
+        // exited when a real OS signal fired. On the programmatic
+        // `trigger()` path (test harness / embedders) it leaked a parked
+        // task + two signal-stream registrations for the runtime's life.
+        // `trigger()` must now abort it.
+        let shutdown = Arc::new(Shutdown::new());
+        shutdown.install_signal_handlers().unwrap();
+        let handle = shutdown
+            .signal_task_handle()
+            .expect("a signal task was spawned");
+
+        shutdown.trigger();
+
+        // The task ends (aborted, or it ran trigger() and returned).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !handle.is_finished() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "signal task must terminate after a programmatic trigger",
+            );
+            tokio::task::yield_now().await;
+        }
     }
 
     #[tokio::test]

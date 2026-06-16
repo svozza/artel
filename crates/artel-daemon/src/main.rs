@@ -112,13 +112,7 @@ fn build_config(args: &Args) -> Result<DaemonConfig, String> {
     let endpoint_setup = {
         #[cfg(feature = "test-utils")]
         {
-            std::env::var("ARTEL_RELAY_URL").map_or_else(
-                |_| artel_daemon::EndpointSetup::default(),
-                |url| {
-                    let relay_url = url.parse().expect("ARTEL_RELAY_URL invalid");
-                    artel_daemon::EndpointSetup::ProductionCustomRelay { relay_url }
-                },
-            )
+            resolve_endpoint_setup(std::env::var("ARTEL_RELAY_URL").ok().as_deref())?
         }
         #[cfg(not(feature = "test-utils"))]
         {
@@ -138,6 +132,24 @@ fn build_config(args: &Args) -> Result<DaemonConfig, String> {
     })
 }
 
+/// Resolve the test-utils endpoint setup from an optional
+/// `ARTEL_RELAY_URL` value. `None` ⇒ the default setup; `Some(url)` ⇒ a
+/// custom-relay setup, or a config `Err` if the url is malformed (L11:
+/// a bad value exits cleanly via exit code 2, not a panic). Pure +
+/// env-free so it's unit-testable without mutating process globals.
+#[cfg(all(feature = "iroh", feature = "test-utils"))]
+fn resolve_endpoint_setup(relay_url: Option<&str>) -> Result<artel_daemon::EndpointSetup, String> {
+    match relay_url {
+        None => Ok(artel_daemon::EndpointSetup::default()),
+        Some(url) => {
+            let relay_url = url
+                .parse()
+                .map_err(|e| format!("ARTEL_RELAY_URL invalid: {e}"))?;
+            Ok(artel_daemon::EndpointSetup::ProductionCustomRelay { relay_url })
+        }
+    }
+}
+
 fn init_tracing(filter: Option<&str>) -> Result<(), String> {
     let env = if let Some(f) = filter {
         EnvFilter::try_new(f).map_err(|e| format!("invalid filter: {e}"))?
@@ -150,4 +162,37 @@ fn init_tracing(filter: Option<&str>) -> Result<(), String> {
         .with_env_filter(env)
         .try_init()
         .map_err(|e| format!("init tracing: {e}"))
+}
+
+#[cfg(all(test, feature = "iroh", feature = "test-utils"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_relay_url_is_a_config_error_not_a_panic() {
+        // L11: a bad ARTEL_RELAY_URL must surface as Err(String) (clean
+        // exit 2), not abort the process via panic like the prior
+        // `.expect()` did.
+        let err =
+            resolve_endpoint_setup(Some("not a url")).expect_err("malformed url must be rejected");
+        assert!(
+            err.contains("ARTEL_RELAY_URL invalid"),
+            "error should name the offending config: {err}",
+        );
+    }
+
+    #[test]
+    fn absent_relay_url_resolves_to_default() {
+        assert!(resolve_endpoint_setup(None).is_ok());
+    }
+
+    #[test]
+    fn valid_relay_url_resolves_to_custom_relay() {
+        let setup = resolve_endpoint_setup(Some("https://relay.example.com"))
+            .expect("a valid url must resolve");
+        assert!(matches!(
+            setup,
+            artel_daemon::EndpointSetup::ProductionCustomRelay { .. }
+        ));
+    }
 }

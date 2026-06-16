@@ -986,19 +986,26 @@ fn append_log(path: &Path, message: &SessionMessage) -> io::Result<()> {
     Ok(())
 }
 
-/// Read every complete frame in `path`. A trailing partial frame
-/// (length prefix not fully present, length prefix says N bytes but
-/// fewer follow, or postcard parse fails) is logged and the file is
-/// truncated to the last good byte.
+/// Read every complete frame in `path`. Corruption is handled by
+/// whether the *framing* is still intact:
+///
+/// - **Torn framing** (length prefix not fully present, or a length
+///   prefix that says N bytes but fewer follow, or an announced length
+///   over [`MAX_FRAME_SIZE`]) — the next frame boundary is unknowable,
+///   so this is treated as a torn trailing write: log and truncate the
+///   file to the last good byte.
+/// - **Intact framing, bad payload** (we read the full `len` bytes but
+///   postcard decode fails — at-rest bit-rot of one frame) — skip that
+///   frame and keep reading (L5). The on-disk log is **not** truncated:
+///   later durable frames survive, leaving a non-contiguous `seq` gap.
 ///
 /// When `verify` is `true`, each frame's signature is checked against
 /// `session_id` and frames that fail are dropped with a `warn` and
-/// **not** appended. The on-disk log is **not** truncated mid-file:
-/// the surrounding good frames stay, leaving a non-contiguous `seq`
-/// gap. That is intentional — the receiver has no truth for the
-/// missing seq, and a future `Replay { since: head }` can fill it.
-/// Truncating-on-bad-frame would amputate every valid frame after a
-/// single tampered one.
+/// **not** appended — same skip-and-continue, non-truncating shape.
+/// That is intentional — the receiver has no truth for the missing
+/// seq, and a future `Replay { since: head }` can fill it. Truncating
+/// on a bad mid-log frame would amputate every valid frame after a
+/// single tampered/corrupt one.
 ///
 /// `verify` mirrors whether the daemon *signs* on write: a no-iroh
 /// build emits `SIGNATURE_UNSIGNED` (no wire surface), so it loads
@@ -1098,13 +1105,21 @@ fn read_log(path: &Path, session_id: SessionId, verify: bool) -> io::Result<Vec<
                 last_good = f.stream_position()?;
             }
             Err(err) => {
+                // Malformed payload but INTACT framing (we read the full
+                // `len` bytes, so the cursor is at the next frame
+                // boundary). This is at-rest corruption of one frame, not
+                // a torn trailing write — skip it and keep reading, like
+                // the signature-fail branch above (L5). Truncating here
+                // would amputate every durable frame that physically
+                // follows a single mid-log bit-flip. Advance `last_good`
+                // past the skipped frame so a genuine torn tail later
+                // still truncates to the right place.
                 warn!(
                     file = %path.display(),
                     error = %err,
-                    "truncating malformed log frame"
+                    "skipping malformed log frame (intact framing); preserving later frames"
                 );
-                f.set_len(last_good)?;
-                break;
+                last_good = f.stream_position()?;
             }
         }
     }
@@ -2174,6 +2189,57 @@ mod tests {
             on_disk_size,
             bytes.len() as u64,
             "tampered-frame skip must not truncate the log",
+        );
+    }
+
+    #[tokio::test]
+    async fn read_log_skips_malformed_mid_frame_and_keeps_later_frames() {
+        // L5: a frame whose length prefix is intact but whose payload
+        // fails to postcard-decode (at-rest bit-rot mid-log, not a torn
+        // trailing write) must be SKIPPED — leaving the durable frames
+        // after it intact — exactly like the signature-fail path. The
+        // old behaviour set_len-truncated at the bad frame, destroying
+        // every good frame that physically followed.
+        let dir = tempdir().unwrap();
+        let store = FsLogStore::open(dir.path()).unwrap();
+        store.create(&record(1)).await.unwrap();
+        for seq in 1..=3u64 {
+            store.append(record(1).id, &message(seq)).await.unwrap();
+        }
+
+        let log_path = dir.path().join(record(1).id.to_string()).join(LOG_FILE);
+        let original = std::fs::read(&log_path).unwrap();
+        // Corrupt the START of frame 2's payload so postcard decode
+        // fails outright (the leading bytes drive the variant/field
+        // structure), while frame 2's 4-byte length prefix stays valid
+        // so the reader can still find frame 3's boundary.
+        let mut bytes = original.clone();
+        let len1 = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
+        let frame2_payload_start = 4 + len1 + 4;
+        bytes[frame2_payload_start] ^= 0xff;
+        bytes[frame2_payload_start + 1] ^= 0xff;
+        std::fs::write(&log_path, &bytes).unwrap();
+
+        let loaded = FsLogStore::open(dir.path())
+            .unwrap()
+            .load_all()
+            .await
+            .unwrap();
+        assert_eq!(loaded.len(), 1);
+        // Frame 2 is dropped (undecodable), but frames 1 AND 3 survive —
+        // the bug was frame 3 being amputated.
+        let seqs: Vec<_> = loaded[0].log.iter().map(|m| m.seq).collect();
+        assert_eq!(
+            seqs,
+            vec![Seq::new(1), Seq::new(3)],
+            "a malformed mid-log frame must not amputate later durable frames",
+        );
+        // The on-disk file is NOT truncated.
+        let on_disk_size = std::fs::metadata(&log_path).unwrap().len();
+        assert_eq!(
+            on_disk_size,
+            bytes.len() as u64,
+            "malformed-frame skip must not truncate the log",
         );
     }
 
