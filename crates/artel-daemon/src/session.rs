@@ -840,17 +840,39 @@ impl Registry {
                     // the writes like every other ledger mutation
                     // (write_tickets' deterministic tmp name relies on
                     // it). On store failure, surface it and leave
-                    // memory untouched: a resume that can't durably
-                    // record its new epoch would re-emit a stale epoch
-                    // after the next restart, and an unpersisted
-                    // ledger entry would brick the ticket we are about
-                    // to return (issued-only).
+                    // memory untouched.
+                    //
+                    // These are two writes to two separate files
+                    // (tickets.json, then meta.json's host_epoch) and
+                    // can't be made atomic without a journal, so ORDER
+                    // is the failure-mode lever: write the ledger FIRST,
+                    // bump the epoch LAST.
+                    // - put_tickets fails ⇒ nothing was bumped; disk
+                    //   epoch and ledger both stay at their prior values,
+                    //   consistent with the untouched memory. The ticket
+                    //   isn't returned, and issued-only admission means
+                    //   an unpersisted entry simply never admits.
+                    // - bump_host_epoch fails (ledger already written)
+                    //   ⇒ the durable epoch stays equal to memory, and
+                    //   the ledger carries one extra entry for the
+                    //   ticket we never returned — inert (no bearer holds
+                    //   its claim) and dropped by the next ledger
+                    //   rewrite. This is the documented "stale epoch"
+                    //   degradation: a resume that can't record its new
+                    //   epoch re-emits the prior one after restart.
+                    // The reverse order (bump, then put) would instead
+                    // leave the durable epoch AHEAD of the in-memory
+                    // signing epoch on a put failure. The incarnation
+                    // epoch fences stale SessionClosed replay on joiner
+                    // mirrors, so a disk epoch that outran memory is the
+                    // more dangerous divergence; prefer the benign inert
+                    // ledger entry.
                     self.store
-                        .bump_host_epoch(id, host_epoch)
+                        .put_tickets(id, &tickets)
                         .await
                         .map_err(SessionError::Storage)?;
                     self.store
-                        .put_tickets(id, &tickets)
+                        .bump_host_epoch(id, host_epoch)
                         .await
                         .map_err(SessionError::Storage)?;
                     s.host_epoch = host_epoch;
@@ -6079,6 +6101,7 @@ mod tests {
         park_epoch: std::sync::atomic::AtomicBool,
         epoch_gate: tokio::sync::Semaphore,
         fail_next_put_tickets: std::sync::atomic::AtomicBool,
+        fail_next_bump_epoch: std::sync::atomic::AtomicBool,
     }
 
     impl ResumeProbeStore {
@@ -6088,6 +6111,7 @@ mod tests {
                 park_epoch: std::sync::atomic::AtomicBool::new(false),
                 epoch_gate: tokio::sync::Semaphore::new(0),
                 fail_next_put_tickets: std::sync::atomic::AtomicBool::new(false),
+                fail_next_bump_epoch: std::sync::atomic::AtomicBool::new(false),
             }
         }
 
@@ -6102,6 +6126,11 @@ mod tests {
 
         fn fail_next_put_tickets(&self) {
             self.fail_next_put_tickets
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn fail_next_bump_epoch(&self) {
+            self.fail_next_bump_epoch
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
@@ -6127,6 +6156,12 @@ mod tests {
                     .await
                     .expect("gate never closed")
                     .forget();
+            }
+            if self
+                .fail_next_bump_epoch
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(std::io::Error::other("injected bump_host_epoch failure"));
             }
             self.inner.bump_host_epoch(session, epoch).await
         }
@@ -6278,6 +6313,26 @@ mod tests {
         };
         assert_eq!(epoch, 0, "failed resume must not bump the in-memory epoch");
 
+        // Disk must agree with memory. The resume writes the ledger
+        // FIRST and bumps the epoch LAST, so a put_tickets failure bumps
+        // nothing: the durable epoch stays at 0, never ahead of the
+        // in-memory signing epoch. (Reordered to put-then-bump precisely
+        // so this can't diverge — see Registry::host.)
+        let on_disk = r.store.load_all().await.unwrap();
+        assert_eq!(
+            on_disk[0].host_epoch, 0,
+            "failed put_tickets must not leave the durable epoch ahead of memory",
+        );
+        assert_eq!(
+            on_disk[0]
+                .tickets
+                .iter()
+                .map(|t| t.ticket_id)
+                .collect::<Vec<_>>(),
+            vec![create_tid],
+            "failed put_tickets must not persist the phantom ledger entry",
+        );
+
         // A later successful mutation must not resurrect the phantom.
         let (_, issued) = r.issue_ticket(id, Capability::Read, 0).await.unwrap();
         let persisted: Vec<TicketId> = r.store.load_all().await.unwrap()[0]
@@ -6286,6 +6341,75 @@ mod tests {
             .map(|t| t.ticket_id)
             .collect();
         assert_eq!(persisted, vec![create_tid, issued]);
+    }
+
+    #[tokio::test]
+    async fn failed_resume_epoch_bump_keeps_disk_epoch_level_with_memory() {
+        // The other half of the two-write resume: the ledger write
+        // SUCCEEDS but the epoch bump FAILS. Because the bump is last,
+        // the durable epoch must stay equal to the (untouched) in-memory
+        // signing epoch — never behind a SessionClosed the host would
+        // sign, and never ahead. The ledger may carry one extra entry
+        // for the ticket that was never returned; that entry is inert
+        // (no bearer holds its claim) and is dropped by the next ledger
+        // rewrite. This is the accepted "stale epoch" degradation, the
+        // safe failure mode the put-then-bump order buys us.
+        let probe = Arc::new(ResumeProbeStore::new());
+        let r = Registry::new(
+            PeerId::from_bytes([0xfe; 32]),
+            Arc::clone(&probe) as DynStore,
+        );
+        let alice = peer(1, "alice");
+        let (id, _, create_tid) = r
+            .host(alice.clone(), None, Capability::ReadWrite, 0)
+            .await
+            .unwrap();
+
+        probe.fail_next_bump_epoch();
+        let err = r
+            .host(alice.clone(), Some(id), Capability::ReadWrite, 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SessionError::Storage(_)));
+
+        // Memory untouched: epoch still 0 (store-before-memory).
+        let mem_epoch = {
+            let arc = r.sessions.read().await.get(&id).cloned().unwrap();
+            let s = arc.lock().await;
+            s.host_epoch
+        };
+        assert_eq!(
+            mem_epoch, 0,
+            "failed bump must not advance the in-memory epoch"
+        );
+
+        // Disk epoch equals memory — not ahead. This is the divergence
+        // the put-then-bump order exists to prevent.
+        let on_disk = r.store.load_all().await.unwrap();
+        assert_eq!(
+            on_disk[0].host_epoch, mem_epoch,
+            "durable epoch must stay level with the in-memory signing epoch on a failed bump",
+        );
+
+        // The next successful resume converges cleanly: epoch advances
+        // by one and the now-rewritten ledger drops the inert phantom,
+        // keeping only the genuinely-returned tickets.
+        let (_, _, resumed_tid) = r
+            .host(alice.clone(), Some(id), Capability::ReadWrite, 0)
+            .await
+            .unwrap();
+        let after = r.store.load_all().await.unwrap();
+        assert_eq!(
+            after[0].host_epoch, 1,
+            "a clean resume advances the epoch by one"
+        );
+        let ids: Vec<TicketId> = after[0].tickets.iter().map(|t| t.ticket_id).collect();
+        assert_eq!(
+            ids,
+            vec![create_tid, resumed_tid],
+            "the clean resume's ledger rewrite keeps only the create + returned tickets, \
+             dropping the inert phantom from the failed resume",
+        );
     }
 
     #[cfg(feature = "iroh")]
