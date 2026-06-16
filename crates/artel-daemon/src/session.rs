@@ -2439,7 +2439,15 @@ impl Registry {
             s.log
                 .iter()
                 .filter(|m| {
-                    m.seq > cutoff && !(m.kind == MessageKind::System && m.action == TICKET_ACTION)
+                    // Suppress BOTH reserved daemon-injected System
+                    // actions (L2): the genuine TICKET_ACTION /
+                    // UPGRADE_ACTION arrive over the host→peer unicast as
+                    // synthetics and are never store-appended, so any
+                    // log-borne one is a stale/forged broadcast that must
+                    // stay inert on this joiner-visible surface.
+                    m.seq > cutoff
+                        && !(m.kind == MessageKind::System
+                            && reserved_system_action(&m.action).is_some())
                 })
                 .cloned(),
         );
@@ -2896,20 +2904,24 @@ async fn apply_inbound_mirror_message(
     if msg.seq > s.head {
         s.head = msg.seq;
     }
-    // Log-borne TICKET_ACTION is never surfaced live to IPC
-    // subscribers (revoked-lurker fix): the genuine envelope arrives
-    // over the host→peer unicast and is injected from the persisted
-    // copy only; a gossip Message carrying the action is a stale or
-    // forged broadcast and must not drive a joiner's
-    // `wait_for_ticket`. The entry stays in the mirror log (seq
-    // continuity for dedup); `subscribe` applies the same filter, so
-    // it is inert on every joiner-visible surface.
-    if msg.kind == MessageKind::System && msg.action == TICKET_ACTION {
+    // Log-borne reserved System actions are never surfaced live to IPC
+    // subscribers (revoked-lurker fix; L2 covers both TICKET_ACTION and
+    // UPGRADE_ACTION): the genuine envelope / session-key material
+    // arrives over the host→peer unicast and is injected from the
+    // persisted copy only; a gossip Message carrying the action is a
+    // stale or forged broadcast and must not drive a joiner's
+    // `wait_for_ticket` or upgrade import. The entry stays in the mirror
+    // log (seq continuity for dedup); `subscribe` applies the same
+    // filter, so it is inert on every joiner-visible surface.
+    if msg.kind == MessageKind::System
+        && let Some(reserved) = reserved_system_action(&msg.action)
+    {
         tracing::warn!(
             ?session,
             seq = ?msg.seq,
             peer = %msg.peer.id,
-            "suppressing log-borne TICKET_ACTION broadcast (unicast is the only sanctioned source)",
+            action = reserved,
+            "suppressing log-borne reserved-action broadcast (unicast is the only sanctioned source)",
         );
         return;
     }
@@ -4080,6 +4092,63 @@ mod tests {
                 Err(broadcast::error::TryRecvError::Empty)
             ),
             "log-borne TICKET_ACTION must not surface as a live event",
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "iroh")]
+    async fn mirror_suppresses_log_borne_upgrade_action_from_live_events() {
+        // L2: symmetry with TICKET_ACTION on the joiner mirror's live
+        // path. A fully host-signed System/UPGRADE_ACTION gossip Message
+        // (carrying session-key material) is persisted for seq
+        // continuity but must NOT surface as a live Event::Message — the
+        // host→peer unicast synthetic is the only sanctioned source.
+        let (host_key, session, author_key, mirror, store) = remote_mirror_fixture();
+        store.create(&mirror.lock().await.record()).await.unwrap();
+
+        let mut events_rx = mirror.lock().await.events_tx.subscribe();
+
+        let author = PeerInfo::new(
+            PeerId::from_bytes(author_key.verifying_key().to_bytes()),
+            "mallory",
+        );
+        let timestamp_ms = 1_700_000_000_000u64;
+        let payload = vec![0xAB; 32];
+        let author_sig = artel_protocol::signing::sign_body(
+            &author_key,
+            session,
+            artel_protocol::message::MESSAGE_FORMAT,
+            timestamp_ms,
+            &author,
+            MessageKind::System,
+            UPGRADE_ACTION,
+            &payload,
+        );
+        let host_sig =
+            artel_protocol::signing::sign_seq(&host_key, session, Seq::new(1), &author_sig);
+        let msg = SessionMessage::new(
+            Seq::new(1),
+            timestamp_ms,
+            author,
+            MessageKind::System,
+            UPGRADE_ACTION,
+            payload,
+            author_sig,
+            host_sig,
+        );
+
+        apply_inbound_mirror_message(&store, &mirror, session, msg).await;
+        assert_eq!(
+            mirror.lock().await.log.len(),
+            1,
+            "entry persists for seq continuity",
+        );
+        assert!(
+            matches!(
+                events_rx.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ),
+            "log-borne UPGRADE_ACTION must not surface as a live event",
         );
     }
 
@@ -5350,6 +5419,49 @@ mod tests {
         let sub = r.subscribe(id, None).await.unwrap();
         let actions: Vec<&str> = sub.replay.iter().map(|m| m.action.as_str()).collect();
         assert_eq!(actions, vec!["hello"]);
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn subscribe_filters_log_borne_upgrade_action() {
+        // L2: symmetry with TICKET_ACTION. A log-borne UPGRADE_ACTION
+        // System message (the more sensitive action — it carries
+        // session-key material) must also be filtered from the Subscribe
+        // replay surface. The genuine upgrade arrives over the host→peer
+        // unicast as a Seq::ZERO synthetic and is never store-appended,
+        // so any log-borne one is illegitimate by construction.
+        let r = registry();
+        let host = peer(1, "alice");
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
+        r.inject_log_entry(
+            id,
+            log_fixture(
+                1,
+                &host,
+                MessageKind::System,
+                UPGRADE_ACTION,
+                vec![0xAB; 64],
+            ),
+        )
+        .await;
+        r.send(
+            id,
+            host,
+            MessageKind::Chat,
+            "hello".into(),
+            vec![],
+            Authoring::Local,
+        )
+        .await
+        .unwrap();
+
+        let sub = r.subscribe(id, None).await.unwrap();
+        let actions: Vec<&str> = sub.replay.iter().map(|m| m.action.as_str()).collect();
+        assert_eq!(
+            actions,
+            vec!["hello"],
+            "a log-borne UPGRADE_ACTION must be filtered from Subscribe replay",
+        );
     }
 
     // ---- workspace ticket: emit (joiner side) ----
