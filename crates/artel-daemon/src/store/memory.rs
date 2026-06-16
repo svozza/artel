@@ -73,7 +73,13 @@ impl SessionStore for MemoryStore {
         let entry = guard
             .get_mut(&session)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown session"))?;
-        entry.record.head = message.seq;
+        // Monotonic head, matching `FsLogStore::append`: a Remote mirror
+        // can append a lower seq after a higher one (gossip frames apply
+        // in arbitrary lock order), and the persisted head must not
+        // regress. Keeping the two stores' semantics identical means the
+        // in-memory test baseline catches a head-regression the disk
+        // store would also suffer.
+        entry.record.head = entry.record.head.max(message.seq);
         entry.record.log.push(message.clone());
         Ok(())
     }
