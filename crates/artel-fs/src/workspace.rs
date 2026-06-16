@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use artel_client::{Client, ClientError};
 use artel_protocol::{
-    Event, JoinTicket, MessageKind, PeerId, ProtocolError, Request, Response, SendPayload,
+    Event, JoinTicket, MessageKind, PeerId, ProtocolError, Request, Response, SendPayload, Seq,
     SessionId, UpgradePayload,
 };
 use bytes::Bytes;
@@ -79,6 +79,23 @@ use artel_protocol::UPGRADE_ACTION;
 /// stuck consumer back-pressures the watcher rather than letting
 /// events queue without bound.
 const EVENT_BUFFER: usize = 64;
+
+/// First retry delay for the cap-listener's reconnect loop. Subsequent
+/// attempts double this (see [`cap_reconnect_backoff`]) up to
+/// [`CAP_RECONNECT_MAX_DELAY`].
+const CAP_RECONNECT_BASE_DELAY: Duration = Duration::from_millis(100);
+
+/// Ceiling on the cap-listener reconnect backoff — once the doubling
+/// delay reaches this, it stays here for the remaining attempts.
+const CAP_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(5);
+
+/// How many reconnect attempts the cap-listener makes after an EOF
+/// before giving up and surfacing a [`WorkspaceError`]. A genuinely
+/// dead daemon shouldn't keep a listener task spinning indefinitely.
+/// The total wait before giving up is the sum of the backoff series
+/// (~0.1s + 0.2s + … capped at 5s) — roughly a minute at the default,
+/// long enough to ride out a daemon restart but bounded.
+const CAP_RECONNECT_MAX_ATTEMPTS: u32 = 16;
 
 /// Default name of the workspace's per-`root` state directory.
 ///
@@ -745,6 +762,7 @@ impl Workspace {
             shutdown_token.child_token(),
             host_ctx,
             None,
+            tx.clone(),
         )
         .await?;
 
@@ -970,6 +988,12 @@ impl Workspace {
         // event stream (from wait_for_ticket) is still subscribed —
         // reuse it. If a daemon_socket is configured, prefer a
         // dedicated connection so the caller can reuse their client.
+        //
+        // Either way the listener can recover from a lag-induced
+        // teardown (M3): with a configured socket it reconnects there;
+        // when reusing the caller's stream it reconnects on the
+        // caller's own socket (`client.socket_path()`), opening a fresh
+        // second connection rather than disturbing the caller's.
         let shutdown_token = CancellationToken::new();
         let joiner_ctx = Some(JoinerUpgradeCtx {
             my_peer_id: client.daemon_peer_id(),
@@ -983,6 +1007,7 @@ impl Workspace {
                 shutdown_token.child_token(),
                 None,
                 joiner_ctx,
+                tx.clone(),
             )
             .await?
         } else {
@@ -993,6 +1018,8 @@ impl Workspace {
                 shutdown_token.child_token(),
                 None,
                 joiner_ctx,
+                client.socket_path().to_path_buf(),
+                tx.clone(),
             )
         };
 
@@ -2057,6 +2084,73 @@ struct JoinerUpgradeCtx {
     docs: iroh_docs::protocol::Docs,
 }
 
+/// Exponential backoff for the cap-listener's reconnect loop.
+///
+/// `attempt` is zero-based: attempt 0 is the first retry delay. The
+/// delay doubles from [`CAP_RECONNECT_BASE_DELAY`] each attempt, capped
+/// at [`CAP_RECONNECT_MAX_DELAY`]. Returns `None` once `attempt`
+/// reaches [`CAP_RECONNECT_MAX_ATTEMPTS`] — the signal to give up so a
+/// genuinely-dead daemon doesn't keep a task spinning forever.
+fn cap_reconnect_backoff(attempt: u32) -> Option<Duration> {
+    if attempt >= CAP_RECONNECT_MAX_ATTEMPTS {
+        return None;
+    }
+    // Saturating doubling: `BASE << attempt`, clamped to the cap. Guard
+    // the shift so a large `attempt` can't overflow before the clamp.
+    let delay = if attempt >= 32 {
+        CAP_RECONNECT_MAX_DELAY
+    } else {
+        CAP_RECONNECT_BASE_DELAY
+            .saturating_mul(1u32 << attempt)
+            .min(CAP_RECONNECT_MAX_DELAY)
+    };
+    Some(delay)
+}
+
+/// Fold a freshly-seen message `seq` into the cap-listener's last-seen
+/// watermark. The watermark only ever advances — a `Seq::ZERO`
+/// synthetic (the daemon re-injects the workspace ticket at
+/// `Seq::ZERO` on every `Subscribe`) or a replayed lower seq can't pull
+/// it back, so a resume from `since: Some(prev)` never re-requests
+/// already-processed log entries.
+fn max_seq(prev: Option<Seq>, seq: Seq) -> Seq {
+    prev.map_or(seq, |p| p.max(seq))
+}
+
+/// Reconnect to `socket` and re-`Subscribe { since }`, returning a
+/// fresh event stream on success.
+///
+/// Used by the cap-listener after the daemon tears the connection down
+/// on subscriber lag (M3): a new connection plus `since: last_seq`
+/// replays every log entry past the watermark, so the reconnect is
+/// gap-free for log-borne events. The transient `Client` is dropped on
+/// return — its reader task keeps the returned [`EventStream`] alive,
+/// matching the [`spawn_cap_listener_from_socket`] pattern.
+async fn cap_resubscribe(
+    socket: &Path,
+    session: SessionId,
+    since: Option<Seq>,
+) -> Result<artel_client::EventStream, WorkspaceError> {
+    let client = Client::connect(socket)
+        .await
+        .map_err(|e| WorkspaceError::Iroh(format!("cap-listener reconnect: {e}")))?;
+    match client
+        .request(Request::Subscribe { session, since })
+        .await?
+    {
+        Response::Subscribed { .. } => {}
+        other => {
+            return Err(WorkspaceError::Iroh(format!(
+                "cap-listener resubscribe: unexpected response: {other:?}",
+            )));
+        }
+    }
+    client
+        .take_events()
+        .await
+        .ok_or_else(|| WorkspaceError::Iroh("cap-listener: events already taken".into()))
+}
+
 async fn spawn_cap_listener_from_socket(
     socket: Option<&Path>,
     session: SessionId,
@@ -2064,41 +2158,32 @@ async fn spawn_cap_listener_from_socket(
     cancel: CancellationToken,
     host_ctx: Option<HostUpgradeCtx>,
     joiner_ctx: Option<JoinerUpgradeCtx>,
+    events_tx: mpsc::Sender<WorkspaceEvent>,
 ) -> Result<tokio::task::JoinHandle<()>, WorkspaceError> {
     let Some(socket) = socket else {
         return Ok(tokio::spawn(async move {
             cancel.cancelled().await;
         }));
     };
-    let cap_client = Client::connect(socket)
-        .await
-        .map_err(|e| WorkspaceError::Iroh(format!("cap-listener connect: {e}")))?;
-    match cap_client
-        .request(Request::Subscribe {
-            session,
-            since: None,
-        })
-        .await?
-    {
-        Response::Subscribed { .. } => {}
-        other => {
-            return Err(WorkspaceError::Iroh(format!(
-                "cap-listener subscribe: unexpected response: {other:?}",
-            )));
-        }
-    }
-    let events = cap_client
-        .take_events()
-        .await
-        .ok_or_else(|| WorkspaceError::Iroh("cap-listener: events already taken".into()))?;
+    let events = cap_resubscribe(socket, session, None).await?;
     Ok(spawn_cap_listener(
-        events, session, peer_map, cancel, host_ctx, joiner_ctx,
+        events,
+        session,
+        peer_map,
+        cancel,
+        host_ctx,
+        joiner_ctx,
+        socket.to_path_buf(),
+        events_tx,
     ))
 }
 
-/// Spawn a background task that drains session events into `peer_map`.
+/// Apply one cap-listener [`Event`] to `peer_map` and trigger any
+/// host-side upgrade delivery. Returns the message `seq` when the event
+/// was a session [`Event::Message`] (so the caller can advance its
+/// last-seen watermark), `None` otherwise.
 ///
-/// Processes three event types:
+/// Processes three message types:
 /// - `MessageKind::Capability`: applies grant/revoke to the cap-set
 ///   projection so the docs gate starts rejecting revoked peers.
 ///   On the host side, an RW grant also triggers delivery of the
@@ -2107,8 +2192,124 @@ async fn spawn_cap_listener_from_socket(
 ///   from a joiner's workspace `EndpointId` to their daemon `PeerId`.
 /// - `MessageKind::System` with `UPGRADE_ACTION`: on the joiner side,
 ///   imports the `NamespaceSecret` to gain Write capability.
+async fn handle_cap_event(
+    ev: Event,
+    session: SessionId,
+    peer_map: &Arc<PeerMap>,
+    host_ctx: Option<&HostUpgradeCtx>,
+    joiner_ctx: Option<&JoinerUpgradeCtx>,
+) -> Option<Seq> {
+    match ev {
+        Event::Message {
+            session: ev_session,
+            message,
+        } if ev_session == session => {
+            let seq = message.seq;
+            match message.kind {
+                MessageKind::Capability => {
+                    peer_map.apply_capability(message.peer.id, &message.payload);
+                    // Host: on RW grant, deliver the
+                    // NamespaceSecret to the promoted peer.
+                    // Check has_rw AFTER apply so a grant
+                    // whose peer was later revoked (during
+                    // replay) is suppressed.
+                    if let Some(ctx) = host_ctx
+                        && let Ok(artel_protocol::capability::CapabilityAction::Grant {
+                            peer,
+                            cap: artel_protocol::capability::Capability::ReadWrite,
+                        }) =
+                            artel_protocol::capability::CapabilityAction::decode(&message.payload)
+                        && peer_map.has_rw(peer)
+                    {
+                        let client = Arc::clone(&ctx.client);
+                        let sess = ctx.session;
+                        let secret = ctx.namespace_secret;
+                        tokio::spawn(async move {
+                            if let Err(e) = publish_upgrade(&client, sess, peer, secret).await {
+                                warn!(?e, ?peer, "upgrade delivery failed");
+                            }
+                        });
+                    }
+                }
+                MessageKind::System if message.action == NODE_ID_ACTION => {
+                    if let Ok(bytes) = <[u8; 32]>::try_from(message.payload.as_slice())
+                        && let Ok(workspace_id) = iroh::EndpointId::from_bytes(&bytes)
+                    {
+                        peer_map.register(workspace_id, message.peer.id);
+                    }
+                }
+                MessageKind::System if message.action == UPGRADE_ACTION => {
+                    if let Some(ctx) = joiner_ctx
+                        && message.peer.id == peer_map.host_peer_id()
+                        && let Ok(payload) =
+                            postcard::from_bytes::<UpgradePayload>(&message.payload)
+                        && payload.target_peer == ctx.my_peer_id
+                    {
+                        let secret =
+                            iroh_docs::NamespaceSecret::from_bytes(&payload.namespace_secret);
+                        let cap = iroh_docs::Capability::Write(secret);
+                        if let Err(e) = ctx.docs.import_namespace(cap).await {
+                            warn!("workspace.upgrade import_namespace failed: {e}");
+                        }
+                    }
+                }
+                _ => {}
+            }
+            Some(seq)
+        }
+        // Host: re-deliver the upgrade to a peer that
+        // (re-)joins while already holding RW. Covers
+        // the case where the original broadcast was
+        // missed due to a network blip.
+        Event::PeerJoined {
+            session: ev_session,
+            peer: joined_peer,
+        } if ev_session == session => {
+            if let Some(ctx) = host_ctx
+                && peer_map.has_rw(joined_peer.id)
+            {
+                let client = Arc::clone(&ctx.client);
+                let sess = ctx.session;
+                let secret = ctx.namespace_secret;
+                let peer = joined_peer.id;
+                tokio::spawn(async move {
+                    if let Err(e) = publish_upgrade(&client, sess, peer, secret).await {
+                        warn!(?e, ?peer, "upgrade re-delivery on rejoin failed");
+                    }
+                });
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Spawn a background task that drains session events into `peer_map`.
+///
+/// See [`handle_cap_event`] for the event types processed.
+///
+/// **Lag recovery (M3):** the daemon tears the connection down (rather
+/// than silently dropping events) when this subscriber falls more than
+/// the broadcast capacity behind. The drained stream then ends
+/// (`recv()` yields `None`). On that EOF — and only that EOF, not a
+/// [`cancel`] — the task reconnects to `reconnect_socket` and
+/// re-`Subscribe`s from `last_seq`, with bounded
+/// [`cap_reconnect_backoff`]. The daemon replays every log entry with
+/// `seq > last_seq`, so recovery is gap-free for everything this loop
+/// acts on: `Capability`, `NODE_ID_ACTION`, and `UPGRADE_ACTION` are
+/// all log-borne and replayed, and both [`PeerMap::apply_capability`]
+/// and [`PeerMap::register`] are idempotent. `PeerJoined`/`PeerLeft`/
+/// `SessionClosed` are live-only and not replayed, but the only one
+/// this loop acts on (`PeerJoined`, host-side) merely re-fires an
+/// upgrade that the replayed `Capability::Grant` already re-fires — so
+/// no separate membership reconciliation RPC is needed here.
+///
+/// After [`CAP_RECONNECT_MAX_ATTEMPTS`] failed reconnects the task
+/// surfaces a [`WorkspaceError`] as a [`WorkspaceEvent::Error`] and
+/// stops, so a genuinely-dead daemon doesn't spin forever.
 ///
 /// Runs until `cancel` is triggered (from `Workspace::shutdown`).
+#[allow(clippy::too_many_arguments)]
 fn spawn_cap_listener(
     mut events: artel_client::EventStream,
     session: SessionId,
@@ -2116,96 +2317,69 @@ fn spawn_cap_listener(
     cancel: CancellationToken,
     host_ctx: Option<HostUpgradeCtx>,
     joiner_ctx: Option<JoinerUpgradeCtx>,
+    reconnect_socket: PathBuf,
+    events_tx: mpsc::Sender<WorkspaceEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                () = cancel.cancelled() => break,
-                ev = events.recv() => {
-                    let Some(ev) = ev else { break };
-                    match ev {
-                        Event::Message {
-                            session: ev_session,
-                            message,
-                        } if ev_session == session => {
-                            match message.kind {
-                                MessageKind::Capability => {
-                                    peer_map.apply_capability(
-                                        message.peer.id,
-                                        &message.payload,
-                                    );
-                                    // Host: on RW grant, deliver the
-                                    // NamespaceSecret to the promoted peer.
-                                    // Check has_rw AFTER apply so a grant
-                                    // whose peer was later revoked (during
-                                    // replay) is suppressed.
-                                    if let Some(ref ctx) = host_ctx
-                                        && let Ok(artel_protocol::capability::CapabilityAction::Grant {
-                                            peer,
-                                            cap: artel_protocol::capability::Capability::ReadWrite,
-                                        }) = artel_protocol::capability::CapabilityAction::decode(&message.payload)
-                                        && peer_map.has_rw(peer)
-                                    {
-                                        let client = Arc::clone(&ctx.client);
-                                        let sess = ctx.session;
-                                        let secret = ctx.namespace_secret;
-                                        tokio::spawn(async move {
-                                            if let Err(e) = publish_upgrade(
-                                                &client, sess, peer, secret,
-                                            ).await {
-                                                warn!(?e, ?peer, "upgrade delivery failed");
-                                            }
-                                        });
-                                    }
-                                }
-                                MessageKind::System if message.action == NODE_ID_ACTION => {
-                                    if let Ok(bytes) = <[u8; 32]>::try_from(message.payload.as_slice())
-                                        && let Ok(workspace_id) = iroh::EndpointId::from_bytes(&bytes)
-                                    {
-                                        peer_map.register(workspace_id, message.peer.id);
-                                    }
-                                }
-                                MessageKind::System if message.action == UPGRADE_ACTION => {
-                                    if let Some(ref ctx) = joiner_ctx
-                                        && message.peer.id == peer_map.host_peer_id()
-                                        && let Ok(payload) = postcard::from_bytes::<UpgradePayload>(&message.payload)
-                                        && payload.target_peer == ctx.my_peer_id
-                                    {
-                                        let secret = iroh_docs::NamespaceSecret::from_bytes(&payload.namespace_secret);
-                                        let cap = iroh_docs::Capability::Write(secret);
-                                        if let Err(e) = ctx.docs.import_namespace(cap).await {
-                                            warn!("workspace.upgrade import_namespace failed: {e}");
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
+        let mut last_seq: Option<Seq> = None;
+        'outer: loop {
+            // Drain the current stream until EOF or cancellation.
+            loop {
+                tokio::select! {
+                    () = cancel.cancelled() => break 'outer,
+                    ev = events.recv() => {
+                        let Some(ev) = ev else {
+                            // EOF — the daemon closed the connection
+                            // (lag teardown, or it restarted). Fall
+                            // through to the reconnect loop.
+                            break;
+                        };
+                        if let Some(seq) =
+                            handle_cap_event(ev, session, &peer_map, host_ctx.as_ref(), joiner_ctx.as_ref())
+                                .await
+                        {
+                            last_seq = Some(max_seq(last_seq, seq));
                         }
-                        // Host: re-deliver the upgrade to a peer that
-                        // (re-)joins while already holding RW. Covers
-                        // the case where the original broadcast was
-                        // missed due to a network blip.
-                        Event::PeerJoined {
-                            session: ev_session,
-                            peer: joined_peer,
-                        } if ev_session == session => {
-                            if let Some(ref ctx) = host_ctx
-                                && peer_map.has_rw(joined_peer.id)
-                            {
-                                let client = Arc::clone(&ctx.client);
-                                let sess = ctx.session;
-                                let secret = ctx.namespace_secret;
-                                let peer = joined_peer.id;
-                                tokio::spawn(async move {
-                                    if let Err(e) = publish_upgrade(
-                                        &client, sess, peer, secret,
-                                    ).await {
-                                        warn!(?e, ?peer, "upgrade re-delivery on rejoin failed");
-                                    }
-                                });
-                            }
-                        }
-                        _ => {}
+                    }
+                }
+            }
+
+            // Reconnect + re-Subscribe { since: last_seq } with bounded
+            // backoff. Retry on BOTH connect and subscribe failure so a
+            // transient error (e.g. UnknownSession while the host
+            // re-hosts) is rideable.
+            let mut attempt = 0u32;
+            loop {
+                let Some(delay) = cap_reconnect_backoff(attempt) else {
+                    let msg = format!(
+                        "cap-listener: giving up after {CAP_RECONNECT_MAX_ATTEMPTS} reconnect \
+                         attempts; peer/capability-change events will no longer be observed",
+                    );
+                    warn!(?session, "{msg}");
+                    emit_event(&events_tx, WorkspaceEvent::Error(msg));
+                    break 'outer;
+                };
+                tokio::select! {
+                    () = cancel.cancelled() => break 'outer,
+                    () = tokio::time::sleep(delay) => {}
+                }
+                match cap_resubscribe(&reconnect_socket, session, last_seq).await {
+                    Ok(fresh) => {
+                        debug!(
+                            target: "artel_fs::workspace",
+                            ?session, ?last_seq, attempt,
+                            "cap-listener reconnected after stream close",
+                        );
+                        events = fresh;
+                        continue 'outer;
+                    }
+                    Err(e) => {
+                        debug!(
+                            target: "artel_fs::workspace",
+                            ?session, attempt, %e,
+                            "cap-listener reconnect attempt failed; backing off",
+                        );
+                        attempt += 1;
                     }
                 }
             }
@@ -2220,6 +2394,244 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn max_seq_tracks_highest_and_ignores_synthetic_zero() {
+        // Starting empty, the first real seq becomes the watermark.
+        assert_eq!(max_seq(None, Seq::new(5)), Seq::new(5));
+        // A higher seq advances it.
+        assert_eq!(max_seq(Some(Seq::new(5)), Seq::new(9)), Seq::new(9));
+        // A lower (or replayed) seq never regresses the watermark.
+        assert_eq!(max_seq(Some(Seq::new(9)), Seq::new(3)), Seq::new(9));
+        // A `Seq::ZERO` synthetic (e.g. the re-injected ticket) can't
+        // pull an established watermark back to zero.
+        assert_eq!(max_seq(Some(Seq::new(9)), Seq::ZERO), Seq::new(9));
+    }
+
+    #[test]
+    fn cap_reconnect_backoff_grows_then_caps_then_gives_up() {
+        // Attempt 0 is the first retry delay; delays grow monotonically
+        // until they saturate at the cap, then the ceiling returns None
+        // so a genuinely-dead daemon doesn't spin forever.
+        let mut prev = Duration::ZERO;
+        let mut saw_cap = false;
+        for attempt in 0..CAP_RECONNECT_MAX_ATTEMPTS {
+            let d = cap_reconnect_backoff(attempt).expect("under ceiling => Some");
+            assert!(
+                d >= prev,
+                "backoff must be monotonic non-decreasing: attempt {attempt} gave {d:?} < {prev:?}",
+            );
+            assert!(
+                d <= CAP_RECONNECT_MAX_DELAY,
+                "backoff must never exceed the cap: {d:?}",
+            );
+            if d == CAP_RECONNECT_MAX_DELAY {
+                saw_cap = true;
+            }
+            prev = d;
+        }
+        assert!(
+            saw_cap,
+            "backoff should saturate at the cap before the ceiling"
+        );
+        // At and past the ceiling: give up.
+        assert_eq!(cap_reconnect_backoff(CAP_RECONNECT_MAX_ATTEMPTS), None);
+        assert_eq!(cap_reconnect_backoff(CAP_RECONNECT_MAX_ATTEMPTS + 7), None);
+    }
+
+    /// End-to-end recovery proof (M3): a cap-listener whose connection
+    /// is torn down (here: the daemon stops and a fresh one resumes the
+    /// hosted session on the same socket + sessions dir) reconnects,
+    /// re-`Subscribe`s from its last-seen seq, and applies a capability
+    /// grant that was issued *after* the disconnect.
+    ///
+    /// Without the reconnect loop this is red: the listener's
+    /// `events.recv()` yields `None` on the daemon stop and the task
+    /// exits, so the post-restart grant is never observed and
+    /// `has_rw(promoted_after_restart)` stays false until the timeout.
+    ///
+    /// Pure IPC — no iroh data-plane sync — so it's deterministic: the
+    /// daemon reloads the hosted session from disk, the post-restart
+    /// grant lands in the log, and the reconnect's
+    /// `Subscribe { since: last_seq }` replays it. The peer-map is
+    /// idempotent, so even a replay of the pre-restart grant is benign.
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::too_many_lines)]
+    async fn cap_listener_recovers_grant_after_daemon_restart() {
+        use std::sync::Arc;
+
+        use artel_client::Client;
+        use artel_daemon::shutdown::Shutdown;
+        use artel_daemon::{Daemon, DaemonConfig, EndpointSetup as DaemonEndpointSetup};
+        use artel_protocol::capability::{Capability, CapabilityAction};
+        use iroh::test_utils::DnsPkarrServer;
+
+        async fn spawn_daemon(
+            socket: &Path,
+            pid: &Path,
+            sessions: &Path,
+            iroh_key: &Path,
+            dns_pkarr: Arc<DnsPkarrServer>,
+        ) -> (Arc<Shutdown>, tokio::task::JoinHandle<std::io::Result<()>>) {
+            let daemon = Daemon::start(DaemonConfig {
+                socket_path: socket.to_path_buf(),
+                pid_path: pid.to_path_buf(),
+                sessions_dir: sessions.to_path_buf(),
+                iroh_key_path: Some(iroh_key.to_path_buf()),
+                endpoint_setup: DaemonEndpointSetup::Testing { dns_pkarr },
+            })
+            .await
+            .expect("daemon start");
+            let shutdown = daemon.shutdown_handle();
+            let join = tokio::spawn(daemon.run());
+            (shutdown, join)
+        }
+
+        // Poll `has_rw(peer)` until true or a bounded deadline.
+        async fn wait_has_rw(peer_map: &Arc<PeerMap>, peer: PeerId, what: &str) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            while !peer_map.has_rw(peer) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "cap-listener never observed RW for {what}",
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        let dns_pkarr = Arc::new(DnsPkarrServer::run().await.expect("DnsPkarrServer::run"));
+        let dir = TempDir::new().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let pid = dir.path().join("daemon.pid");
+        let sessions = dir.path().join("sessions");
+        let iroh_key = dir.path().join("iroh.key");
+
+        // --- Phase 1: daemon up, host a session, attach a cap-listener.
+        let (shutdown1, join1) =
+            spawn_daemon(&socket, &pid, &sessions, &iroh_key, Arc::clone(&dns_pkarr)).await;
+
+        let client = Client::connect(&socket).await.expect("connect");
+        let session = match client
+            .request(Request::HostSession {
+                display_name: "host".into(),
+                session: None,
+            })
+            .await
+            .expect("host")
+        {
+            Response::HostSession { session, .. } => session,
+            other => panic!("unexpected HostSession reply: {other:?}"),
+        };
+        let host_peer = client.daemon_peer_id();
+
+        let peer_map = Arc::new(PeerMap::new(host_peer));
+        let cancel = CancellationToken::new();
+        // Sink for the give-up WorkspaceError; we don't expect one here.
+        let (ev_tx, _ev_rx) = mpsc::channel(EVENT_BUFFER);
+        let listener = spawn_cap_listener_from_socket(
+            Some(socket.as_path()),
+            session,
+            Arc::clone(&peer_map),
+            cancel.child_token(),
+            None,
+            None,
+            ev_tx,
+        )
+        .await
+        .expect("cap-listener spawn");
+
+        // Grant RW to a first peer; the listener must apply it.
+        let peer_before = PeerId::from_bytes([7; 32]);
+        grant_rw(&client, session, peer_before).await;
+        wait_has_rw(&peer_map, peer_before, "peer granted before restart").await;
+
+        // --- Phase 2: stop the daemon. The listener sees EOF and
+        // enters its reconnect loop.
+        drop(client);
+        shutdown1.trigger();
+        timeout(Duration::from_secs(10), join1)
+            .await
+            .expect("daemon 1 exit")
+            .expect("daemon 1 join")
+            .expect("daemon 1 io");
+
+        // --- Phase 3: bring a fresh daemon up on the same socket +
+        // sessions dir. It reloads the hosted session from disk.
+        let (shutdown2, join2) =
+            spawn_daemon(&socket, &pid, &sessions, &iroh_key, Arc::clone(&dns_pkarr)).await;
+
+        // A fresh client re-hosts (resume) to gain send membership on
+        // its connection, then grants RW to a second peer — issued
+        // entirely after the disconnect.
+        let client2 = Client::connect(&socket).await.expect("reconnect client");
+        match client2
+            .request(Request::HostSession {
+                display_name: "host".into(),
+                session: Some(session),
+            })
+            .await
+            .expect("re-host")
+        {
+            Response::HostSession { session: s, .. } => assert_eq!(s, session),
+            other => panic!("unexpected re-host reply: {other:?}"),
+        }
+        let peer_after = PeerId::from_bytes([9; 32]);
+        let grant = CapabilityAction::Grant {
+            peer: peer_after,
+            cap: Capability::ReadWrite,
+        };
+        match client2
+            .request(Request::Send {
+                session,
+                payload: SendPayload {
+                    kind: MessageKind::Capability,
+                    action: grant.action_str().to_string(),
+                    payload: grant.encode(),
+                },
+            })
+            .await
+            .expect("post-restart grant")
+        {
+            Response::Sent { .. } => {}
+            other => panic!("unexpected Send reply: {other:?}"),
+        }
+
+        // The payoff: the reconnected listener applies the
+        // post-restart grant. Red without the reconnect loop.
+        wait_has_rw(&peer_map, peer_after, "peer granted after restart").await;
+
+        // Cleanup.
+        cancel.cancel();
+        let _ = timeout(Duration::from_secs(5), listener).await;
+        drop(client2);
+        shutdown2.trigger();
+        let _ = timeout(Duration::from_secs(10), join2).await;
+    }
+
+    /// Helper mirroring the test-suite `grant_rw`: host authors a
+    /// `Capability::Grant` for `target`.
+    async fn grant_rw(client: &artel_client::Client, session: SessionId, target: PeerId) {
+        use artel_protocol::capability::{Capability, CapabilityAction};
+        let grant = CapabilityAction::Grant {
+            peer: target,
+            cap: Capability::ReadWrite,
+        };
+        match client
+            .request(Request::Send {
+                session,
+                payload: SendPayload {
+                    kind: MessageKind::Capability,
+                    action: grant.action_str().to_string(),
+                    payload: grant.encode(),
+                },
+            })
+            .await
+            .expect("grant send")
+        {
+            Response::Sent { .. } => {}
+            other => panic!("unexpected Send reply: {other:?}"),
+        }
+    }
 
     #[test]
     fn workspace_config_with_join_ticket_timeout_sets_field() {

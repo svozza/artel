@@ -17,7 +17,7 @@
 //! forever for a response that will not come.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -69,6 +69,11 @@ pub struct Client {
     daemon_version: ProtocolVersion,
     /// Daemon's reported peer id, captured at handshake.
     daemon_peer_id: PeerId,
+    /// Socket path this client connected on. Retained so recovery
+    /// loops (e.g. `artel-fs`'s cap-listener lag recovery) can open a
+    /// fresh connection to the same daemon without the caller having
+    /// to thread the path separately.
+    socket_path: PathBuf,
     /// Holds the events receiver until [`Client::take_events`] hands
     /// it out. Single-consumer.
     events_rx: Mutex<Option<EventStream>>,
@@ -91,10 +96,11 @@ impl Client {
     /// The handshake exchange happens inside this call; callers do not
     /// (and should not) issue [`Request::Hello`] manually.
     pub async fn connect(path: impl AsRef<Path>) -> Result<Self, ClientError> {
+        let path = path.as_ref();
         let framed = transport_connect(path)
             .await
             .map_err(|err| ClientError::Transport(transport::TransportError::Io(err)))?;
-        Self::handshake(framed).await
+        Self::handshake(framed, path.to_path_buf()).await
     }
 
     /// Connect to a daemon, launching one if it isn't running.
@@ -110,7 +116,10 @@ impl Client {
         crate::spawn::connect_or_spawn(opts).await
     }
 
-    async fn handshake(framed: Framed<UnixStream>) -> Result<Self, ClientError> {
+    async fn handshake(
+        framed: Framed<UnixStream>,
+        socket_path: PathBuf,
+    ) -> Result<Self, ClientError> {
         let (mut sink, mut stream) = framed.split();
 
         // Send Hello directly on the sink so we don't need the writer
@@ -142,13 +151,19 @@ impl Client {
         };
 
         let framed = sink.reunite(stream).expect("split halves match");
-        Ok(Self::spawn(framed, daemon_version, daemon_peer_id))
+        Ok(Self::spawn(
+            framed,
+            daemon_version,
+            daemon_peer_id,
+            socket_path,
+        ))
     }
 
     fn spawn(
         framed: Framed<UnixStream>,
         daemon_version: ProtocolVersion,
         daemon_peer_id: PeerId,
+        socket_path: PathBuf,
     ) -> Self {
         let (out_tx, out_rx) = mpsc::channel::<WireMessage>(WRITER_QUEUE_CAPACITY);
         let (events_tx, events_rx) = mpsc::channel(EVENTS_QUEUE_CAPACITY);
@@ -167,6 +182,7 @@ impl Client {
             next_id: AtomicU64::new(1),
             daemon_version,
             daemon_peer_id,
+            socket_path,
             events_rx: Mutex::new(Some(events_rx)),
         }
     }
@@ -235,6 +251,17 @@ impl Client {
     #[must_use]
     pub const fn daemon_peer_id(&self) -> PeerId {
         self.daemon_peer_id
+    }
+
+    /// Socket path this client connected on.
+    ///
+    /// Exposed so recovery loops can reconnect to the same daemon by
+    /// opening a fresh [`Client::connect`] — see `artel-fs`'s
+    /// cap-listener lag recovery, which re-`Subscribe`s after the
+    /// daemon tears the connection down on subscriber lag (M3).
+    #[must_use]
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
     }
 
     /// Whether the underlying connection has been observed closed.
