@@ -21,7 +21,7 @@
 
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use iroh::SecretKey;
@@ -109,12 +109,15 @@ fn generate_and_persist(path: &Path) -> Result<SecretKey, KeyError> {
 fn write_atomic(path: &Path, bytes: &[u8; 32]) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
     {
-        let mut f = fs::File::create(&tmp)?;
+        // Create the tmp at 0600 AT OPEN (M6): the 32 secret bytes must
+        // never exist on disk at the umask default (commonly 0644), even
+        // for the window between write and a chmod-after. A stale tmp
+        // from a prior crashed write is removed first so the exclusive
+        // create_new doesn't spuriously fail.
+        let _ = fs::remove_file(&tmp);
+        let mut f = create_private(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
-        let mut perms = f.metadata()?.permissions();
-        perms.set_mode(KEY_MODE);
-        fs::set_permissions(&tmp, perms)?;
     }
     fs::rename(&tmp, path)?;
     // fsync the parent directory so the rename is durable across a
@@ -128,6 +131,19 @@ fn write_atomic(path: &Path, bytes: &[u8; 32]) -> io::Result<()> {
         fsync_dir(parent)?;
     }
     Ok(())
+}
+
+/// Create `path` for writing with mode `0600` set at open time and
+/// `O_EXCL` (fails if it already exists). Setting the mode on the open
+/// — rather than `File::create` then a `chmod` afterwards — means the
+/// secret bytes are never on disk at the umask-default mode for any
+/// window (M6). Exclusive create also refuses to adopt a stale tmp.
+fn create_private(path: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(KEY_MODE)
+        .open(path)
 }
 
 /// fsync the *directory* `dir` so a preceding `rename` into it is
@@ -218,6 +234,32 @@ mod tests {
 
         let mode = fs::metadata(&path).unwrap().mode() & 0o777;
         assert_eq!(mode, KEY_MODE, "key file mode should be {KEY_MODE:o}");
+    }
+
+    #[test]
+    fn create_private_makes_a_0600_exclusive_file_regardless_of_umask() {
+        // M6: the secret bytes must never touch disk at a wider mode.
+        // `create_private` sets 0600 AT CREATION (mode flag on the open),
+        // not via a chmod after write, so there is no window where the
+        // file exists at the umask default (commonly 0644). The
+        // mid-write window itself isn't observable in a unit test (the
+        // file is renamed away on success), so we pin the mechanism:
+        // the created file is 0600, and the open is exclusive
+        // (create_new) so a stale tmp can't be silently reused.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("secret.tmp");
+
+        let f = create_private(&path).expect("create_private");
+        drop(f);
+        let mode = fs::metadata(&path).unwrap().mode() & 0o777;
+        assert_eq!(mode, KEY_MODE, "created file must be 0600 at creation");
+
+        // Exclusive: a second create over the same path fails rather
+        // than adopting a pre-existing (possibly wrong-mode) file.
+        assert!(
+            create_private(&path).is_err(),
+            "create_private must be exclusive (create_new)",
+        );
     }
 
     #[test]

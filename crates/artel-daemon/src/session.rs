@@ -33,11 +33,15 @@ use crate::store::{DynStore, SessionKind, SessionRecord, StoredAttachment};
 
 /// Capacity of the per-session broadcast channel.
 ///
-/// Slow subscribers that lag by more than this lose old events; the
-/// transport surfaces that to the client as a message gap (which the
-/// client can recover from with a `Subscribe { since }`). This is the
-/// right shape — we do not want to back-pressure publishers because of
-/// one slow subscriber.
+/// We deliberately do not back-pressure publishers because of one slow
+/// subscriber. A subscriber that lags more than this many events past
+/// the head loses the oldest ones; the daemon's subscription forwarder
+/// detects the `Lagged` and **closes that client's connection** (M3),
+/// so the loss is loud — the client observes EOF and must reconnect and
+/// re-`Subscribe` (from its last-known seq, once it tracks one) rather
+/// than silently continuing on a desynced stream. A finer-grained
+/// in-band gap signal that avoids the reconnect is a planned follow-up;
+/// see `docs/handoff-m3-subscriber-lag-recovery.md`.
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
 /// How many times the spawned workspace-ticket delivery retries a
@@ -376,6 +380,17 @@ pub struct Session {
     /// [`SessionRecord::workspace_ticket`].
     workspace_ticket: Option<Vec<u8>>,
     events_tx: broadcast::Sender<Event>,
+    /// Per-peer serialization lanes for workspace-ticket delivery (M2).
+    /// Each spawned [`deliver_workspace_ticket_to`] task holds its
+    /// target's lane across the `{still_current → network send}` of each
+    /// attempt, so a newer publish's delivery can't overtake an older
+    /// one in flight and land a stale envelope. **Runtime-only** —
+    /// never persisted (it carries no session state, just mutual
+    /// exclusion), so it's absent from `record`/`from_record`. An
+    /// `Arc<Mutex<()>>` per peer, created on first delivery; dropped
+    /// with the session.
+    #[cfg(feature = "iroh")]
+    delivery_lanes: std::sync::Mutex<HashMap<PeerId, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl Session {
@@ -403,6 +418,8 @@ impl Session {
             tickets: Vec::new(),
             workspace_ticket: None,
             events_tx,
+            #[cfg(feature = "iroh")]
+            delivery_lanes: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -430,6 +447,8 @@ impl Session {
             tickets: record.tickets,
             workspace_ticket: record.workspace_ticket,
             events_tx,
+            #[cfg(feature = "iroh")]
+            delivery_lanes: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -1768,6 +1787,14 @@ impl Registry {
         let Some(session_arc) = session_arc else {
             return;
         };
+        // Fetch (or lazily create) this peer's delivery lane so all
+        // deliveries to `target` for this session serialize through it
+        // (M2). Held only briefly here to clone the Arc out.
+        let lane = {
+            let s = session_arc.lock().await;
+            let mut lanes = s.delivery_lanes.lock().expect("poisoned");
+            Arc::clone(lanes.entry(target).or_default())
+        };
         let frame = artel_protocol::upgrade::DeliveryFrame::WorkspaceTicket {
             session_id: session,
             envelope_bytes: envelope_bytes.clone(),
@@ -1778,6 +1805,7 @@ impl Registry {
                 target,
                 WORKSPACE_TICKET_DELIVERY_RETRIES,
                 WORKSPACE_TICKET_DELIVERY_BACKOFF,
+                &lane,
                 // Still-current check: re-read live state under the lock.
                 || async {
                     let s = session_arc.lock().await;
@@ -2637,12 +2665,26 @@ fn delivery_still_current(
 /// retry/abort/backoff logic is unit-testable with injected closures
 /// (the production path supplies a session-lock read and
 /// `deliver_frame`). Returns once delivered, exhausted, or aborted.
+///
+/// `lane` is a per-(session, peer) mutex held across each attempt's
+/// `{still_current → deliver}` pair (M2). Without it, the currency
+/// check and the network send weren't atomic: an older publish's
+/// in-flight `deliver()` could complete *after* a newer publish's,
+/// landing a stale envelope on the peer — the
+/// `delivery_still_current` re-check can't un-send a frame already on
+/// the wire. Holding the lane serializes deliveries to one peer, so the
+/// older send completes (or is found stale and aborts) before the newer
+/// one starts. The lane is released across the `backoff` sleep so a
+/// failed attempt doesn't block a superseding publish from making
+/// progress. Different peers keep their own lanes and deliver
+/// concurrently.
 #[cfg(feature = "iroh")]
 async fn run_delivery_with_retry<C, CFut, D, DFut>(
     session: SessionId,
     target: PeerId,
     retries: u32,
     backoff: std::time::Duration,
+    lane: &tokio::sync::Mutex<()>,
     still_current: C,
     deliver: D,
 ) where
@@ -2652,10 +2694,16 @@ async fn run_delivery_with_retry<C, CFut, D, DFut>(
     DFut: std::future::Future<Output = Result<(), String>>,
 {
     for attempt in 0..retries {
-        if !still_current().await {
-            return;
-        }
-        match deliver().await {
+        // Hold the lane across the currency check AND the send so they
+        // are atomic w.r.t. another delivery to the same peer.
+        let attempt_result = {
+            let _lane = lane.lock().await;
+            if !still_current().await {
+                return;
+            }
+            deliver().await
+        };
+        match attempt_result {
             Ok(()) => return,
             Err(err) => {
                 let last = attempt + 1 == retries;
@@ -5716,11 +5764,13 @@ mod tests {
         let target = peer(2, "bob").id;
         let attempts = AtomicU32::new(0);
 
+        let lane = tokio::sync::Mutex::new(());
         run_delivery_with_retry(
             session,
             target,
             5,
             Duration::from_secs(3),
+            &lane,
             || async { true },
             || async {
                 let n = attempts.fetch_add(1, Ordering::SeqCst);
@@ -5745,11 +5795,13 @@ mod tests {
     async fn delivery_retry_gives_up_after_exhausting_attempts() {
         use std::sync::atomic::{AtomicU32, Ordering};
         let attempts = AtomicU32::new(0);
+        let lane = tokio::sync::Mutex::new(());
         run_delivery_with_retry(
             SessionId::from_bytes([1; 16]),
             peer(2, "bob").id,
             5,
             Duration::from_secs(3),
+            &lane,
             || async { true },
             || async {
                 attempts.fetch_add(1, Ordering::SeqCst);
@@ -5765,6 +5817,63 @@ mod tests {
     }
 
     #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn delivery_lane_serializes_concurrent_deliveries_to_one_peer() {
+        // M2: two deliveries for the SAME (session, peer) — an older
+        // publish's retry and a newer publish's — must never be inside
+        // deliver() at the same time, so a stale envelope's network send
+        // can't overtake a fresh one. The shared lane makes
+        // {still_current + deliver} mutually exclusive across the two
+        // tasks; this pins that they never overlap.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let session = SessionId::from_bytes([1; 16]);
+        let target = peer(2, "bob").id;
+        let lane = Arc::new(tokio::sync::Mutex::new(()));
+        let in_deliver = Arc::new(AtomicU32::new(0));
+        let max_seen = Arc::new(AtomicU32::new(0));
+
+        let spawn_one = |lane: Arc<tokio::sync::Mutex<()>>| {
+            let in_deliver = Arc::clone(&in_deliver);
+            let max_seen = Arc::clone(&max_seen);
+            async move {
+                run_delivery_with_retry(
+                    session,
+                    target,
+                    1,
+                    Duration::from_millis(0),
+                    &lane,
+                    || async { true },
+                    || {
+                        let in_deliver = Arc::clone(&in_deliver);
+                        let max_seen = Arc::clone(&max_seen);
+                        async move {
+                            let now = in_deliver.fetch_add(1, Ordering::SeqCst) + 1;
+                            max_seen.fetch_max(now, Ordering::SeqCst);
+                            // Hold the "network send" open briefly so an
+                            // unserialized peer would overlap here.
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            in_deliver.fetch_sub(1, Ordering::SeqCst);
+                            Ok::<(), String>(())
+                        }
+                    },
+                )
+                .await;
+            }
+        };
+
+        let a = tokio::spawn(spawn_one(Arc::clone(&lane)));
+        let b = tokio::spawn(spawn_one(Arc::clone(&lane)));
+        a.await.unwrap();
+        b.await.unwrap();
+
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            1,
+            "deliveries to one peer must be serialized by the lane (never overlap)",
+        );
+    }
+
+    #[cfg(feature = "iroh")]
     #[tokio::test(start_paused = true)]
     async fn delivery_retry_aborts_when_superseded() {
         // still_current goes false after the first failed attempt (a
@@ -5772,11 +5881,13 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
         let attempts = AtomicU32::new(0);
         let checks = AtomicU32::new(0);
+        let lane = tokio::sync::Mutex::new(());
         run_delivery_with_retry(
             SessionId::from_bytes([1; 16]),
             peer(2, "bob").id,
             5,
             Duration::from_secs(3),
+            &lane,
             || async {
                 // current on the first check, stale thereafter.
                 checks.fetch_add(1, Ordering::SeqCst) == 0
