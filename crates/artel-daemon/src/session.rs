@@ -552,7 +552,22 @@ fn apply_capability_to(caps: &mut HashMap<PeerId, Capability>, host: PeerId, msg
         // Author held RW but shipped a malformed payload — inert.
         return;
     };
+    // Host RW floor (H3): the host is the cap-log root and must always
+    // retain ReadWrite — `Session::new`/`project_caps` seed it, and
+    // `ensure_can_write` / `auto_grant_on_join` depend on it. A
+    // self-targeted action passes the authority gate above (the host
+    // authored it), so without this guard a `Revoke{host}` would
+    // `caps.remove(host)` (dropping the host to the absent⇒Read floor)
+    // and a `Grant{host, Read}` would downgrade it — after which
+    // `ensure_can_write` rejects every subsequent host send, INCLUDING
+    // the corrective `Grant{host, RW}`. The state is re-derived from the
+    // log on every load, so the brick is permanent and unrecoverable.
+    // Make any action targeting the host inert. (For P2P, where there is
+    // no single host root, this floor becomes a per-author rule keyed on
+    // causal authority — see the brainstorm referenced above.)
     match action {
+        CapabilityAction::Grant { peer, .. } | CapabilityAction::Revoke { peer }
+            if peer == host => {}
         CapabilityAction::Grant { peer, cap } => {
             caps.insert(peer, cap);
         }
@@ -4116,6 +4131,98 @@ mod tests {
         assert!(
             !s.can_write(mallory.id),
             "non-host cannot grant — even itself",
+        );
+    }
+
+    #[tokio::test]
+    async fn host_self_revoke_is_a_no_op_on_caps() {
+        // H3: the host always retains ReadWrite. A self-targeted Revoke
+        // — even authored by the host, so it passes the authority gate —
+        // must NOT drop the host below the RW root. Without the floor,
+        // caps.remove(host) leaves the host at the absent⇒Read floor and
+        // ensure_can_write then rejects every subsequent host send,
+        // including the corrective Grant{host, RW} — an irreversible,
+        // unrecoverable brick.
+        let host = peer(1, "alice");
+        let mut s = Session::new(SessionId::from_bytes([1; 16]), &host, SessionKind::Local);
+
+        let self_revoke = CapabilityAction::Revoke { peer: host.id };
+        s.log.push(cap_msg(1, &host, &self_revoke));
+        s.apply_capability(&s.log.last().unwrap().clone());
+
+        assert!(
+            s.can_write(host.id),
+            "host must retain ReadWrite after a self-targeted revoke",
+        );
+        assert_eq!(
+            s.caps.get(&host.id),
+            Some(&Capability::ReadWrite),
+            "the host's RW root must be preserved, not removed",
+        );
+    }
+
+    #[tokio::test]
+    async fn host_self_downgrade_grant_is_a_no_op_on_caps() {
+        // H3, second vector: a Grant{host, Read} would otherwise
+        // overwrite the host's RW root with Read. The host floor must
+        // hold the host at ReadWrite regardless of the granted cap.
+        let host = peer(1, "alice");
+        let mut s = Session::new(SessionId::from_bytes([1; 16]), &host, SessionKind::Local);
+
+        let self_downgrade = CapabilityAction::Grant {
+            peer: host.id,
+            cap: Capability::Read,
+        };
+        s.log.push(cap_msg(1, &host, &self_downgrade));
+        s.apply_capability(&s.log.last().unwrap().clone());
+
+        assert!(
+            s.can_write(host.id),
+            "host must retain ReadWrite after a self-targeted downgrading grant",
+        );
+        assert_eq!(
+            s.caps.get(&host.id),
+            Some(&Capability::ReadWrite),
+            "a Grant(host, Read) must not downgrade the host's RW root",
+        );
+    }
+
+    #[tokio::test]
+    async fn host_floor_survives_self_revoke_in_replayed_log() {
+        // H3 on the replay path: project_caps / from_record re-derive
+        // the cap-set from the persisted log on every load, so the floor
+        // must hold there too — otherwise a self-revoke in the log
+        // bricks the session permanently across restarts.
+        let host = peer(1, "alice");
+        let session_id = SessionId::from_bytes([0xcd; 16]);
+
+        let self_revoke = CapabilityAction::Revoke { peer: host.id };
+        let log = vec![cap_msg(1, &host, &self_revoke)];
+
+        // Projection helper holds the floor.
+        let caps = project_caps(host.id, &log);
+        assert_eq!(
+            caps.get(&host.id),
+            Some(&Capability::ReadWrite),
+            "project_caps must preserve the host floor",
+        );
+
+        // And so does a full record rebuild.
+        let record = SessionRecord {
+            id: session_id,
+            host: host.id,
+            members: HashSet::from([host.id]),
+            head: Seq::new(1),
+            log,
+            kind: SessionKind::Local,
+            host_epoch: 0,
+            tickets: Vec::new(),
+            workspace_ticket: None,
+        };
+        let s = Session::from_record(record);
+        assert!(
+            s.can_write(host.id),
+            "host can still write after a self-revoke is replayed from the log",
         );
     }
 
