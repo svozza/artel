@@ -96,6 +96,19 @@ async fn connect_does_handshake_and_records_daemon_info() {
 }
 
 #[tokio::test]
+async fn connect_records_socket_path_for_reconnect() {
+    // The cap-listener's lag-recovery loop reconnects by opening a
+    // fresh connection to the same socket; `Client` must therefore
+    // remember the path it was connected on so callers don't have to
+    // thread it separately.
+    let h = DaemonHarness::spawn().await;
+    let client = Client::connect(&h.socket).await.unwrap();
+    assert_eq!(client.socket_path(), h.socket.as_path());
+    drop(client);
+    h.shutdown().await;
+}
+
+#[tokio::test]
 async fn connect_against_missing_socket_errors() {
     let dir = tempfile::tempdir().unwrap();
     let bogus = dir.path().join("absent.sock");
