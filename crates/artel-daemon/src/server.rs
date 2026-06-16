@@ -572,6 +572,12 @@ async fn serve_connection(
     // Leave so we don't need the client to re-send peer info.
     let mut memberships: HashMap<SessionId, PeerInfo> = HashMap::new();
 
+    // Per-connection subscription forwarders, owned here so they're
+    // aborted when this connection ends (H6) — `ForwarderSet`'s `Drop`
+    // runs on every return path below, including stream EOF and
+    // shutdown. Also dedups repeated Subscribe of one session (M4).
+    let mut forwarders = ForwarderSet::new();
+
     // Main request loop.
     loop {
         let frame = tokio::select! {
@@ -594,6 +600,7 @@ async fn serve_connection(
             &sink,
             shutdown.clone(),
             &mut memberships,
+            &mut forwarders,
         )
         .await;
         send_frame(&sink, WireMessage::Response { id, response }).await?;
@@ -608,6 +615,7 @@ async fn dispatch(
     sink: &Arc<AsyncMutex<SplitSink<Framed<UnixStream>, WireMessage>>>,
     shutdown: ShutdownToken,
     memberships: &mut HashMap<SessionId, PeerInfo>,
+    forwarders: &mut ForwarderSet,
 ) -> Response {
     match request {
         Request::Hello { .. } => Response::Error {
@@ -626,7 +634,11 @@ async fn dispatch(
         },
         Request::Subscribe { session, since } => match registry.subscribe(session, since).await {
             Ok(sub) => {
-                spawn_subscription_forwarder(session, sub, Arc::clone(sink), shutdown);
+                // Own the forwarder in the per-connection set: aborts a
+                // prior forwarder for this session (M4 dedup) and is
+                // itself aborted when the connection ends (H6).
+                let handle = spawn_subscription_forwarder(session, sub, Arc::clone(sink), shutdown);
+                forwarders.insert(session, handle);
                 Response::Subscribed { session }
             }
             Err(err) => Response::Error {
@@ -674,6 +686,15 @@ async fn dispatch(
                 };
             };
             match registry.leave(session, peer.id).await {
+                // Don't abort the forwarder here: `leave` emits the
+                // terminal event (`SessionClosed` on a host leave,
+                // `PeerLeft` otherwise) into the broadcast channel, and
+                // the forwarder still has to drain+deliver it. When the
+                // session is torn down its `events_tx` drops, so the
+                // forwarder sees `Closed` right after that final event
+                // and exits on its own — no leak. The per-connection
+                // `ForwarderSet::drop` is the backstop for everything
+                // else (H6).
                 Ok(()) => Response::Left { session },
                 Err(err) => {
                     // Re-insert: the leave failed so the client is still
@@ -1220,12 +1241,56 @@ fn iroh_endpoint_to_wire(addr: &iroh::EndpointAddr) -> artel_protocol::WireEndpo
 /// Spawn a task that forwards events from `sub.events` as
 /// [`WireMessage::Event`] frames into `sink`. Backfills `sub.replay`
 /// first.
+/// Per-connection owner of subscription forwarder tasks, keyed by
+/// session.
+///
+/// Each `Subscribe` spawns a forwarder that holds a clone of the
+/// connection's write half (an FD) and a `broadcast::Receiver`. Those
+/// tasks must die when the connection does — they only notice a dead
+/// socket by *attempting a write*, and a quiescent session never
+/// triggers one, so an unowned forwarder parks in `events.recv()`
+/// forever, leaking task + FD + broadcast slot for the daemon's
+/// lifetime (H6). They must also be deduped per session: a client that
+/// re-`Subscribe`s the same session would otherwise stack a second
+/// live forwarder and receive every event twice (M4).
+///
+/// `ForwarderSet` owns the `JoinHandle`s: [`insert`](Self::insert)
+/// aborts any prior forwarder for the same session before replacing it,
+/// and `Drop` aborts every remaining forwarder when `serve_connection`
+/// returns.
+#[derive(Default)]
+struct ForwarderSet {
+    by_session: HashMap<SessionId, tokio::task::JoinHandle<()>>,
+}
+
+impl ForwarderSet {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Track `handle` as the forwarder for `session`, aborting and
+    /// replacing any existing one (a repeated Subscribe — M4).
+    fn insert(&mut self, session: SessionId, handle: tokio::task::JoinHandle<()>) {
+        if let Some(prev) = self.by_session.insert(session, handle) {
+            prev.abort();
+        }
+    }
+}
+
+impl Drop for ForwarderSet {
+    fn drop(&mut self) {
+        for (_session, handle) in self.by_session.drain() {
+            handle.abort();
+        }
+    }
+}
+
 fn spawn_subscription_forwarder(
     session: SessionId,
     sub: Subscription,
     sink: Arc<AsyncMutex<SplitSink<Framed<UnixStream>, WireMessage>>>,
     mut shutdown: ShutdownToken,
-) {
+) -> tokio::task::JoinHandle<()> {
     let Subscription { replay, mut events } = sub;
     tokio::spawn(async move {
         for message in replay {
@@ -1253,7 +1318,7 @@ fn spawn_subscription_forwarder(
                 return;
             }
         }
-    });
+    })
 }
 
 async fn push_message(
@@ -1400,5 +1465,97 @@ mod tests {
         if let Some(router) = runtime.router {
             router.shutdown().await.expect("router shutdown");
         }
+    }
+}
+
+#[cfg(test)]
+mod forwarder_set_tests {
+    use std::time::Duration;
+
+    use artel_protocol::SessionId;
+
+    use super::ForwarderSet;
+
+    fn sid(b: u8) -> SessionId {
+        SessionId::from_bytes([b; 16])
+    }
+
+    /// Spawn a task that parks forever until aborted.
+    fn spawn_parked() -> tokio::task::JoinHandle<()> {
+        tokio::spawn(std::future::pending::<()>())
+    }
+
+    /// Wait (bounded) for `handle` to reach the finished state. An
+    /// aborted task only becomes finished once the runtime has processed
+    /// the cancellation, so we poll rather than assume a fixed number of
+    /// yields. Panics if it never finishes — the abort didn't happen.
+    async fn assert_finishes(handle: &tokio::task::AbortHandle, what: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !handle.is_finished() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{what}: forwarder was not aborted within the deadline",
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn second_insert_for_same_session_aborts_the_first() {
+        // M4: a repeated Subscribe for the same session must not stack a
+        // second live forwarder — the first is aborted and replaced, so
+        // the client never gets duplicate event streams.
+        let mut set = ForwarderSet::new();
+        let first = spawn_parked();
+        let first_h = first.abort_handle();
+        set.insert(sid(1), first);
+
+        let second = spawn_parked();
+        let second_h = second.abort_handle();
+        set.insert(sid(1), second);
+
+        assert_finishes(&first_h, "displaced forwarder").await;
+        assert!(
+            !second_h.is_finished(),
+            "the replacement forwarder stays live",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_the_set_aborts_all_forwarders() {
+        // H6: when the connection ends, serve_connection drops its
+        // ForwarderSet; every per-connection forwarder must be aborted
+        // so a quiescent session's forwarder doesn't leak its task + the
+        // connection's write half (an FD) + a broadcast slot for the
+        // daemon's lifetime.
+        let a = spawn_parked();
+        let b = spawn_parked();
+        let (a_h, b_h) = (a.abort_handle(), b.abort_handle());
+        {
+            let mut set = ForwarderSet::new();
+            set.insert(sid(1), a);
+            set.insert(sid(2), b);
+        } // set dropped here
+
+        assert_finishes(&a_h, "forwarder a").await;
+        assert_finishes(&b_h, "forwarder b").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn distinct_sessions_coexist() {
+        let mut set = ForwarderSet::new();
+        let a = spawn_parked();
+        let a_h = a.abort_handle();
+        set.insert(sid(1), a);
+        set.insert(sid(2), spawn_parked());
+
+        // A brief spin to give any erroneous abort a chance to land.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !a_h.is_finished(),
+            "inserting a forwarder for a different session must not abort the first",
+        );
     }
 }
