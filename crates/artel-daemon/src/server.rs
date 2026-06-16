@@ -1307,8 +1307,21 @@ fn spawn_subscription_forwarder(
                 Ok(event) => event,
                 Err(broadcast::error::RecvError::Closed) => return,
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    warn!(missed = n, "subscriber lagged; dropping {n} events");
-                    continue;
+                    // M3: the subscriber fell more than EVENT_CHANNEL_CAPACITY
+                    // behind, so `n` events are gone. We can't replay them on
+                    // this channel, and silently continuing would desync the
+                    // client (it would think it had a contiguous stream). Make
+                    // the loss LOUD: close the connection so the client sees
+                    // EOF and reconnects + re-Subscribes from its last-known
+                    // seq. (A finer-grained in-band gap signal that avoids the
+                    // reconnect is the follow-up — see
+                    // docs/handoff-m3-subscriber-lag-recovery.md.)
+                    warn!(
+                        missed = n,
+                        "subscriber lagged; closing connection so the client re-subscribes"
+                    );
+                    let _ = sink.lock().await.close().await;
+                    return;
                 }
             };
             if send_frame(&sink, WireMessage::Event { event })
@@ -1470,11 +1483,15 @@ mod tests {
 
 #[cfg(test)]
 mod forwarder_set_tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use artel_protocol::SessionId;
+    use tokio::net::UnixStream;
+    use tokio::sync::Mutex as AsyncMutex;
 
-    use super::ForwarderSet;
+    use super::{ForwarderSet, Subscription, spawn_subscription_forwarder};
+    use crate::shutdown::Shutdown;
 
     fn sid(b: u8) -> SessionId {
         SessionId::from_bytes([b; 16])
@@ -1557,5 +1574,55 @@ mod forwarder_set_tests {
             !a_h.is_finished(),
             "inserting a forwarder for a different session must not abort the first",
         );
+    }
+
+    // ---- M3: subscriber-lag tears the connection down ----
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forwarder_closes_connection_on_subscriber_lag() {
+        // M3: when a subscriber lags past the broadcast capacity, the
+        // forwarder must make the loss LOUD by tearing the connection
+        // down — the client observes EOF and reconnects + re-Subscribes
+        // — rather than silently swallowing the dropped events (which
+        // contradicted the documented recovery contract). Here we
+        // overflow a tiny broadcast channel so the forwarder's recv()
+        // returns Lagged, then assert the client side reads EOF.
+        use artel_protocol::Event;
+        use futures_util::StreamExt;
+        use tokio::sync::broadcast;
+
+        let (client_io, daemon_io) = UnixStream::pair().unwrap();
+        let daemon_sink = {
+            let framed = artel_protocol::transport::new(daemon_io);
+            let (sink, _stream) = framed.split();
+            Arc::new(AsyncMutex::new(sink))
+        };
+
+        // Tiny channel; fill it past capacity BEFORE the forwarder runs
+        // so its first recv() is a guaranteed Lagged.
+        let (tx, rx) = broadcast::channel::<Event>(2);
+        for _ in 0..8 {
+            let _ = tx.send(Event::SessionClosed { session: sid(1) });
+        }
+        let sub = Subscription {
+            replay: Vec::new(),
+            events: rx,
+        };
+
+        let shutdown = Arc::new(Shutdown::new());
+        let handle = spawn_subscription_forwarder(sid(1), sub, daemon_sink, shutdown.token());
+
+        // The client's read half must hit EOF (connection closed by the
+        // daemon) within a bounded wait.
+        let mut client = artel_protocol::transport::new(client_io);
+        let got = tokio::time::timeout(Duration::from_secs(2), client.next())
+            .await
+            .expect("forwarder must close the connection on lag, not hang");
+        assert!(
+            got.is_none(),
+            "client should see EOF after a lag-induced teardown, got {got:?}",
+        );
+        // The forwarder task itself ends.
+        assert_finishes(&handle.abort_handle(), "lagged forwarder").await;
     }
 }
