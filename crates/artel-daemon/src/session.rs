@@ -1426,7 +1426,7 @@ impl Registry {
                 if peer == host && kind == SessionKind::Local {
                     bridge.publish_session_closed(session, host_epoch).await;
                 }
-                bridge.forget_session(session).await;
+                bridge.forget_session(session);
             }
         }
         Ok(())
@@ -1809,7 +1809,7 @@ impl Registry {
         let _ = events_tx.send(Event::SessionClosed { session });
 
         if let Some(bridge) = &self.bridge {
-            bridge.forget_session(session).await;
+            bridge.forget_session(session);
         }
         Ok(())
     }

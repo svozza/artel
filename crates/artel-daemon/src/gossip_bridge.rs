@@ -113,8 +113,12 @@ pub(crate) struct GossipBridge {
     /// Live topic handles, keyed by session id. We keep the sender
     /// alive for the lifetime of the session so broadcasts work; the
     /// receiver is owned by a forwarder task whose `JoinHandle` lives
-    /// here too.
-    sessions: Mutex<HashMap<SessionId, SessionState>>,
+    /// here too. Wrapped in [`SessionSlots`] for the reserve→finalize
+    /// protocol that makes subscribe atomic against a concurrent
+    /// subscribe (H7) and a concurrent teardown (H8); held as `Arc` so
+    /// a [`SlotReservation`] can outlive the borrow across the subscribe
+    /// awaits.
+    sessions: Arc<SessionSlots<SessionState>>,
     /// In-flight joiner-side sends keyed by their `req_id`. The
     /// forwarder resolves the matching oneshot when a `SendAck`
     /// arrives. The map is shared across sessions because `req_id`
@@ -162,6 +166,186 @@ struct SessionState {
     sender: iroh_gossip::api::GossipSender,
     forwarder: tokio::task::JoinHandle<()>,
 }
+
+/// Per-session slot table with a **reserve → finalize** protocol that
+/// makes subscribe atomic against a concurrent subscribe (H7) and
+/// against a concurrent teardown (H8).
+///
+/// The bug it replaces: `subscribe_inner` used to check "is this
+/// session present?" under the lock, *release* the lock across the
+/// gossip `subscribe()` / `joined()` / `spawn` awaits, then re-acquire
+/// it to insert. Two entry points racing the same id both saw "absent"
+/// and both inserted — the second `HashMap::insert` dropped the first's
+/// `JoinHandle` **without aborting it** (an un-killable detached task +
+/// leaked topic). And a `forget_session` landing in that window removed
+/// nothing (the entry wasn't registered yet), then the late insert
+/// resurrected a live forwarder for a session the registry had already
+/// torn down.
+///
+/// Fix: claim the slot *before* the awaits. [`reserve`] atomically marks
+/// the slot occupied and hands back a [`SlotReservation`]; a second
+/// `reserve` (or a resume re-subscribe) sees the slot taken and backs
+/// off. After its awaits the caller [`finalize`](SlotReservation::finalize)s
+/// the reservation with the real payload — which *fails* if a
+/// [`forget`] invalidated the reservation meanwhile, handing the payload
+/// back so the caller aborts the just-spawned task. All transitions are
+/// under one `std::sync::Mutex` with no `.await` held, so the protocol
+/// is a pure state machine — unit-tested payload-generically in this
+/// module's tests, since there is no in-process gossip harness to drive
+/// the live path deterministically.
+#[derive(Debug)]
+struct SessionSlots<T> {
+    inner: std::sync::Mutex<HashMap<SessionId, Slot<T>>>,
+}
+
+#[derive(Debug)]
+enum Slot<T> {
+    /// A subscribe is in flight; `gen` distinguishes this reservation
+    /// from any later one for the same id so a stale `finalize` can't
+    /// land on a slot that was forgotten-and-re-reserved.
+    Reserved { generation: u64 },
+    /// A finalized, usable payload (the live `SessionState`).
+    Live(T),
+}
+
+/// RAII claim on a session slot, returned by [`SessionSlots::reserve`].
+/// Either [`finalize`](Self::finalize)d into a live payload or dropped
+/// (which frees the slot so a failed subscribe can be retried).
+#[must_use = "a reservation must be finalized or it just frees the slot on drop"]
+struct SlotReservation<T> {
+    slots: Weak<SessionSlots<T>>,
+    session: SessionId,
+    generation: u64,
+    finalized: bool,
+}
+
+impl<T> SessionSlots<T> {
+    fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Atomically claim the slot for `session`. Returns `None` if the
+    /// slot is already `Reserved` (a concurrent subscribe) or `Live` (a
+    /// resume re-subscribe) — the caller must then treat the subscribe
+    /// as a no-op and NOT spawn anything.
+    fn reserve(self: &Arc<Self>, session: SessionId) -> Option<SlotReservation<T>> {
+        // A monotonic per-slot generation — distinctness across a
+        // forget-then-re-reserve of the same id is all we need, so a
+        // single process-wide counter suffices.
+        let generation = NEXT_SLOT_GENERATION.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut guard = self.inner.lock().expect("poisoned");
+            if guard.contains_key(&session) {
+                return None;
+            }
+            guard.insert(session, Slot::Reserved { generation });
+        }
+        Some(SlotReservation {
+            slots: Arc::downgrade(self),
+            session,
+            generation,
+            finalized: false,
+        })
+    }
+
+    /// Run `f` over the live payload for `session`, returning its result,
+    /// or `None` if the slot is absent or merely reserved (not yet
+    /// finalized). The closure runs under the slot lock, so it must not
+    /// block or `.await`; callers use it to clone out a cheap handle
+    /// (e.g. the `GossipSender`).
+    fn map_live<R>(&self, session: SessionId, f: impl FnOnce(&T) -> R) -> Option<R> {
+        match self.inner.lock().expect("poisoned").get(&session) {
+            Some(Slot::Live(payload)) => Some(f(payload)),
+            _ => None,
+        }
+    }
+
+    /// A cloned handle to the live payload for `session`, or `None` if
+    /// the slot is absent or merely reserved. Test-only convenience for
+    /// asserting slot contents; production reads go through
+    /// [`map_live`](Self::map_live) since the live payload
+    /// (`SessionState`) isn't `Clone`.
+    #[cfg(test)]
+    fn get(&self, session: SessionId) -> Option<T>
+    where
+        T: Clone,
+    {
+        self.map_live(session, Clone::clone)
+    }
+
+    /// Tear the slot down. Returns the live payload (so the caller can
+    /// abort its forwarder / drop its sender) if the slot was finalized.
+    /// Removing a `Reserved` slot invalidates that reservation, so the
+    /// in-flight subscribe's `finalize` will fail and abort its task —
+    /// the H8 guarantee.
+    fn forget(&self, session: SessionId) -> Option<T> {
+        let removed = self.inner.lock().expect("poisoned").remove(&session);
+        match removed {
+            Some(Slot::Live(payload)) => Some(payload),
+            // Reserved (subscribe in flight) or absent: nothing live to
+            // hand back. The removal already invalidated the reservation.
+            _ => None,
+        }
+    }
+}
+
+impl<T> SlotReservation<T> {
+    /// Install `payload` as the live slot. Returns `Err(payload)` if the
+    /// reservation was invalidated by a [`SessionSlots::forget`] (or an
+    /// intervening re-reservation) while the subscribe was in flight, so
+    /// the caller can abort the forwarder it just spawned rather than
+    /// leave a live task for a torn-down session.
+    fn finalize(mut self, payload: T) -> Result<(), T> {
+        let Some(slots) = self.slots.upgrade() else {
+            // Bridge dropped mid-subscribe (shutdown). Nothing to install.
+            return Err(payload);
+        };
+        // Check-and-install under a single lock hold so a concurrent
+        // `forget` can't slip between the check and the insert and let
+        // us resurrect a torn-down slot.
+        let mut guard = slots.inner.lock().expect("poisoned");
+        let ours = matches!(
+            guard.get(&self.session),
+            Some(Slot::Reserved { generation }) if *generation == self.generation,
+        );
+        if !ours {
+            // Our reservation is gone or was superseded — a forget (or a
+            // later reserve) ran while we were awaiting. Hand the payload
+            // back so the caller aborts the forwarder it just spawned.
+            return Err(payload);
+        }
+        guard.insert(self.session, Slot::Live(payload));
+        drop(guard);
+        self.finalized = true;
+        Ok(())
+    }
+}
+
+impl<T> Drop for SlotReservation<T> {
+    fn drop(&mut self) {
+        if self.finalized {
+            return;
+        }
+        // An un-finalized reservation (failed subscribe) frees the slot,
+        // but only if it's still OUR reservation — a forget may have
+        // removed it, and a later reserve may have re-claimed the id.
+        if let Some(slots) = self.slots.upgrade() {
+            let mut guard = slots.inner.lock().expect("poisoned");
+            if let Some(Slot::Reserved { generation }) = guard.get(&self.session)
+                && *generation == self.generation
+            {
+                guard.remove(&self.session);
+            }
+        }
+    }
+}
+
+/// Process-wide monotonic source of slot generations. Only distinctness
+/// across a forget-then-re-reserve of the same id matters, so a single
+/// shared counter suffices.
+static NEXT_SLOT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Map a [`SessionId`] to the gossip [`TopicId`] used for its traffic.
 fn topic_for(session: SessionId) -> TopicId {
@@ -224,7 +408,7 @@ impl GossipBridge {
         let authenticated_peer_id = PeerId::from_bytes(*endpoint_id.as_bytes());
         Self {
             gossip,
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Arc::new(SessionSlots::new()),
             pending_sends: Mutex::new(HashMap::new()),
             registry: Mutex::new(Weak::new()),
             addr_hint,
@@ -367,10 +551,13 @@ impl GossipBridge {
     /// `GossipSender` and `GossipReceiver` halves are dropped; we
     /// own the sender here and abort the forwarder task to drop
     /// the receiver.
-    pub(crate) async fn forget_session(&self, session: SessionId) {
-        let removed = self.sessions.lock().await.remove(&session);
-        let Some(state) = removed else {
-            debug!(?session, "forget_session: bridge had no entry");
+    pub(crate) fn forget_session(&self, session: SessionId) {
+        // `forget` removes a live entry AND invalidates any in-flight
+        // reservation, so a subscribe racing this teardown (H8) will
+        // fail its `finalize` and abort its own forwarder rather than
+        // resurrect a live task for a torn-down session.
+        let Some(state) = self.sessions.forget(session) else {
+            debug!(?session, "forget_session: bridge had no live entry");
             return;
         };
         // Abort first so the forwarder stops processing inbound
@@ -401,10 +588,7 @@ impl GossipBridge {
     ) -> Result<SessionMessage, BridgeError> {
         let sender = self
             .sessions
-            .lock()
-            .await
-            .get(&session)
-            .map(|s| s.sender.clone())
+            .map_live(session, |s| s.sender.clone())
             .ok_or(BridgeError::UnknownSession(session))?;
 
         let req_id = Uuid::new_v4();
@@ -496,13 +680,18 @@ impl GossipBridge {
         bootstrap: Vec<iroh::EndpointId>,
         role: SessionRole,
     ) -> Result<(), BridgeError> {
-        // Idempotency: a same-process resume re-calls `host_session`
-        // for an id we're already subscribed to. The existing
-        // `SessionState` (sender + forwarder) is fine; tearing it
-        // down and re-subscribing would briefly drop the topic.
-        if self.sessions.lock().await.contains_key(&session) {
+        // Claim the slot BEFORE the subscribe/joined/spawn awaits, so a
+        // concurrent subscribe for the same id (H7) backs off and a
+        // teardown landing mid-subscribe (H8) can invalidate us. A
+        // `None` here means the slot is already reserved or live — a
+        // same-process resume re-calling `host_session`, or a genuine
+        // double-subscribe; either way the existing/in-flight
+        // `SessionState` is what we want, so this is an idempotent
+        // no-op. The reservation frees the slot on drop if we bail
+        // before finalizing (e.g. a `joined()` timeout below).
+        let Some(reservation) = self.sessions.reserve(session) else {
             return Ok(());
-        }
+        };
         let topic_id = topic_for(session);
         let wait_for_neighbor = !bootstrap.is_empty();
         let topic = self
@@ -559,10 +748,20 @@ impl GossipBridge {
             }
             debug!(?session_for_log, "gossip forwarder exited");
         });
-        self.sessions
-            .lock()
-            .await
-            .insert(session, SessionState { sender, forwarder });
+        // Finalize the reservation with the live state. If a
+        // `forget_session` invalidated us while we were subscribing
+        // (H8), `finalize` hands the state back: abort the forwarder we
+        // just spawned and drop the sender so we don't leave a live task
+        // (and a held topic) for a session the registry already tore
+        // down.
+        if let Err(state) = reservation.finalize(SessionState { sender, forwarder }) {
+            debug!(
+                ?session,
+                "subscribe superseded by teardown; aborting forwarder",
+            );
+            state.forwarder.abort();
+            drop(state.sender);
+        }
         Ok(())
     }
 
@@ -572,12 +771,7 @@ impl GossipBridge {
     /// hosting this session — the local fan-out has already
     /// happened, this is just bonus reach.
     pub(crate) async fn publish_message(&self, session: SessionId, msg: SessionMessage) {
-        let sender = self
-            .sessions
-            .lock()
-            .await
-            .get(&session)
-            .map(|s| s.sender.clone());
+        let sender = self.sessions.map_live(session, |s| s.sender.clone());
         let Some(sender) = sender else {
             debug!(
                 ?session,
@@ -597,12 +791,7 @@ impl GossipBridge {
     /// Best-effort: a failed broadcast just means the joiner's
     /// mirror starts empty rather than backfilled.
     async fn publish_replay(&self, session: SessionId, since: Seq) {
-        let sender = self
-            .sessions
-            .lock()
-            .await
-            .get(&session)
-            .map(|s| s.sender.clone());
+        let sender = self.sessions.map_live(session, |s| s.sender.clone());
         let Some(sender) = sender else {
             debug!(
                 ?session,
@@ -624,12 +813,7 @@ impl GossipBridge {
     /// joiners fall back to discovering the close via their next
     /// `SendRequest` timing out.
     pub(crate) async fn publish_session_closed(&self, session: SessionId, host_epoch: u64) {
-        let sender = self
-            .sessions
-            .lock()
-            .await
-            .get(&session)
-            .map(|s| s.sender.clone());
+        let sender = self.sessions.map_live(session, |s| s.sender.clone());
         let Some(sender) = sender else {
             debug!(
                 ?session,
@@ -663,12 +847,7 @@ impl GossipBridge {
     /// advances a joiner's `host_epoch` watermark, and it carries a
     /// host-*signed* epoch so an attacker can't forge a high value.
     pub(crate) async fn publish_epoch_beacon(&self, session: SessionId, host_epoch: u64) {
-        let sender = self
-            .sessions
-            .lock()
-            .await
-            .get(&session)
-            .map(|s| s.sender.clone());
+        let sender = self.sessions.map_live(session, |s| s.sender.clone());
         let Some(sender) = sender else {
             debug!(
                 ?session,
@@ -704,12 +883,7 @@ impl GossipBridge {
         expiry_ms: u64,
         cap_sig: SigBytes,
     ) {
-        let sender = self
-            .sessions
-            .lock()
-            .await
-            .get(&session)
-            .map(|s| s.sender.clone());
+        let sender = self.sessions.map_live(session, |s| s.sender.clone());
         let Some(sender) = sender else {
             debug!(
                 ?session,
@@ -749,12 +923,7 @@ impl GossipBridge {
         req_id: Uuid,
         result: Result<SessionMessage, ProtocolError>,
     ) {
-        let sender = self
-            .sessions
-            .lock()
-            .await
-            .get(&session)
-            .map(|s| s.sender.clone());
+        let sender = self.sessions.map_live(session, |s| s.sender.clone());
         let Some(sender) = sender else {
             debug!(
                 ?session,
@@ -1289,6 +1458,132 @@ fn wire_addr_to_iroh(addr: &WireEndpointAddr) -> Result<EndpointAddr, String> {
 mod tests {
     use super::*;
     use artel_protocol::SessionId;
+
+    // ---- SessionSlots: the H7/H8 race protocol ----
+    //
+    // These pin the reserve/finalize/forget state machine that
+    // subscribe_inner and forget_session route through. They are
+    // payload-generic (T = i32 here) precisely so the races can be
+    // driven deterministically WITHOUT a live iroh Gossip subscription
+    // — there is no in-process gossip harness, and timing-based
+    // multi-daemon tests can't pin a check-then-insert window without
+    // flaking. The end-to-end wiring (subscribe_inner reserves before
+    // its awaits, finalizes after; forget aborts the real task) is
+    // covered by the production call sites; what's verified here is the
+    // ordering invariant those sites depend on.
+
+    fn sid(b: u8) -> SessionId {
+        SessionId::from_bytes([b; 16])
+    }
+
+    #[test]
+    fn reserve_is_exclusive_then_finalize_publishes() {
+        // Happy path: one reserve, finalize installs the payload, get
+        // sees it.
+        let slots = Arc::new(SessionSlots::<i32>::new());
+        let guard = slots.reserve(sid(1)).expect("first reserve wins");
+        // While reserved (not yet finalized), get() returns nothing —
+        // the slot isn't usable until the payload lands.
+        assert!(
+            slots.get(sid(1)).is_none(),
+            "reserved-but-unfinalized is not gettable"
+        );
+        guard
+            .finalize(7)
+            .expect("finalize of a live reservation succeeds");
+        assert_eq!(slots.get(sid(1)), Some(7));
+    }
+
+    #[test]
+    fn second_reserve_while_reserved_is_refused() {
+        // H7: two concurrent subscribes for one session. The slot is
+        // marked reserved before any await, so the second reserve sees
+        // the reservation and backs off (None) — it must NOT proceed to
+        // spawn+insert and overwrite the first, which would drop a
+        // JoinHandle without aborting it.
+        let slots = Arc::new(SessionSlots::<i32>::new());
+        let _g1 = slots.reserve(sid(1)).expect("first reserve wins");
+        assert!(
+            slots.reserve(sid(1)).is_none(),
+            "a second reserve while the first is in flight must be refused",
+        );
+    }
+
+    #[test]
+    fn second_reserve_while_finalized_is_refused() {
+        // Idempotency contract host_session relies on: a resume that
+        // re-subscribes an already-live session is a no-op.
+        let slots = Arc::new(SessionSlots::<i32>::new());
+        slots.reserve(sid(1)).unwrap().finalize(1).unwrap();
+        assert!(
+            slots.reserve(sid(1)).is_none(),
+            "reserve of an already-finalized session is a no-op",
+        );
+    }
+
+    #[test]
+    fn forget_during_reservation_makes_finalize_fail() {
+        // H8: forget runs while a subscribe is mid-flight (between its
+        // reserve and finalize — i.e. during the network awaits). The
+        // finalize must FAIL and hand the payload back so the caller
+        // aborts the just-spawned forwarder; the slot must end empty,
+        // never holding a live forwarder for a session the registry
+        // already tore down.
+        let slots = Arc::new(SessionSlots::<i32>::new());
+        let guard = slots.reserve(sid(1)).expect("reserve");
+        // Teardown arrives before finalize. Nothing was finalized yet,
+        // so there's no payload to return to the caller.
+        assert!(
+            slots.forget(sid(1)).is_none(),
+            "forget of a not-yet-finalized session returns no payload",
+        );
+        // The reservation is now invalid: finalize hands the payload
+        // back as Err so the caller can abort its forwarder.
+        assert_eq!(
+            guard.finalize(7),
+            Err(7),
+            "finalize after a racing forget must fail and return the payload",
+        );
+        assert!(
+            slots.get(sid(1)).is_none(),
+            "a forgotten-during-reservation slot must end empty",
+        );
+    }
+
+    #[test]
+    fn forget_after_finalize_returns_payload_for_teardown() {
+        // Normal teardown: forget removes a finalized payload and hands
+        // it back so the caller aborts the real forwarder + drops the
+        // sender.
+        let slots = Arc::new(SessionSlots::<i32>::new());
+        slots.reserve(sid(1)).unwrap().finalize(9).unwrap();
+        assert_eq!(slots.forget(sid(1)), Some(9));
+        assert!(slots.get(sid(1)).is_none());
+    }
+
+    #[test]
+    fn dropped_reservation_frees_the_slot() {
+        // A subscribe that fails before finalize (e.g. joined() times
+        // out) drops its guard. The slot must free so a later subscribe
+        // can retry — not wedge forever.
+        let slots = Arc::new(SessionSlots::<i32>::new());
+        let guard = slots.reserve(sid(1)).expect("reserve");
+        drop(guard);
+        assert!(
+            slots.reserve(sid(1)).is_some(),
+            "dropping an un-finalized reservation must free the slot for retry",
+        );
+    }
+
+    #[test]
+    fn distinct_sessions_reserve_independently() {
+        let slots = Arc::new(SessionSlots::<i32>::new());
+        let _g1 = slots.reserve(sid(1)).expect("reserve 1");
+        assert!(
+            slots.reserve(sid(2)).is_some(),
+            "a reservation on one session must not block another",
+        );
+    }
 
     #[test]
     fn topic_id_is_derived_from_session_uuid() {
