@@ -1,0 +1,153 @@
+# artel
+
+A peer-to-peer collaborative filesystem substrate built on iroh. A **host**
+shares a workspace directory; **joiners** mirror it. All inter-daemon traffic
+rides iroh-gossip, with one sanctioned exception: host→peer unicast of
+session-key material. The host is the sole sequencer for its sessions.
+
+## Language
+
+### Write authority
+
+**NamespaceSecret**:
+The iroh-docs document **write key** — an ed25519 *signing* key. Possession of
+it *is* write capability: any holder can author valid, verifiable doc entries.
+One symmetric secret shared by all RW peers. Its public half is the
+`NamespaceId`. Revocation today does *not* take it away — that is the gap.
+_Avoid_: write key (ambiguous), doc secret.
+
+**NamespaceId**:
+The public half of the `NamespaceSecret` (32 bytes) and the identity of an
+iroh-docs document. Not secret. Changing the secret changes the id, i.e. it is
+a *different document*. After rotation there are two of relevance — see
+[[Genesis namespace]] and [[Current namespace]].
+_Avoid_: doc id (overloaded with the on-disk `doc-id` file).
+
+**Genesis namespace**:
+The `NamespaceId` a session was *born* with, persisted write-once in the
+`doc-id` file and **never rewritten on rotation**. It is the stable root the
+`SessionId` derivation reads (`SessionId = session_id_for(genesis_ns)`,
+recomputed every start — the pure derivation is preserved verbatim across
+rotation). Distinct from the document currently holding content.
+
+**Current namespace**:
+The `NamespaceId` the workspace is *currently* writing to — a **mutable
+session attribute** persisted separately from `doc-id`, advanced on each
+rotation. Decoupled from `SessionId` so rotation never changes the session id,
+gossip topic, or any issued ticket.
+
+**AuthorId**:
+A **per-node** ed25519 keypair that signs each individual entry a node writes
+(`doc.set_bytes(author, …)`). Distinct from the `NamespaceSecret`: never
+shared, not the revocation gap. Identifies *which node* authored an entry.
+**Seeded from the same bytes as the workspace endpoint key**, so `AuthorId`
+== `endpoint_id` and `peer_map` resolves `entry.author` → daemon `PeerId` with
+no announcement. The key reuse is proven safe — a TLS `CertificateVerify`
+payload (64 `0x20` bytes + context string) can never collide with an
+`entry.to_vec()` (32-byte namespace pubkey prefix). Replaces iroh-docs'
+`author_default()`.
+
+**Author binding**:
+The fact that `entry.author` resolves to the `PeerId` whose capability the
+session tracks — established by same-seed (see `AuthorId`), not a maintained
+map. Lets carry-forward and (future) ingest enforcement reason about *who*
+authored a doc entry in cap terms.
+
+**Namespace rotation**:
+Minting a fresh `NamespaceSecret` (hence a new `NamespaceId`, hence a new
+document), distributing it to survivors but never the revoked peer, and
+re-pointing the `path→hash` map at it. Cheap because file bytes are
+content-addressed in iroh-blobs and never move. The fix for write cut-off.
+Driven by the host under a **freeze-drain barrier**: the host re-publishes the
+quiesced old doc's latest-per-key snapshot under its **own author** into the
+new namespace (the entry author signature covers the `NamespaceId`, so entries
+cannot be copied across namespaces — they must be re-authored, and only a key's
+holder can sign). The revoked peer's entries are filtered out at snapshot via
+the **author binding**.
+
+**Freeze-drain barrier**:
+The rotation's quiescence protocol. Host broadcasts a freeze (host-sequenced),
+survivors pause their watcher and ack, the host drains in-flight sync and
+snapshots a *provably quiescent* old doc, then re-publishes and ships the new
+secret; survivors import and resume. Eliminates concurrent-write stragglers so
+there is one re-publisher and no cross-doc timestamp reconciliation. A survivor
+that never acks is stranded on the old doc (detected via `namespace_epoch`,
+recovers on reconnect) — the same failure class as a partitioned peer.
+
+**namespace_epoch**:
+A monotonic counter carried (opaque) in the workspace ticket envelope, bumped
+on each rotation, so a peer detects it is on a stale namespace and re-imports.
+
+### Layer boundary (invariant)
+
+**Namespace-agnostic daemon**:
+Neither `artel-protocol` nor `artel-daemon` depends on `iroh-docs`, and they
+never name a `NamespaceId`. The daemon handles the `NamespaceSecret` only as
+opaque `[u8; 32]` it couriers over the upgrade unicast, and the
+`WorkspaceTicketEnvelope` as opaque bytes it persists/forwards. **All
+iroh-docs concepts — namespaces, the doc, blobs, rotation — live in `artel-fs`
+and `state_dir`.** Rotation must not push any of this below the fs line: the
+`namespace_epoch` travels *inside* the already-opaque envelope; the daemon
+never interprets it. This boundary is load-bearing — do not give the daemon an
+`iroh-docs` dependency.
+
+### Capability & revocation
+
+**Capability**:
+A peer's current authority in a session — `ReadWrite` or `Read`. Derived by
+replaying host-signed `Capability` grant/revoke messages in seq order. Absent
+peer ⇒ `Read` floor.
+
+**Demote**:
+A *cooperative* RW→Read downgrade of a **trusted** peer. Wire form
+`Grant{peer, Read}` (peer stays connected as read-only). It is **not** a
+cryptographic write cut-off — the peer keeps the live `NamespaceSecret`, has no
+joiner-side write check, and its watcher would keep publishing. Enforcement is
+*voluntary*: the **downgrade notification** is load-bearing — the demoted
+daemon honours it by halting its own watcher. Cheap, no rotation; safe only
+under a cooperative threat model.
+
+**Evict**:
+An *adversarial* removal. Wire form `Revoke{peer}` (`PeerFilter` blocks the
+connection). The only true **cryptographic** write cut-off: `PeerFilter` block
++ freeze-drain namespace rotation, so the peer's retained `NamespaceSecret`
+becomes worthless. Use when the peer is not trusted to self-halt.
+
+**Revoke**:
+The `Revoke{peer}` wire verb underlying **Evict**. Historically (pre-rotation)
+it suspended *delivery* only, not *writing* — the gap rotation closes.
+
+**Write cut-off**:
+Stopping a revoked peer from *producing* valid state. Distinct from **read
+cut-off** (stopping it pulling new state — already works) and **notification**
+(telling it — today it is never told; the silent one-way partition).
+
+**Downgrade notification**:
+A host→peer unicast telling a peer it was demoted, mirroring the existing
+RW-promotion `UPGRADE_ACTION`. **Load-bearing for [[Demote]]** — it is the
+mechanism a cooperative demoted daemon uses to halt its own watcher (a
+voluntary write-stop), not merely a UI signal. Independently shippable.
+
+### Tiers
+
+**Tier 1 (host-centric)**:
+Revocation that leans on the host being the sole sequencer — the host drives
+rotation and distributes the new secret. The pragmatic near-term path.
+
+**Tier 2 (P2P / project-at-merge)**:
+Sequencerless revocation: every peer rejects revoked authors at merge time via
+a causal-DAG high-water mark. Requires an authority model, monotonic
+project-at-merge, and convergence under partition. Supersedes Tier 1 but is the
+research-frontier end-state.
+
+### MLS (evaluated, deferred)
+
+**MLS exporter secret**:
+A deterministic per-epoch symmetric value every *current* MLS group member —
+and only current members — can derive via `export_secret`. It identifies group
+*membership*, not message *origin*, so it can only ever be a **seed** stretched
+into a `NamespaceSecret`; it sits *above* the namespace key and never *is* it.
+MLS member-removal rotates this on `remove_members`. Deferred in Tier 1 — see
+`docs/adr/` — because its post-compromise security protects the write *signing*
+key, an asset that guards content-addressed blobs the key never encrypts. It
+earns its weight only if a group key ever encrypts *content*, or in Tier 2.
