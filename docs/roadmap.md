@@ -906,6 +906,49 @@ Listed for completeness, no detailed plan yet:
   sequencer gives you robust revoke without solving any of (1)–(3). You
   take these on only at the moment you give up the host, which is the
   same moment you'd be building project-at-merge anyway.
+
+  **Ecosystem leverage (verified 2026-06; re-check before relying).** No
+  turnkey "P2P revocation" crate exists — the three rows want different
+  tools and the seam between them is ours — but there's more off-the-shelf
+  than expected, and one fact decides the host-vs-P2P split:
+
+  | Need | Off-the-shelf? |
+  |---|---|
+  | iroh: transport / discovery / blobs / gossip / per-author *signed* entries / *content* convergence | ✅ already have it (`AuthorId` writes; iroh-docs is the content CRDT) |
+  | (1) authority / delegation tokens | **Biscuit** (`biscuit-auth` 6.0, Eclipse/Clever Cloud, prod) — attenuable Datalog caps. **UCAN** Rust crate is stale (last release 2023). **Both punt revocation *convergence* to the app** — they solve "who may revoke," not the iceberg. |
+  | (2) make the secret worthless (rotation crypto) | **OpenMLS** v0.8.1, **audited** (SRLabs, 2026-05) — member removal with post-compromise security. ⚠️ **RFC 9420 §14: stock MLS assumes a delivery service *serializes* commits — it does NOT merge concurrent ones.** |
+  | (3) causal ordering + membership convergence | **No stable dep.** References only. |
+
+  Two leverage facts that map cleanly onto the fork:
+
+  - **OpenMLS needs a sequencer → it fits Tier 1.** The host *is* the
+    delivery service MLS wants, so audited off-the-shelf member-removal
+    crypto drops straight into host-centric rotation — strongly prefer it
+    over hand-rolled secret rotation. In sequencerless P2P stock MLS
+    forks; you'd need the research variants **DMLS** (Phoenix R&D — keeps
+    MLS wire format, epoch space forks into a tree, puncturable-PRF for
+    forward secrecy) or **DCGKA** (Weidner/Kleppmann, CCS'21 — *not* MLS;
+    authenticated causal-order broadcast, concurrency-native, loses
+    TreeKEM's O(log n)).
+  - **Ink & Switch Keyhive is the closest Tier-2 reference** (`keyhive_core`
+    0.4.1, 2026-06, Apache-2.0, **pre-alpha/unaudited** — evaluate, don't
+    depend). Its architecture validates rows (1)–(3) almost verbatim:
+    convergent capabilities + a hash-linked membership-op DAG (a CRDT,
+    RIBLT-reconciled) + **BeeKEM**, a TreeKEM-derived group-key agreement
+    that **needs only *causal* order, not total order** — i.e. exactly
+    what an iroh-gossip/causal-DAG substrate can provide, unlike MLS.
+  - **Matrix state-res v2** is the battle-tested prior art for (3) —
+    *deterministic convergence + auth-filtering that drops unauthorized
+    events* (NOT a CRDT; that filtering is what lets fork-and-merge
+    re-enforce a ban). Reference impl `ruma-state-res`. Learn from it,
+    don't depend; its buried body is **state resets** (recurring, and a
+    CVE — CVE-2025-49090, only partially fixed in v2.1 / Room v12).
+
+  **Frontier note:** *nobody* has shipped the malicious **mutual-revocation**
+  case (two admins concurrently revoke each other) — Keyhive explicitly
+  defers it, Matrix needed a CVE fix and got it "mostly." If we ever need
+  that guarantee, we're at the research frontier, not integrating a
+  library.
 - **Control-frame & sequence authentication (auth Slice B.5).** DONE
   (2026-06-03; `PROTOCOL_VERSION` 5→6, `MESSAGE_FORMAT` 2→3, `Meta`
   2→3). A code review of the L3 landing surfaced three issues that
