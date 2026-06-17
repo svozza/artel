@@ -758,6 +758,51 @@ Listed for completeness, no detailed plan yet:
   The docs-gate + transport-layer `PeerFilter` block revoked peers
   bidirectionally (`356e8c2`). With B.5 and tiered tickets below,
   this completed the v1 auth story.
+  **Implication of host-only caps:** `Capability` grant/revoke is
+  host-private (kept off the gossip wire *and* off replay), so a joiner
+  is never told its capability changed — a grant is observable to it
+  only incidentally (RW delivers the `NamespaceSecret` via
+  `UPGRADE_ACTION`), and a **revoke is not observable at all**: the host
+  simply stops accepting the peer's sync. Consequence for consumers: a
+  revoked joiner gets **no error** — its local writes still succeed
+  (file → `set_bytes` on its own replica both return `Ok`; there is no
+  joiner-side cap check), and only cross-peer replication stops, rejected
+  on the *host's* side by the docs-gate / `PeerFilter`. So revocation is
+  effectively a **silent one-way partition**: the joiner keeps writing to
+  itself, sees its own optimistic UI, and is never told its changes stop
+  propagating. An app can react to promotion but not to its own demotion.
+
+  Three *distinct* concerns hide behind "fix revoke", worth separating
+  before anyone calls one of them "the fix":
+
+  1. **Notification** — does the revoked peer find out? Today: no. Two
+     fixes: a narrow host→peer **downgrade unicast** mirroring
+     `UPGRADE_ACTION` (host-only enforcement unchanged; could land in v1),
+     or the **P2P cap-propagation** rethink where joiners maintain their
+     own cap-set projection and observe `Revoke` directly (the principled
+     end-state; notification falls out for free, but it's the v2-scale
+     symmetric-peer change — see
+     `docs/brainstorms/2026-06-04-auth-slice-c-l2-delivery-rethink-brainstorm.md`).
+  2. **Read cut-off** — stop them pulling new state. Today: works
+     (`PeerFilter` rejects their connection).
+  3. **Write cut-off** — stop them *producing* valid state. Today:
+     **does not hold.** Revoke does not rotate the `NamespaceSecret`, and
+     local `set_bytes` has no cap check, so a revoked peer keeps authoring
+     valid, signed doc entries with the secret it already holds. Revoke
+     only suspends *delivery*: on any re-grant (or other sync path) the
+     CRDT reconciles the peer's whole replica, so **everything written
+     during the revoke window flushes wholesale** — cooperative
+     demote→re-promote loses nothing, but adversarial revoke is not a real
+     write-revocation. The true fix is **namespace-secret rotation +
+     redistribution to the remaining RW peers**, a separate (harder)
+     mechanism from notification or cap-propagation.
+
+  Whether to "fix" notification at all is partly threat-model dependent:
+  for an **adversarial** kick, staying silent is arguably correct (don't
+  tell an attacker they've been cut so they switch tactics); for a
+  **cooperative** downgrade (RW → read-only collaborator), silence is just
+  bad UX. v1 conflates both into one `Revoke`; distinguishing them is its
+  own design question.
 - **Control-frame & sequence authentication (auth Slice B.5).** DONE
   (2026-06-03; `PROTOCOL_VERSION` 5→6, `MESSAGE_FORMAT` 2→3, `Meta`
   2→3). A code review of the L3 landing surfaced three issues that
