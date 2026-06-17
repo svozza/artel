@@ -803,6 +803,70 @@ Listed for completeness, no detailed plan yet:
   **cooperative** downgrade (RW → read-only collaborator), silence is just
   bad UX. v1 conflates both into one `Revoke`; distinguishing them is its
   own design question.
+
+  **What namespace-secret rotation actually costs (the write cut-off
+  fix).** Write capability *is* possession of the `NamespaceSecret` (the
+  iroh-docs document write key, one symmetric secret shared by all RW
+  peers). The only way to make a revoked peer's secret worthless is to
+  rotate the namespace — mint a new secret, give it to survivors, never
+  to the revoked peer. A new secret means a new `NamespaceId` means a
+  *different iroh-docs document* — which sounds catastrophic for a
+  long-lived session with large shared files, but **is not**, because
+  storage is content-addressed:
+
+  - **iroh-blobs (`FsStore`, one per node)** holds the file bytes, keyed
+    by hash, *namespace-agnostic*. The **iroh-docs document** is only a
+    `path → content-hash` mapping (metadata, not data). The secret/ID
+    govern the *mapping*, not the blobs.
+  - "Migrating" to the rotated namespace re-points keys at hashes that
+    already exist locally — copying a list of `(path, 32-byte hash)`
+    pairs (kilobytes for thousands of files), **not** file contents. A
+    4 GB file is one 32-byte hash in both the old and new doc; its bytes
+    never move or re-transfer.
+  - Survivors already hold the blobs, so importing the rotated namespace
+    reconciles only the *entry set* — for every unchanged file the hash
+    is already present, nothing downloads. Cheap on the wire too.
+  - The revoked peer's post-revoke writes land in the **old, abandoned**
+    doc nobody feeds — so the "flushes wholesale on re-grant" bug above
+    fixes itself once rotation exists.
+
+  So rotation's real cost is **not** the data. It's:
+
+  1. **Decouple `SessionId` from `NamespaceId`.** Today `SessionId =
+     session_id_for(NamespaceId)` (load-bearing for re-host-across-restart
+     resume). Rotation changes the namespace, so the session id must be
+     minted+persisted once and the namespace become a *mutable attribute*
+     of the session. Touches `session_id.rs`, host resume, daemon record.
+  2. **A `namespace_epoch` in the ticket envelope** so joiners re-import
+     on a bump.
+  3. **The freeze-drain-snapshot barrier** — the genuinely hard slice:
+     freeze writes, drain in-flight ones, snapshot the entry set
+     atomically, or a survivor's concurrent write lands in the old doc
+     and is lost. Correctness-critical; a concurrency problem, not a
+     bytes problem.
+  4. **Downgrade notification** (slice from the notification concern
+     above) — independently shippable, cheap, and the thing that makes a
+     revoked peer's app able to react.
+
+  **Alpha note (no backward compat):** this lets us change the SessionId
+  derivation, envelope shape, and on-disk `doc-id` layout outright (bump
+  `PROTOCOL_VERSION`, hard-reject old shapes) — deletes the dual-format
+  reads and persisted-session migration, ~⅓ of the fiddly work. It does
+  **not** reduce the identity decoupling or the quiescence barrier; those
+  are intrinsic.
+
+  **Strategic fork — don't build rotation reflexively.** This host-centric
+  rotation (Tier 1) keeps the host-as-sequencer model and is achievable
+  now, but it is **partially throwaway** if the symmetric-P2P rethink is
+  near: per-author authorization that rejects revoked authors at
+  *project-at-merge* (Tier 2 — see `l2-host-only-enforcement-v1` and the
+  delivery-rethink brainstorm) supersedes namespace rotation and is the
+  only thing that works when there's no single gatekeeper to drive a
+  rotation. Recommendation: **ship the downgrade notification (slice 4)
+  now** regardless — cheap, closes the silent-partition UX gap, makes the
+  chat-harness send-gate honest — and hold slices 1–3 until a concrete
+  forcing function (first multi-tenant / untrusted-peer deployment), then
+  re-ask Tier 1 vs Tier 2 against the P2P timeline.
 - **Control-frame & sequence authentication (auth Slice B.5).** DONE
   (2026-06-03; `PROTOCOL_VERSION` 5→6, `MESSAGE_FORMAT` 2→3, `Meta`
   2→3). A code review of the L3 landing surfaced three issues that
