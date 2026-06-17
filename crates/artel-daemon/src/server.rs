@@ -1307,21 +1307,36 @@ fn spawn_subscription_forwarder(
                 Ok(event) => event,
                 Err(broadcast::error::RecvError::Closed) => return,
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    // M3: the subscriber fell more than EVENT_CHANNEL_CAPACITY
-                    // behind, so `n` events are gone. We can't replay them on
-                    // this channel, and silently continuing would desync the
-                    // client (it would think it had a contiguous stream). Make
-                    // the loss LOUD: close the connection so the client sees
-                    // EOF and reconnects + re-Subscribes from its last-known
-                    // seq. (A finer-grained in-band gap signal that avoids the
-                    // reconnect is the follow-up — see
-                    // docs/handoff-m3-subscriber-lag-recovery.md.)
+                    // M3 Part B: the subscriber fell more than
+                    // EVENT_CHANNEL_CAPACITY behind, so `n` events are gone. We
+                    // can't replay them on this channel, and silently
+                    // continuing would desync the client (it would think it had
+                    // a contiguous stream). Make the loss LOUD *without*
+                    // tearing the connection down: send an in-band
+                    // `Event::Gap { session }` and keep forwarding. The client
+                    // re-Subscribes from its last-seen seq on the SAME
+                    // connection, and any other sessions multiplexed on this
+                    // connection are left undisturbed.
+                    //
+                    // Fallback: if the Gap send itself fails, the client's read
+                    // half is gone — there's nothing left to keep open, so we
+                    // return (same as any other send failure below).
                     warn!(
                         missed = n,
-                        "subscriber lagged; closing connection so the client re-subscribes"
+                        "subscriber lagged; sending in-band Gap so the client re-subscribes"
                     );
-                    let _ = sink.lock().await.close().await;
-                    return;
+                    if send_frame(
+                        &sink,
+                        WireMessage::Event {
+                            event: Event::Gap { session },
+                        },
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                    continue;
                 }
             };
             if send_frame(&sink, WireMessage::Event { event })
@@ -1576,18 +1591,19 @@ mod forwarder_set_tests {
         );
     }
 
-    // ---- M3: subscriber-lag tears the connection down ----
+    // ---- M3 Part B: subscriber-lag → in-band Gap (connection stays up) ----
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn forwarder_closes_connection_on_subscriber_lag() {
-        // M3: when a subscriber lags past the broadcast capacity, the
-        // forwarder must make the loss LOUD by tearing the connection
-        // down — the client observes EOF and reconnects + re-Subscribes
-        // — rather than silently swallowing the dropped events (which
-        // contradicted the documented recovery contract). Here we
-        // overflow a tiny broadcast channel so the forwarder's recv()
-        // returns Lagged, then assert the client side reads EOF.
-        use artel_protocol::Event;
+    async fn forwarder_sends_gap_on_subscriber_lag() {
+        // M3 Part B: when a subscriber lags past the broadcast capacity,
+        // the forwarder makes the loss LOUD *without* tearing the
+        // connection down — it sends an in-band `Event::Gap { session }`
+        // and keeps the stream open, so the client re-Subscribes from
+        // its last-seen seq on the SAME connection (and any other
+        // sessions on that connection are undisturbed). Here we overflow
+        // a tiny broadcast channel so the forwarder's recv() returns
+        // Lagged, then assert the client reads a Gap frame (not EOF).
+        use artel_protocol::{Event, WireMessage};
         use futures_util::StreamExt;
         use tokio::sync::broadcast;
 
@@ -1612,17 +1628,63 @@ mod forwarder_set_tests {
         let shutdown = Arc::new(Shutdown::new());
         let handle = spawn_subscription_forwarder(sid(1), sub, daemon_sink, shutdown.token());
 
-        // The client's read half must hit EOF (connection closed by the
-        // daemon) within a bounded wait.
+        // The client's first frame must be the in-band Gap signal.
         let mut client = artel_protocol::transport::new(client_io);
         let got = tokio::time::timeout(Duration::from_secs(2), client.next())
             .await
-            .expect("forwarder must close the connection on lag, not hang");
+            .expect("forwarder must send a Gap, not hang")
+            .expect("connection stays open — Gap, not EOF")
+            .expect("decodable frame");
         assert!(
-            got.is_none(),
-            "client should see EOF after a lag-induced teardown, got {got:?}",
+            matches!(
+                got,
+                WireMessage::Event {
+                    event: Event::Gap { session },
+                } if session == sid(1)
+            ),
+            "expected an in-band Gap for the lagged session, got {got:?}",
         );
-        // The forwarder task itself ends.
-        assert_finishes(&handle.abort_handle(), "lagged forwarder").await;
+
+        // The forwarder keeps running (the connection is NOT torn down);
+        // it's only stopped here by shutdown.
+        shutdown.trigger();
+        assert_finishes(&handle.abort_handle(), "post-gap forwarder on shutdown").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forwarder_closes_when_gap_send_fails() {
+        // M3 Part B fallback: if the Gap send itself fails (the client's
+        // read half is already gone), there's nothing to keep open — the
+        // forwarder gives up and returns, same as any other send
+        // failure. We drop the client end first, then drive a Lagged.
+        use artel_protocol::Event;
+        use futures_util::StreamExt;
+        use tokio::sync::broadcast;
+
+        let (client_io, daemon_io) = UnixStream::pair().unwrap();
+        let daemon_sink = {
+            let framed = artel_protocol::transport::new(daemon_io);
+            let (sink, _stream) = framed.split();
+            Arc::new(AsyncMutex::new(sink))
+        };
+
+        let (tx, rx) = broadcast::channel::<Event>(2);
+        for _ in 0..8 {
+            let _ = tx.send(Event::SessionClosed { session: sid(1) });
+        }
+        let sub = Subscription {
+            replay: Vec::new(),
+            events: rx,
+        };
+
+        // Drop the client's half so the Gap send fails.
+        drop(client_io);
+
+        let shutdown = Arc::new(Shutdown::new());
+        let handle = spawn_subscription_forwarder(sid(1), sub, daemon_sink, shutdown.token());
+
+        // With nowhere to send the Gap, the forwarder returns on its own
+        // — no shutdown needed.
+        assert_finishes(&handle.abort_handle(), "forwarder after failed Gap send").await;
     }
 }

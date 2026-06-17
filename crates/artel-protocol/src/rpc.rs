@@ -551,6 +551,24 @@ pub enum Event {
         /// Session that closed.
         session: SessionId,
     },
+
+    /// One or more events were dropped for this subscriber before they
+    /// could be delivered (the daemon's per-subscriber broadcast buffer
+    /// overflowed — see `EVENT_CHANNEL_CAPACITY`). The stream stays
+    /// open; the daemon does **not** close the connection. The
+    /// subscriber recovers by re-`Subscribe`ing from its last-seen seq
+    /// (`Subscribe { since }`), which replays every logged message past
+    /// the gap. Live-only events (`PeerJoined`/`PeerLeft`/
+    /// `SessionClosed`) that fell in the gap are not replayed; a
+    /// consumer that needs them must reconcile membership separately.
+    ///
+    /// Appended last (postcard index 4) on `PROTOCOL_VERSION` 10 so the
+    /// earlier variants keep their wire positions — see the
+    /// `event_gap_is_appended_at_index_four` test (M3 Part B).
+    Gap {
+        /// Session whose stream dropped events.
+        session: SessionId,
+    },
 }
 
 /// One frame on the IPC wire.
@@ -1177,6 +1195,28 @@ mod tests {
         let bytes = postcard::to_allocvec(&ev).unwrap();
         let back: Event = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(ev, back);
+    }
+
+    #[test]
+    fn event_gap_round_trip() {
+        let ev = Event::Gap {
+            session: SessionId::from_bytes([7; 16]),
+        };
+        let bytes = postcard::to_allocvec(&ev).unwrap();
+        let back: Event = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(ev, back);
+    }
+
+    #[test]
+    fn event_gap_is_appended_at_index_four() {
+        // M3 Part B: `Gap` is appended last so the existing variants
+        // keep their postcard indices (Message=0, PeerJoined=1,
+        // PeerLeft=2, SessionClosed=3, Gap=4). Pre-existing subscribers
+        // decode the older variants unchanged.
+        let gap = Event::Gap {
+            session: SessionId::from_bytes([1; 16]),
+        };
+        assert_eq!(postcard::to_allocvec(&gap).unwrap()[0], 4);
     }
 
     // ---- WireMessage envelope ----
