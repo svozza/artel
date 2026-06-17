@@ -867,6 +867,45 @@ Listed for completeness, no detailed plan yet:
   chat-harness send-gate honest — and hold slices 1–3 until a concrete
   forcing function (first multi-tenant / untrusted-peer deployment), then
   re-ask Tier 1 vs Tier 2 against the P2P timeline.
+
+  **What P2P revocation *additionally* pulls in (beyond project-at-merge).**
+  The host model collapses three problems into "the host said so, in
+  sequence order" — drop the host and all three come back:
+
+  1. **An authority model — *who* may revoke.** Not automatically quorum;
+     it's a design axis with at least three points: a **founder/owner
+     key** (whoever created the session, or a designated admin key,
+     signs revocations — simplest; a *logical* authority without a
+     *runtime* one), **capability delegation** (admin is itself a
+     grantable cap — any current admin revokes; cf.
+     `reopen-grant-authority-on-readonly-tickets`), or **k-of-n quorum**
+     (valid only with a threshold of admin signatures — robust against a
+     single compromised admin, most complex). Which one is a
+     *threat-model* choice, not a foregone "we need quorum." Crucially
+     this is **per-session policy, chosen at creation**, not one global
+     decision — a solo/small-team workspace can run owner-key while an
+     adversarial multi-party one runs quorum, same substrate. The model
+     becomes part of the session's genesis record so every peer projects
+     against the same rule.
+  2. **Monotonic project-at-merge.** The peer being revoked also *writes*
+     — it can keep signing entries (including ones contradicting its own
+     revocation) or withhold the revocation from some peers. So a
+     revocation must be a **high-water mark in the causal DAG**: once any
+     peer sees a valid revocation at causal point X, no later-merged
+     entry from that author past X is ever accepted, regardless of
+     arrival order. Not a mutable flag.
+  3. **Convergence under partition.** Two peers healing a split must
+     agree on the membership set, or it forks permanently. This is the
+     step that turns "design a quorum" into "design a conflict-free
+     *authorization* CRDT over the content CRDT" — the real meat of the
+     symmetric-P2P rethink.
+
+  The revocation authority (1) is the visible tip; the
+  causal-consistency machinery (2)+(3) is the iceberg, and it's *why*
+  host-centric rotation is the pragmatic near-term answer — the
+  sequencer gives you robust revoke without solving any of (1)–(3). You
+  take these on only at the moment you give up the host, which is the
+  same moment you'd be building project-at-merge anyway.
 - **Control-frame & sequence authentication (auth Slice B.5).** DONE
   (2026-06-03; `PROTOCOL_VERSION` 5→6, `MESSAGE_FORMAT` 2→3, `Meta`
   2→3). A code review of the L3 landing surfaced three issues that
