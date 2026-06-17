@@ -503,6 +503,29 @@ pub async fn grant_rw(client: &Client, session: SessionId, target_peer: PeerId) 
     assert!(matches!(resp, Response::Sent { .. }), "{resp:?}");
 }
 
+/// Cooperatively demote `target_peer` from `ReadWrite` to `Read` by having
+/// the host author a `Grant{peer, Read}` capability message. The host's
+/// `cap_listener` turns the RW→Read transition into a `DOWNGRADE_ACTION`
+/// unicast that halts the demoted node's watcher (Slice 0).
+pub async fn demote(client: &Client, session: SessionId, target_peer: PeerId) {
+    let grant = CapabilityAction::Grant {
+        peer: target_peer,
+        cap: Capability::Read,
+    };
+    let resp = client
+        .request(Request::Send {
+            session,
+            payload: SendPayload {
+                kind: MessageKind::Capability,
+                action: grant.action_str().to_string(),
+                payload: grant.encode(),
+            },
+        })
+        .await
+        .unwrap();
+    assert!(matches!(resp, Response::Sent { .. }), "{resp:?}");
+}
+
 /// Grant RW and wait for the upgrade to propagate by polling a probe
 /// write. Writes `".artel_rw_probe"` from the joiner's workspace dir
 /// and waits for it to appear in the host's dir, proving the full

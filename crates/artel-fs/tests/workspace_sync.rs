@@ -689,6 +689,133 @@ async fn read_only_joiner_write_does_not_propagate() {
 }
 
 // =============================================================
+// Cooperative demote (Slice 0): an RW joiner that the host demotes to
+// Read receives a DOWNGRADE_ACTION notification and halts its own
+// watcher, so its subsequent local writes stop propagating to the host.
+//
+// Exercises the full Slice-0 path: host detects RW→Read in its
+// cap_listener → DeliverDowngrade → daemon emit_downgrade → joiner
+// DOWNGRADE_ACTION handler → write_halted flag → watcher skip.
+// =============================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn demoted_joiner_writes_stop_propagating() {
+    use artel_protocol::capability::Capability;
+
+    let Pair {
+        daemon_a,
+        daemon_b,
+        dns_pkarr,
+    } = spawn_pair().await;
+
+    // Alice hosts.
+    let alice = Client::connect(&daemon_a.socket).await.unwrap();
+    let alice_dir = tempfile::tempdir().unwrap();
+    let (alice_ws, _) = Workspace::host_with(
+        &alice,
+        "alice",
+        alice_dir.path().to_path_buf(),
+        AttachPolicy::RequireEmpty,
+        WorkspaceConfig::default()
+            .with_endpoint_setup(testing_setup(&dns_pkarr))
+            .with_daemon_socket(daemon_a.socket.clone()),
+    )
+    .await
+    .expect("Workspace::host");
+    let session = alice_ws.session_id();
+    let alice_ws = Arc::new(alice_ws);
+    let alice_handle = Arc::clone(&alice_ws).run().await;
+
+    // Bob joins with a Read ticket, then Alice grants RW so his writes
+    // propagate (the precondition we then revoke).
+    let issue_resp = alice
+        .request(Request::IssueTicket {
+            session,
+            granted_cap: Capability::Read,
+            expiry_ms: 0,
+        })
+        .await
+        .unwrap();
+    let read_ticket = match issue_resp {
+        Response::IssuedTicket { ticket: t, .. } => t,
+        other => panic!("expected IssuedTicket, got {other:?}"),
+    };
+
+    let bob = Client::connect(&daemon_b.socket).await.unwrap();
+    let bob_peer = bob.daemon_peer_id();
+    let resp = bob
+        .request(Request::JoinSession {
+            display_name: "bob".into(),
+            ticket: read_ticket,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(resp, Response::JoinSession { .. }), "{resp:?}");
+
+    let bob_dir = tempfile::tempdir().unwrap();
+    let (bob_ws, _) = Workspace::join_with(
+        &bob,
+        session,
+        bob_dir.path().to_path_buf(),
+        AttachPolicy::RequireEmpty,
+        WorkspaceConfig::default()
+            .with_endpoint_setup(testing_setup(&dns_pkarr))
+            .with_daemon_socket(daemon_b.socket.clone()),
+    )
+    .await
+    .expect("Workspace::join");
+    let bob_ws = Arc::new(bob_ws);
+    let bob_handle = Arc::clone(&bob_ws).run().await;
+
+    // Promote Bob to RW and wait until the upgrade has propagated (his
+    // writes reach Alice).
+    common::grant_rw_and_wait(&alice, session, bob_peer, bob_dir.path(), alice_dir.path()).await;
+
+    // Sanity: a normal RW write reaches Alice.
+    let pre = bob_dir.path().join("pre_demote.txt");
+    tokio::fs::write(&pre, b"before demote").await.unwrap();
+    common::wait_for_file(&alice_dir.path().join("pre_demote.txt"), b"before demote").await;
+
+    // Demote Bob (RW → Read). The host's cap_listener fires the
+    // DOWNGRADE_ACTION unicast; Bob's watcher halts.
+    common::demote(&alice, session, bob_peer).await;
+
+    // Poll until Bob's watcher is halted, proving the notification
+    // arrived and was applied. We can't read Bob's flag across the
+    // process boundary here (same process, but private), so we assert
+    // behaviourally below; give the notification a moment to land.
+    sleep(Duration::from_secs(2)).await;
+
+    // Bob writes again post-demote. This must NOT propagate.
+    let post = bob_dir.path().join("post_demote.txt");
+    tokio::fs::write(&post, b"after demote").await.unwrap();
+
+    // Alice writes a sentinel; once Bob sees it, the inbound pipeline
+    // has flushed, so if Bob's post-demote write were going to arrive
+    // it would have by now.
+    let sentinel = alice_dir.path().join("sentinel.txt");
+    tokio::fs::write(&sentinel, b"sentinel").await.unwrap();
+    common::wait_for_file(&bob_dir.path().join("sentinel.txt"), b"sentinel").await;
+
+    let leaked = tokio::fs::try_exists(alice_dir.path().join("post_demote.txt"))
+        .await
+        .unwrap_or(false);
+    assert!(
+        !leaked,
+        "demoted joiner's post-demote write propagated to host — watcher-halt not honoured",
+    );
+
+    alice_ws.shutdown().await.expect("shutdown");
+    bob_ws.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), alice_handle).await;
+    let _ = timeout(Duration::from_secs(5), bob_handle).await;
+    drop(alice);
+    drop(bob);
+    daemon_a.stop().await;
+    daemon_b.stop().await;
+}
+
+// =============================================================
 // A live edit on the host's filesystem propagates to the joiner via
 // the watcher → doc → applier pipeline.
 //

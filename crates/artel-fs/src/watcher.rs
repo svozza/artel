@@ -159,6 +159,13 @@ async fn on_modified(
     path: PathBuf,
 ) {
     debug!(target: "artel_fs::watcher", path = %path.display(), "on_modified entered");
+    // Cooperative demotion: a downgraded node stops publishing its own
+    // writes (voluntary write-stop). Checked first so a halted node
+    // doesn't even read the file.
+    if workspace.is_write_halted() {
+        debug!(target: "artel_fs::watcher", path = %path.display(), "write-halted: skip publish");
+        return;
+    }
     match filter.check(&path) {
         FilterDecision::Skip(SkipReason::TooLarge { size }) => {
             debug!(target: "artel_fs::watcher", path = %path.display(), size, "filter: skip too-large");
@@ -314,6 +321,12 @@ async fn rescan_dir(
 
 async fn on_removed(workspace: &Arc<Workspace>, path: PathBuf) {
     debug!(target: "artel_fs::watcher", path = %path.display(), "on_removed entered");
+    // Cooperative demotion: a downgraded node stops propagating its
+    // own deletes too (voluntary write-stop).
+    if workspace.is_write_halted() {
+        debug!(target: "artel_fs::watcher", path = %path.display(), "write-halted: skip delete");
+        return;
+    }
     // Belt-and-braces with `on_modified`: on macOS, FSEvents reports
     // post-unlink as `Modify(Metadata)` and `on_modified` already
     // gates on `ReadOnly` before its own fallthrough into here. On

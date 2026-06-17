@@ -162,6 +162,9 @@ impl UpgradeProtocol {
                     .emit_workspace_ticket(session_id, remote_peer, envelope_bytes)
                     .await
             }
+            DeliveryFrame::Downgrade { session_id } => {
+                self.registry.emit_downgrade(session_id, remote_peer).await
+            }
         };
         result.map_err(|e| {
             warn!(error = %e, "upgrade_protocol: delivery rejected");

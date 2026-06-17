@@ -23,8 +23,8 @@ use artel_protocol::message::{MESSAGE_FORMAT, SIGNATURE_UNSIGNED, SigBytes};
 use artel_protocol::signing::{self, verify_reason};
 use artel_protocol::ticket::{self, SessionTicket, TicketEntry, TicketStatus, WireEndpointAddr};
 use artel_protocol::{
-    Event, JoinTicket, MessageKind, PeerId, PeerInfo, ProtocolError, Seq, SessionId,
-    SessionMessage, SessionSummary, UpgradePayload,
+    DowngradePayload, Event, JoinTicket, MessageKind, PeerId, PeerInfo, ProtocolError, Seq,
+    SessionId, SessionMessage, SessionSummary, UpgradePayload,
 };
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, broadcast};
@@ -62,7 +62,7 @@ const WORKSPACE_TICKET_DELIVERY_RETRIES: u32 = 5;
 #[cfg(feature = "iroh")]
 const WORKSPACE_TICKET_DELIVERY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(3);
 
-use artel_protocol::{TICKET_ACTION, UPGRADE_ACTION};
+use artel_protocol::{DOWNGRADE_ACTION, TICKET_ACTION, UPGRADE_ACTION};
 
 /// Wall-clock millis since the Unix epoch. The `Local` arm of
 /// [`Authoring`] stamps this onto every body it signs.
@@ -1868,7 +1868,9 @@ impl Registry {
                 m.seq > since
                     && m.kind != MessageKind::Capability
                     && !(m.kind == MessageKind::System
-                        && (m.action == UPGRADE_ACTION || m.action == TICKET_ACTION))
+                        && (m.action == UPGRADE_ACTION
+                            || m.action == TICKET_ACTION
+                            || m.action == DOWNGRADE_ACTION))
             })
             .cloned()
             .collect())
@@ -2542,6 +2544,47 @@ impl Registry {
         // (e.g. offline promotion), this must become a sequenced,
         // persisted message instead.
         let message = synthetic_system_message(s.host, UPGRADE_ACTION, payload);
+
+        let events_tx = s.events_tx.clone();
+        drop(s);
+
+        // Best-effort: if no subscribers are listening, that's fine.
+        let _ = events_tx.send(Event::Message { session, message });
+
+        Ok(())
+    }
+
+    /// Emit a synthetic downgrade event into a session's broadcast channel.
+    ///
+    /// Mirror of [`Self::emit_upgrade`] for the cooperative-demotion
+    /// notification ([`DeliveryFrame::Downgrade`]): the synthetic event has
+    /// `kind: System`, `action: DOWNGRADE_ACTION`, and a postcard-encoded
+    /// [`DowngradePayload`] naming this daemon as the demoted peer, which
+    /// `artel-fs`'s `cap_listener` consumes to halt its own watcher.
+    /// Carries no key material — a demotion conveys only "stop writing".
+    ///
+    /// Validates via [`Self::lock_remote_session_from_host`]: session
+    /// exists, is `Remote`, and `sender_peer` is the host. Like
+    /// `UPGRADE_ACTION` it is live-only and not persisted/replayed.
+    #[cfg(feature = "iroh")]
+    pub(crate) async fn emit_downgrade(
+        &self,
+        session: SessionId,
+        sender_peer: PeerId,
+    ) -> Result<(), SessionError> {
+        let s = self
+            .lock_remote_session_from_host(session, sender_peer, "downgrades")
+            .await?;
+
+        let payload = postcard::to_allocvec(&DowngradePayload {
+            target_peer: self.daemon_peer_id,
+        })
+        .expect("DowngradePayload is infallible to serialize");
+
+        // Synthetic, non-persisted, live-only — same posture as
+        // UPGRADE_ACTION (excluded from replay in `log_since`). A joiner
+        // that misses it relies on the host re-delivering on reconnect.
+        let message = synthetic_system_message(s.host, DOWNGRADE_ACTION, payload);
 
         let events_tx = s.events_tx.clone();
         drop(s);

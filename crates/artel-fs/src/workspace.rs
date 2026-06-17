@@ -26,7 +26,7 @@ use std::time::Duration;
 use artel_client::{Client, ClientError};
 use artel_protocol::{
     Event, JoinTicket, MessageKind, PeerId, ProtocolError, Request, Response, SendPayload, Seq,
-    SessionId, UpgradePayload,
+    SessionId, SessionMessage, UpgradePayload,
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -73,7 +73,7 @@ pub const TICKET_ACTION: &str = artel_protocol::TICKET_ACTION;
 /// raw 32-byte `EndpointId`.
 pub const NODE_ID_ACTION: &str = "workspace.node_id";
 
-use artel_protocol::UPGRADE_ACTION;
+use artel_protocol::{DOWNGRADE_ACTION, DowngradePayload, UPGRADE_ACTION};
 
 /// Capacity of the [`Workspace::events`] channel. Modest cap so a
 /// stuck consumer back-pressures the watcher rather than letting
@@ -328,6 +328,11 @@ pub enum WorkspaceEvent {
         /// or the apply side (`Incoming`).
         direction: Direction,
     },
+    /// The host cooperatively demoted this node (RW → Read). The
+    /// watcher has stopped publishing local changes (a voluntary
+    /// write-stop); the node keeps reading peer writes. Surfaced so a
+    /// consumer (e.g. a TUI send-gate) can reflect the demotion.
+    Demoted,
     /// Non-fatal error in the live loop. Logged for the consumer;
     /// the workspace keeps running.
     Error(String),
@@ -420,6 +425,20 @@ pub struct Workspace {
     /// Cancellation token tripped by [`Self::shutdown`] to stop the
     /// background tasks.
     pub(crate) shutdown_token: CancellationToken,
+    /// Set when the host has cooperatively demoted this node (RW →
+    /// Read) via a `DOWNGRADE_ACTION` notification. The watcher checks
+    /// it before every publish/delete and skips when halted — a
+    /// *voluntary* write-stop (cooperative threat model only; the
+    /// cryptographic write cut-off is namespace rotation on Evict).
+    /// `Relaxed` is sufficient: the only correctness requirement is
+    /// that the watcher eventually observes the flip, and a stray
+    /// publish in the race window is exactly the cooperative-trust
+    /// assumption this slice rests on.
+    ///
+    /// Shared (`Arc`) with the joiner's `cap_listener`, which spawns
+    /// before the `Workspace` is constructed and flips the flag on a
+    /// `DOWNGRADE_ACTION`. The watcher reads it via [`Self::write_halted`].
+    pub(crate) write_halted: Arc<std::sync::atomic::AtomicBool>,
     /// The per-workspace iroh runtime. Owned so its `Drop` runs when
     /// the workspace goes out of scope. `Mutex<Option<...>>` so
     /// [`Self::shutdown`] can take it and consume it without
@@ -781,6 +800,7 @@ impl Workspace {
                 echo_guard,
                 events: tx,
                 shutdown_token,
+                write_halted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 node: tokio::sync::Mutex::new(Some(node)),
                 rules,
                 compiled_rules,
@@ -993,9 +1013,11 @@ impl Workspace {
         // (consumed by `wait_for_ticket` above) is dropped — we never
         // reuse it for the listener.
         let shutdown_token = CancellationToken::new();
+        let write_halted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let joiner_ctx = Some(JoinerUpgradeCtx {
             my_peer_id: client.daemon_peer_id(),
             docs: node.docs.clone(),
+            write_halted: Arc::clone(&write_halted),
         });
         let listener_socket = join_daemon_socket.unwrap_or_else(|| client.socket_path());
         let cap_listener = spawn_cap_listener_from_socket(
@@ -1042,6 +1064,7 @@ impl Workspace {
                 echo_guard,
                 events: tx,
                 shutdown_token,
+                write_halted,
                 node: tokio::sync::Mutex::new(Some(node)),
                 rules,
                 compiled_rules,
@@ -1107,6 +1130,16 @@ impl Workspace {
     #[must_use]
     pub const fn rules(&self) -> &PathRules {
         &self.rules
+    }
+
+    /// Whether this node has been cooperatively demoted (RW → Read) and
+    /// should stop publishing local writes. The watcher consults this
+    /// before every publish/delete; flipped by a `DOWNGRADE_ACTION`
+    /// notification. A *voluntary* write-stop — cooperative threat
+    /// model only.
+    #[must_use]
+    pub(crate) fn is_write_halted(&self) -> bool {
+        self.write_halted.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The [`AuthorId`] this workspace stamps on its outgoing writes.
@@ -1590,6 +1623,24 @@ async fn publish_upgrade(
     Ok(())
 }
 
+/// Host-side: ask the daemon to deliver a cooperative-downgrade
+/// notification to `target_peer` over the direct stream. Mirror of
+/// [`publish_upgrade`] with no key material — a demotion only tells the
+/// peer to stop writing.
+async fn publish_downgrade(
+    client: &Client,
+    session: SessionId,
+    target_peer: PeerId,
+) -> Result<(), ClientError> {
+    client
+        .request(Request::DeliverDowngrade {
+            session,
+            target_peer,
+        })
+        .await?;
+    Ok(())
+}
+
 /// Wait for `iroh-docs` to finish its first reconciliation pass and
 /// download all pending content. Returns when [`LiveEvent::SyncFinished`]
 /// has been observed *and* a subsequent
@@ -2068,6 +2119,9 @@ struct HostUpgradeCtx {
 struct JoinerUpgradeCtx {
     my_peer_id: PeerId,
     docs: iroh_docs::protocol::Docs,
+    /// Shared with [`Workspace::write_halted`]; the `DOWNGRADE_ACTION`
+    /// handler flips it so the watcher stops publishing.
+    write_halted: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Exponential backoff for the cap-listener's reconnect loop.
@@ -2174,25 +2228,95 @@ enum CapOutcome {
     Ignored,
 }
 
+/// Apply a `Capability` message to `peer_map`, then fire host-side unicast.
+///
+/// On the host an RW grant delivers the `NamespaceSecret` (upgrade),
+/// and a cooperative demote from RW to Read delivers a downgrade
+/// notification so the peer halts its own watcher. Both side-effects
+/// are best-effort spawns.
+fn handle_capability_message(
+    message: &SessionMessage,
+    peer_map: &Arc<PeerMap>,
+    host_ctx: Option<&HostUpgradeCtx>,
+) {
+    use artel_protocol::capability::{Capability, CapabilityAction};
+
+    // Capture the affected peer's cap *before* applying, so we can tell
+    // a cooperative demote (was RW, now Read) from a fresh Read grant —
+    // the downgrade notification fires only on the former.
+    let demote_target = if host_ctx.is_some() {
+        match CapabilityAction::decode(&message.payload) {
+            Ok(CapabilityAction::Grant {
+                peer,
+                cap: Capability::Read,
+            }) if peer_map.has_rw(peer) => Some(peer),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    peer_map.apply_capability(message.peer.id, &message.payload);
+
+    // Host: on RW grant, deliver the NamespaceSecret to the promoted
+    // peer. Check has_rw AFTER apply so a grant whose peer was later
+    // revoked (during replay) is suppressed.
+    if let Some(ctx) = host_ctx
+        && let Ok(CapabilityAction::Grant {
+            peer,
+            cap: Capability::ReadWrite,
+        }) = CapabilityAction::decode(&message.payload)
+        && peer_map.has_rw(peer)
+    {
+        let client = Arc::clone(&ctx.client);
+        let sess = ctx.session;
+        let secret = ctx.namespace_secret;
+        tokio::spawn(async move {
+            if let Err(e) = publish_upgrade(&client, sess, peer, secret).await {
+                warn!(?e, ?peer, "upgrade delivery failed");
+            }
+        });
+    }
+
+    // Host: on a cooperative demote (RW → Read), notify the peer so its
+    // daemon halts its own watcher. Carries no key material; the
+    // cryptographic write cut-off is rotation on Revoke/Evict.
+    if let Some(ctx) = host_ctx
+        && let Some(peer) = demote_target
+    {
+        let client = Arc::clone(&ctx.client);
+        let sess = ctx.session;
+        tokio::spawn(async move {
+            if let Err(e) = publish_downgrade(&client, sess, peer).await {
+                warn!(?e, ?peer, "downgrade delivery failed");
+            }
+        });
+    }
+}
+
 /// Apply one cap-listener [`Event`] to `peer_map` and trigger any
 /// host-side upgrade delivery. See [`CapOutcome`] for what the return
 /// value tells the loop.
 ///
-/// Processes three message types:
+/// Processes these message types:
 /// - `MessageKind::Capability`: applies grant/revoke to the cap-set
 ///   projection so the docs gate starts rejecting revoked peers.
 ///   On the host side, an RW grant also triggers delivery of the
-///   `NamespaceSecret` to the promoted peer.
+///   `NamespaceSecret` to the promoted peer, and a demote to Read a
+///   downgrade notification (see [`handle_capability_message`]).
 /// - `MessageKind::System` with `NODE_ID_ACTION`: registers the mapping
 ///   from a joiner's workspace `EndpointId` to their daemon `PeerId`.
 /// - `MessageKind::System` with `UPGRADE_ACTION`: on the joiner side,
 ///   imports the `NamespaceSecret` to gain Write capability.
+/// - `MessageKind::System` with `DOWNGRADE_ACTION`: on the joiner side,
+///   halts the watcher and emits [`WorkspaceEvent::Demoted`].
 async fn handle_cap_event(
     ev: Event,
     session: SessionId,
     peer_map: &Arc<PeerMap>,
     host_ctx: Option<&HostUpgradeCtx>,
     joiner_ctx: Option<&JoinerUpgradeCtx>,
+    events_tx: &mpsc::Sender<WorkspaceEvent>,
 ) -> CapOutcome {
     match ev {
         Event::Message {
@@ -2202,29 +2326,7 @@ async fn handle_cap_event(
             let seq = message.seq;
             match message.kind {
                 MessageKind::Capability => {
-                    peer_map.apply_capability(message.peer.id, &message.payload);
-                    // Host: on RW grant, deliver the
-                    // NamespaceSecret to the promoted peer.
-                    // Check has_rw AFTER apply so a grant
-                    // whose peer was later revoked (during
-                    // replay) is suppressed.
-                    if let Some(ctx) = host_ctx
-                        && let Ok(artel_protocol::capability::CapabilityAction::Grant {
-                            peer,
-                            cap: artel_protocol::capability::Capability::ReadWrite,
-                        }) =
-                            artel_protocol::capability::CapabilityAction::decode(&message.payload)
-                        && peer_map.has_rw(peer)
-                    {
-                        let client = Arc::clone(&ctx.client);
-                        let sess = ctx.session;
-                        let secret = ctx.namespace_secret;
-                        tokio::spawn(async move {
-                            if let Err(e) = publish_upgrade(&client, sess, peer, secret).await {
-                                warn!(?e, ?peer, "upgrade delivery failed");
-                            }
-                        });
-                    }
+                    handle_capability_message(&message, peer_map, host_ctx);
                 }
                 MessageKind::System if message.action == NODE_ID_ACTION => {
                     if let Ok(bytes) = <[u8; 32]>::try_from(message.payload.as_slice())
@@ -2246,6 +2348,22 @@ async fn handle_cap_event(
                         if let Err(e) = ctx.docs.import_namespace(cap).await {
                             warn!("workspace.upgrade import_namespace failed: {e}");
                         }
+                    }
+                }
+                MessageKind::System if message.action == DOWNGRADE_ACTION => {
+                    // Joiner: the host cooperatively demoted us (RW →
+                    // Read). Halt our own watcher (voluntary write-stop)
+                    // and surface a Demoted event. Verify host origin
+                    // and that we are the target before acting.
+                    if let Some(ctx) = joiner_ctx
+                        && message.peer.id == peer_map.host_peer_id()
+                        && let Ok(payload) =
+                            postcard::from_bytes::<DowngradePayload>(&message.payload)
+                        && payload.target_peer == ctx.my_peer_id
+                    {
+                        ctx.write_halted
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        emit_event(events_tx, WorkspaceEvent::Demoted);
                     }
                 }
                 _ => {}
@@ -2384,7 +2502,7 @@ fn spawn_cap_listener(
                             // reconnect loop.
                             break;
                         };
-                        match handle_cap_event(ev, session, &peer_map, host_ctx.as_ref(), joiner_ctx.as_ref())
+                        match handle_cap_event(ev, session, &peer_map, host_ctx.as_ref(), joiner_ctx.as_ref(), &events_tx)
                             .await
                         {
                             CapOutcome::Advanced(seq) => last_seq = Some(max_seq(last_seq, seq)),
@@ -2502,8 +2620,17 @@ mod tests {
         let session = SessionId::from_bytes([1; 16]);
         let other = SessionId::from_bytes([2; 16]);
         let peer_map = Arc::new(PeerMap::new(PeerId::from_bytes([0; 32])));
+        let (events_tx, _events_rx) = mpsc::channel(EVENT_BUFFER);
 
-        let out = handle_cap_event(Event::Gap { session }, session, &peer_map, None, None).await;
+        let out = handle_cap_event(
+            Event::Gap { session },
+            session,
+            &peer_map,
+            None,
+            None,
+            &events_tx,
+        )
+        .await;
         assert!(matches!(out, CapOutcome::Gap));
 
         let out = handle_cap_event(
@@ -2512,6 +2639,7 @@ mod tests {
             &peer_map,
             None,
             None,
+            &events_tx,
         )
         .await;
         assert!(matches!(out, CapOutcome::Ignored));
@@ -2522,6 +2650,7 @@ mod tests {
             &peer_map,
             None,
             None,
+            &events_tx,
         )
         .await;
         assert!(matches!(out, CapOutcome::Ignored));

@@ -65,6 +65,19 @@ pub const SIGNATURE_UNSIGNED: SigBytes = [0u8; 64];
 /// and the FS layer's publisher/consumer must agree on this value.
 pub const UPGRADE_ACTION: &str = "workspace.upgrade";
 
+/// Action string for the FS-layer downgrade message that tells a peer
+/// it has been cooperatively demoted (RW → Read).
+///
+/// Mirrors [`UPGRADE_ACTION`]: the host delivers it host→peer over the
+/// direct stream (never gossip — `Capability` messages are host-private
+/// in v1), the joiner's daemon injects it as a synthetic System message,
+/// and the FS-layer `cap_listener` consumes it to halt the demoted
+/// node's own watcher (a *voluntary* write-stop — cooperative-threat
+/// only; the cryptographic write cut-off is namespace rotation on
+/// `Revoke`/Evict). Like `UPGRADE_ACTION` it is live-only and excluded
+/// from replay.
+pub const DOWNGRADE_ACTION: &str = "workspace.downgrade";
+
 /// Action string for the FS-layer workspace-ticket message
 /// (revoked-lurker fix).
 ///

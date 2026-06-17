@@ -42,8 +42,8 @@ pub use capability::{ACTION_GRANT, ACTION_REVOKE, Capability, CapabilityAction};
 pub use error::ProtocolError;
 pub use ids::{PeerId, Seq, SessionId, TicketId};
 pub use message::{
-    MESSAGE_FORMAT, MessageFormat, MessageKind, PeerInfo, SIGNATURE_UNSIGNED, SessionMessage,
-    SigBytes, TICKET_ACTION, UPGRADE_ACTION,
+    DOWNGRADE_ACTION, MESSAGE_FORMAT, MessageFormat, MessageKind, PeerInfo, SIGNATURE_UNSIGNED,
+    SessionMessage, SigBytes, TICKET_ACTION, UPGRADE_ACTION,
 };
 pub use rpc::{
     Attachment, Event, JoinTicket, Request, RequestId, Response, SendPayload, SessionSummary,
@@ -53,5 +53,7 @@ pub use ticket::{
     SessionTicket, TICKET_PREFIX, TICKET_VERSION, TicketEntry, TicketError, TicketStatus,
     WireEndpointAddr,
 };
-pub use upgrade::{DeliveryFrame, UPGRADE_ACK, UPGRADE_ALPN, UpgradeFrame, UpgradePayload};
+pub use upgrade::{
+    DeliveryFrame, DowngradePayload, UPGRADE_ACK, UPGRADE_ALPN, UpgradeFrame, UpgradePayload,
+};
 pub use version::{PROTOCOL_VERSION, ProtocolVersion, VersionMismatch};

@@ -75,6 +75,34 @@ pub enum DeliveryFrame {
         #[serde(with = "serde_bytes")]
         envelope_bytes: Vec<u8>,
     },
+    /// Cooperative downgrade (RW → Read) notification, host→peer at the
+    /// moment the host demotes the peer. Carries no key material — the
+    /// demoted peer keeps reading and (until it self-halts) keeps its
+    /// retained `NamespaceSecret`; this frame only *tells* it to stop
+    /// writing. The daemon couriers it opaquely (no namespace
+    /// knowledge — ADR-003) and injects a synthetic
+    /// [`crate::DOWNGRADE_ACTION`] System message. Append-only variant
+    /// index 2.
+    Downgrade {
+        /// Session the demotion applies to.
+        session_id: SessionId,
+    },
+}
+
+/// Payload of the synthetic `workspace.downgrade` system message the
+/// joiner daemon injects once it has received a [`DeliveryFrame::Downgrade`]
+/// over the direct stream.
+///
+/// Mirrors [`UpgradePayload`] but carries no secret: a demotion conveys
+/// no key, only *which* peer (the receiving daemon itself) must halt its
+/// watcher. Shared here so the daemon's injector and `artel-fs`'s
+/// `cap_listener` consumer can't drift on field order or type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DowngradePayload {
+    /// The peer being demoted — the receiving daemon's own `PeerId`,
+    /// stamped by the daemon at injection (mirrors
+    /// [`UpgradePayload::target_peer`]).
+    pub target_peer: PeerId,
 }
 
 /// `NamespaceSecret` payload of [`DeliveryFrame::Secret`].
@@ -181,6 +209,35 @@ mod tests {
             1,
             "WorkspaceTicket must stay at variant index 1",
         );
+
+        let downgrade = DeliveryFrame::Downgrade {
+            session_id: SessionId::from_bytes([1; 16]),
+        };
+        assert_eq!(
+            postcard::to_allocvec(&downgrade).unwrap()[0],
+            2,
+            "Downgrade must stay at variant index 2",
+        );
+    }
+
+    #[test]
+    fn delivery_frame_downgrade_round_trip() {
+        let frame = DeliveryFrame::Downgrade {
+            session_id: SessionId::from_bytes([0x7c; 16]),
+        };
+        let bytes = postcard::to_allocvec(&frame).unwrap();
+        let back: DeliveryFrame = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(frame, back);
+    }
+
+    #[test]
+    fn downgrade_payload_postcard_round_trip() {
+        let payload = DowngradePayload {
+            target_peer: PeerId::from_bytes([0x22; 32]),
+        };
+        let bytes = postcard::to_allocvec(&payload).unwrap();
+        let back: DowngradePayload = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(payload, back);
     }
 
     #[test]
@@ -199,8 +256,8 @@ mod tests {
 
     #[test]
     fn delivery_frame_unknown_variant_byte_rejected() {
-        // Variant index 2 doesn't exist; postcard must reject.
-        let result: Result<DeliveryFrame, _> = postcard::from_bytes(&[0x02, 0x00, 0x00]);
+        // Variant index 3 doesn't exist; postcard must reject.
+        let result: Result<DeliveryFrame, _> = postcard::from_bytes(&[0x03, 0x00, 0x00]);
         assert!(result.is_err());
     }
 

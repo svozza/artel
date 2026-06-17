@@ -309,6 +309,22 @@ pub enum Request {
         #[serde(with = "send_payload_bytes")]
         envelope_bytes: Vec<u8>,
     },
+
+    /// Deliver a cooperative-downgrade (RW → Read) notification to a
+    /// peer over the direct stream. Host-only; only the `Local` host of
+    /// the session may call this. Mirrors [`Self::DeliverUpgrade`] but
+    /// carries no key material — it only tells the peer to stop writing
+    /// (the demoted node halts its own watcher). The daemon opens a
+    /// stream on [`crate::upgrade::UPGRADE_ALPN`], sends a
+    /// [`crate::upgrade::DeliveryFrame::Downgrade`], and waits for an
+    /// ACK. Returns [`Response::DowngradeDelivered`] on success.
+    /// Append-only variant — keep last.
+    DeliverDowngrade {
+        /// Session the downgrade applies to.
+        session: SessionId,
+        /// Peer to notify of its demotion.
+        target_peer: PeerId,
+    },
 }
 
 /// Fields of a [`Request::Send`] that the client supplies.
@@ -499,6 +515,11 @@ pub enum Response {
     /// per-member unicast delivery is best-effort (offline members
     /// are covered by admission-redelivery on their re-announce).
     WorkspaceTicketPublished,
+
+    /// Reply to [`Request::DeliverDowngrade`]. Confirms the target peer
+    /// received and acknowledged the downgrade notification.
+    /// Append-only variant — keep last.
+    DowngradeDelivered,
 }
 
 /// One entry in [`Response::Attachments`].
