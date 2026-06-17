@@ -63,6 +63,16 @@ pub(crate) struct WorkspaceNode {
     /// This node's `EndpointId`, captured before the router takes
     /// ownership.
     pub endpoint_id: EndpointId,
+    /// The iroh-docs author this node stamps on its writes, **seeded
+    /// from the same bytes as the endpoint key** so `AuthorId` ==
+    /// `endpoint_id`. This binds every doc entry's author to the peer
+    /// whose capability the session tracks (the `peer_map` resolves
+    /// `entry.author` → daemon `PeerId` for free), without an
+    /// announcement. Replaces iroh-docs' random `author_default()`.
+    /// See ADR-002 / CONTEXT.md "Author binding". The key reuse is safe:
+    /// a TLS `CertificateVerify` payload can never collide with an
+    /// iroh-docs `entry.to_vec()` (distinct fixed prefixes).
+    pub author: iroh_docs::AuthorId,
     /// Holding the router keeps the accept loop alive. Calling
     /// [`Router::shutdown`] on it during teardown closes the
     /// endpoint for us.
@@ -103,6 +113,10 @@ impl WorkspaceNode {
     ) -> Result<Self, WorkspaceError> {
         let secret = load_or_create_secret(&state_dir.join("iroh.key"))
             .map_err(|e| WorkspaceError::Iroh(format!("workspace key: {e}")))?;
+        // Capture the raw key bytes before `secret` moves into the
+        // endpoint builder — they seed the doc author below so
+        // `AuthorId` == `endpoint_id` (same-seed author binding).
+        let secret_bytes = secret.to_bytes();
 
         // Start from `presets::Empty` (no defaults set) and let the
         // `EndpointSetup::apply` chain layer the discovery preset of
@@ -148,6 +162,27 @@ impl WorkspaceNode {
             .map_err(|e| WorkspaceError::Iroh(format!("spawn docs: {e}")))?;
 
         let endpoint_id = endpoint.id();
+
+        // Same-seed author binding: import an author keyed by the
+        // endpoint's own secret bytes and make it the default, so every
+        // write this node stamps carries `AuthorId == endpoint_id`. The
+        // `peer_map` already maps `endpoint_id → daemon PeerId`, so this
+        // binds doc-entry authorship to the capability-tracked peer with
+        // no announcement. Replaces the random `author_default()`.
+        let author = iroh_docs::Author::from_bytes(&secret_bytes);
+        let author_id = author.id();
+        docs.author_import(author)
+            .await
+            .map_err(|e| WorkspaceError::Doc(format!("author_import: {e}")))?;
+        docs.author_set_default(author_id)
+            .await
+            .map_err(|e| WorkspaceError::Doc(format!("author_set_default: {e}")))?;
+        debug_assert_eq!(
+            author_id.as_bytes(),
+            endpoint_id.as_bytes(),
+            "same-seed author must equal endpoint id",
+        );
+
         let router = Router::builder(endpoint.clone())
             .accept(iroh_gossip::ALPN, gossip)
             .accept(iroh_blobs::ALPN, blobs.clone())
@@ -183,6 +218,7 @@ impl WorkspaceNode {
             blobs,
             peer_map,
             endpoint_id,
+            author: author_id,
             router,
             #[cfg(feature = "test-utils")]
             shutdown_failure_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

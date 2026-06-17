@@ -632,13 +632,9 @@ impl Workspace {
         // map so the gate never accidentally blocks the host itself.
         peer_map.register(node.endpoint_id, daemon_peer_id);
 
-        // Persistent docs store; default-author is managed by
-        // iroh-docs at `state_dir/docs/default-author`.
-        let author = node
-            .docs
-            .author_default()
-            .await
-            .map_err(|e| WorkspaceError::Doc(format!("author_default: {e}")))?;
+        // Same-seed author: bound to this node's endpoint key by
+        // `WorkspaceNode::spawn`, so `AuthorId == endpoint_id`.
+        let author = node.author;
 
         let doc_id_path = state_dir.join(DOC_ID_FILE);
         let (doc, returning) = open_or_create_doc(node, &doc_id_path).await?;
@@ -959,13 +955,10 @@ impl Workspace {
         let node = rb.node.as_ref().expect("just stored");
         // Joiners don't persist a per-workspace `doc-id` — they
         // import the host's namespace from the ticket each time.
-        // The default author is still useful for stamping our own
-        // writes once live sync starts.
-        let author = node
-            .docs
-            .author_default()
-            .await
-            .map_err(|e| WorkspaceError::Doc(format!("author_default: {e}")))?;
+        // Same-seed author (bound to the endpoint key in
+        // `WorkspaceNode::spawn`) stamps our own writes once live sync
+        // starts, so `AuthorId == endpoint_id`.
+        let author = node.author;
 
         let (doc, live) = node
             .docs
@@ -1289,6 +1282,18 @@ impl Workspace {
             .ok_or(())?;
         flag.store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(())
+    }
+
+    /// This workspace node's `EndpointId` bytes, for tests asserting the
+    /// same-seed author binding (`AuthorId == endpoint_id`). Returns
+    /// `None` if the node has already been torn down.
+    #[cfg(feature = "test-utils")]
+    pub async fn test_endpoint_id_bytes(&self) -> Option<[u8; 32]> {
+        self.node
+            .lock()
+            .await
+            .as_ref()
+            .map(|node| *node.endpoint_id.as_bytes())
     }
 }
 

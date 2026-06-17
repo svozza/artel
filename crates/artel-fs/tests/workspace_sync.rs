@@ -238,6 +238,60 @@ async fn wait_for_doc_entry(ws: &Workspace, path: &Path, budget: Duration) -> bo
     false
 }
 
+// =============================================================
+// Same-seed author binding (Slice 1): the workspace's doc author is
+// seeded from its endpoint key, so AuthorId == endpoint_id and every
+// authored entry carries that id. This is what lets the host resolve
+// entry.author → daemon PeerId via the peer_map (no announcement).
+// =============================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn author_id_equals_endpoint_id_and_stamps_entries() {
+    let (daemon, _client, ws, handle, _events, dir, _dns_pkarr) =
+        spawn_host_workspace_for_empty_test().await;
+
+    // (1) The author the workspace stamps equals its endpoint id.
+    let endpoint_id = ws
+        .test_endpoint_id_bytes()
+        .await
+        .expect("node live: endpoint id available");
+    assert_eq!(
+        ws.author().as_bytes(),
+        &endpoint_id,
+        "same-seed binding: AuthorId must equal endpoint_id",
+    );
+
+    // (2) A real authored entry carries that same author — proving the
+    // binding holds on the write path, not just at construction.
+    let file = dir.path().join("authored.txt");
+    tokio::fs::write(&file, b"by me").await.unwrap();
+    assert!(
+        wait_for_doc_entry(&ws, &file, WAIT_BUDGET).await,
+        "authored entry never landed in the doc",
+    );
+    let key = path_to_key(ws.root.as_path(), &file).expect("path_to_key");
+    let stream = ws
+        .doc()
+        .get_many(Query::key_exact(key))
+        .await
+        .expect("get_many");
+    tokio::pin!(stream);
+    let entry = stream
+        .next()
+        .await
+        .expect("entry present")
+        .expect("entry ok");
+    assert_eq!(
+        entry.author().as_bytes(),
+        &endpoint_id,
+        "authored entry's author must be the same-seed endpoint id",
+    );
+
+    ws.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), handle).await;
+    daemon.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn touching_empty_file_does_not_error_and_does_not_publish() {
     let (daemon, client, ws, handle, events, dir, _dns_pkarr) =
