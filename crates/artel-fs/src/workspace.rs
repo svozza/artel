@@ -104,10 +104,24 @@ const CAP_RECONNECT_MAX_ATTEMPTS: u32 = 16;
 /// tries to publish iroh's own redb / blob files into the doc.
 pub const DEFAULT_STATE_SUBDIR: &str = ".artel-fs";
 
-/// File inside `state_dir` that stores the host's persisted
-/// `NamespaceId`. 32 raw bytes — namespaces aren't secret so no
-/// special permissions are required.
+/// File inside `state_dir` that stores the host's **genesis**
+/// `NamespaceId` — the namespace the session was *born* with. 32 raw
+/// bytes; namespaces aren't secret so no special permissions are
+/// required. **Write-once: never rewritten on namespace rotation.**
+/// It is the stable root the `SessionId` derivation reads, so a
+/// rotation changes the document holding content (see
+/// [`CURRENT_NAMESPACE_FILE`]) without changing the session id, gossip
+/// topic, or any issued ticket. See CONTEXT.md "Genesis namespace".
 const DOC_ID_FILE: &str = "doc-id";
+
+/// File inside `state_dir` that stores the host's **current**
+/// `NamespaceId` — the document the workspace is *currently* writing
+/// to. 32 raw bytes. Absent until the first rotation, in which case the
+/// current namespace *is* the genesis ([`DOC_ID_FILE`]); written (and
+/// rewritten) on each rotation. Decoupled from `DOC_ID_FILE` so the
+/// `SessionId` derivation stays pinned to genesis. See CONTEXT.md
+/// "Current namespace".
+const CURRENT_NAMESPACE_FILE: &str = "current-namespace";
 
 /// How a [`Workspace::host`] / [`Workspace::join`] call may attach
 /// to its workspace root.
@@ -637,22 +651,28 @@ impl Workspace {
         let author = node.author;
 
         let doc_id_path = state_dir.join(DOC_ID_FILE);
-        let (doc, returning) = open_or_create_doc(node, &doc_id_path).await?;
+        let current_ns_path = state_dir.join(CURRENT_NAMESPACE_FILE);
+        let OpenedDoc {
+            doc,
+            genesis,
+            returning,
+        } = open_or_create_doc(node, &doc_id_path, &current_ns_path).await?;
         doc.start_sync(vec![])
             .await
             .map_err(|e| WorkspaceError::Doc(format!("start_sync: {e}")))?;
         debug!(
             target: "artel_fs::workspace",
             namespace = %doc.id(),
+            %genesis,
             returning,
             "host_with: doc opened + sync registered"
         );
 
-        // Derive the session id from the persisted NamespaceId
-        // *before* registering with the daemon. First host and every
-        // subsequent restart land on the same id — that's what
-        // gives us resume across daemon restarts.
-        let session_id = crate::session_id::session_id_for(doc.id());
+        // Derive the session id from the **genesis** NamespaceId
+        // *before* registering with the daemon. Genesis is write-once,
+        // so the session id is stable across both daemon restarts and
+        // (future) namespace rotations — that's what gives us resume.
+        let session_id = crate::session_id::session_id_for(genesis);
 
         // Register with the daemon. `Some(session_id)` either creates
         // the session at this id (first host) or resumes the existing
@@ -1963,70 +1983,111 @@ fn ensure_state_dir(state_dir: &Path) -> Result<(), WorkspaceError> {
         .map_err(|e| WorkspaceError::Iroh(format!("create state_dir {}: {e}", state_dir.display())))
 }
 
-/// Open the host's persisted doc, or create a fresh one and stamp
-/// `doc_id_path` with its `NamespaceId`. Returns the doc plus a
-/// flag: `true` means we opened an existing doc (the caller must
-/// reconcile it against disk), `false` means we created a fresh
-/// one (no reconcile needed).
-async fn open_or_create_doc(
-    node: &WorkspaceNode,
-    doc_id_path: &Path,
-) -> Result<(Doc, bool), WorkspaceError> {
-    match std::fs::read(doc_id_path) {
+/// What [`open_or_create_doc`] resolved for a host workspace.
+struct OpenedDoc {
+    /// The doc handle for the **current** namespace (the one the
+    /// workspace writes to and syncs).
+    doc: Doc,
+    /// The **genesis** `NamespaceId` (`doc-id`), the stable root the
+    /// `SessionId` derivation reads. Equals `doc.id()` until a rotation
+    /// has happened.
+    genesis: NamespaceId,
+    /// `true` if we opened an existing doc (caller must reconcile
+    /// against disk); `false` if we created a fresh one.
+    returning: bool,
+}
+
+/// Read a 32-byte `NamespaceId` from a state-dir file. `Ok(None)` if
+/// the file is absent; `Err` if present-but-corrupt or unreadable.
+fn read_namespace_file(path: &Path) -> Result<Option<NamespaceId>, WorkspaceError> {
+    match std::fs::read(path) {
         Ok(bytes) => {
             let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
                 WorkspaceError::Doc(format!(
-                    "doc-id at {} is corrupt: expected 32 bytes, got {}",
-                    doc_id_path.display(),
+                    "namespace file at {} is corrupt: expected 32 bytes, got {}",
+                    path.display(),
                     bytes.len(),
                 ))
             })?;
-            let id = NamespaceId::from(&arr);
-            // `Docs::open` returns "Replica not found" if the redb
-            // commit for the namespace hasn't durably landed yet —
-            // `iroh-docs` batches writes with a 500 ms delay, so a
-            // crash between `Docs::create` returning and the commit
-            // firing can leave a `doc-id` pointing at a namespace
-            // that doesn't exist on disk. Self-heal by recreating;
-            // joiners with the prior ticket lose the ability to
-            // resume, which is acceptable since they wouldn't have
-            // synced anything pre-crash anyway.
-            if let Ok(Some(doc)) = node.docs.open(id).await {
-                Ok((doc, true))
-            } else {
-                tracing::warn!(
-                    ?id,
-                    "stale doc-id at {}: namespace not in store, recreating",
-                    doc_id_path.display(),
-                );
-                create_and_persist(node, doc_id_path).await
-            }
+            Ok(Some(NamespaceId::from(&arr)))
         }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            create_and_persist(node, doc_id_path).await
-        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(WorkspaceError::Doc(format!(
-            "read doc-id at {}: {err}",
-            doc_id_path.display(),
+            "read namespace file at {}: {err}",
+            path.display(),
         ))),
     }
 }
 
-/// Create a fresh namespace and persist its id.
+/// Open the host's persisted doc, or create a fresh one.
+///
+/// Identity decoupling (Slice 2): `doc-id` holds the **genesis**
+/// namespace (write-once, drives `SessionId`); `current-namespace`
+/// holds the namespace actually opened/synced (absent ⇒ equals
+/// genesis). Until rotation exists they are always equal; the split is
+/// what lets a later rotation change the current namespace without
+/// disturbing the session id.
+async fn open_or_create_doc(
+    node: &WorkspaceNode,
+    doc_id_path: &Path,
+    current_ns_path: &Path,
+) -> Result<OpenedDoc, WorkspaceError> {
+    let Some(genesis) = read_namespace_file(doc_id_path)? else {
+        // No genesis yet ⇒ first host. Create a fresh namespace; it is
+        // both genesis and current.
+        return create_and_persist(node, doc_id_path).await;
+    };
+
+    // The namespace to actually open is the current one if recorded,
+    // else the genesis.
+    let current = read_namespace_file(current_ns_path)?.unwrap_or(genesis);
+
+    // `Docs::open` returns "Replica not found" if the redb commit for
+    // the namespace hasn't durably landed yet — `iroh-docs` batches
+    // writes with a 500 ms delay, so a crash between `Docs::create`
+    // returning and the commit firing can leave a recorded id pointing
+    // at a namespace that doesn't exist on disk. Self-heal by
+    // recreating; joiners with the prior ticket lose the ability to
+    // resume, which is acceptable since they wouldn't have synced
+    // anything pre-crash anyway.
+    if let Ok(Some(doc)) = node.docs.open(current).await {
+        Ok(OpenedDoc {
+            doc,
+            genesis,
+            returning: true,
+        })
+    } else {
+        tracing::warn!(
+            ?current,
+            "stale namespace at {}: not in store, recreating",
+            current_ns_path.display(),
+        );
+        create_and_persist(node, doc_id_path).await
+    }
+}
+
+/// Create a fresh namespace and persist its id as the genesis. The
+/// fresh namespace is both genesis and current, so no
+/// `current-namespace` file is written (absent ⇒ equals genesis).
 async fn create_and_persist(
     node: &WorkspaceNode,
     doc_id_path: &Path,
-) -> Result<(Doc, bool), WorkspaceError> {
+) -> Result<OpenedDoc, WorkspaceError> {
     let doc = node
         .docs
         .create()
         .await
         .map_err(|e| WorkspaceError::Doc(format!("doc create: {e}")))?;
+    let genesis = doc.id();
     // No chmod — namespace ids aren't secret.
-    crate::keystore::write_atomic(doc_id_path, &doc.id().to_bytes(), None).map_err(|e| {
+    crate::keystore::write_atomic(doc_id_path, &genesis.to_bytes(), None).map_err(|e| {
         WorkspaceError::Doc(format!("persist doc-id at {}: {e}", doc_id_path.display()))
     })?;
-    Ok((doc, false))
+    Ok(OpenedDoc {
+        doc,
+        genesis,
+        returning: false,
+    })
 }
 
 /// Walk the doc and tombstone any entry whose key maps to a path

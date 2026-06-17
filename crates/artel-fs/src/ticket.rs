@@ -25,8 +25,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::rules::PathRules;
 
-/// Current envelope version.
-const ENVELOPE_VERSION: u8 = 1;
+/// Current envelope version. Bumped 1→2 when `namespace_epoch` was
+/// added (identity-decoupling Slice 2). Alpha: old shapes are
+/// hard-rejected, no migration.
+const ENVELOPE_VERSION: u8 = 2;
 
 /// Versioned envelope shipped as the `workspace.ticket` payload.
 ///
@@ -44,16 +46,33 @@ pub struct WorkspaceTicketEnvelope {
     pub doc_ticket: String,
     /// Host-bound rules. Validated at encode-time and decode-time.
     pub rules: PathRules,
+    /// Monotonic namespace-rotation counter (identity-decoupling Slice
+    /// 2). `0` at genesis; bumped on each rotation so a joiner that
+    /// holds an envelope at a lower epoch knows it is on a stale
+    /// namespace and must re-import the current one. Opaque to the
+    /// daemon (it persists/forwards the envelope bytes without
+    /// decoding) — see ADR-003.
+    pub namespace_epoch: u64,
 }
 
 impl WorkspaceTicketEnvelope {
-    /// Build a v1 envelope around `doc_ticket` and `rules`.
+    /// Build a genesis (epoch 0) envelope around `doc_ticket` and
+    /// `rules`.
     #[must_use]
     pub const fn new(doc_ticket: String, rules: PathRules) -> Self {
+        Self::at_epoch(doc_ticket, rules, 0)
+    }
+
+    /// Build an envelope at an explicit `namespace_epoch` (used by
+    /// rotation to mark survivors' envelopes as belonging to the new
+    /// namespace).
+    #[must_use]
+    pub const fn at_epoch(doc_ticket: String, rules: PathRules, namespace_epoch: u64) -> Self {
         Self {
             version: ENVELOPE_VERSION,
             doc_ticket,
             rules,
+            namespace_epoch,
         }
     }
 }
@@ -173,6 +192,21 @@ mod tests {
         let bytes = encode(&env).unwrap();
         let back = decode(&bytes).unwrap();
         assert_eq!(env, back);
+    }
+
+    #[test]
+    fn envelope_new_defaults_to_genesis_epoch() {
+        let env = WorkspaceTicketEnvelope::new("docticket".into(), rules_empty());
+        assert_eq!(env.namespace_epoch, 0, "new() must be genesis epoch 0");
+    }
+
+    #[test]
+    fn envelope_round_trips_at_nonzero_epoch() {
+        let env = WorkspaceTicketEnvelope::at_epoch("docticket".into(), rules_dozen(), 7);
+        let bytes = encode(&env).unwrap();
+        let back = decode(&bytes).unwrap();
+        assert_eq!(env, back);
+        assert_eq!(back.namespace_epoch, 7);
     }
 
     #[test]

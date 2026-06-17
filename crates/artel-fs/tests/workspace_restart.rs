@@ -212,6 +212,15 @@ async fn workspace_state_survives_graceful_restart() {
         alice_wstate.path().join("doc-id").exists(),
         "alice doc-id should persist"
     );
+    // Identity decoupling (Slice 2): with no rotation yet, the current
+    // namespace IS the genesis, so no `current-namespace` file is
+    // written (absent ⇒ equals genesis). A spuriously-written file
+    // here would mean the decoupling logic diverged genesis from
+    // current without a rotation.
+    assert!(
+        !alice_wstate.path().join("current-namespace").exists(),
+        "no rotation yet ⇒ current-namespace must be absent (equals genesis)",
+    );
     assert!(
         bob_wstate.path().join("iroh.key").exists(),
         "bob iroh.key should persist"
