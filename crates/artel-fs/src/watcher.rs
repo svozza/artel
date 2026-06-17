@@ -275,7 +275,7 @@ async fn on_modified(
     let len = bytes.len();
     debug!(target: "artel_fs::watcher", path = %path.display(), len, "publishing via set_bytes");
     match workspace
-        .doc
+        .doc()
         .set_bytes(workspace.author, key, bytes.clone())
         .await
     {
@@ -353,7 +353,7 @@ async fn on_removed(workspace: &Arc<Workspace>, path: PathBuf) {
     let Some(key) = path_to_key_or_emit(&workspace.root, &path, &workspace.events) else {
         return;
     };
-    match workspace.doc.del(workspace.author, key).await {
+    match workspace.doc().del(workspace.author, key).await {
         Ok(removed) => {
             debug!(target: "artel_fs::watcher", path = %path.display(), removed, "doc.del ok");
         }

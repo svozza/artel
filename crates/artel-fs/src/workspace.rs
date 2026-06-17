@@ -418,9 +418,13 @@ pub(crate) fn emit_event(events: &mpsc::Sender<WorkspaceEvent>, ev: WorkspaceEve
 pub struct Workspace {
     /// Absolute path of the directory being mirrored.
     pub root: PathBuf,
-    /// Doc handle. The watcher writes to it; the applier reads from
-    /// `doc.subscribe()`. Borrowed via [`Self::doc`].
-    pub(crate) doc: Doc,
+    /// Doc handle for the **current** namespace. The watcher writes to
+    /// it; the applier reads from `doc.subscribe()`. Cloned via
+    /// [`Self::doc`]. Behind a `Mutex` so namespace rotation (Slice 3d
+    /// re-import) can swap in the new namespace's handle while the
+    /// consumer's `Arc<Workspace>` stays stable; `Doc` is a cheap
+    /// `Clone` handle, so readers clone it out and drop the lock.
+    pub(crate) doc: std::sync::Mutex<Doc>,
     /// Author id used to stamp our writes. Borrowed via
     /// [`Self::author`]. Exposed so integration tests can inject
     /// `InsertRemote`-shaped events that bypass the watcher's rule
@@ -830,7 +834,7 @@ impl Workspace {
         Ok((
             Self {
                 root,
-                doc,
+                doc: std::sync::Mutex::new(doc),
                 author,
                 blobs,
                 echo_guard,
@@ -1097,7 +1101,7 @@ impl Workspace {
         Ok((
             Self {
                 root,
-                doc,
+                doc: std::sync::Mutex::new(doc),
                 author,
                 blobs,
                 echo_guard,
@@ -1148,14 +1152,16 @@ impl Workspace {
         self.join_ticket.as_ref()
     }
 
-    /// Borrow the underlying `iroh-docs` document.
+    /// A clone of the current `iroh-docs` document handle.
     ///
     /// Exposed for diagnostics and tests — the watcher / applier
     /// drive it internally. Apps shouldn't normally need to write
-    /// to it directly; use the filesystem path instead.
+    /// to it directly; use the filesystem path instead. `Doc` is a
+    /// cheap `Clone` handle; callers get a snapshot of the *current*
+    /// namespace (rotation may swap the underlying handle).
     #[must_use]
-    pub const fn doc(&self) -> &Doc {
-        &self.doc
+    pub fn doc(&self) -> Doc {
+        self.doc.lock().expect("doc mutex").clone()
     }
 
     /// Borrow the workspace's [`PathRules`] in wire form.
@@ -1228,7 +1234,7 @@ impl Workspace {
 
         // Snapshot the current doc: latest entry per key, tombstones
         // included (a delete must carry forward as a delete).
-        let old_doc = &self.doc;
+        let old_doc = self.doc();
         let stream = old_doc
             .get_many(Query::single_latest_per_key().include_empty())
             .await
@@ -1324,6 +1330,95 @@ impl Workspace {
             survivor_entries: survivors.len(),
             dropped_entries: dropped,
         })
+    }
+
+    /// Re-import the workspace onto a rotated namespace (Slice 3d — the
+    /// survivor side of rotation).
+    ///
+    /// Imports `new_secret` as a Write capability, persists it as the
+    /// current namespace, swaps the live doc handle, then **resets the
+    /// doc-scoped token** — cancelling the watcher/applier bound to the
+    /// old namespace — and respawns them against the new one. The
+    /// cap-listener (on a *separate* `shutdown_token` child) is left
+    /// running, so the signal channel that drove this re-import stays
+    /// alive (Slice 3a token split).
+    ///
+    /// Blobs are namespace-agnostic and already local, so nothing
+    /// re-downloads; the new doc reconciles only the `path → hash`
+    /// entry set. Idempotent-ish: importing a secret already present is
+    /// a no-op at the docs layer.
+    ///
+    /// Takes `Arc<Self>` because it respawns the background tasks, which
+    /// capture the workspace.
+    #[allow(clippy::significant_drop_tightening)]
+    pub(crate) async fn reimport_namespace(
+        self: &Arc<Self>,
+        new_secret: [u8; 32],
+        new_namespace: NamespaceId,
+    ) -> Result<(), WorkspaceError> {
+        // Import the new namespace as Write and open its doc handle.
+        let new_doc = {
+            let guard = self.node.lock().await;
+            let node = guard
+                .as_ref()
+                .ok_or_else(|| WorkspaceError::Doc("reimport: node torn down".into()))?;
+            let secret = iroh_docs::NamespaceSecret::from_bytes(&new_secret);
+            let cap = iroh_docs::Capability::Write(secret);
+            node.docs
+                .import_namespace(cap)
+                .await
+                .map_err(|e| WorkspaceError::Doc(format!("reimport import_namespace: {e}")))?;
+            node.docs
+                .open(new_namespace)
+                .await
+                .map_err(|e| WorkspaceError::Doc(format!("reimport open: {e}")))?
+                .ok_or_else(|| {
+                    WorkspaceError::Doc("reimport: namespace absent after import".into())
+                })?
+        };
+        new_doc
+            .start_sync(vec![])
+            .await
+            .map_err(|e| WorkspaceError::Doc(format!("reimport start_sync: {e}")))?;
+
+        // Persist the new current namespace (genesis/doc-id untouched).
+        let current_ns_path = self.state_dir.join(CURRENT_NAMESPACE_FILE);
+        crate::keystore::write_atomic(&current_ns_path, &new_namespace.to_bytes(), None).map_err(
+            |e| {
+                WorkspaceError::Doc(format!(
+                    "reimport: persist current-namespace at {}: {e}",
+                    current_ns_path.display(),
+                ))
+            },
+        )?;
+
+        // Swap the live doc handle, then reset the doc token to tear
+        // down the old watcher/applier. Order: install the new doc
+        // BEFORE cancelling, so respawned tasks (which clone via
+        // `doc()`) pick up the new namespace.
+        {
+            let mut doc_slot = self.doc.lock().expect("doc mutex");
+            *doc_slot = new_doc;
+        }
+        {
+            let mut tok = self.doc_token.lock().expect("doc_token mutex");
+            tok.cancel(); // stop the old watcher/applier
+            *tok = self.shutdown_token.child_token();
+        }
+
+        // Respawn watcher + applier against the new namespace. They
+        // select on the fresh doc token (via `doc_token()`) and clone
+        // the swapped doc. The returned JoinHandle is owned by the
+        // spawned tasks' own lifetime; we don't await it here (it only
+        // completes at shutdown).
+        drop(Arc::clone(self).run().await);
+
+        debug!(
+            target: "artel_fs::workspace",
+            %new_namespace,
+            "reimport_namespace: swapped onto rotated namespace",
+        );
+        Ok(())
     }
 
     /// The [`AuthorId`] this workspace stamps on its outgoing writes.
@@ -1508,6 +1603,31 @@ impl Workspace {
                 )
             })
             .map_err(|e| e.to_string())
+    }
+
+    /// Rotate, then re-import this same workspace onto the rotated
+    /// namespace (host self-rotation). Returns the new `NamespaceId`
+    /// bytes. For tests exercising the rotate→reimport round-trip
+    /// without the full host→survivor distribution wiring (Slice 3e).
+    #[cfg(feature = "test-utils")]
+    pub async fn test_rotate_and_reimport(
+        self: &Arc<Self>,
+        prev_epoch: u64,
+    ) -> Result<[u8; 32], String> {
+        let outcome = self
+            .rotate_namespace(prev_epoch)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.reimport_namespace(outcome.new_secret, outcome.new_namespace)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(outcome.new_namespace.to_bytes())
+    }
+
+    /// The `NamespaceId` bytes of the workspace's **current** doc.
+    #[cfg(feature = "test-utils")]
+    pub fn test_current_namespace_bytes(&self) -> [u8; 32] {
+        self.doc().id().to_bytes()
     }
 
     /// The set of file keys (UTF-8 lossy) at the latest entry per key

@@ -595,7 +595,7 @@ async fn watcher_blocks_outgoing_read_only_write() {
     )
     .expect("path_to_key");
     assert!(
-        !doc_has_key(alice_ws.doc(), &secret_key).await,
+        !doc_has_key(&alice_ws.doc(), &secret_key).await,
         "alice's watcher regression: secret/key.txt landed in the doc",
     );
 
@@ -720,7 +720,7 @@ async fn scan_blocks_outgoing_read_only_preexisting_file() {
     )
     .expect("path_to_key");
     assert!(
-        !doc_has_key(alice_ws.doc(), &secret_key).await,
+        !doc_has_key(&alice_ws.doc(), &secret_key).await,
         "alice's scan regression: secret/key.txt landed in the doc",
     );
 
@@ -824,7 +824,7 @@ async fn post_join_live_write_to_read_only_zone_is_blocked() {
     let locked_key = path_to_key(alice_ws.root.as_path(), &alice_ws.root.join("locked/x.txt"))
         .expect("path_to_key");
     assert!(
-        !doc_has_key(alice_ws.doc(), &locked_key).await,
+        !doc_has_key(&alice_ws.doc(), &locked_key).await,
         "alice's post-join watcher regression: locked/x.txt landed in the doc",
     );
 

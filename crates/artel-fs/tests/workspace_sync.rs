@@ -292,6 +292,75 @@ async fn author_id_equals_endpoint_id_and_stamps_entries() {
     daemon.stop().await;
 }
 
+// =============================================================
+// Namespace re-import (Slice 3d): after rotation, re-importing onto the
+// new namespace swaps the live doc, respawns the watcher/applier
+// against it, and keeps the workspace operational — a write made AFTER
+// re-import lands in the NEW namespace, and the genesis-derived
+// SessionId is unchanged.
+// =============================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reimport_swaps_namespace_and_keeps_workspace_live() {
+    let (daemon, _client, ws, handle, _events, dir, _dns_pkarr) =
+        spawn_host_workspace_for_empty_test().await;
+
+    let session_before = ws.session_id();
+
+    // Seed a file and wait for it into the doc.
+    tokio::fs::write(dir.path().join("kept.txt"), b"keep me")
+        .await
+        .unwrap();
+    assert!(
+        wait_for_doc_entry(&ws, &dir.path().join("kept.txt"), WAIT_BUDGET).await,
+        "seed file never landed pre-rotation",
+    );
+
+    let ns_before = ws.test_current_namespace_bytes();
+
+    // Rotate + re-import onto the new namespace (host self-rotation).
+    let ns_after = ws
+        .test_rotate_and_reimport(0)
+        .await
+        .expect("rotate_and_reimport");
+
+    assert_ne!(
+        ns_before, ns_after,
+        "current namespace must change after rotation",
+    );
+    assert_eq!(
+        ws.test_current_namespace_bytes(),
+        ns_after,
+        "live doc must now be the rotated namespace",
+    );
+    // SessionId is genesis-derived, so it must be unchanged by rotation.
+    assert_eq!(
+        ws.session_id(),
+        session_before,
+        "SessionId must be stable across rotation (genesis-derived)",
+    );
+
+    // The respawned watcher must be live on the new namespace: a write
+    // made AFTER re-import lands in the new doc.
+    tokio::fs::write(dir.path().join("post_rotate.txt"), b"after")
+        .await
+        .unwrap();
+    assert!(
+        wait_for_doc_entry(&ws, &dir.path().join("post_rotate.txt"), WAIT_BUDGET).await,
+        "post-rotation write never landed — respawned watcher not live on new namespace",
+    );
+    // And the carried-forward entry is present in the new namespace.
+    let keys = ws.test_namespace_keys(ns_after).await;
+    assert!(
+        keys.iter().any(|k| k.ends_with("kept.txt")),
+        "rotated namespace must carry forward kept.txt; keys={keys:?}",
+    );
+
+    ws.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), handle).await;
+    daemon.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn touching_empty_file_does_not_error_and_does_not_publish() {
     let (daemon, client, ws, handle, events, dir, _dns_pkarr) =

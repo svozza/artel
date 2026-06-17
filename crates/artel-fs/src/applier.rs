@@ -46,7 +46,11 @@ use crate::{EchoGuard, keys};
 ///
 /// [`Workspace::run`]: crate::workspace::Workspace::run
 pub(crate) async fn run(workspace: Arc<Workspace>, ready: oneshot::Sender<()>) {
-    let mut events = match workspace.doc.subscribe().await {
+    // Snapshot the current doc handle once for this task's lifetime. On
+    // namespace rotation the task is cancelled (doc_token) and respawned
+    // by re-import, picking up the new handle here.
+    let doc = workspace.doc();
+    let mut events = match doc.subscribe().await {
         Ok(s) => s,
         Err(err) => {
             warn!(target: "artel_fs::applier", %err, "doc.subscribe failed");
@@ -243,7 +247,7 @@ async fn handle_content_ready(
     // filter or write work. Keep that ordering invariant if this
     // function ever grows a fast-path: `Mode::ReadOnly` must be
     // honoured *before* the disk write.
-    let stream = match workspace.doc.get_many(Query::all()).await {
+    let stream = match workspace.doc().get_many(Query::all()).await {
         Ok(s) => s,
         Err(err) => {
             warn!(target: "artel_fs::applier", %hash, %err, "get_many failed in ContentReady handler");
