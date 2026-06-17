@@ -36,12 +36,13 @@ use crate::store::{DynStore, SessionKind, SessionRecord, StoredAttachment};
 /// We deliberately do not back-pressure publishers because of one slow
 /// subscriber. A subscriber that lags more than this many events past
 /// the head loses the oldest ones; the daemon's subscription forwarder
-/// detects the `Lagged` and **closes that client's connection** (M3),
-/// so the loss is loud — the client observes EOF and must reconnect and
-/// re-`Subscribe` (from its last-known seq, once it tracks one) rather
-/// than silently continuing on a desynced stream. A finer-grained
-/// in-band gap signal that avoids the reconnect is a planned follow-up;
-/// see `docs/handoff-m3-subscriber-lag-recovery.md`.
+/// detects the `Lagged` and makes the loss **loud** by sending an
+/// in-band `Event::Gap { session }` on that subscriber's stream (M3
+/// Part B), keeping the connection open. The client recovers by
+/// re-`Subscribe`ing from its last-seen seq, which replays every logged
+/// message past the gap, rather than silently continuing on a desynced
+/// stream. If the Gap send itself fails the forwarder falls back to
+/// closing the connection (the client then sees EOF and reconnects).
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
 /// How many times the spawned workspace-ticket delivery retries a

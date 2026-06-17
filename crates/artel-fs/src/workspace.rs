@@ -984,44 +984,30 @@ impl Workspace {
 
         bulk_export(&root, &doc, &node.blobs, &compiled_rules, &echo_guard, &tx).await?;
 
-        // Spawn the cap-listener. On the joiner path, the existing
-        // event stream (from wait_for_ticket) is still subscribed —
-        // reuse it. If a daemon_socket is configured, prefer a
-        // dedicated connection so the caller can reuse their client.
-        //
-        // Either way the listener can recover from a lag-induced
-        // teardown (M3): with a configured socket it reconnects there;
-        // when reusing the caller's stream it reconnects on the
-        // caller's own socket (`client.socket_path()`), opening a fresh
-        // second connection rather than disturbing the caller's.
+        // Spawn the cap-listener on its own dedicated connection so it
+        // owns the `Client` it drains — required for M3 recovery, which
+        // both reconnects on EOF and re-`Subscribe`s in-band on a gap.
+        // Prefer an explicitly-configured `daemon_socket`; otherwise
+        // dial the same socket the caller's client is on
+        // (`client.socket_path()`). The caller's own event stream
+        // (consumed by `wait_for_ticket` above) is dropped — we never
+        // reuse it for the listener.
         let shutdown_token = CancellationToken::new();
         let joiner_ctx = Some(JoinerUpgradeCtx {
             my_peer_id: client.daemon_peer_id(),
             docs: node.docs.clone(),
         });
-        let cap_listener = if join_daemon_socket.is_some() {
-            spawn_cap_listener_from_socket(
-                join_daemon_socket,
-                session,
-                Arc::clone(&peer_map),
-                shutdown_token.child_token(),
-                None,
-                joiner_ctx,
-                tx.clone(),
-            )
-            .await?
-        } else {
-            spawn_cap_listener(
-                events,
-                session,
-                Arc::clone(&peer_map),
-                shutdown_token.child_token(),
-                None,
-                joiner_ctx,
-                client.socket_path().to_path_buf(),
-                tx.clone(),
-            )
-        };
+        let listener_socket = join_daemon_socket.unwrap_or_else(|| client.socket_path());
+        let cap_listener = spawn_cap_listener_from_socket(
+            Some(listener_socket),
+            session,
+            Arc::clone(&peer_map),
+            shutdown_token.child_token(),
+            None,
+            joiner_ctx,
+            tx.clone(),
+        )
+        .await?;
 
         // Announce our workspace EndpointId to the host so it can
         // register our mapping in its own PeerMap.
@@ -2117,20 +2103,22 @@ fn max_seq(prev: Option<Seq>, seq: Seq) -> Seq {
     prev.map_or(seq, |p| p.max(seq))
 }
 
-/// Reconnect to `socket` and re-`Subscribe { since }`, returning a
-/// fresh event stream on success.
+/// Open a fresh connection to `socket`, `Subscribe { since }`, and
+/// return the owning [`Client`] plus its event stream.
 ///
-/// Used by the cap-listener after the daemon tears the connection down
-/// on subscriber lag (M3): a new connection plus `since: last_seq`
-/// replays every log entry past the watermark, so the reconnect is
-/// gap-free for log-borne events. The transient `Client` is dropped on
-/// return — its reader task keeps the returned [`EventStream`] alive,
-/// matching the [`spawn_cap_listener_from_socket`] pattern.
+/// The cap-listener **keeps** the returned `Arc<Client>` (it is not
+/// dropped) so it can issue an in-band re-`Subscribe` on the same
+/// connection when the daemon signals a gap (M3 Part B). The held
+/// client also carries its [`Client::socket_path`], which the listener
+/// uses to reconnect from scratch on a full EOF (Part A).
+///
+/// A `since` of `last_seq` makes the daemon replay every logged message
+/// past the watermark, so resumption is gap-free for log-borne events.
 async fn cap_resubscribe(
     socket: &Path,
     session: SessionId,
     since: Option<Seq>,
-) -> Result<artel_client::EventStream, WorkspaceError> {
+) -> Result<(Arc<Client>, artel_client::EventStream), WorkspaceError> {
     let client = Client::connect(socket)
         .await
         .map_err(|e| WorkspaceError::Iroh(format!("cap-listener reconnect: {e}")))?;
@@ -2145,10 +2133,11 @@ async fn cap_resubscribe(
             )));
         }
     }
-    client
+    let events = client
         .take_events()
         .await
-        .ok_or_else(|| WorkspaceError::Iroh("cap-listener: events already taken".into()))
+        .ok_or_else(|| WorkspaceError::Iroh("cap-listener: events already taken".into()))?;
+    Ok((Arc::new(client), events))
 }
 
 async fn spawn_cap_listener_from_socket(
@@ -2165,23 +2154,29 @@ async fn spawn_cap_listener_from_socket(
             cancel.cancelled().await;
         }));
     };
-    let events = cap_resubscribe(socket, session, None).await?;
+    let (client, events) = cap_resubscribe(socket, session, None).await?;
     Ok(spawn_cap_listener(
-        events,
-        session,
-        peer_map,
-        cancel,
-        host_ctx,
-        joiner_ctx,
-        socket.to_path_buf(),
-        events_tx,
+        client, events, session, peer_map, cancel, host_ctx, joiner_ctx, events_tx,
     ))
 }
 
+/// What one [`Event`] meant to the cap-listener loop.
+enum CapOutcome {
+    /// A session [`Event::Message`] was applied; carries its `seq` so
+    /// the loop can advance its last-seen watermark.
+    Advanced(Seq),
+    /// The daemon signalled [`Event::Gap`] for this session — the
+    /// per-subscriber buffer overflowed. The loop must re-`Subscribe`
+    /// from its watermark to recover the dropped log entries.
+    Gap,
+    /// Nothing the loop needs to react to (live-only membership events,
+    /// or an event for another session).
+    Ignored,
+}
+
 /// Apply one cap-listener [`Event`] to `peer_map` and trigger any
-/// host-side upgrade delivery. Returns the message `seq` when the event
-/// was a session [`Event::Message`] (so the caller can advance its
-/// last-seen watermark), `None` otherwise.
+/// host-side upgrade delivery. See [`CapOutcome`] for what the return
+/// value tells the loop.
 ///
 /// Processes three message types:
 /// - `MessageKind::Capability`: applies grant/revoke to the cap-set
@@ -2198,7 +2193,7 @@ async fn handle_cap_event(
     peer_map: &Arc<PeerMap>,
     host_ctx: Option<&HostUpgradeCtx>,
     joiner_ctx: Option<&JoinerUpgradeCtx>,
-) -> Option<Seq> {
+) -> CapOutcome {
     match ev {
         Event::Message {
             session: ev_session,
@@ -2255,7 +2250,7 @@ async fn handle_cap_event(
                 }
                 _ => {}
             }
-            Some(seq)
+            CapOutcome::Advanced(seq)
         }
         // Host: re-deliver the upgrade to a peer that
         // (re-)joins while already holding RW. Covers
@@ -2278,31 +2273,85 @@ async fn handle_cap_event(
                     }
                 });
             }
-            None
+            CapOutcome::Ignored
         }
-        _ => None,
+        // The daemon dropped events for this subscriber but kept the
+        // connection open (M3 Part B). Tell the loop to re-Subscribe
+        // from its watermark.
+        Event::Gap {
+            session: ev_session,
+        } if ev_session == session => CapOutcome::Gap,
+        _ => CapOutcome::Ignored,
     }
+}
+
+/// Fire-and-forget an in-band re-`Subscribe { since }` on `client` to
+/// recover from an [`Event::Gap`] (M3 Part B).
+///
+/// **Must not be awaited from the loop.** A Gap arrives precisely
+/// because the subscriber was draining slowly, so the client's events
+/// channel may be near-full. The daemon answers a `Subscribe` by
+/// spawning the replacement forwarder (which immediately pushes replay
+/// frames) *and* a `Subscribed` response on the same connection; if the
+/// loop blocked on `request().await` while being the sole drainer, the
+/// reader could wedge on a full events channel with the response queued
+/// behind replay frames. Spawning the request keeps the loop draining,
+/// so replay flows and the response resolves on the spawned task.
+///
+/// The replayed events arrive on the *same* [`artel_client::EventStream`]
+/// the loop already drains: the daemon's M4 forwarder-dedup replaces the
+/// prior forwarder for this session on re-`Subscribe`, so there is no
+/// new stream to swap in — unlike the EOF path.
+fn spawn_gap_resubscribe(client: &Arc<Client>, session: SessionId, since: Option<Seq>) {
+    let client = Arc::clone(client);
+    tokio::spawn(async move {
+        match client.request(Request::Subscribe { session, since }).await {
+            Ok(Response::Subscribed { .. }) => {
+                debug!(
+                    target: "artel_fs::workspace",
+                    ?session, ?since,
+                    "cap-listener re-subscribed in-band after gap",
+                );
+            }
+            Ok(other) => warn!(
+                ?session,
+                ?other,
+                "cap-listener gap re-subscribe: unexpected reply"
+            ),
+            Err(e) => warn!(?session, %e, "cap-listener gap re-subscribe failed"),
+        }
+    });
 }
 
 /// Spawn a background task that drains session events into `peer_map`.
 ///
-/// See [`handle_cap_event`] for the event types processed.
+/// See [`handle_cap_event`] for the event types processed. The task owns
+/// `client` (the connection it drains) so it can both reconnect on EOF
+/// and re-`Subscribe` in-band on a gap.
 ///
-/// **Lag recovery (M3):** the daemon tears the connection down (rather
-/// than silently dropping events) when this subscriber falls more than
-/// the broadcast capacity behind. The drained stream then ends
-/// (`recv()` yields `None`). On that EOF — and only that EOF, not a
-/// [`cancel`] — the task reconnects to `reconnect_socket` and
-/// re-`Subscribe`s from `last_seq`, with bounded
-/// [`cap_reconnect_backoff`]. The daemon replays every log entry with
-/// `seq > last_seq`, so recovery is gap-free for everything this loop
-/// acts on: `Capability`, `NODE_ID_ACTION`, and `UPGRADE_ACTION` are
-/// all log-borne and replayed, and both [`PeerMap::apply_capability`]
-/// and [`PeerMap::register`] are idempotent. `PeerJoined`/`PeerLeft`/
-/// `SessionClosed` are live-only and not replayed, but the only one
-/// this loop acts on (`PeerJoined`, host-side) merely re-fires an
-/// upgrade that the replayed `Capability::Grant` already re-fires — so
-/// no separate membership reconciliation RPC is needed here.
+/// **Lag recovery (M3):** when this subscriber falls more than the
+/// broadcast capacity behind, the daemon makes the loss loud. Two
+/// recovery paths, both resuming from the last-seen `seq` so the daemon
+/// replays every logged message past the watermark:
+///
+/// - **Gap (Part B):** the daemon sends [`Event::Gap`] and keeps the
+///   connection open. The loop re-`Subscribe`s in-band on the same
+///   `client` (see [`spawn_gap_resubscribe`]); replayed + live events
+///   resume on the same stream. The common case — no reconnect.
+/// - **EOF (Part A):** if the connection actually drops (e.g. the daemon
+///   restarted, or the Part-B gap send failed and it closed), `recv()`
+///   yields `None`. The loop reconnects via [`cap_resubscribe`] on the
+///   client's [`Client::socket_path`] with bounded
+///   [`cap_reconnect_backoff`], swapping in the fresh client + stream.
+///
+/// Either way recovery is gap-free for everything this loop acts on:
+/// `Capability`, `NODE_ID_ACTION`, and `UPGRADE_ACTION` are all
+/// log-borne and replayed, and both [`PeerMap::apply_capability`] and
+/// [`PeerMap::register`] are idempotent. `PeerJoined`/`PeerLeft`/
+/// `SessionClosed` are live-only and not replayed, but the only one this
+/// loop acts on (`PeerJoined`, host-side) merely re-fires an upgrade
+/// that the replayed `Capability::Grant` already re-fires — so no
+/// separate membership reconciliation RPC is needed here.
 ///
 /// After [`CAP_RECONNECT_MAX_ATTEMPTS`] failed reconnects the task
 /// surfaces a [`WorkspaceError`] as a [`WorkspaceEvent::Error`] and
@@ -2311,13 +2360,13 @@ async fn handle_cap_event(
 /// Runs until `cancel` is triggered (from `Workspace::shutdown`).
 #[allow(clippy::too_many_arguments)]
 fn spawn_cap_listener(
+    mut client: Arc<Client>,
     mut events: artel_client::EventStream,
     session: SessionId,
     peer_map: Arc<PeerMap>,
     cancel: CancellationToken,
     host_ctx: Option<HostUpgradeCtx>,
     joiner_ctx: Option<JoinerUpgradeCtx>,
-    reconnect_socket: PathBuf,
     events_tx: mpsc::Sender<WorkspaceEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -2329,16 +2378,21 @@ fn spawn_cap_listener(
                     () = cancel.cancelled() => break 'outer,
                     ev = events.recv() => {
                         let Some(ev) = ev else {
-                            // EOF — the daemon closed the connection
-                            // (lag teardown, or it restarted). Fall
-                            // through to the reconnect loop.
+                            // EOF — the connection actually dropped
+                            // (daemon restart, or a Part-B gap send that
+                            // failed and closed). Fall through to the
+                            // reconnect loop.
                             break;
                         };
-                        if let Some(seq) =
-                            handle_cap_event(ev, session, &peer_map, host_ctx.as_ref(), joiner_ctx.as_ref())
-                                .await
+                        match handle_cap_event(ev, session, &peer_map, host_ctx.as_ref(), joiner_ctx.as_ref())
+                            .await
                         {
-                            last_seq = Some(max_seq(last_seq, seq));
+                            CapOutcome::Advanced(seq) => last_seq = Some(max_seq(last_seq, seq)),
+                            // In-band gap: re-Subscribe on the SAME
+                            // connection without dropping it. Replayed
+                            // events arrive on this same stream.
+                            CapOutcome::Gap => spawn_gap_resubscribe(&client, session, last_seq),
+                            CapOutcome::Ignored => {}
                         }
                     }
                 }
@@ -2363,14 +2417,15 @@ fn spawn_cap_listener(
                     () = cancel.cancelled() => break 'outer,
                     () = tokio::time::sleep(delay) => {}
                 }
-                match cap_resubscribe(&reconnect_socket, session, last_seq).await {
-                    Ok(fresh) => {
+                match cap_resubscribe(client.socket_path(), session, last_seq).await {
+                    Ok((fresh_client, fresh_events)) => {
                         debug!(
                             target: "artel_fs::workspace",
                             ?session, ?last_seq, attempt,
                             "cap-listener reconnected after stream close",
                         );
-                        events = fresh;
+                        client = fresh_client;
+                        events = fresh_events;
                         continue 'outer;
                     }
                     Err(e) => {
@@ -2437,6 +2492,39 @@ mod tests {
         // At and past the ceiling: give up.
         assert_eq!(cap_reconnect_backoff(CAP_RECONNECT_MAX_ATTEMPTS), None);
         assert_eq!(cap_reconnect_backoff(CAP_RECONNECT_MAX_ATTEMPTS + 7), None);
+    }
+
+    #[tokio::test]
+    async fn handle_cap_event_classifies_gap() {
+        // M3 Part B: an Event::Gap for our session asks the loop to
+        // re-Subscribe (CapOutcome::Gap); a Gap for a different session
+        // is ignored; a Message advances the watermark.
+        let session = SessionId::from_bytes([1; 16]);
+        let other = SessionId::from_bytes([2; 16]);
+        let peer_map = Arc::new(PeerMap::new(PeerId::from_bytes([0; 32])));
+
+        let out = handle_cap_event(Event::Gap { session }, session, &peer_map, None, None).await;
+        assert!(matches!(out, CapOutcome::Gap));
+
+        let out = handle_cap_event(
+            Event::Gap { session: other },
+            session,
+            &peer_map,
+            None,
+            None,
+        )
+        .await;
+        assert!(matches!(out, CapOutcome::Ignored));
+
+        let out = handle_cap_event(
+            Event::SessionClosed { session },
+            session,
+            &peer_map,
+            None,
+            None,
+        )
+        .await;
+        assert!(matches!(out, CapOutcome::Ignored));
     }
 
     /// End-to-end recovery proof (M3): a cap-listener whose connection
@@ -2631,6 +2719,128 @@ mod tests {
             Response::Sent { .. } => {}
             other => panic!("unexpected Send reply: {other:?}"),
         }
+    }
+
+    /// Drain `events` until the next session [`Event::Message`] (with
+    /// `seq > after` when `after` is set), returning its seq. Bounded so
+    /// a missing message fails loudly rather than hanging the test.
+    async fn next_message_seq(
+        events: &mut artel_client::EventStream,
+        after: Option<Seq>,
+        what: &str,
+    ) -> Seq {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Event::Message { message, .. } = events.recv().await.expect("stream open")
+                    && after.is_none_or(|a| message.seq > a)
+                {
+                    break message.seq;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what} did not arrive in time"))
+    }
+
+    /// In-band gap recovery (M3 Part B): `spawn_gap_resubscribe` issues a
+    /// `Subscribe { since: last_seq }` on the *same* connection the
+    /// listener already holds, and the daemon replays every logged
+    /// message past the watermark back onto that same event stream — no
+    /// reconnect, no new socket.
+    ///
+    /// We drive it directly (rather than forcing a real 256-event lag,
+    /// which is inherently racy) because the daemon's Gap *emission* is
+    /// already covered deterministically by
+    /// `server::forwarder_set_tests::forwarder_sends_gap_on_subscriber_lag`,
+    /// and the loop's Gap *classification* by
+    /// `handle_cap_event_classifies_gap`. This test pins the third leg:
+    /// that the in-band re-Subscribe actually backfills the gap.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gap_resubscribe_replays_missed_messages_in_band() {
+        use std::sync::Arc;
+
+        use artel_client::Client;
+        use artel_daemon::{Daemon, DaemonConfig, EndpointSetup as DaemonEndpointSetup};
+        use iroh::test_utils::DnsPkarrServer;
+
+        let dns_pkarr = Arc::new(DnsPkarrServer::run().await.expect("DnsPkarrServer::run"));
+        let dir = TempDir::new().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let daemon = Daemon::start(DaemonConfig {
+            socket_path: socket.clone(),
+            pid_path: dir.path().join("daemon.pid"),
+            sessions_dir: dir.path().join("sessions"),
+            iroh_key_path: Some(dir.path().join("iroh.key")),
+            endpoint_setup: DaemonEndpointSetup::Testing { dns_pkarr },
+        })
+        .await
+        .expect("daemon start");
+        let shutdown = daemon.shutdown_handle();
+        let join = tokio::spawn(daemon.run());
+
+        let client = Client::connect(&socket).await.expect("connect");
+        let session = match client
+            .request(Request::HostSession {
+                display_name: "host".into(),
+                session: None,
+            })
+            .await
+            .expect("host")
+        {
+            Response::HostSession { session, .. } => session,
+            other => panic!("unexpected HostSession reply: {other:?}"),
+        };
+
+        // The listener's connection: subscribe and take the stream.
+        let (cap_client, mut events) = cap_resubscribe(&socket, session, None)
+            .await
+            .expect("subscribe");
+
+        // Drain a first grant live; pin the watermark *at* its seq. This
+        // is the "last seq processed before the gap" — the resume point.
+        grant_rw(&client, session, PeerId::from_bytes([7; 32])).await;
+        let watermark = next_message_seq(&mut events, None, "first grant").await;
+
+        // A second grant. We drain its LIVE copy here so it's no longer
+        // pending on the stream — modelling a message that, in a real
+        // gap, would have been dropped. The watermark stays at the first
+        // seq, so re-Subscribe { since: watermark } must REPLAY this one.
+        grant_rw(&client, session, PeerId::from_bytes([9; 32])).await;
+        let second_seq = next_message_seq(&mut events, Some(watermark), "second grant live").await;
+
+        // Gap-recovery action: re-Subscribe in-band from the watermark on
+        // the SAME connection. With the live copy already drained, the
+        // only way the second grant reappears is the daemon's replay of
+        // `seq > watermark` — which is exactly the gap-recovery contract.
+        spawn_gap_resubscribe(&cap_client, session, Some(watermark));
+
+        let replayed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Event::Message { message, .. } = events.recv().await.expect("stream open")
+                    && message.seq == second_seq
+                {
+                    break message;
+                }
+            }
+        })
+        .await
+        .expect("in-band replay must re-deliver the missed message past the watermark");
+
+        let decoded = artel_protocol::capability::CapabilityAction::decode(&replayed.payload)
+            .expect("capability action");
+        assert!(
+            matches!(
+                decoded,
+                artel_protocol::capability::CapabilityAction::Grant { peer, .. }
+                    if peer == PeerId::from_bytes([9; 32])
+            ),
+            "replayed message should be the post-watermark grant, got {decoded:?}",
+        );
+
+        drop(client);
+        drop(cap_client);
+        shutdown.trigger();
+        let _ = tokio::time::timeout(Duration::from_secs(10), join).await;
     }
 
     #[test]
