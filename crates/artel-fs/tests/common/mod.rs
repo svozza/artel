@@ -503,6 +503,25 @@ pub async fn grant_rw(client: &Client, session: SessionId, target_peer: PeerId) 
     assert!(matches!(resp, Response::Sent { .. }), "{resp:?}");
 }
 
+/// Evict `target_peer` by having the host author a `Revoke` capability
+/// message (the adversarial removal verb — `PeerFilter` blocks the peer
+/// and, with rotation wired, the namespace rotates).
+pub async fn revoke(client: &Client, session: SessionId, target_peer: PeerId) {
+    let action = CapabilityAction::Revoke { peer: target_peer };
+    let resp = client
+        .request(Request::Send {
+            session,
+            payload: SendPayload {
+                kind: MessageKind::Capability,
+                action: action.action_str().to_string(),
+                payload: action.encode(),
+            },
+        })
+        .await
+        .unwrap();
+    assert!(matches!(resp, Response::Sent { .. }), "{resp:?}");
+}
+
 /// Cooperatively demote `target_peer` from `ReadWrite` to `Read` by having
 /// the host author a `Grant{peer, Read}` capability message. The host's
 /// `cap_listener` turns the RW→Read transition into a `DOWNGRADE_ACTION`

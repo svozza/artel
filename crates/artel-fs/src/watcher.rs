@@ -128,10 +128,16 @@ pub(crate) async fn run(workspace: Arc<Workspace>, ready: oneshot::Sender<()>) {
         workspace.echo_guard.last_published_handle(),
     );
 
+    // Doc-scoped token: cancelled at workspace shutdown AND on
+    // namespace rotation (which respawns this task against the new
+    // namespace). A child of the workspace shutdown token, so either
+    // path stops the watcher.
+    let doc_token = workspace.doc_token();
+
     loop {
         tokio::select! {
-            () = workspace.shutdown_token.cancelled() => {
-                debug!(target: "artel_fs::watcher", "shutdown token tripped, exiting watcher loop");
+            () = doc_token.cancelled() => {
+                debug!(target: "artel_fs::watcher", "doc token tripped, exiting watcher loop");
                 return;
             }
             change = rx.recv() => {

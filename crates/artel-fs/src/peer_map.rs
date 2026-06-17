@@ -117,6 +117,25 @@ impl PeerMap {
             .is_some_and(|c| *c == Capability::ReadWrite)
     }
 
+    /// Whether the peer owning workspace `EndpointId` currently holds
+    /// `ReadWrite`. Resolves `EndpointId → daemon PeerId` (the
+    /// same-seed author binding makes a doc entry's author equal the
+    /// owning node's `EndpointId`), then checks `has_rw`. Used by
+    /// namespace rotation to keep only still-RW authors' entries in the
+    /// snapshot. The host itself is always RW (seeded in `new`).
+    ///
+    /// Returns `false` for an unknown `EndpointId` (no mapping yet) —
+    /// fail-closed: an entry whose author we can't resolve to a current
+    /// RW peer is dropped from the rotated namespace.
+    pub(crate) fn endpoint_has_rw(&self, workspace_id: EndpointId) -> bool {
+        let id_map = self.id_map.read().unwrap();
+        let Some(&daemon_peer) = id_map.get(&workspace_id) else {
+            return false;
+        };
+        drop(id_map);
+        self.has_rw(daemon_peer)
+    }
+
     /// Check whether an incoming workspace `EndpointId` belongs to a
     /// peer that was explicitly revoked. Returns `false` (allow) for:
     /// - Unknown `EndpointId`s (haven't seen the mapping yet)

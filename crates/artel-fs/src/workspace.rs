@@ -436,9 +436,20 @@ pub struct Workspace {
     /// Sender side of the [`WorkspaceEvent`] mpsc. Held by the
     /// workspace so background tasks can clone it cheaply.
     pub(crate) events: mpsc::Sender<WorkspaceEvent>,
-    /// Cancellation token tripped by [`Self::shutdown`] to stop the
-    /// background tasks.
+    /// Cancellation token tripped by [`Self::shutdown`] to stop *all*
+    /// background tasks at workspace end. Parent of both
+    /// [`Self::doc_token`] and the cap-listener's token, so cancelling
+    /// it takes everything down.
     pub(crate) shutdown_token: CancellationToken,
+    /// Doc-scoped cancellation token — a child of [`Self::shutdown_token`]
+    /// that scopes only the watcher / applier / iroh node, **not** the
+    /// cap-listener. Stored behind a `Mutex` so namespace rotation
+    /// (Slice 3 re-import) can cancel it and install a fresh child to
+    /// tear down + respawn the doc machinery against the new namespace
+    /// *without* killing the cap-listener that carries the
+    /// rotation-bump signal. Watcher/applier select on the value here
+    /// at spawn time (see [`Self::doc_token`]).
+    pub(crate) doc_token: std::sync::Mutex<CancellationToken>,
     /// Set when the host has cooperatively demoted this node (RW →
     /// Read) via a `DOWNGRADE_ACTION` notification. The watcher checks
     /// it before every publish/delete and skips when halted — a
@@ -472,11 +483,16 @@ pub struct Workspace {
     /// Precompiled rules; built once from `rules` at construction
     /// and read per event. See [`Self::rules`].
     pub(crate) compiled_rules: CompiledPathRules,
+    /// The workspace's state directory (holds `iroh.key`, `doc-id`,
+    /// `current-namespace`, the docs/blobs stores). Retained so
+    /// namespace rotation can persist the new `current-namespace`.
+    pub(crate) state_dir: PathBuf,
     /// Session id this workspace is attached to.
     ///
-    /// On the host: derived from the workspace's persisted
+    /// On the host: derived from the workspace's persisted **genesis**
     /// [`NamespaceId`] via [`crate::session_id_for`] so a re-host of
-    /// the same dir under a fresh daemon recovers the same id.
+    /// the same dir under a fresh daemon recovers the same id, and a
+    /// namespace rotation doesn't change it.
     /// On the joiner: whatever id the daemon's [`Request::JoinSession`]
     /// reply returned. Borrow via [`Self::session_id`].
     pub(crate) session_id: SessionId,
@@ -807,6 +823,10 @@ impl Workspace {
             .disarm()
             .expect("rb.node populated above");
         let blobs = node.blobs.clone();
+        // Doc-scoped token: a child of shutdown_token. The cap-listener
+        // above is on a *separate* shutdown_token child so it survives
+        // a doc_token reset (namespace rotation re-import).
+        let doc_token = std::sync::Mutex::new(shutdown_token.child_token());
         Ok((
             Self {
                 root,
@@ -816,10 +836,12 @@ impl Workspace {
                 echo_guard,
                 events: tx,
                 shutdown_token,
+                doc_token,
                 write_halted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 node: tokio::sync::Mutex::new(Some(node)),
                 rules,
                 compiled_rules,
+                state_dir,
                 session_id,
                 join_ticket: Some(join_ticket),
                 _cap_listener: cap_listener,
@@ -1068,6 +1090,10 @@ impl Workspace {
             .disarm()
             .expect("rb.node populated above");
         let blobs = node.blobs.clone();
+        // Doc-scoped token: a child of shutdown_token, separate from the
+        // cap-listener's token so a rotation re-import can reset it
+        // without killing the cap-listener.
+        let doc_token = std::sync::Mutex::new(shutdown_token.child_token());
         Ok((
             Self {
                 root,
@@ -1077,10 +1103,12 @@ impl Workspace {
                 echo_guard,
                 events: tx,
                 shutdown_token,
+                doc_token,
                 write_halted,
                 node: tokio::sync::Mutex::new(Some(node)),
                 rules,
                 compiled_rules,
+                state_dir,
                 session_id: session,
                 join_ticket: None,
                 _cap_listener: cap_listener,
@@ -1153,6 +1181,149 @@ impl Workspace {
     #[must_use]
     pub(crate) fn is_write_halted(&self) -> bool {
         self.write_halted.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A clone of the current doc-scoped cancellation token. The
+    /// watcher and applier select on this (rather than
+    /// [`Self::shutdown_token`]) so namespace rotation can stop and
+    /// respawn them without taking down the cap-listener. Cloning a
+    /// `CancellationToken` shares the same cancellation state.
+    #[must_use]
+    pub(crate) fn doc_token(&self) -> CancellationToken {
+        self.doc_token.lock().expect("doc_token mutex").clone()
+    }
+
+    /// Rotate the workspace namespace (Slice 3 — the cryptographic
+    /// write cut-off behind Evict).
+    ///
+    /// Mints a **fresh** `NamespaceSecret`, re-publishes the current
+    /// doc's latest-per-key snapshot into it **under the host's own
+    /// author**, keeping only entries whose author is a still-RW peer
+    /// (the revoked author's entries are dropped at the snapshot). File
+    /// bytes never move — only `path → content-hash` pairs are copied
+    /// (`set_hash`), and survivors already hold the blobs. The new
+    /// namespace is persisted as the current namespace; the genesis
+    /// (`doc-id`) and therefore the `SessionId` are untouched.
+    ///
+    /// Returns the new secret (for host→survivor distribution) and the
+    /// bumped epoch. The caller is responsible for quiescing writes
+    /// before calling (the freeze-drain barrier) and for distributing
+    /// the secret afterward.
+    ///
+    /// Host-only: requires the workspace node and its `peer_map`
+    /// (cap projection). Entries authored by a peer the `peer_map`
+    /// can't resolve to a current RW cap are dropped (fail-closed).
+    #[allow(clippy::significant_drop_tightening)]
+    pub(crate) async fn rotate_namespace(
+        &self,
+        prev_epoch: u64,
+    ) -> Result<RotationOutcome, WorkspaceError> {
+        // Hold the node lock across the whole rotation: the snapshot
+        // read, the new-namespace create + re-author, and the share
+        // must see a consistent node (no concurrent teardown).
+        let guard = self.node.lock().await;
+        let node = guard
+            .as_ref()
+            .ok_or_else(|| WorkspaceError::Doc("rotate: node already torn down".into()))?;
+
+        // Snapshot the current doc: latest entry per key, tombstones
+        // included (a delete must carry forward as a delete).
+        let old_doc = &self.doc;
+        let stream = old_doc
+            .get_many(Query::single_latest_per_key().include_empty())
+            .await
+            .map_err(|e| WorkspaceError::Doc(format!("rotate: snapshot get_many: {e}")))?;
+        tokio::pin!(stream);
+
+        // Collect the surviving (author still RW) entries as
+        // (key, hash, len) triples. The author bytes equal the owning
+        // node's EndpointId (same-seed binding, Slice 1), so the
+        // peer_map resolves author → RW directly.
+        let mut survivors: Vec<(Vec<u8>, iroh_blobs::Hash, u64)> = Vec::new();
+        let mut dropped = 0usize;
+        while let Some(res) = stream.next().await {
+            let entry =
+                res.map_err(|e| WorkspaceError::Doc(format!("rotate: snapshot entry: {e}")))?;
+            let author_endpoint = iroh::EndpointId::from_bytes(entry.author().as_bytes())
+                .map_err(|e| WorkspaceError::Doc(format!("rotate: author not an endpoint: {e}")))?;
+            // The host's own writes always survive (host is RW by
+            // construction); other authors must be currently RW.
+            let keep = author_endpoint == node.endpoint_id
+                || node.peer_map.endpoint_has_rw(author_endpoint);
+            if keep {
+                survivors.push((
+                    entry.key().to_vec(),
+                    entry.content_hash(),
+                    entry.content_len(),
+                ));
+            } else {
+                dropped += 1;
+            }
+        }
+
+        // Mint the fresh namespace and re-author the snapshot into it
+        // under the host's own author. `set_hash` re-points keys at
+        // hashes that already exist locally — no blob bytes move.
+        let new_doc = node
+            .docs
+            .create()
+            .await
+            .map_err(|e| WorkspaceError::Doc(format!("rotate: create namespace: {e}")))?;
+        for (key, hash, len) in &survivors {
+            // Skip tombstones (len 0): a fresh namespace has no prior
+            // entry for the key, so there is nothing to delete, and
+            // `set_hash` of an empty entry would be rejected.
+            if *len == 0 {
+                continue;
+            }
+            new_doc
+                .set_hash(self.author, key.clone(), *hash, *len)
+                .await
+                .map_err(|e| WorkspaceError::Doc(format!("rotate: set_hash: {e}")))?;
+        }
+
+        // Extract the new secret for distribution.
+        let write_ticket = new_doc
+            .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+            .await
+            .map_err(|e| WorkspaceError::Doc(format!("rotate: share new doc: {e}")))?;
+        let new_secret = match write_ticket.capability {
+            iroh_docs::Capability::Write(ref secret) => secret.to_bytes(),
+            iroh_docs::Capability::Read(_) => {
+                unreachable!("freshly created namespace always has Write capability")
+            }
+        };
+        let new_namespace = new_doc.id();
+        let new_epoch = prev_epoch + 1;
+
+        // Persist the new current namespace (genesis/doc-id untouched,
+        // so SessionId is stable). store-before-anyone-uses-it.
+        let current_ns_path = self.state_dir.join(CURRENT_NAMESPACE_FILE);
+        crate::keystore::write_atomic(&current_ns_path, &new_namespace.to_bytes(), None).map_err(
+            |e| {
+                WorkspaceError::Doc(format!(
+                    "rotate: persist current-namespace at {}: {e}",
+                    current_ns_path.display(),
+                ))
+            },
+        )?;
+
+        debug!(
+            target: "artel_fs::workspace",
+            %new_namespace,
+            new_epoch,
+            survivors = survivors.len(),
+            dropped,
+            "rotate_namespace: minted new namespace",
+        );
+
+        Ok(RotationOutcome {
+            new_secret,
+            new_namespace,
+            new_epoch,
+            survivor_entries: survivors.len(),
+            dropped_entries: dropped,
+        })
     }
 
     /// The [`AuthorId`] this workspace stamps on its outgoing writes.
@@ -1314,6 +1485,61 @@ impl Workspace {
             .await
             .as_ref()
             .map(|node| *node.endpoint_id.as_bytes())
+    }
+
+    /// Drive a namespace rotation directly (Slice 3). Returns the new
+    /// epoch, the new `NamespaceId` bytes, and (survivor, dropped)
+    /// entry counts. For tests that exercise the rotation core without
+    /// the full freeze-drain orchestration (the live doc swap is
+    /// Slice 3d).
+    #[cfg(feature = "test-utils")]
+    pub async fn test_rotate_namespace(
+        &self,
+        prev_epoch: u64,
+    ) -> Result<(u64, [u8; 32], usize, usize), String> {
+        self.rotate_namespace(prev_epoch)
+            .await
+            .map(|o| {
+                (
+                    o.new_epoch,
+                    o.new_namespace.to_bytes(),
+                    o.survivor_entries,
+                    o.dropped_entries,
+                )
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    /// The set of file keys (UTF-8 lossy) at the latest entry per key
+    /// (excluding tombstones) in the namespace `namespace_id_bytes`,
+    /// opened through this node's docs store. For tests asserting which
+    /// entries survived a rotation into a freshly minted namespace.
+    #[cfg(feature = "test-utils")]
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn test_namespace_keys(&self, namespace_id_bytes: [u8; 32]) -> Vec<String> {
+        let guard = self.node.lock().await;
+        let node = guard.as_ref().expect("node live");
+        let id = NamespaceId::from(&namespace_id_bytes);
+        let doc = node
+            .docs
+            .open(id)
+            .await
+            .expect("open namespace")
+            .expect("namespace present");
+        let stream = doc
+            .get_many(Query::single_latest_per_key())
+            .await
+            .expect("get_many");
+        tokio::pin!(stream);
+        let mut keys = Vec::new();
+        while let Some(res) = stream.next().await {
+            if let Ok(entry) = res
+                && entry.content_len() > 0
+            {
+                keys.push(String::from_utf8_lossy(entry.key()).into_owned());
+            }
+        }
+        keys
     }
 }
 
@@ -1983,6 +2209,27 @@ fn ensure_state_dir(state_dir: &Path) -> Result<(), WorkspaceError> {
         .map_err(|e| WorkspaceError::Iroh(format!("create state_dir {}: {e}", state_dir.display())))
 }
 
+/// Result of [`Workspace::rotate_namespace`].
+pub(crate) struct RotationOutcome {
+    /// The freshly minted `NamespaceSecret` (32 bytes) for host→survivor
+    /// distribution. Never given to the revoked peer. Consumed by the
+    /// freeze-drain orchestration (Slice 3d/3e) that distributes it over
+    /// the existing `DeliverUpgrade` unicast; unread until that wiring
+    /// lands.
+    #[allow(dead_code)]
+    pub(crate) new_secret: [u8; 32],
+    /// The new current `NamespaceId`.
+    pub(crate) new_namespace: NamespaceId,
+    /// The bumped `namespace_epoch` (prev + 1).
+    pub(crate) new_epoch: u64,
+    /// How many latest-per-key entries were carried into the new
+    /// namespace (still-RW authors).
+    pub(crate) survivor_entries: usize,
+    /// How many entries were dropped because their author was no longer
+    /// RW (the revoked peer's, plus any unresolvable authors).
+    pub(crate) dropped_entries: usize,
+}
+
 /// What [`open_or_create_doc`] resolved for a host workspace.
 struct OpenedDoc {
     /// The doc handle for the **current** namespace (the one the
@@ -2633,6 +2880,38 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    /// Token hierarchy (Slice 3a): the doc-scoped token is a child of
+    /// the shutdown token, so cancelling the parent (workspace
+    /// shutdown) cancels the doc token — but cancelling the doc token
+    /// (namespace-rotation re-import) leaves a *sibling* cap-listener
+    /// token, also a child of the parent, untouched. This is what lets
+    /// re-import tear down the watcher/applier without killing the
+    /// cap-listener that carries the rotation-bump signal.
+    #[test]
+    fn doc_token_is_child_of_shutdown_but_sibling_of_cap_listener() {
+        let shutdown = CancellationToken::new();
+        let doc_token = shutdown.child_token();
+        let cap_token = shutdown.child_token();
+
+        // Cancelling the doc token must NOT cancel the cap-listener
+        // sibling or the parent.
+        doc_token.cancel();
+        assert!(doc_token.is_cancelled());
+        assert!(
+            !cap_token.is_cancelled(),
+            "cap-listener token must survive a doc-token reset (rotation re-import)",
+        );
+        assert!(!shutdown.is_cancelled(), "parent must survive a doc reset");
+
+        // Cancelling the parent (workspace shutdown) cancels the
+        // cap-listener sibling too.
+        shutdown.cancel();
+        assert!(
+            cap_token.is_cancelled(),
+            "workspace shutdown must take the cap-listener down",
+        );
+    }
 
     #[test]
     fn max_seq_tracks_highest_and_ignores_synthetic_zero() {

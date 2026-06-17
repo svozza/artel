@@ -73,10 +73,14 @@ pub(crate) async fn run(workspace: Arc<Workspace>, ready: oneshot::Sender<()>) {
     );
     let filter = WorkspaceFilter::new(&workspace.root);
 
+    // Doc-scoped token: cancelled at workspace shutdown AND on
+    // namespace rotation. A child of the workspace shutdown token.
+    let doc_token = workspace.doc_token();
+
     loop {
         tokio::select! {
-            () = workspace.shutdown_token.cancelled() => {
-                debug!(target: "artel_fs::applier", "shutdown token tripped, exiting applier loop");
+            () = doc_token.cancelled() => {
+                debug!(target: "artel_fs::applier", "doc token tripped, exiting applier loop");
                 return;
             }
             ev = events.next() => {

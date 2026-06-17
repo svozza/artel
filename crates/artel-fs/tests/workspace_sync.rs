@@ -870,6 +870,134 @@ async fn demoted_joiner_writes_stop_propagating() {
 }
 
 // =============================================================
+// Namespace rotation core (Slice 3c): after evicting an RW peer, the
+// host rotates the namespace. The freshly minted namespace carries the
+// surviving (still-RW) authors' entries but DROPS the revoked author's
+// — the cryptographic write cut-off. Exercises the rotation core
+// directly via test_rotate_namespace (the live doc swap is Slice 3d).
+// =============================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rotation_drops_revoked_author_entries() {
+    use artel_protocol::capability::Capability;
+
+    let Pair {
+        daemon_a,
+        daemon_b,
+        dns_pkarr,
+    } = spawn_pair().await;
+
+    let alice = Client::connect(&daemon_a.socket).await.unwrap();
+    let alice_dir = tempfile::tempdir().unwrap();
+    let (alice_ws, _) = Workspace::host_with(
+        &alice,
+        "alice",
+        alice_dir.path().to_path_buf(),
+        AttachPolicy::RequireEmpty,
+        WorkspaceConfig::default()
+            .with_endpoint_setup(testing_setup(&dns_pkarr))
+            .with_daemon_socket(daemon_a.socket.clone()),
+    )
+    .await
+    .expect("Workspace::host");
+    let session = alice_ws.session_id();
+    let alice_ws = Arc::new(alice_ws);
+    let alice_handle = Arc::clone(&alice_ws).run().await;
+
+    // Bob joins (Read ticket) then is promoted to RW.
+    let read_ticket = match alice
+        .request(Request::IssueTicket {
+            session,
+            granted_cap: Capability::Read,
+            expiry_ms: 0,
+        })
+        .await
+        .unwrap()
+    {
+        Response::IssuedTicket { ticket, .. } => ticket,
+        other => panic!("expected IssuedTicket, got {other:?}"),
+    };
+    let bob = Client::connect(&daemon_b.socket).await.unwrap();
+    let bob_peer = bob.daemon_peer_id();
+    let resp = bob
+        .request(Request::JoinSession {
+            display_name: "bob".into(),
+            ticket: read_ticket,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(resp, Response::JoinSession { .. }), "{resp:?}");
+    let bob_dir = tempfile::tempdir().unwrap();
+    let (bob_ws, _) = Workspace::join_with(
+        &bob,
+        session,
+        bob_dir.path().to_path_buf(),
+        AttachPolicy::RequireEmpty,
+        WorkspaceConfig::default()
+            .with_endpoint_setup(testing_setup(&dns_pkarr))
+            .with_daemon_socket(daemon_b.socket.clone()),
+    )
+    .await
+    .expect("Workspace::join");
+    let bob_ws = Arc::new(bob_ws);
+    let bob_handle = Arc::clone(&bob_ws).run().await;
+
+    common::grant_rw_and_wait(&alice, session, bob_peer, bob_dir.path(), alice_dir.path()).await;
+
+    // Alice writes host.txt; Bob writes joiner.txt. Wait until BOTH are
+    // visible on Alice's doc (so the snapshot would include both).
+    tokio::fs::write(alice_dir.path().join("host.txt"), b"by host")
+        .await
+        .unwrap();
+    tokio::fs::write(bob_dir.path().join("joiner.txt"), b"by joiner")
+        .await
+        .unwrap();
+    common::wait_for_file(&alice_dir.path().join("joiner.txt"), b"by joiner").await;
+
+    // Evict Bob and wait for Alice's peer_map to project the revoke
+    // (poll: rotation reads the cap set, so it must reflect the revoke
+    // first). We detect it by the host no longer accepting Bob's RW —
+    // observable as: after revoke, a fresh Bob write doesn't reach
+    // Alice. Simpler + deterministic: poll a bounded delay then rotate,
+    // and assert on the rotation's own drop count.
+    common::revoke(&alice, session, bob_peer).await;
+    // Give the host cap_listener a moment to apply the revoke into its
+    // peer_map before we snapshot.
+    sleep(Duration::from_secs(2)).await;
+
+    // Rotate. The new namespace must keep host.txt, drop joiner.txt.
+    let (new_epoch, new_ns, survivors, dropped) = alice_ws
+        .test_rotate_namespace(0)
+        .await
+        .expect("rotate_namespace");
+    assert_eq!(new_epoch, 1, "epoch must bump 0→1");
+    assert!(survivors >= 1, "host.txt must survive (got {survivors})");
+    assert!(
+        dropped >= 1,
+        "revoked author's joiner.txt must be dropped (got {dropped})",
+    );
+
+    let keys = alice_ws.test_namespace_keys(new_ns).await;
+    assert!(
+        keys.iter().any(|k| k.ends_with("host.txt")),
+        "rotated namespace must contain host.txt; keys={keys:?}",
+    );
+    assert!(
+        !keys.iter().any(|k| k.ends_with("joiner.txt")),
+        "rotated namespace must NOT contain revoked author's joiner.txt; keys={keys:?}",
+    );
+
+    alice_ws.shutdown().await.expect("shutdown");
+    bob_ws.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), alice_handle).await;
+    let _ = timeout(Duration::from_secs(5), bob_handle).await;
+    drop(alice);
+    drop(bob);
+    daemon_a.stop().await;
+    daemon_b.stop().await;
+}
+
+// =============================================================
 // A live edit on the host's filesystem propagates to the joiner via
 // the watcher → doc → applier pipeline.
 //
