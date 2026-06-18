@@ -702,10 +702,7 @@ async fn survivor_follows_rotation_evicted_is_cut() {
         loop {
             let _ = tokio::fs::write(&joiner_probe, b"rw").await;
             sleep(POLL_INTERVAL).await;
-            if tokio::fs::read(&host_probe)
-                .await
-                .is_ok_and(|b| b == b"rw")
-            {
+            if tokio::fs::read(&host_probe).await.is_ok_and(|b| b == b"rw") {
                 let _ = tokio::fs::remove_file(&joiner_probe).await;
                 return;
             }
@@ -1118,11 +1115,9 @@ async fn namespace_epoch_survives_host_restart() {
 
     // Phase 2: re-host the same state dir under a fresh daemon. The
     // epoch must be recovered from disk, not reset to 0.
-    let daemon = common::spawn_daemon_with_setup(
-        common::fresh_state(),
-        daemon_testing_setup(&dns_pkarr),
-    )
-    .await;
+    let daemon =
+        common::spawn_daemon_with_setup(common::fresh_state(), daemon_testing_setup(&dns_pkarr))
+            .await;
     let client = Client::connect(&daemon.socket).await.unwrap();
     let cfg = WorkspaceConfig::default()
         .with_state_dir(state.path().to_path_buf())
@@ -1168,16 +1163,12 @@ async fn replayed_revoke_does_not_re_rotate_on_workspace_restart() {
     // Alice's daemon stays up across the workspace restart, so its
     // session log (with the Revoke) persists. Alice's workspace state
     // dir is persistent so the re-host resumes the same session.
-    let alice_daemon = common::spawn_daemon_with_setup(
-        common::fresh_state(),
-        daemon_testing_setup(&dns_pkarr),
-    )
-    .await;
-    let bob_daemon = common::spawn_daemon_with_setup(
-        common::fresh_state(),
-        daemon_testing_setup(&dns_pkarr),
-    )
-    .await;
+    let alice_daemon =
+        common::spawn_daemon_with_setup(common::fresh_state(), daemon_testing_setup(&dns_pkarr))
+            .await;
+    let bob_daemon =
+        common::spawn_daemon_with_setup(common::fresh_state(), daemon_testing_setup(&dns_pkarr))
+            .await;
 
     let alice_dir = tempfile::tempdir().unwrap();
     let alice_state = tempfile::tempdir().unwrap();
@@ -1318,12 +1309,16 @@ async fn replayed_revoke_does_not_re_rotate_on_workspace_restart() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn burst_of_evictions_all_rotate_no_signal_dropped() {
+    // Far exceed the old bounded buffer (16) so a lossy try_send would
+    // drop signals. Each Revoke targets a distinct synthetic PeerId, so
+    // each gets a strictly higher log seq and clears the C3 watermark —
+    // a genuine rotation per revoke.
+    const BURST: u64 = 40;
+
     let dns_pkarr = Arc::new(DnsPkarrServer::run().await.expect("dns_pkarr"));
-    let daemon = common::spawn_daemon_with_setup(
-        common::fresh_state(),
-        daemon_testing_setup(&dns_pkarr),
-    )
-    .await;
+    let daemon =
+        common::spawn_daemon_with_setup(common::fresh_state(), daemon_testing_setup(&dns_pkarr))
+            .await;
     let client = Client::connect(&daemon.socket).await.unwrap();
     let dir = tempfile::tempdir().unwrap();
     // Wire the daemon socket so the cap-listener observes the host's own
@@ -1343,11 +1338,6 @@ async fn burst_of_evictions_all_rotate_no_signal_dropped() {
     let ws = Arc::new(ws);
     let handle = Arc::clone(&ws).run().await;
 
-    // Far exceed the old bounded buffer (16) so a lossy try_send would
-    // drop signals. Each Revoke targets a distinct synthetic PeerId, so
-    // each gets a strictly higher log seq and clears the C3 watermark —
-    // a genuine rotation per revoke.
-    const BURST: u64 = 40;
     let session = ws.session_id();
     for i in 0..BURST {
         let mut bytes = [0u8; 32];
@@ -1357,7 +1347,7 @@ async fn burst_of_evictions_all_rotate_no_signal_dropped() {
 
     // The rotation task drains serially; wait for the epoch to settle at
     // exactly BURST. Unbounded ⇒ no signal lost ⇒ every revoke rotated.
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     loop {
         let epoch = ws.namespace_epoch();
         if epoch == BURST {

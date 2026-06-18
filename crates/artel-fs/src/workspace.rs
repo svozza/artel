@@ -82,7 +82,6 @@ use artel_protocol::{
 /// events queue without bound.
 const EVENT_BUFFER: usize = 64;
 
-
 /// First retry delay for the cap-listener's reconnect loop. Subsequent
 /// attempts double this (see [`cap_reconnect_backoff`]) up to
 /// [`CAP_RECONNECT_MAX_DELAY`].
@@ -1658,158 +1657,7 @@ impl Workspace {
             RotationSignal::HostEvict {
                 revoked_peer,
                 revoke_seq,
-            } => {
-                // Idempotency guard (C3): skip a Revoke we've already
-                // rotated for. On a host restart the cap-listener
-                // re-subscribes `since: None`, so every historical Revoke
-                // replays; without this, each past eviction would
-                // re-rotate (churn the namespace, re-distribute). A
-                // genuinely new live Revoke carries a strictly higher seq
-                // (the daemon assigns monotonic seqs), so it still fires.
-                let watermark = self
-                    .rotated_revoke_seq
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                if revoke_seq.get() <= watermark {
-                    debug!(
-                        revoke_seq = revoke_seq.get(),
-                        watermark,
-                        ?revoked_peer,
-                        "rotation: skipping already-rotated (replayed) revoke",
-                    );
-                    return;
-                }
-                let prev = self
-                    .namespace_epoch
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                let outcome = match self.rotate_namespace(prev).await {
-                    Ok(o) => o,
-                    Err(e) => {
-                        warn!(?e, ?revoked_peer, "rotation: rotate_namespace failed");
-                        emit_event(
-                            &self.events,
-                            WorkspaceEvent::Error(format!("rotation failed: {e}")),
-                        );
-                        return;
-                    }
-                };
-                // Set the epoch before distributing so a concurrent
-                // signal sees the bump.
-                self.namespace_epoch
-                    .store(outcome.new_epoch, std::sync::atomic::Ordering::Relaxed);
-
-                // Advance + persist the rotated-revoke high-water mark
-                // (C3): the rotation succeeded, so this Revoke (and every
-                // earlier one) must never re-rotate on a future restart.
-                // Persist before distribution — distribution failure is
-                // recoverable (survivors re-sync on their next
-                // epoch-bearing delivery), but a re-rotation of this same
-                // revoke is exactly the churn we're preventing. A
-                // persist failure only logs: the in-memory mark still
-                // advances, so this process won't re-rotate; worst case a
-                // crash before the next durable write replays one extra
-                // rotation, which is safe (idempotent at the epoch gate).
-                self.rotated_revoke_seq
-                    .store(revoke_seq.get(), std::sync::atomic::Ordering::Relaxed);
-                if let Err(e) = persist_u64(
-                    &self.state_dir.join(ROTATED_REVOKE_SEQ_FILE),
-                    revoke_seq.get(),
-                    "rotated-revoke-seq",
-                ) {
-                    warn!(?e, "rotation: persist rotated-revoke-seq failed");
-                }
-
-                // Refresh the host's durable distribution state (C1) so
-                // peers that join or are promoted AFTER this rotation land
-                // on the rotated namespace, not the abandoned genesis:
-                //   1. overwrite the shared upgrade-secret cell, so a
-                //      later RW grant delivers the rotated secret;
-                //   2. re-publish the `workspace.ticket` envelope at the
-                //      new namespace + epoch, so a later joiner imports
-                //      the rotated namespace (and the daemon re-delivers
-                //      it to current members — inert for them).
-                // Both are best-effort: a failure leaves the steady-state
-                // cut-off intact (survivors already followed) but logs so
-                // the gap is visible.
-                if let Some(ctx) = &self.rotation_distribute_ctx {
-                    *ctx.upgrade_secret.lock().expect("upgrade_secret mutex") =
-                        outcome.new_secret;
-                    let envelope = WorkspaceTicketEnvelope::at_epoch(
-                        outcome.read_ticket.clone(),
-                        ctx.rules.clone(),
-                        outcome.new_epoch,
-                    );
-                    match ticket::encode(&envelope) {
-                        Ok(envelope_bytes) => {
-                            if let Err(e) = ctx
-                                .client
-                                .request(Request::PublishWorkspaceTicket {
-                                    session: ctx.session,
-                                    envelope_bytes,
-                                })
-                                .await
-                            {
-                                warn!(?e, "rotation: re-publish workspace ticket failed");
-                                emit_event(
-                                    &self.events,
-                                    WorkspaceEvent::Error(format!(
-                                        "rotation: re-publish ticket failed: {e}"
-                                    )),
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            warn!(?e, "rotation: encode rotated envelope failed");
-                            emit_event(
-                                &self.events,
-                                WorkspaceEvent::Error(format!(
-                                    "rotation: encode rotated envelope failed: {e}"
-                                )),
-                            );
-                        }
-                    }
-                }
-
-                // Distribute the new ticket to every surviving RW peer
-                // (the revoked peer is already gone from the cap set, so
-                // `rw_peers_except_host` excludes it).
-                let survivors = {
-                    let guard = self.node.lock().await;
-                    guard
-                        .as_ref()
-                        .map_or_else(Vec::new, |node| node.peer_map.rw_peers_except_host())
-                };
-                if let Some(ctx) = &self.rotation_distribute_ctx {
-                    for peer in survivors {
-                        if let Err(e) = publish_rotate(
-                            &ctx.client,
-                            ctx.session,
-                            peer,
-                            outcome.new_epoch,
-                            outcome.write_ticket.clone(),
-                        )
-                        .await
-                        {
-                            warn!(?e, ?peer, "rotation: deliver to survivor failed");
-                        }
-                    }
-                }
-
-                // Reimport the host onto the namespace it just minted.
-                if let Err(e) = self
-                    .reimport_namespace(ReimportSource::HostLocal {
-                        new_secret: outcome.new_secret,
-                        new_namespace: outcome.new_namespace,
-                        new_epoch_hint: outcome.new_epoch,
-                    })
-                    .await
-                {
-                    warn!(?e, "rotation: host reimport failed");
-                    emit_event(
-                        &self.events,
-                        WorkspaceEvent::Error(format!("host reimport failed: {e}")),
-                    );
-                }
-            }
+            } => self.handle_host_evict(revoked_peer, revoke_seq).await,
             RotationSignal::SurvivorRotate {
                 namespace_epoch,
                 doc_ticket,
@@ -1838,6 +1686,160 @@ impl Workspace {
                     );
                 }
             }
+        }
+    }
+
+    /// Host side of a [`RotationSignal::HostEvict`]: rotate the namespace,
+    /// refresh durable distribution state (C1), distribute the new ticket
+    /// to survivors, and reimport locally. Skips replayed revokes via the
+    /// rotated-revoke high-water mark (C3).
+    async fn handle_host_evict(self: &Arc<Self>, revoked_peer: PeerId, revoke_seq: Seq) {
+        // Idempotency guard (C3): skip a Revoke we've already rotated for.
+        // On a host restart the cap-listener re-subscribes `since: None`,
+        // so every historical Revoke replays; without this, each past
+        // eviction would re-rotate (churn the namespace, re-distribute). A
+        // genuinely new live Revoke carries a strictly higher seq (the
+        // daemon assigns monotonic seqs), so it still fires.
+        let watermark = self
+            .rotated_revoke_seq
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if revoke_seq.get() <= watermark {
+            debug!(
+                revoke_seq = revoke_seq.get(),
+                watermark,
+                ?revoked_peer,
+                "rotation: skipping already-rotated (replayed) revoke",
+            );
+            return;
+        }
+        let prev = self
+            .namespace_epoch
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let outcome = match self.rotate_namespace(prev).await {
+            Ok(o) => o,
+            Err(e) => {
+                warn!(?e, ?revoked_peer, "rotation: rotate_namespace failed");
+                emit_event(
+                    &self.events,
+                    WorkspaceEvent::Error(format!("rotation failed: {e}")),
+                );
+                return;
+            }
+        };
+        // Set the epoch before distributing so a concurrent signal sees
+        // the bump.
+        self.namespace_epoch
+            .store(outcome.new_epoch, std::sync::atomic::Ordering::Relaxed);
+
+        // Advance + persist the rotated-revoke high-water mark (C3): the
+        // rotation succeeded, so this Revoke (and every earlier one) must
+        // never re-rotate on a future restart. Persist before
+        // distribution — distribution failure is recoverable (survivors
+        // re-sync on their next epoch-bearing delivery), but a re-rotation
+        // of this same revoke is exactly the churn we're preventing. A
+        // persist failure only logs: the in-memory mark still advances, so
+        // this process won't re-rotate; worst case a crash before the next
+        // durable write replays one extra rotation, which is safe
+        // (idempotent at the epoch gate).
+        self.rotated_revoke_seq
+            .store(revoke_seq.get(), std::sync::atomic::Ordering::Relaxed);
+        if let Err(e) = persist_u64(
+            &self.state_dir.join(ROTATED_REVOKE_SEQ_FILE),
+            revoke_seq.get(),
+            "rotated-revoke-seq",
+        ) {
+            warn!(?e, "rotation: persist rotated-revoke-seq failed");
+        }
+
+        // Refresh the host's durable distribution state (C1) so peers that
+        // join or are promoted AFTER this rotation land on the rotated
+        // namespace, not the abandoned genesis.
+        self.refresh_distribution_state(&outcome).await;
+
+        // Distribute the new ticket to every surviving RW peer (the
+        // revoked peer is already gone from the cap set, so
+        // `rw_peers_except_host` excludes it).
+        let survivors = {
+            let guard = self.node.lock().await;
+            guard
+                .as_ref()
+                .map_or_else(Vec::new, |node| node.peer_map.rw_peers_except_host())
+        };
+        if let Some(ctx) = &self.rotation_distribute_ctx {
+            for peer in survivors {
+                if let Err(e) = publish_rotate(
+                    &ctx.client,
+                    ctx.session,
+                    peer,
+                    outcome.new_epoch,
+                    outcome.write_ticket.clone(),
+                )
+                .await
+                {
+                    warn!(?e, ?peer, "rotation: deliver to survivor failed");
+                }
+            }
+        }
+
+        // Reimport the host onto the namespace it just minted.
+        if let Err(e) = self
+            .reimport_namespace(ReimportSource::HostLocal {
+                new_secret: outcome.new_secret,
+                new_namespace: outcome.new_namespace,
+                new_epoch_hint: outcome.new_epoch,
+            })
+            .await
+        {
+            warn!(?e, "rotation: host reimport failed");
+            emit_event(
+                &self.events,
+                WorkspaceEvent::Error(format!("host reimport failed: {e}")),
+            );
+        }
+    }
+
+    /// Refresh the host's durable distribution state after a rotation
+    /// (C1): overwrite the shared upgrade-secret cell (so a later RW grant
+    /// delivers the rotated secret) and re-publish the `workspace.ticket`
+    /// envelope at the new namespace + epoch (so a later joiner imports
+    /// the rotated namespace; the daemon re-delivers it to current members
+    /// — inert for them). Both are best-effort: a failure leaves the
+    /// steady-state cut-off intact (survivors already followed) but logs +
+    /// surfaces a [`WorkspaceEvent::Error`] so the gap is visible.
+    async fn refresh_distribution_state(self: &Arc<Self>, outcome: &RotationOutcome) {
+        let Some(ctx) = &self.rotation_distribute_ctx else {
+            return;
+        };
+        *ctx.upgrade_secret.lock().expect("upgrade_secret mutex") = outcome.new_secret;
+        let envelope = WorkspaceTicketEnvelope::at_epoch(
+            outcome.read_ticket.clone(),
+            ctx.rules.clone(),
+            outcome.new_epoch,
+        );
+        let envelope_bytes = match ticket::encode(&envelope) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(?e, "rotation: encode rotated envelope failed");
+                emit_event(
+                    &self.events,
+                    WorkspaceEvent::Error(format!("rotation: encode rotated envelope failed: {e}")),
+                );
+                return;
+            }
+        };
+        if let Err(e) = ctx
+            .client
+            .request(Request::PublishWorkspaceTicket {
+                session: ctx.session,
+                envelope_bytes,
+            })
+            .await
+        {
+            warn!(?e, "rotation: re-publish workspace ticket failed");
+            emit_event(
+                &self.events,
+                WorkspaceEvent::Error(format!("rotation: re-publish ticket failed: {e}")),
+            );
         }
     }
 
@@ -2983,9 +2985,8 @@ fn read_u64_file(path: &Path, label: &str) -> Result<u64, WorkspaceError> {
 /// value in error messages. Used for `namespace_epoch` (C2) and
 /// `rotated-revoke-seq` (C3).
 fn persist_u64(path: &Path, value: u64, label: &str) -> Result<(), WorkspaceError> {
-    crate::keystore::write_atomic(path, &value.to_le_bytes(), None).map_err(|e| {
-        WorkspaceError::Doc(format!("persist {label} at {}: {e}", path.display()))
-    })
+    crate::keystore::write_atomic(path, &value.to_le_bytes(), None)
+        .map_err(|e| WorkspaceError::Doc(format!("persist {label} at {}: {e}", path.display())))
 }
 
 /// Open the host's persisted doc, or create a fresh one.
