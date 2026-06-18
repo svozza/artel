@@ -2072,6 +2072,81 @@ async fn rotation_drops_revoked_author_entries() {
 }
 
 // =============================================================
+// Rotation carries deletes forward (D3): a tombstone in the old
+// namespace must reappear as a tombstone in the rotated namespace, not
+// vanish. If it vanished, a survivor offline across the rotation would
+// reimport a namespace with neither the file nor a delete for it, keep
+// its stale local copy, and its respawned watcher could republish the
+// deleted path — resurrecting it.
+// =============================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rotation_carries_tombstones_forward() {
+    let (daemon, _client, ws, handle, _events, dir, _dns_pkarr) =
+        spawn_host_workspace_for_empty_test().await;
+
+    // Create then delete a file: the doc ends with a tombstone for it,
+    // and a live, surviving file alongside it.
+    tokio::fs::write(dir.path().join("kept.txt"), b"keep")
+        .await
+        .unwrap();
+    tokio::fs::write(dir.path().join("deleted.txt"), b"bye")
+        .await
+        .unwrap();
+    assert!(
+        wait_for_doc_entry(&ws, &dir.path().join("deleted.txt"), WAIT_BUDGET).await,
+        "deleted.txt never landed before delete",
+    );
+    assert!(
+        wait_for_doc_entry(&ws, &dir.path().join("kept.txt"), WAIT_BUDGET).await,
+        "kept.txt never landed",
+    );
+    tokio::fs::remove_file(dir.path().join("deleted.txt"))
+        .await
+        .unwrap();
+    // Wait for the tombstone to land in the current namespace.
+    let deadline = Instant::now() + WAIT_BUDGET;
+    loop {
+        let toms = ws
+            .test_namespace_tombstone_keys(ws.test_current_namespace_bytes())
+            .await;
+        if toms.iter().any(|k| k.ends_with("deleted.txt")) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "tombstone for deleted.txt never landed in the current namespace",
+        );
+        sleep(POLL_INTERVAL).await;
+    }
+
+    // Rotate (host self-rotation). The new namespace must carry the
+    // tombstone forward AND keep the live file.
+    let (_epoch, new_ns, _survivors, _dropped) =
+        ws.test_rotate_namespace(0).await.expect("rotate_namespace");
+
+    let live_keys = ws.test_namespace_keys(new_ns).await;
+    assert!(
+        live_keys.iter().any(|k| k.ends_with("kept.txt")),
+        "rotated namespace must keep the live kept.txt; live={live_keys:?}",
+    );
+    assert!(
+        !live_keys.iter().any(|k| k.ends_with("deleted.txt")),
+        "deleted.txt must not be a LIVE entry in the rotated namespace; live={live_keys:?}",
+    );
+    let tomb_keys = ws.test_namespace_tombstone_keys(new_ns).await;
+    assert!(
+        tomb_keys.iter().any(|k| k.ends_with("deleted.txt")),
+        "the delete must be carried forward as a tombstone (D3), not dropped; \
+         tombstones={tomb_keys:?}",
+    );
+
+    ws.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), handle).await;
+    daemon.stop().await;
+}
+
+// =============================================================
 // A live edit on the host's filesystem propagates to the joiner via
 // the watcher → doc → applier pipeline.
 //

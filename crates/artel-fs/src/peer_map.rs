@@ -12,6 +12,27 @@ use artel_protocol::PeerId;
 use artel_protocol::capability::{Capability, CapabilityAction};
 use iroh::EndpointId;
 
+/// Verdict for a doc-entry author at namespace-rotation time (D2). Only
+/// [`Self::Rw`] carries forward; the rest are dropped, but the caller
+/// distinguishes the *expected* drop ([`Self::Revoked`]) from the
+/// *alarming* one ([`Self::Unresolvable`], a survivor whose mapping
+/// hadn't landed yet) for diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthorDisposition {
+    /// Author resolves to a currently-`ReadWrite` peer — keep its entry.
+    Rw,
+    /// Author resolves to a peer explicitly revoked by the host — drop
+    /// (the intended effect of an Evict).
+    Revoked,
+    /// Author resolves to a known peer that is neither RW nor revoked
+    /// (a Read peer, or one dropped to the Read floor) — drop, unalarming.
+    NotRw,
+    /// Author's `EndpointId` has no `PeerId` mapping yet — drop
+    /// fail-closed, but this is a liveness race that silently loses a
+    /// (possibly trusted) peer's data, so the caller logs it loudly.
+    Unresolvable,
+}
+
 #[derive(Debug)]
 pub(crate) struct PeerMap {
     /// Workspace `EndpointId` → daemon `PeerId`.
@@ -130,23 +151,31 @@ impl PeerMap {
             .collect()
     }
 
-    /// Whether the peer owning workspace `EndpointId` currently holds
-    /// `ReadWrite`. Resolves `EndpointId → daemon PeerId` (the
-    /// same-seed author binding makes a doc entry's author equal the
-    /// owning node's `EndpointId`), then checks `has_rw`. Used by
-    /// namespace rotation to keep only still-RW authors' entries in the
-    /// snapshot. The host itself is always RW (seeded in `new`).
-    ///
-    /// Returns `false` for an unknown `EndpointId` (no mapping yet) —
-    /// fail-closed: an entry whose author we can't resolve to a current
-    /// RW peer is dropped from the rotated namespace.
-    pub(crate) fn endpoint_has_rw(&self, workspace_id: EndpointId) -> bool {
+    /// Classify a doc-entry author's `EndpointId` for the namespace-
+    /// rotation filter (D2). Both [`AuthorDisposition::Revoked`] and
+    /// [`AuthorDisposition::Unresolvable`] are dropped from the rotated
+    /// snapshot (fail-closed), but the caller logs them differently:
+    /// a `Revoked` drop is the *intended* effect of an Evict, while an
+    /// `Unresolvable` drop is a liveness race (the survivor's
+    /// `NODE_ID_ACTION` mapping hadn't landed when rotation fired) that
+    /// silently loses a *trusted* peer's data — worth a loud warning.
+    pub(crate) fn classify_author(&self, workspace_id: EndpointId) -> AuthorDisposition {
         let id_map = self.id_map.read().unwrap();
         let Some(&daemon_peer) = id_map.get(&workspace_id) else {
-            return false;
+            return AuthorDisposition::Unresolvable;
         };
         drop(id_map);
-        self.has_rw(daemon_peer)
+        if self.has_rw(daemon_peer) {
+            AuthorDisposition::Rw
+        } else if self.revoked.read().unwrap().contains(&daemon_peer) {
+            AuthorDisposition::Revoked
+        } else {
+            // Resolvable but neither RW nor explicitly revoked — a Read
+            // peer, or one granted then dropped to the Read floor. Its
+            // writes shouldn't carry forward (not RW), but it isn't the
+            // evicted adversary either; treat as a non-alarming drop.
+            AuthorDisposition::NotRw
+        }
     }
 
     /// Check whether an incoming workspace `EndpointId` belongs to a
@@ -339,5 +368,81 @@ mod tests {
 
         map.apply_capability(host, &grant_payload(peer, Capability::ReadWrite));
         assert!(!map.register(wid, peer));
+    }
+
+    // ---- classify_author (D2) ----
+
+    #[test]
+    fn classify_author_unresolvable_when_no_mapping() {
+        let map = PeerMap::new(test_host());
+        // Endpoint never registered → no PeerId mapping.
+        assert_eq!(
+            map.classify_author(test_workspace_id()),
+            AuthorDisposition::Unresolvable,
+        );
+    }
+
+    #[test]
+    fn classify_author_rw_for_granted_peer() {
+        let map = PeerMap::new(test_host());
+        let host = test_host();
+        let peer = test_peer();
+        let wid = test_workspace_id();
+        map.register(wid, peer);
+        map.apply_capability(host, &grant_payload(peer, Capability::ReadWrite));
+        assert_eq!(map.classify_author(wid), AuthorDisposition::Rw);
+    }
+
+    #[test]
+    fn classify_author_revoked_after_evict() {
+        let map = PeerMap::new(test_host());
+        let host = test_host();
+        let peer = test_peer();
+        let wid = test_workspace_id();
+        map.register(wid, peer);
+        map.apply_capability(host, &grant_payload(peer, Capability::ReadWrite));
+        map.apply_capability(host, &revoke_payload(peer));
+        assert_eq!(map.classify_author(wid), AuthorDisposition::Revoked);
+    }
+
+    #[test]
+    fn classify_author_not_rw_for_read_peer() {
+        let map = PeerMap::new(test_host());
+        let host = test_host();
+        let peer = test_peer();
+        let wid = test_workspace_id();
+        map.register(wid, peer);
+        map.apply_capability(host, &grant_payload(peer, Capability::Read));
+        // Resolvable, holds a cap, but not RW and not revoked.
+        assert_eq!(map.classify_author(wid), AuthorDisposition::NotRw);
+    }
+
+    #[test]
+    fn classify_author_distinguishes_revoked_from_unresolvable() {
+        // The D2 distinction that matters: a revoked peer (intended drop)
+        // must classify differently from an unmapped author (alarming
+        // drop — possible survivor data loss), even though the rotation
+        // filter drops both.
+        let map = PeerMap::new(test_host());
+        let host = test_host();
+        let peer = test_peer();
+        let wid = test_workspace_id();
+        map.register(wid, peer);
+        map.apply_capability(host, &grant_payload(peer, Capability::ReadWrite));
+        map.apply_capability(host, &revoke_payload(peer));
+
+        // A distinct, valid endpoint id that was never registered.
+        // (Fill byte 10 is a valid ed25519 point; 7 is not.)
+        let unmapped = EndpointId::from_bytes(&[10; 32]).unwrap();
+        assert_eq!(map.classify_author(wid), AuthorDisposition::Revoked);
+        assert_eq!(
+            map.classify_author(unmapped),
+            AuthorDisposition::Unresolvable,
+        );
+        assert_ne!(
+            map.classify_author(wid),
+            map.classify_author(unmapped),
+            "revoked and unresolvable must be distinguishable for D2 diagnostics",
+        );
     }
 }

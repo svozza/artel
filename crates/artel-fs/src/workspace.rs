@@ -1341,6 +1341,77 @@ impl Workspace {
         self.doc_token.lock().expect("doc_token mutex").clone()
     }
 
+    /// Snapshot the current doc and split its latest-per-key entries into
+    /// the carry-forward survivor set and per-reason drop counts (D2).
+    ///
+    /// Tombstones are **included** in the survivors (len 0) so the
+    /// re-author loop can carry deletes forward (D3); the author-filter
+    /// classifies each non-host entry via [`PeerMap::classify_author`].
+    /// An [`AuthorDisposition::Unresolvable`] author is dropped
+    /// fail-closed but logged loudly: it is a survivor whose
+    /// `NODE_ID_ACTION` mapping hadn't reached the host's `peer_map` when
+    /// rotation fired, so dropping it silently loses a trusted peer's data.
+    ///
+    /// `node` is the caller's already-locked node guard (the lock is held
+    /// across the whole rotation for a consistent snapshot).
+    async fn collect_rotation_survivors(
+        &self,
+        node: &WorkspaceNode,
+    ) -> Result<(Vec<(Vec<u8>, iroh_blobs::Hash, u64)>, RotationDropCounts), WorkspaceError> {
+        use crate::peer_map::AuthorDisposition;
+
+        // Latest entry per key, tombstones included (a delete must carry
+        // forward as a delete — D3).
+        let old_doc = self.doc();
+        let stream = old_doc
+            .get_many(Query::single_latest_per_key().include_empty())
+            .await
+            .map_err(|e| WorkspaceError::Doc(format!("rotate: snapshot get_many: {e}")))?;
+        tokio::pin!(stream);
+
+        let mut survivors: Vec<(Vec<u8>, iroh_blobs::Hash, u64)> = Vec::new();
+        let mut drops = RotationDropCounts::default();
+        while let Some(res) = stream.next().await {
+            let entry =
+                res.map_err(|e| WorkspaceError::Doc(format!("rotate: snapshot entry: {e}")))?;
+            let author_endpoint = iroh::EndpointId::from_bytes(entry.author().as_bytes())
+                .map_err(|e| WorkspaceError::Doc(format!("rotate: author not an endpoint: {e}")))?;
+            // The host's own writes always survive (host is RW by
+            // construction); other authors are classified via the binding.
+            let keep = author_endpoint == node.endpoint_id
+                || match node.peer_map.classify_author(author_endpoint) {
+                    AuthorDisposition::Rw => true,
+                    AuthorDisposition::Revoked => {
+                        drops.revoked += 1;
+                        false
+                    }
+                    AuthorDisposition::NotRw => {
+                        drops.not_rw += 1;
+                        false
+                    }
+                    AuthorDisposition::Unresolvable => {
+                        drops.unresolvable += 1;
+                        warn!(
+                            target: "artel_fs::workspace",
+                            %author_endpoint,
+                            key = %String::from_utf8_lossy(entry.key()),
+                            "rotate: dropping entry with unresolvable author (mapping not yet \
+                             known); if this is a survivor, its NODE_ID_ACTION race lost data",
+                        );
+                        false
+                    }
+                };
+            if keep {
+                survivors.push((
+                    entry.key().to_vec(),
+                    entry.content_hash(),
+                    entry.content_len(),
+                ));
+            }
+        }
+        Ok((survivors, drops))
+    }
+
     /// Rotate the workspace namespace (Slice 3 — the cryptographic
     /// write cut-off behind Evict).
     ///
@@ -1374,39 +1445,21 @@ impl Workspace {
             .as_ref()
             .ok_or_else(|| WorkspaceError::Doc("rotate: node already torn down".into()))?;
 
-        // Snapshot the current doc: latest entry per key, tombstones
-        // included (a delete must carry forward as a delete).
-        let old_doc = self.doc();
-        let stream = old_doc
-            .get_many(Query::single_latest_per_key().include_empty())
-            .await
-            .map_err(|e| WorkspaceError::Doc(format!("rotate: snapshot get_many: {e}")))?;
-        tokio::pin!(stream);
-
-        // Collect the surviving (author still RW) entries as
-        // (key, hash, len) triples. The author bytes equal the owning
-        // node's EndpointId (same-seed binding, Slice 1), so the
-        // peer_map resolves author → RW directly.
-        let mut survivors: Vec<(Vec<u8>, iroh_blobs::Hash, u64)> = Vec::new();
-        let mut dropped = 0usize;
-        while let Some(res) = stream.next().await {
-            let entry =
-                res.map_err(|e| WorkspaceError::Doc(format!("rotate: snapshot entry: {e}")))?;
-            let author_endpoint = iroh::EndpointId::from_bytes(entry.author().as_bytes())
-                .map_err(|e| WorkspaceError::Doc(format!("rotate: author not an endpoint: {e}")))?;
-            // The host's own writes always survive (host is RW by
-            // construction); other authors must be currently RW.
-            let keep = author_endpoint == node.endpoint_id
-                || node.peer_map.endpoint_has_rw(author_endpoint);
-            if keep {
-                survivors.push((
-                    entry.key().to_vec(),
-                    entry.content_hash(),
-                    entry.content_len(),
-                ));
-            } else {
-                dropped += 1;
-            }
+        // Snapshot the current doc and classify each entry's author
+        // (D2: split drops by reason; an unresolvable-author drop is a
+        // possible survivor-data-loss race and is surfaced loudly).
+        let (survivors, drops) = self.collect_rotation_survivors(node).await?;
+        let dropped = drops.total();
+        if drops.unresolvable > 0 {
+            emit_event(
+                &self.events,
+                WorkspaceEvent::Error(format!(
+                    "rotation dropped {} entr{} with an unresolvable author \
+                     (possible survivor data loss from a NODE_ID mapping race)",
+                    drops.unresolvable,
+                    if drops.unresolvable == 1 { "y" } else { "ies" },
+                )),
+            );
         }
 
         // Mint the fresh namespace and re-author the snapshot into it
@@ -1418,10 +1471,18 @@ impl Workspace {
             .await
             .map_err(|e| WorkspaceError::Doc(format!("rotate: create namespace: {e}")))?;
         for (key, hash, len) in &survivors {
-            // Skip tombstones (len 0): a fresh namespace has no prior
-            // entry for the key, so there is nothing to delete, and
-            // `set_hash` of an empty entry would be rejected.
             if *len == 0 {
+                // Tombstone (D3): carry the delete forward by re-authoring
+                // an empty entry under the host. A `set_hash` of a 0-len
+                // entry would be rejected, but `del` writes a syncable
+                // deletion marker — so a survivor that was OFFLINE across
+                // the rotation reimports the new namespace and still sees
+                // the delete, rather than resurrecting its stale local
+                // copy (and republishing it via its respawned watcher).
+                new_doc
+                    .del(self.author, key.clone())
+                    .await
+                    .map_err(|e| WorkspaceError::Doc(format!("rotate: carry-forward del: {e}")))?;
                 continue;
             }
             new_doc
@@ -1491,6 +1552,9 @@ impl Workspace {
             new_epoch,
             survivors = survivors.len(),
             dropped,
+            dropped_revoked = drops.revoked,
+            dropped_not_rw = drops.not_rw,
+            dropped_unresolvable = drops.unresolvable,
             "rotate_namespace: minted new namespace",
         );
 
@@ -2118,6 +2182,39 @@ impl Workspace {
         while let Some(res) = stream.next().await {
             if let Ok(entry) = res
                 && entry.content_len() > 0
+            {
+                keys.push(String::from_utf8_lossy(entry.key()).into_owned());
+            }
+        }
+        keys
+    }
+
+    /// The set of keys whose **latest** entry in `namespace_id_bytes` is a
+    /// tombstone (zero-length deletion marker). For tests asserting that a
+    /// delete was carried forward into a rotated namespace (D3) rather
+    /// than silently dropped (which would let an offline survivor
+    /// resurrect the deleted path on reimport).
+    #[cfg(feature = "test-utils")]
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn test_namespace_tombstone_keys(&self, namespace_id_bytes: [u8; 32]) -> Vec<String> {
+        let guard = self.node.lock().await;
+        let node = guard.as_ref().expect("node live");
+        let id = NamespaceId::from(&namespace_id_bytes);
+        let doc = node
+            .docs
+            .open(id)
+            .await
+            .expect("open namespace")
+            .expect("namespace present");
+        let stream = doc
+            .get_many(Query::single_latest_per_key().include_empty())
+            .await
+            .expect("get_many");
+        tokio::pin!(stream);
+        let mut keys = Vec::new();
+        while let Some(res) = stream.next().await {
+            if let Ok(entry) = res
+                && entry.content_len() == 0
             {
                 keys.push(String::from_utf8_lossy(entry.key()).into_owned());
             }
@@ -2835,6 +2932,28 @@ fn ensure_state_dir(state_dir: &Path) -> Result<(), WorkspaceError> {
     // keystore's own threat model.
     crate::keystore::ensure_dir(state_dir)
         .map_err(|e| WorkspaceError::Iroh(format!("create state_dir {}: {e}", state_dir.display())))
+}
+
+/// Per-reason drop counts from [`Workspace::collect_rotation_survivors`]
+/// (D2). All three are dropped from the rotated namespace, but they are
+/// counted separately so the caller can surface the *alarming* one
+/// (`unresolvable` — possible survivor data loss) distinctly from the
+/// *expected* one (`revoked` — the intended effect of an Evict).
+#[derive(Default)]
+struct RotationDropCounts {
+    /// Author resolves to an explicitly-revoked peer (intended drop).
+    revoked: usize,
+    /// Author resolves to a known non-RW peer (Read / dropped to floor).
+    not_rw: usize,
+    /// Author's `EndpointId` has no mapping yet — fail-closed drop, but a
+    /// liveness race that may have silently lost a trusted peer's data.
+    unresolvable: usize,
+}
+
+impl RotationDropCounts {
+    const fn total(&self) -> usize {
+        self.revoked + self.not_rw + self.unresolvable
+    }
 }
 
 /// Result of [`Workspace::rotate_namespace`].

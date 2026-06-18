@@ -193,8 +193,8 @@ impl WorkspaceNode {
             .map_err(|e| WorkspaceError::Doc(format!("author_import: {e}")))?;
         // Hard-assert the same-seed binding (not just debug_assert): it is
         // security-load-bearing. Namespace rotation's author-filter keeps
-        // an entry only if `peer_map.endpoint_has_rw(entry.author)`, which
-        // resolves *because* `AuthorId == endpoint_id`. If a future
+        // an entry only if `peer_map.classify_author(entry.author)` is RW,
+        // which resolves *because* `AuthorId == endpoint_id`. If a future
         // iroh-docs change made `Author::from_bytes` derive its id
         // differently, the binding would silently break in release and the
         // fail-closed filter would drop *every* survivor's entries on the
@@ -304,7 +304,7 @@ mod tests {
     /// disjoint byte-strings, so a signature minted in one can never be
     /// replayed as a valid signature in the other.
     ///
-    /// - **TLS 1.3 CertificateVerify** (RFC 8446 §4.4.3): the signed
+    /// - **TLS 1.3 `CertificateVerify`** (RFC 8446 §4.4.3): the signed
     ///   content begins with exactly **64 octets of `0x20`** (a fixed
     ///   padding prefix), followed by a context string, a `0x00`
     ///   separator, and the transcript hash.
