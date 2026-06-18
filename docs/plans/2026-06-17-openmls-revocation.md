@@ -1,7 +1,7 @@
 ---
 date: 2026-06-17
 topic: openmls-revocation (Tier-1 robust write-revocation)
-status: IN PROGRESS — Slices 0,1,2 done; Slice 3 partial (3a,3c,3d done; 3b,3e remain)
+status: COMPLETE — Slices 0,1,2,3 all shipped (3a–3e done)
 adrs: docs/adr/002-no-mls-for-tier1-write-revocation.md, docs/adr/003-daemon-stays-namespace-agnostic.md
 context: CONTEXT.md (Write authority / Capability & revocation / Tiers / Layer boundary)
 
@@ -15,27 +15,28 @@ context: CONTEXT.md (Write authority / Capability & revocation / Tiers / Layer b
   persist current-ns, bump epoch (`d4d3182`)
 - ✅ **Slice 3d** — joiner re-import: `Mutex<Doc>` swap + token reset +
   task respawn, cap-listener survives (`44e2fe4`)
-- ⬜ **Slice 3b** — freeze/drain quiescence protocol (the hard slice;
-  needs real-n0 multi-peer tests). NOT STARTED.
-- ⬜ **Slice 3e** — Evict→rotate auto-trigger + host→survivor secret
-  distribution. NOT STARTED. **Must not land before 3b** — auto-firing
-  rotation without the freeze barrier ships a known-lossy rotation
-  (a survivor write racing the snapshot is lost). The rotation core
-  (3c) and re-import (3d) primitives exist and are tested; 3e is the
-  orchestration that calls them, and `rotate_namespace.new_secret` is
-  produced but not yet consumed/distributed.
+- ✅ **Slice 3b** — quiescence: shipped as the **epoch-gated light**
+  shape (not a host-coordinated freeze/ack). The "freeze" is each
+  survivor's own reimport pausing its watcher (3d). Accepted loss
+  documented in CONTEXT.md; heavy barrier is a future additive upgrade.
+- ✅ **Slice 3e** — Evict→rotate auto-trigger + host→survivor ticket
+  distribution (`53c3561`). Plain `Revoke` auto-fires rotate → distribute
+  rotated DocTicket to survivors via new `DeliverRotate` unicast → host
+  + survivors reimport. Lifecycle seam resolved via a `RotationSignal`
+  channel drained by a once-spawned rotation task in `run()`;
+  `spawn_doc_tasks` extracted so reimport respawns watcher/applier
+  without re-entering the rotation-task spawn (avoids a recursive !Send
+  future). Survivors get a full `DocTicket` (capability + addresses), not
+  a bare secret, since a brand-new namespace needs `start_sync(nodes)`.
 
-### Next-session entry points
-- 3e lifecycle seam: the host cap-listener (detects `Revoke` in
-  `handle_capability_message`) spawns *before* the `Arc<Workspace>`
-  exists, but rotation needs that Arc. Resolve via a channel: cap-listener
-  sends the revoked `PeerId`; a rotation task spawned where the Arc is
-  live drains it → `rotate_namespace` → distribute `new_secret` over the
-  existing `DeliverUpgrade` unicast to each surviving RW peer → host
-  `reimport_namespace`. Beware `run()` is re-entrant (re-import calls it):
-  spawn the rotation listener once, not per `run()`.
-- 3b barrier: freeze message (host-sequenced), survivor acks via the
-  sequencer, bounded-wait drain before the snapshot in `rotate_namespace`.
+### Tests proving the feature
+- `evict_auto_rotates_and_cuts_off_writes` (+ `_n0` real-relay): plain
+  Revoke auto-rotates; evicted peer with retained old secret + live
+  watcher is cut off; host operates on the new namespace.
+- `survivor_follows_rotation_evicted_is_cut` (3 real peers): survivor
+  auto-follows the rotation and keeps round-tripping; evicted peer cut.
+- `rotation_drops_revoked_author_entries`, `reimport_swaps_...`,
+  `doc_token_...`, author-binding + envelope-epoch unit tests.
 ---
 
 # Tier-1 robust write-revocation — namespace rotation (no MLS)
