@@ -1193,6 +1193,17 @@ impl Workspace {
         self.session_id
     }
 
+    /// The current namespace-rotation epoch (Slice 3). `0` at genesis;
+    /// bumped on each write-revocation rotation (host) or on reimport
+    /// onto a rotated namespace (survivor). Lets a consumer surface
+    /// "we are on namespace epoch N" so a rotation is visible — e.g. a
+    /// chat-harness status line confirming an Evict took effect.
+    #[must_use]
+    pub fn namespace_epoch(&self) -> u64 {
+        self.namespace_epoch
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// The artel-session [`JoinTicket`] the daemon issued when this
     /// workspace registered as host. `None` on joiners — they
     /// already had a ticket to get here.
