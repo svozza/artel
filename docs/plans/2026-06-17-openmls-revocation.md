@@ -1,9 +1,41 @@
 ---
 date: 2026-06-17
 topic: openmls-revocation (Tier-1 robust write-revocation)
-status: PLAN — ready to implement
+status: IN PROGRESS — Slices 0,1,2 done; Slice 3 partial (3a,3c,3d done; 3b,3e remain)
 adrs: docs/adr/002-no-mls-for-tier1-write-revocation.md, docs/adr/003-daemon-stays-namespace-agnostic.md
 context: CONTEXT.md (Write authority / Capability & revocation / Tiers / Layer boundary)
+
+## Progress (2026-06-18)
+
+- ✅ **Slice 0** — Demote / downgrade notification + watcher-halt (`ccefdee`)
+- ✅ **Slice 1** — Same-seed author binding, `AuthorId == endpoint_id` (`1fb5d89`)
+- ✅ **Slice 2** — Identity decoupling, genesis vs current namespace (`aae05e6`)
+- ✅ **Slice 3a** — doc/cap token split (`d4d3182`)
+- ✅ **Slice 3c** — rotation core: mint new ns, author-filter, re-author,
+  persist current-ns, bump epoch (`d4d3182`)
+- ✅ **Slice 3d** — joiner re-import: `Mutex<Doc>` swap + token reset +
+  task respawn, cap-listener survives (`44e2fe4`)
+- ⬜ **Slice 3b** — freeze/drain quiescence protocol (the hard slice;
+  needs real-n0 multi-peer tests). NOT STARTED.
+- ⬜ **Slice 3e** — Evict→rotate auto-trigger + host→survivor secret
+  distribution. NOT STARTED. **Must not land before 3b** — auto-firing
+  rotation without the freeze barrier ships a known-lossy rotation
+  (a survivor write racing the snapshot is lost). The rotation core
+  (3c) and re-import (3d) primitives exist and are tested; 3e is the
+  orchestration that calls them, and `rotate_namespace.new_secret` is
+  produced but not yet consumed/distributed.
+
+### Next-session entry points
+- 3e lifecycle seam: the host cap-listener (detects `Revoke` in
+  `handle_capability_message`) spawns *before* the `Arc<Workspace>`
+  exists, but rotation needs that Arc. Resolve via a channel: cap-listener
+  sends the revoked `PeerId`; a rotation task spawned where the Arc is
+  live drains it → `rotate_namespace` → distribute `new_secret` over the
+  existing `DeliverUpgrade` unicast to each surviving RW peer → host
+  `reimport_namespace`. Beware `run()` is re-entrant (re-import calls it):
+  spawn the rotation listener once, not per `run()`.
+- 3b barrier: freeze message (host-sequenced), survivor acks via the
+  sequencer, bounded-wait drain before the snapshot in `rotate_namespace`.
 ---
 
 # Tier-1 robust write-revocation — namespace rotation (no MLS)
