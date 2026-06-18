@@ -795,6 +795,205 @@ async fn survivor_follows_rotation_evicted_is_cut() {
 }
 
 // =============================================================
+// Post-rotation join + promotion (C1): after a rotation the host must
+// refresh its durable distribution state so a peer that joins LATER
+// lands on the rotated namespace (not the abandoned genesis), and a
+// peer promoted to RW AFTER the rotation receives the rotated secret
+// (not the stale genesis one). Without the fix the late joiner imports
+// the frozen genesis namespace and a post-rotation promotion hands out
+// a worthless secret.
+// =============================================================
+
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn late_joiner_lands_on_rotated_namespace_and_can_be_promoted() {
+    use artel_protocol::capability::Capability;
+
+    // Three daemons sharing one DnsPkarrServer: alice hosts, bob is the
+    // peer we evict to force a rotation, carol joins afterwards.
+    let pair = spawn_pair().await;
+    let dns_pkarr = Arc::clone(&pair.dns_pkarr);
+    let daemon_c = common::spawn_daemon_with_setup(
+        common::fresh_state(),
+        common::daemon_testing_setup(&dns_pkarr),
+    )
+    .await;
+    common::wait_for_endpoint(&dns_pkarr, &daemon_c.iroh_addr.as_ref().expect("addr").id).await;
+    let Pair {
+        daemon_a, daemon_b, ..
+    } = pair;
+
+    // Alice hosts.
+    let alice = Client::connect(&daemon_a.socket).await.unwrap();
+    let alice_dir = tempfile::tempdir().unwrap();
+    let (alice_ws, alice_ev) = Workspace::host_with(
+        &alice,
+        "alice",
+        alice_dir.path().to_path_buf(),
+        AttachPolicy::RequireEmpty,
+        WorkspaceConfig::default()
+            .with_endpoint_setup(testing_setup(&dns_pkarr))
+            .with_daemon_socket(daemon_a.socket.clone()),
+    )
+    .await
+    .expect("host");
+    common::drain_ws_events(alice_ev);
+    let session = alice_ws.session_id();
+    let alice_ws = Arc::new(alice_ws);
+    let alice_handle = Arc::clone(&alice_ws).run().await;
+
+    // Bob joins (Read ticket) and is granted RW so an Evict triggers a
+    // real rotation.
+    let bob = Client::connect(&daemon_b.socket).await.unwrap();
+    let bob_peer = bob.daemon_peer_id();
+    let bob_dir = tempfile::tempdir().unwrap();
+    let read_ticket = match alice
+        .request(Request::IssueTicket {
+            session,
+            granted_cap: Capability::Read,
+            expiry_ms: 0,
+        })
+        .await
+        .unwrap()
+    {
+        Response::IssuedTicket { ticket, .. } => ticket,
+        other => panic!("expected IssuedTicket, got {other:?}"),
+    };
+    assert!(matches!(
+        bob.request(Request::JoinSession {
+            display_name: "bob".into(),
+            ticket: read_ticket,
+        })
+        .await
+        .unwrap(),
+        Response::JoinSession { .. }
+    ));
+    let (bob_ws, bob_ev) = Workspace::join_with(
+        &bob,
+        session,
+        bob_dir.path().to_path_buf(),
+        AttachPolicy::RequireEmpty,
+        WorkspaceConfig::default()
+            .with_endpoint_setup(testing_setup(&dns_pkarr))
+            .with_daemon_socket(daemon_b.socket.clone()),
+    )
+    .await
+    .expect("bob join");
+    common::drain_ws_events(bob_ev);
+    let bob_ws = Arc::new(bob_ws);
+    let bob_handle = Arc::clone(&bob_ws).run().await;
+    common::grant_rw_and_wait(&alice, session, bob_peer, bob_dir.path(), alice_dir.path()).await;
+
+    // Evict bob → host auto-rotates.
+    let ns_before = alice_ws.test_current_namespace_bytes();
+    common::revoke(&alice, session, bob_peer).await;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if alice_ws.test_current_namespace_bytes() != ns_before {
+            break;
+        }
+        assert!(Instant::now() < deadline, "host never auto-rotated");
+        sleep(POLL_INTERVAL).await;
+    }
+
+    // Host writes content AFTER the rotation — this lives only in the
+    // rotated namespace.
+    tokio::fs::write(alice_dir.path().join("after_rotation.txt"), b"fresh")
+        .await
+        .unwrap();
+    assert!(
+        wait_for_doc_entry(
+            &alice_ws,
+            &alice_dir.path().join("after_rotation.txt"),
+            WAIT_BUDGET
+        )
+        .await,
+        "host post-rotation write never landed in the new namespace",
+    );
+
+    // Carol joins LATE (after the rotation). She must land on the
+    // rotated namespace and bulk-export the post-rotation content — if
+    // she imported the abandoned genesis, after_rotation.txt would never
+    // appear.
+    let carol = Client::connect(&daemon_c.socket).await.unwrap();
+    let carol_peer = carol.daemon_peer_id();
+    let carol_dir = tempfile::tempdir().unwrap();
+    let carol_ticket = match alice
+        .request(Request::IssueTicket {
+            session,
+            granted_cap: Capability::Read,
+            expiry_ms: 0,
+        })
+        .await
+        .unwrap()
+    {
+        Response::IssuedTicket { ticket, .. } => ticket,
+        other => panic!("expected IssuedTicket, got {other:?}"),
+    };
+    assert!(matches!(
+        carol
+            .request(Request::JoinSession {
+                display_name: "carol".into(),
+                ticket: carol_ticket,
+            })
+            .await
+            .unwrap(),
+        Response::JoinSession { .. }
+    ));
+    let (carol_ws, carol_ev) = Workspace::join_with(
+        &carol,
+        session,
+        carol_dir.path().to_path_buf(),
+        AttachPolicy::RequireEmpty,
+        WorkspaceConfig::default()
+            .with_endpoint_setup(testing_setup(&dns_pkarr))
+            .with_daemon_socket(daemon_c.socket.clone()),
+    )
+    .await
+    .expect("carol join");
+    common::drain_ws_events(carol_ev);
+    let carol_ws = Arc::new(carol_ws);
+    let carol_handle = Arc::clone(&carol_ws).run().await;
+
+    common::wait_for_file(&carol_dir.path().join("after_rotation.txt"), b"fresh").await;
+
+    // Now promote carol to RW AFTER the rotation: she must receive the
+    // ROTATED secret (not the stale genesis one), so her write reaches
+    // the host on the live namespace.
+    common::grant_rw(&alice, session, carol_peer).await;
+    let probe = carol_dir.path().join("carol_rw.txt");
+    let host_sees = alice_dir.path().join("carol_rw.txt");
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        let _ = tokio::fs::write(&probe, b"carol-rw").await;
+        sleep(POLL_INTERVAL).await;
+        if tokio::fs::read(&host_sees)
+            .await
+            .is_ok_and(|b| b == b"carol-rw")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "post-rotation promotion: carol's RW write never reached host — stale secret",
+        );
+    }
+
+    alice_ws.shutdown().await.unwrap();
+    bob_ws.shutdown().await.unwrap();
+    carol_ws.shutdown().await.unwrap();
+    let _ = timeout(Duration::from_secs(5), alice_handle).await;
+    let _ = timeout(Duration::from_secs(5), bob_handle).await;
+    let _ = timeout(Duration::from_secs(5), carol_handle).await;
+    drop(alice);
+    drop(bob);
+    drop(carol);
+    daemon_a.stop().await;
+    daemon_b.stop().await;
+    daemon_c.stop().await;
+}
+
+// =============================================================
 // Namespace re-import (Slice 3d): after rotation, re-importing onto the
 // new namespace swaps the live doc, respawns the watcher/applier
 // against it, and keeps the workspace operational — a write made AFTER

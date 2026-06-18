@@ -853,18 +853,28 @@ impl Workspace {
                 .await
                 .map_err(|e| WorkspaceError::Iroh(format!("upgrade-client host: {e}")))?;
             let upgrade_client = Arc::new(upgrade_client);
+            // The current upgrade secret is shared, mutable state (C1):
+            // on rotation the host re-mints it and the cap-listener must
+            // start delivering the NEW secret to any peer promoted
+            // afterwards. Both the cap-listener's `HostUpgradeCtx` and the
+            // rotation task's `RotationDistributeCtx` hold the same cell.
+            let upgrade_secret = Arc::new(std::sync::Mutex::new(namespace_secret));
             let host_ctx = Some(HostUpgradeCtx {
                 client: Arc::clone(&upgrade_client),
                 session: session_id,
-                namespace_secret,
+                namespace_secret: Arc::clone(&upgrade_secret),
                 rotation_tx: rotation_tx.clone(),
             });
             // Rotation distribution reuses the same upgrade client +
             // session (the host distributes the rotated ticket to
-            // survivors over the same direct-stream path).
+            // survivors over the same direct-stream path) and shares the
+            // upgrade-secret cell + rules so it can refresh both the
+            // promotion secret and the published read envelope on rotate.
             let distribute = Some(RotationDistributeCtx {
                 client: upgrade_client,
                 session: session_id,
+                upgrade_secret,
+                rules: rules.clone(),
             });
             (host_ctx, distribute)
         } else {
@@ -1389,6 +1399,17 @@ impl Workspace {
             }
         };
         let write_ticket = write_ticket.to_string();
+
+        // Build the Read ticket too (capability + addresses). The host
+        // re-publishes this as the new `workspace.ticket` envelope (C1)
+        // so a peer that joins AFTER the rotation imports the rotated
+        // namespace, not the abandoned genesis. Mirrors the host's
+        // construction-time read ticket in `host_with_inner`.
+        let read_ticket = new_doc
+            .share(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
+            .await
+            .map_err(|e| WorkspaceError::Doc(format!("rotate: share new doc (read): {e}")))?
+            .to_string();
         let new_namespace = new_doc.id();
         let new_epoch = prev_epoch + 1;
 
@@ -1424,6 +1445,7 @@ impl Workspace {
         Ok(RotationOutcome {
             new_secret,
             write_ticket,
+            read_ticket,
             new_namespace,
             new_epoch,
             survivor_entries: survivors.len(),
@@ -1595,6 +1617,57 @@ impl Workspace {
                 // signal sees the bump.
                 self.namespace_epoch
                     .store(outcome.new_epoch, std::sync::atomic::Ordering::Relaxed);
+
+                // Refresh the host's durable distribution state (C1) so
+                // peers that join or are promoted AFTER this rotation land
+                // on the rotated namespace, not the abandoned genesis:
+                //   1. overwrite the shared upgrade-secret cell, so a
+                //      later RW grant delivers the rotated secret;
+                //   2. re-publish the `workspace.ticket` envelope at the
+                //      new namespace + epoch, so a later joiner imports
+                //      the rotated namespace (and the daemon re-delivers
+                //      it to current members — inert for them).
+                // Both are best-effort: a failure leaves the steady-state
+                // cut-off intact (survivors already followed) but logs so
+                // the gap is visible.
+                if let Some(ctx) = &self.rotation_distribute_ctx {
+                    *ctx.upgrade_secret.lock().expect("upgrade_secret mutex") =
+                        outcome.new_secret;
+                    let envelope = WorkspaceTicketEnvelope::at_epoch(
+                        outcome.read_ticket.clone(),
+                        ctx.rules.clone(),
+                        outcome.new_epoch,
+                    );
+                    match ticket::encode(&envelope) {
+                        Ok(envelope_bytes) => {
+                            if let Err(e) = ctx
+                                .client
+                                .request(Request::PublishWorkspaceTicket {
+                                    session: ctx.session,
+                                    envelope_bytes,
+                                })
+                                .await
+                            {
+                                warn!(?e, "rotation: re-publish workspace ticket failed");
+                                emit_event(
+                                    &self.events,
+                                    WorkspaceEvent::Error(format!(
+                                        "rotation: re-publish ticket failed: {e}"
+                                    )),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!(?e, "rotation: encode rotated envelope failed");
+                            emit_event(
+                                &self.events,
+                                WorkspaceEvent::Error(format!(
+                                    "rotation: encode rotated envelope failed: {e}"
+                                )),
+                            );
+                        }
+                    }
+                }
 
                 // Distribute the new ticket to every surviving RW peer
                 // (the revoked peer is already gone from the cap set, so
@@ -2301,10 +2374,20 @@ async fn publish_downgrade(
 }
 
 /// Host-side context for distributing a rotated namespace's ticket to
-/// survivors (Slice 3e).
+/// survivors (Slice 3e) and refreshing the host's durable distribution
+/// state on rotation (C1).
 pub(crate) struct RotationDistributeCtx {
     pub(crate) client: Arc<Client>,
     pub(crate) session: SessionId,
+    /// Shared with the cap-listener's [`HostUpgradeCtx`]. On rotation the
+    /// rotation task overwrites this with the freshly minted secret so a
+    /// peer promoted to RW *after* the rotation receives the new secret,
+    /// not the stale genesis one (C1).
+    pub(crate) upgrade_secret: Arc<std::sync::Mutex<[u8; 32]>>,
+    /// The host's path rules, needed to rebuild the `workspace.ticket`
+    /// envelope re-published on rotation so late joiners import the
+    /// rotated namespace (C1).
+    pub(crate) rules: PathRules,
 }
 
 impl std::fmt::Debug for RotationDistributeCtx {
@@ -2666,6 +2749,13 @@ pub(crate) struct RotationOutcome {
     /// style rotation unicast (see [`DeliveryFrame::Rotate`]). Never
     /// given to the revoked peer.
     pub(crate) write_ticket: String,
+    /// The Read [`iroh_docs::DocTicket`] string (capability + addresses)
+    /// for the rotated namespace. The host re-publishes this as the new
+    /// `workspace.ticket` envelope so a peer that joins AFTER the
+    /// rotation imports the rotated namespace, not the abandoned genesis
+    /// (C1). Carries no write capability — RW is delivered separately via
+    /// the refreshed upgrade secret.
+    pub(crate) read_ticket: String,
     /// The new current `NamespaceId`.
     pub(crate) new_namespace: NamespaceId,
     /// The bumped `namespace_epoch` (prev + 1).
@@ -2970,7 +3060,11 @@ async fn reconcile_doc_against_disk(
 struct HostUpgradeCtx {
     client: Arc<Client>,
     session: SessionId,
-    namespace_secret: [u8; 32],
+    /// The *current* namespace secret to deliver on an RW grant. Shared
+    /// (and mutated on rotation) with [`RotationDistributeCtx`] so a peer
+    /// promoted after a rotation receives the rotated secret, not the
+    /// stale genesis one (C1).
+    namespace_secret: Arc<std::sync::Mutex<[u8; 32]>>,
     /// Sender to the rotation task: on a `Revoke` the host cap-listener
     /// sends [`RotationSignal::HostEvict`] here (the cap-listener has no
     /// `Arc<Workspace>`, so it can't rotate directly). Slice 3e.
@@ -3135,7 +3229,8 @@ fn handle_capability_message(
     {
         let client = Arc::clone(&ctx.client);
         let sess = ctx.session;
-        let secret = ctx.namespace_secret;
+        // Read the *current* secret (refreshed on rotation, C1).
+        let secret = *ctx.namespace_secret.lock().expect("upgrade_secret mutex");
         tokio::spawn(async move {
             if let Err(e) = publish_upgrade(&client, sess, peer, secret).await {
                 warn!(?e, ?peer, "upgrade delivery failed");
@@ -3280,7 +3375,8 @@ async fn handle_cap_event(
             {
                 let client = Arc::clone(&ctx.client);
                 let sess = ctx.session;
-                let secret = ctx.namespace_secret;
+                // Read the *current* secret (refreshed on rotation, C1).
+                let secret = *ctx.namespace_secret.lock().expect("upgrade_secret mutex");
                 let peer = joined_peer.id;
                 tokio::spawn(async move {
                     if let Err(e) = publish_upgrade(&client, sess, peer, secret).await {
