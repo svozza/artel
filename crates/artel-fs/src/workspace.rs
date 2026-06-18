@@ -1709,10 +1709,12 @@ impl Workspace {
         Ok(())
     }
 
-    /// Handle one [`RotationSignal`] (Slice 3e). Host: rotate →
-    /// distribute the new ticket to survivors → reimport locally.
-    /// Survivor: reimport onto the delivered namespace if its epoch is
-    /// newer than what we hold. Errors are logged + surfaced as a
+    /// Handle one [`RotationSignal`] (Slice 3e). Host: rotate → reimport
+    /// locally → refresh distribution state → distribute to survivors
+    /// (host-first ordering, D1, so the host's write-loss window is just
+    /// the local doc swap and it is syncing the new namespace before any
+    /// survivor dials). Survivor: reimport onto the delivered namespace if
+    /// its epoch is newer than what we hold. Errors are logged + surfaced as a
     /// [`WorkspaceEvent::Error`]; rotation is best-effort at this layer
     /// (a failed distribution leaves a survivor on the old namespace,
     /// recovered on its next epoch-bearing delivery).
@@ -1754,9 +1756,10 @@ impl Workspace {
     }
 
     /// Host side of a [`RotationSignal::HostEvict`]: rotate the namespace,
-    /// refresh durable distribution state (C1), distribute the new ticket
-    /// to survivors, and reimport locally. Skips replayed revokes via the
-    /// rotated-revoke high-water mark (C3).
+    /// reimport the host locally (D1, host-first), refresh durable
+    /// distribution state (C1), then distribute the new ticket to
+    /// survivors. Skips replayed revokes via the rotated-revoke high-water
+    /// mark (C3).
     async fn handle_host_evict(self: &Arc<Self>, revoked_peer: PeerId, revoke_seq: Seq) {
         // Idempotency guard (C3): skip a Revoke we've already rotated for.
         // On a host restart the cap-listener re-subscribes `since: None`,
@@ -1815,6 +1818,34 @@ impl Workspace {
             warn!(?e, "rotation: persist rotated-revoke-seq failed");
         }
 
+        // Reimport the host onto the namespace it just minted, BEFORE
+        // distributing to survivors (D1). Two reasons to go host-first:
+        //   1. Write-loss window: until the host swaps its live doc it
+        //      keeps writing to the *old* namespace. If distribution ran
+        //      first, that window would span the whole serial survivor
+        //      loop (each delivery bounded by the daemon's ~10s
+        //      DELIVER_FRAME_TIMEOUT, so seconds-to-minutes with an
+        //      unreachable survivor) instead of just the local swap.
+        //   2. Sync readiness: `rotate_namespace` mints the new namespace
+        //      but only the host's reimport calls `start_sync` on it. A
+        //      survivor told to dial before the host is syncing would just
+        //      retry; reimporting first means the host is ready when the
+        //      first survivor dials.
+        if let Err(e) = self
+            .reimport_namespace(ReimportSource::HostLocal {
+                new_secret: outcome.new_secret,
+                new_namespace: outcome.new_namespace,
+                new_epoch_hint: outcome.new_epoch,
+            })
+            .await
+        {
+            warn!(?e, "rotation: host reimport failed");
+            emit_event(
+                &self.events,
+                WorkspaceEvent::Error(format!("host reimport failed: {e}")),
+            );
+        }
+
         // Refresh the host's durable distribution state (C1) so peers that
         // join or are promoted AFTER this rotation land on the rotated
         // namespace, not the abandoned genesis.
@@ -1843,22 +1874,6 @@ impl Workspace {
                     warn!(?e, ?peer, "rotation: deliver to survivor failed");
                 }
             }
-        }
-
-        // Reimport the host onto the namespace it just minted.
-        if let Err(e) = self
-            .reimport_namespace(ReimportSource::HostLocal {
-                new_secret: outcome.new_secret,
-                new_namespace: outcome.new_namespace,
-                new_epoch_hint: outcome.new_epoch,
-            })
-            .await
-        {
-            warn!(?e, "rotation: host reimport failed");
-            emit_event(
-                &self.events,
-                WorkspaceEvent::Error(format!("host reimport failed: {e}")),
-            );
         }
     }
 
