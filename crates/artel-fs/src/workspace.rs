@@ -2630,10 +2630,14 @@ pub(crate) struct RotationOutcome {
     /// The bumped `namespace_epoch` (prev + 1).
     pub(crate) new_epoch: u64,
     /// How many latest-per-key entries were carried into the new
-    /// namespace (still-RW authors).
+    /// namespace (still-RW authors). Read only by the test-utils
+    /// rotation accessor; the production path logs the local counts.
+    #[cfg_attr(not(feature = "test-utils"), allow(dead_code))]
     pub(crate) survivor_entries: usize,
     /// How many entries were dropped because their author was no longer
-    /// RW (the revoked peer's, plus any unresolvable authors).
+    /// RW (the revoked peer's, plus any unresolvable authors). Read only
+    /// by the test-utils rotation accessor.
+    #[cfg_attr(not(feature = "test-utils"), allow(dead_code))]
     pub(crate) dropped_entries: usize,
 }
 
