@@ -3426,6 +3426,52 @@ enum CapOutcome {
     Ignored,
 }
 
+/// Handle a `NODE_ID_ACTION` System message: register the announcing
+/// peer's workspace `EndpointId` -> daemon `PeerId` mapping, and — on the
+/// host — re-deliver the current `NamespaceSecret` if that peer holds RW.
+///
+/// The re-delivery is the recovery path for a member that was offline
+/// across a namespace rotation: its persisted secret is for the abandoned
+/// namespace, the live-only upgrade broadcast it would have received is
+/// long gone, and `PeerJoined` does not re-fire for a reloaded mirror (no
+/// fresh gossip announce). `NODE_ID` is the correct trigger because a
+/// joiner emits it only *after* its own cap-listener is live (see
+/// `join_with`), so the re-delivered secret cannot outrun its receiver —
+/// the property the live-only `emit_upgrade` broadcast requires.
+///
+/// Fires on every reattach. Idempotent: the joiner's import is a
+/// monotonic Read->Write merge onto the already-imported current
+/// namespace. Gated on `has_rw` *after* `register`, so a since-revoked
+/// peer gets nothing. Best-effort spawn.
+fn handle_node_id_message(
+    message: &SessionMessage,
+    peer_map: &Arc<PeerMap>,
+    host_ctx: Option<&HostUpgradeCtx>,
+) {
+    let Ok(bytes) = <[u8; 32]>::try_from(message.payload.as_slice()) else {
+        return;
+    };
+    let Ok(workspace_id) = iroh::EndpointId::from_bytes(&bytes) else {
+        return;
+    };
+    peer_map.register(workspace_id, message.peer.id);
+
+    if let Some(ctx) = host_ctx
+        && peer_map.has_rw(message.peer.id)
+    {
+        let client = Arc::clone(&ctx.client);
+        let sess = ctx.session;
+        let peer = message.peer.id;
+        // Read the live secret (refreshed on rotation, C1).
+        let secret = *ctx.namespace_secret.lock().expect("upgrade_secret mutex");
+        tokio::spawn(async move {
+            if let Err(e) = publish_upgrade(&client, sess, peer, secret).await {
+                warn!(?e, ?peer, "upgrade re-delivery on node_id failed");
+            }
+        });
+    }
+}
+
 /// Apply a `Capability` message to `peer_map`, then fire host-side unicast.
 ///
 /// On the host an RW grant delivers the `NamespaceSecret` (upgrade),
@@ -3525,7 +3571,10 @@ fn handle_capability_message(
 ///   `NamespaceSecret` to the promoted peer, and a demote to Read a
 ///   downgrade notification (see [`handle_capability_message`]).
 /// - `MessageKind::System` with `NODE_ID_ACTION`: registers the mapping
-///   from a joiner's workspace `EndpointId` to their daemon `PeerId`.
+///   from a joiner's workspace `EndpointId` to their daemon `PeerId`. On
+///   the host side, if the (re)announcing peer holds RW, also re-delivers
+///   the current `NamespaceSecret` — the recovery path for a member that
+///   was offline across a namespace rotation.
 /// - `MessageKind::System` with `UPGRADE_ACTION`: on the joiner side,
 ///   imports the `NamespaceSecret` to gain Write capability.
 /// - `MessageKind::System` with `DOWNGRADE_ACTION`: on the joiner side,
@@ -3549,11 +3598,7 @@ async fn handle_cap_event(
                     handle_capability_message(&message, peer_map, host_ctx);
                 }
                 MessageKind::System if message.action == NODE_ID_ACTION => {
-                    if let Ok(bytes) = <[u8; 32]>::try_from(message.payload.as_slice())
-                        && let Ok(workspace_id) = iroh::EndpointId::from_bytes(&bytes)
-                    {
-                        peer_map.register(workspace_id, message.peer.id);
-                    }
+                    handle_node_id_message(&message, peer_map, host_ctx);
                 }
                 MessageKind::System if message.action == UPGRADE_ACTION => {
                     if let Some(ctx) = joiner_ctx
@@ -3927,6 +3972,76 @@ mod tests {
         )
         .await;
         assert!(matches!(out, CapOutcome::Ignored));
+    }
+
+    /// `handle_node_id_message` registers the announcing peer's
+    /// workspace-id -> daemon-id mapping. With `host_ctx = None` (the
+    /// joiner side, or any non-host) there is no secret re-delivery — we
+    /// pin the registration half here, which is observable without a live
+    /// `Client`. The host-side RW-gated re-delivery is exercised
+    /// end-to-end in the real-n0 integration suite (a spawned unicast
+    /// needs a real daemon).
+    #[test]
+    fn node_id_message_registers_mapping() {
+        let host = PeerId::from_bytes([0xa0; 32]);
+        let peer_map = Arc::new(PeerMap::new(host));
+
+        // A returning peer's daemon id + its workspace endpoint id.
+        // The workspace id must be a valid ed25519 public key, so derive
+        // it from a signing key rather than using arbitrary bytes.
+        let peer_daemon = PeerId::from_bytes([0xb0; 32]);
+        let ws_key = artel_protocol::signing::SigningKey::from_bytes(&[0xc0; 32]);
+        let workspace_id =
+            iroh::EndpointId::from_bytes(&ws_key.verifying_key().to_bytes()).unwrap();
+
+        // Before the NODE_ID announce the workspace id is unresolvable.
+        assert_eq!(
+            peer_map.classify_author(workspace_id),
+            crate::peer_map::AuthorDisposition::Unresolvable,
+        );
+
+        let msg = SessionMessage::new(
+            Seq::new(1),
+            1,
+            artel_protocol::PeerInfo::new(peer_daemon, "bob"),
+            MessageKind::System,
+            NODE_ID_ACTION,
+            workspace_id.as_bytes().to_vec(),
+            artel_protocol::message::SIGNATURE_UNSIGNED,
+            artel_protocol::message::SIGNATURE_UNSIGNED,
+        );
+
+        // host_ctx None: registers the mapping, no delivery side-effect.
+        handle_node_id_message(&msg, &peer_map, None);
+
+        // Mapping now resolves. The peer holds no cap yet, so it's NotRw
+        // (resolvable but not RW) — proving the register landed without a
+        // grant having to arrive first.
+        assert_eq!(
+            peer_map.classify_author(workspace_id),
+            crate::peer_map::AuthorDisposition::NotRw,
+        );
+
+        // Grant RW, re-announce: now classified RW — the precise
+        // precondition the host-side re-delivery gates on (`has_rw` after
+        // register).
+        peer_map.apply_capability(host, &grant_rw_payload(peer_daemon));
+        handle_node_id_message(&msg, &peer_map, None);
+        assert_eq!(
+            peer_map.classify_author(workspace_id),
+            crate::peer_map::AuthorDisposition::Rw,
+        );
+        assert!(peer_map.has_rw(peer_daemon));
+    }
+
+    /// Encode a host-authored `Grant{peer, ReadWrite}` capability payload.
+    fn grant_rw_payload(peer: PeerId) -> Vec<u8> {
+        use artel_protocol::capability::{Capability, CapabilityAction};
+        CapabilityAction::Grant {
+            peer,
+            cap: Capability::ReadWrite,
+        }
+        .encode()
     }
 
     /// End-to-end recovery proof (M3): a cap-listener whose connection
