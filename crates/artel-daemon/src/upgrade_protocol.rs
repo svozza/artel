@@ -165,6 +165,15 @@ impl UpgradeProtocol {
             DeliveryFrame::Downgrade { session_id } => {
                 self.registry.emit_downgrade(session_id, remote_peer).await
             }
+            DeliveryFrame::Rotate {
+                session_id,
+                namespace_epoch,
+                doc_ticket,
+            } => {
+                self.registry
+                    .emit_rotate(session_id, remote_peer, namespace_epoch, doc_ticket)
+                    .await
+            }
         };
         result.map_err(|e| {
             warn!(error = %e, "upgrade_protocol: delivery rejected");

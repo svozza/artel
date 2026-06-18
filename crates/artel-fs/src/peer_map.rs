@@ -117,6 +117,19 @@ impl PeerMap {
             .is_some_and(|c| *c == Capability::ReadWrite)
     }
 
+    /// All peers currently holding `ReadWrite`, **excluding the host
+    /// itself**. The survivor set for namespace-rotation distribution:
+    /// the host ships the rotated namespace's ticket to exactly these
+    /// peers (never the revoked one, which `apply_capability` has
+    /// already removed from `caps`).
+    pub(crate) fn rw_peers_except_host(&self) -> Vec<PeerId> {
+        let caps = self.caps.read().unwrap();
+        caps.iter()
+            .filter(|(peer, cap)| **peer != self.host && **cap == Capability::ReadWrite)
+            .map(|(peer, _)| *peer)
+            .collect()
+    }
+
     /// Whether the peer owning workspace `EndpointId` currently holds
     /// `ReadWrite`. Resolves `EndpointId → daemon PeerId` (the
     /// same-seed author binding makes a doc entry's author equal the

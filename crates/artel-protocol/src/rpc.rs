@@ -318,12 +318,29 @@ pub enum Request {
     /// stream on [`crate::upgrade::UPGRADE_ALPN`], sends a
     /// [`crate::upgrade::DeliveryFrame::Downgrade`], and waits for an
     /// ACK. Returns [`Response::DowngradeDelivered`] on success.
-    /// Append-only variant — keep last.
     DeliverDowngrade {
         /// Session the downgrade applies to.
         session: SessionId,
         /// Peer to notify of its demotion.
         target_peer: PeerId,
+    },
+
+    /// Deliver a rotated namespace's Write `DocTicket` + epoch to a
+    /// surviving RW peer over the direct stream (Evict /
+    /// write-revocation, Slice 3e). Host-only. The daemon opens a stream
+    /// on [`crate::upgrade::UPGRADE_ALPN`], sends a
+    /// [`crate::upgrade::DeliveryFrame::Rotate`], and waits for an ACK.
+    /// Returns [`Response::RotateDelivered`] on success. Append-only
+    /// variant — keep last.
+    DeliverRotate {
+        /// Session the rotation applies to.
+        session: SessionId,
+        /// Survivor to deliver the rotated namespace to.
+        target_peer: PeerId,
+        /// New namespace epoch.
+        namespace_epoch: u64,
+        /// Rotated namespace's `DocTicket::to_string()`.
+        doc_ticket: String,
     },
 }
 
@@ -518,8 +535,12 @@ pub enum Response {
 
     /// Reply to [`Request::DeliverDowngrade`]. Confirms the target peer
     /// received and acknowledged the downgrade notification.
-    /// Append-only variant — keep last.
     DowngradeDelivered,
+
+    /// Reply to [`Request::DeliverRotate`]. Confirms the survivor
+    /// received and acknowledged the rotated namespace ticket.
+    /// Append-only variant — keep last.
+    RotateDelivered,
 }
 
 /// One entry in [`Response::Attachments`].

@@ -814,6 +814,25 @@ async fn dispatch(
         Request::DeliverDowngrade { .. } => Response::Error {
             error: ProtocolError::Internal("DeliverDowngrade requires the iroh feature".into()),
         },
+        #[cfg(feature = "iroh")]
+        Request::DeliverRotate {
+            session,
+            target_peer,
+            namespace_epoch,
+            doc_ticket,
+        } => {
+            if !memberships.contains_key(&session) {
+                return Response::Error {
+                    error: ProtocolError::NotSubscribed(session),
+                };
+            }
+            dispatch_deliver_rotate(registry, session, target_peer, namespace_epoch, doc_ticket)
+                .await
+        }
+        #[cfg(not(feature = "iroh"))]
+        Request::DeliverRotate { .. } => Response::Error {
+            error: ProtocolError::Internal("DeliverRotate requires the iroh feature".into()),
+        },
     }
 }
 
@@ -961,6 +980,56 @@ async fn dispatch_deliver_downgrade(
         Ok(()) => Response::DowngradeDelivered,
         Err(e) => {
             warn!(error = %e, %target_peer, "deliver_downgrade failed");
+            Response::Error {
+                error: ProtocolError::Internal(e),
+            }
+        }
+    }
+}
+
+/// Host-side dispatch for [`Request::DeliverRotate`]: validate we host
+/// the session, then send a [`DeliveryFrame::Rotate`] (rotated namespace
+/// `DocTicket` + epoch) to the survivor over the shared [`deliver_frame`]
+/// channel. Mirror of [`dispatch_deliver_downgrade`].
+#[cfg(feature = "iroh")]
+async fn dispatch_deliver_rotate(
+    registry: &Registry,
+    session: SessionId,
+    target_peer: artel_protocol::PeerId,
+    namespace_epoch: u64,
+    doc_ticket: String,
+) -> Response {
+    use artel_protocol::upgrade::DeliveryFrame;
+
+    match registry.is_local_session(session).await {
+        Some(true) => {}
+        Some(false) => {
+            return Response::Error {
+                error: ProtocolError::NotHost,
+            };
+        }
+        None => {
+            return Response::Error {
+                error: ProtocolError::UnknownSession(session),
+            };
+        }
+    }
+
+    let Some(endpoint) = registry.endpoint() else {
+        return Response::Error {
+            error: ProtocolError::Internal("no iroh endpoint available".into()),
+        };
+    };
+
+    let frame = DeliveryFrame::Rotate {
+        session_id: session,
+        namespace_epoch,
+        doc_ticket,
+    };
+    match deliver_frame(endpoint, target_peer, &frame).await {
+        Ok(()) => Response::RotateDelivered,
+        Err(e) => {
+            warn!(error = %e, %target_peer, "deliver_rotate failed");
             Response::Error {
                 error: ProtocolError::Internal(e),
             }

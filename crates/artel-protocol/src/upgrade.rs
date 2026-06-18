@@ -87,6 +87,40 @@ pub enum DeliveryFrame {
         /// Session the demotion applies to.
         session_id: SessionId,
     },
+    /// Namespace-rotation delivery (Evict / write-revocation, Slice 3e):
+    /// host→survivor, carrying the rotated namespace's Write `DocTicket`
+    /// string (capability + the host's addresses) and the bumped
+    /// `namespace_epoch`. The daemon couriers it opaquely (no namespace
+    /// knowledge — ADR-003) and injects a synthetic
+    /// [`crate::ROTATE_ACTION`] System message; the survivor's FS layer
+    /// reimports onto the new namespace. Append-only variant index 3.
+    Rotate {
+        /// Session the rotation applies to.
+        session_id: SessionId,
+        /// The new monotonic namespace epoch (survivor reimports only on
+        /// a strictly-higher epoch than it last saw).
+        namespace_epoch: u64,
+        /// `iroh_docs::DocTicket::to_string()` for the rotated namespace.
+        doc_ticket: String,
+    },
+}
+
+/// Payload of the synthetic `workspace.rotate` system message the joiner
+/// daemon injects on receiving a [`DeliveryFrame::Rotate`].
+///
+/// Carries the rotated namespace's Write `DocTicket` (capability +
+/// addresses) and the epoch; the survivor's `cap_listener` reimports if
+/// the epoch is newer than what it holds. Shared here so the daemon's
+/// injector and `artel-fs`'s consumer can't drift.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RotatePayload {
+    /// The peer being moved to the rotated namespace — the receiving
+    /// daemon's own `PeerId`, stamped by the daemon at injection.
+    pub target_peer: PeerId,
+    /// New namespace epoch.
+    pub namespace_epoch: u64,
+    /// `iroh_docs::DocTicket::to_string()` for the rotated namespace.
+    pub doc_ticket: String,
 }
 
 /// Payload of the synthetic `workspace.downgrade` system message the
@@ -218,6 +252,17 @@ mod tests {
             2,
             "Downgrade must stay at variant index 2",
         );
+
+        let rotate = DeliveryFrame::Rotate {
+            session_id: SessionId::from_bytes([1; 16]),
+            namespace_epoch: 1,
+            doc_ticket: "docticket".into(),
+        };
+        assert_eq!(
+            postcard::to_allocvec(&rotate).unwrap()[0],
+            3,
+            "Rotate must stay at variant index 3",
+        );
     }
 
     #[test]
@@ -256,9 +301,33 @@ mod tests {
 
     #[test]
     fn delivery_frame_unknown_variant_byte_rejected() {
-        // Variant index 3 doesn't exist; postcard must reject.
-        let result: Result<DeliveryFrame, _> = postcard::from_bytes(&[0x03, 0x00, 0x00]);
+        // Variant index 4 doesn't exist; postcard must reject.
+        let result: Result<DeliveryFrame, _> = postcard::from_bytes(&[0x04, 0x00, 0x00]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn delivery_frame_rotate_round_trip() {
+        let frame = DeliveryFrame::Rotate {
+            session_id: SessionId::from_bytes([0x5a; 16]),
+            namespace_epoch: 42,
+            doc_ticket: "docaaaabbbbcccc".into(),
+        };
+        let bytes = postcard::to_allocvec(&frame).unwrap();
+        let back: DeliveryFrame = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(frame, back);
+    }
+
+    #[test]
+    fn rotate_payload_postcard_round_trip() {
+        let payload = RotatePayload {
+            target_peer: PeerId::from_bytes([0x33; 32]),
+            namespace_epoch: 7,
+            doc_ticket: "docticket-string".into(),
+        };
+        let bytes = postcard::to_allocvec(&payload).unwrap();
+        let back: RotatePayload = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(payload, back);
     }
 
     #[test]

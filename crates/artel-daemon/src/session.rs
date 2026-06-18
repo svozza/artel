@@ -23,8 +23,8 @@ use artel_protocol::message::{MESSAGE_FORMAT, SIGNATURE_UNSIGNED, SigBytes};
 use artel_protocol::signing::{self, verify_reason};
 use artel_protocol::ticket::{self, SessionTicket, TicketEntry, TicketStatus, WireEndpointAddr};
 use artel_protocol::{
-    DowngradePayload, Event, JoinTicket, MessageKind, PeerId, PeerInfo, ProtocolError, Seq,
-    SessionId, SessionMessage, SessionSummary, UpgradePayload,
+    DowngradePayload, Event, JoinTicket, MessageKind, PeerId, PeerInfo, ProtocolError,
+    RotatePayload, Seq, SessionId, SessionMessage, SessionSummary, UpgradePayload,
 };
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, broadcast};
@@ -62,7 +62,7 @@ const WORKSPACE_TICKET_DELIVERY_RETRIES: u32 = 5;
 #[cfg(feature = "iroh")]
 const WORKSPACE_TICKET_DELIVERY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(3);
 
-use artel_protocol::{DOWNGRADE_ACTION, TICKET_ACTION, UPGRADE_ACTION};
+use artel_protocol::{DOWNGRADE_ACTION, ROTATE_ACTION, TICKET_ACTION, UPGRADE_ACTION};
 
 /// Wall-clock millis since the Unix epoch. The `Local` arm of
 /// [`Authoring`] stamps this onto every body it signs.
@@ -1870,7 +1870,8 @@ impl Registry {
                     && !(m.kind == MessageKind::System
                         && (m.action == UPGRADE_ACTION
                             || m.action == TICKET_ACTION
-                            || m.action == DOWNGRADE_ACTION))
+                            || m.action == DOWNGRADE_ACTION
+                            || m.action == ROTATE_ACTION))
             })
             .cloned()
             .collect())
@@ -2585,6 +2586,49 @@ impl Registry {
         // UPGRADE_ACTION (excluded from replay in `log_since`). A joiner
         // that misses it relies on the host re-delivering on reconnect.
         let message = synthetic_system_message(s.host, DOWNGRADE_ACTION, payload);
+
+        let events_tx = s.events_tx.clone();
+        drop(s);
+
+        // Best-effort: if no subscribers are listening, that's fine.
+        let _ = events_tx.send(Event::Message { session, message });
+
+        Ok(())
+    }
+
+    /// Emit a synthetic rotation event into a session's broadcast channel
+    /// (Evict / write-revocation, Slice 3e).
+    ///
+    /// Mirror of [`Self::emit_upgrade`] / [`Self::emit_downgrade`] for the
+    /// namespace-rotation delivery: the synthetic event has `kind:
+    /// System`, `action: ROTATE_ACTION`, and a postcard-encoded
+    /// [`RotatePayload`] naming this daemon as the target, carrying the
+    /// rotated namespace's `DocTicket` + epoch. The survivor's
+    /// `cap_listener` reimports onto the new namespace.
+    ///
+    /// Validates via [`Self::lock_remote_session_from_host`]: session
+    /// exists, is `Remote`, and `sender_peer` is the host. Live-only,
+    /// excluded from replay (like `UPGRADE_ACTION`).
+    #[cfg(feature = "iroh")]
+    pub(crate) async fn emit_rotate(
+        &self,
+        session: SessionId,
+        sender_peer: PeerId,
+        namespace_epoch: u64,
+        doc_ticket: String,
+    ) -> Result<(), SessionError> {
+        let s = self
+            .lock_remote_session_from_host(session, sender_peer, "rotations")
+            .await?;
+
+        let payload = postcard::to_allocvec(&RotatePayload {
+            target_peer: self.daemon_peer_id,
+            namespace_epoch,
+            doc_ticket,
+        })
+        .expect("RotatePayload is infallible to serialize");
+
+        let message = synthetic_system_message(s.host, ROTATE_ACTION, payload);
 
         let events_tx = s.events_tx.clone();
         drop(s);

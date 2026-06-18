@@ -20,7 +20,7 @@ use artel_fs::{
     AttachPolicy, Workspace, WorkspaceConfig, WorkspaceError, WorkspaceEvent, key_to_path,
     path_to_key,
 };
-use artel_protocol::{Request, Response, SessionId};
+use artel_protocol::{PeerId, Request, Response, SessionId};
 use futures_util::StreamExt;
 use futures_util::future::FutureExt;
 use iroh::test_utils::DnsPkarrServer;
@@ -290,6 +290,508 @@ async fn author_id_equals_endpoint_id_and_stamps_entries() {
     ws.shutdown().await.expect("shutdown");
     let _ = timeout(Duration::from_secs(5), handle).await;
     daemon.stop().await;
+}
+
+// =============================================================
+// Auto-rotation on Evict (Slice 3e): a plain `Revoke` (no manual
+// rotate call) makes the host's cap-listener auto-trigger the rotation
+// task — rotate the namespace, distribute the new ticket to survivors,
+// and reimport locally. After the evict, the evicted peer (still
+// holding the OLD secret, watcher live) can no longer get writes to the
+// host, and the host operates on the rotated namespace.
+//
+// This is the end-to-end write cut-off: the security goal of the whole
+// feature, driven only by the Revoke verb.
+// =============================================================
+
+#[allow(clippy::too_many_lines)]
+async fn evict_auto_rotation_body(dns_pkarr: Arc<DnsPkarrServer>, pair: Pair) {
+    use artel_protocol::capability::Capability;
+
+    let Pair {
+        daemon_a, daemon_b, ..
+    } = pair;
+
+    // Alice hosts.
+    let alice = Client::connect(&daemon_a.socket).await.unwrap();
+    let alice_dir = tempfile::tempdir().unwrap();
+    let (alice_ws, _) = Workspace::host_with(
+        &alice,
+        "alice",
+        alice_dir.path().to_path_buf(),
+        AttachPolicy::RequireEmpty,
+        WorkspaceConfig::default()
+            .with_endpoint_setup(testing_setup(&dns_pkarr))
+            .with_daemon_socket(daemon_a.socket.clone()),
+    )
+    .await
+    .expect("Workspace::host");
+    let session = alice_ws.session_id();
+    let alice_ws = Arc::new(alice_ws);
+    let alice_handle = Arc::clone(&alice_ws).run().await;
+
+    // Bob joins (Read), is promoted to RW.
+    let read_ticket = match alice
+        .request(Request::IssueTicket {
+            session,
+            granted_cap: Capability::Read,
+            expiry_ms: 0,
+        })
+        .await
+        .unwrap()
+    {
+        Response::IssuedTicket { ticket, .. } => ticket,
+        other => panic!("expected IssuedTicket, got {other:?}"),
+    };
+    let bob = Client::connect(&daemon_b.socket).await.unwrap();
+    let bob_peer = bob.daemon_peer_id();
+    assert!(matches!(
+        bob.request(Request::JoinSession {
+            display_name: "bob".into(),
+            ticket: read_ticket,
+        })
+        .await
+        .unwrap(),
+        Response::JoinSession { .. }
+    ));
+    let bob_dir = tempfile::tempdir().unwrap();
+    let (bob_ws, _) = Workspace::join_with(
+        &bob,
+        session,
+        bob_dir.path().to_path_buf(),
+        AttachPolicy::RequireEmpty,
+        WorkspaceConfig::default()
+            .with_endpoint_setup(testing_setup(&dns_pkarr))
+            .with_daemon_socket(daemon_b.socket.clone()),
+    )
+    .await
+    .expect("Workspace::join");
+    let bob_ws = Arc::new(bob_ws);
+    let bob_handle = Arc::clone(&bob_ws).run().await;
+
+    common::grant_rw_and_wait(&alice, session, bob_peer, bob_dir.path(), alice_dir.path()).await;
+
+    // Confirm Bob (RW) propagates to Alice pre-evict.
+    tokio::fs::write(bob_dir.path().join("pre.txt"), b"pre")
+        .await
+        .unwrap();
+    common::wait_for_file(&alice_dir.path().join("pre.txt"), b"pre").await;
+    let ns_before = alice_ws.test_current_namespace_bytes();
+
+    // EVICT Bob — plain Revoke. The host cap-listener auto-triggers
+    // rotation; no manual rotate call.
+    common::revoke(&alice, session, bob_peer).await;
+
+    // Wait until Alice has actually rotated (current namespace changed).
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if alice_ws.test_current_namespace_bytes() != ns_before {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "host never auto-rotated after Evict",
+        );
+        sleep(POLL_INTERVAL).await;
+    }
+
+    // Bob, still holding the OLD secret with a live watcher, writes
+    // again. This must NOT reach Alice (her namespace rotated + the
+    // PeerFilter blocks Bob).
+    tokio::fs::write(bob_dir.path().join("post.txt"), b"post")
+        .await
+        .unwrap();
+
+    // Alice writes a sentinel into her NEW namespace; she sees her own
+    // write (proving her watcher is live on the rotated namespace).
+    tokio::fs::write(alice_dir.path().join("sentinel.txt"), b"s")
+        .await
+        .unwrap();
+    assert!(
+        wait_for_doc_entry(
+            &alice_ws,
+            &alice_dir.path().join("sentinel.txt"),
+            WAIT_BUDGET
+        )
+        .await,
+        "host's post-rotation write never landed in the new namespace",
+    );
+
+    // Give any (illegitimate) propagation a generous window, then assert
+    // Bob's post-evict write never reached Alice's disk.
+    sleep(Duration::from_secs(2)).await;
+    let leaked = tokio::fs::try_exists(alice_dir.path().join("post.txt"))
+        .await
+        .unwrap_or(false);
+    assert!(
+        !leaked,
+        "evicted peer's post-rotation write reached the host — write cut-off broken",
+    );
+
+    alice_ws.shutdown().await.expect("shutdown");
+    bob_ws.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), alice_handle).await;
+    let _ = timeout(Duration::from_secs(5), bob_handle).await;
+    drop(alice);
+    drop(bob);
+    daemon_a.stop().await;
+    daemon_b.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn evict_auto_rotates_and_cuts_off_writes() {
+    let pair = spawn_pair().await;
+    let dns_pkarr = Arc::clone(&pair.dns_pkarr);
+    evict_auto_rotation_body(dns_pkarr, pair).await;
+}
+
+// Real-n0 variant of the auto-rotation write cut-off (Tier C). Binds
+// against n0's public relay (`Production`) rather than the localhost
+// DnsPkarrServer — see the matching note in `workspace_restart.rs` for
+// why Tier C uses the public relay until the iroh 1.0 upgrade. Filtered
+// out of the default profile by the `_n0` suffix; runs under
+// `make test-n0` / the `n0` nextest profile.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::large_futures, clippy::too_many_lines)]
+async fn evict_auto_rotates_and_cuts_off_writes_n0() {
+    use artel_protocol::capability::Capability;
+
+    common::init_tracing();
+
+    // Hold the daemon-root TempDirs for the test's lifetime (dropping
+    // them would delete the dir out from under the daemon).
+    let alice_daemon_root = TempDir::new().unwrap();
+    let bob_daemon_root = TempDir::new().unwrap();
+    let alice_daemon = common::spawn_daemon_at(
+        &common::DaemonPaths::at(alice_daemon_root.path()),
+        artel_daemon::EndpointSetup::Production,
+    )
+    .await;
+    let bob_daemon = common::spawn_daemon_at(
+        &common::DaemonPaths::at(bob_daemon_root.path()),
+        artel_daemon::EndpointSetup::Production,
+    )
+    .await;
+
+    let alice = Client::connect(&alice_daemon.socket).await.unwrap();
+    let alice_dir = tempfile::tempdir().unwrap();
+    let (alice_ws, alice_ev) = Workspace::host_with(
+        &alice,
+        "alice",
+        alice_dir.path().to_path_buf(),
+        AttachPolicy::RequireEmpty,
+        WorkspaceConfig::default()
+            .with_endpoint_setup(artel_fs::EndpointSetup::Production)
+            .with_daemon_socket(alice_daemon.socket.clone()),
+    )
+    .await
+    .expect("host");
+    common::drain_ws_events(alice_ev);
+    let session = alice_ws.session_id();
+    let alice_ws = Arc::new(alice_ws);
+    let alice_handle = Arc::clone(&alice_ws).run().await;
+
+    let read_ticket = match alice
+        .request(Request::IssueTicket {
+            session,
+            granted_cap: Capability::Read,
+            expiry_ms: 0,
+        })
+        .await
+        .unwrap()
+    {
+        Response::IssuedTicket { ticket, .. } => ticket,
+        other => panic!("expected IssuedTicket, got {other:?}"),
+    };
+    let bob = Client::connect(&bob_daemon.socket).await.unwrap();
+    let bob_peer = bob.daemon_peer_id();
+    assert!(matches!(
+        bob.request(Request::JoinSession {
+            display_name: "bob".into(),
+            ticket: read_ticket,
+        })
+        .await
+        .unwrap(),
+        Response::JoinSession { .. }
+    ));
+    let bob_dir = tempfile::tempdir().unwrap();
+    let (bob_ws, bob_ev) = Workspace::join_with(
+        &bob,
+        session,
+        bob_dir.path().to_path_buf(),
+        AttachPolicy::RequireEmpty,
+        WorkspaceConfig::default()
+            .with_endpoint_setup(artel_fs::EndpointSetup::Production)
+            .with_daemon_socket(bob_daemon.socket.clone()),
+    )
+    .await
+    .expect("join");
+    common::drain_ws_events(bob_ev);
+    let bob_ws = Arc::new(bob_ws);
+    let bob_handle = Arc::clone(&bob_ws).run().await;
+
+    common::grant_rw_and_wait(&alice, session, bob_peer, bob_dir.path(), alice_dir.path()).await;
+
+    tokio::fs::write(bob_dir.path().join("pre.txt"), b"pre")
+        .await
+        .unwrap();
+    common::wait_for_file(&alice_dir.path().join("pre.txt"), b"pre").await;
+    let ns_before = alice_ws.test_current_namespace_bytes();
+
+    common::revoke(&alice, session, bob_peer).await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if alice_ws.test_current_namespace_bytes() != ns_before {
+            break;
+        }
+        assert!(Instant::now() < deadline, "host never auto-rotated (n0)");
+        sleep(POLL_INTERVAL).await;
+    }
+
+    tokio::fs::write(bob_dir.path().join("post.txt"), b"post")
+        .await
+        .unwrap();
+    tokio::fs::write(alice_dir.path().join("sentinel.txt"), b"s")
+        .await
+        .unwrap();
+    assert!(
+        wait_for_doc_entry(
+            &alice_ws,
+            &alice_dir.path().join("sentinel.txt"),
+            WAIT_BUDGET
+        )
+        .await,
+        "host post-rotation write never landed (n0)",
+    );
+    sleep(Duration::from_secs(3)).await;
+    assert!(
+        !tokio::fs::try_exists(alice_dir.path().join("post.txt"))
+            .await
+            .unwrap_or(false),
+        "evicted peer's write reached host after rotation (n0)",
+    );
+
+    alice_ws.shutdown().await.unwrap();
+    bob_ws.shutdown().await.unwrap();
+    let _ = timeout(Duration::from_secs(5), alice_handle).await;
+    let _ = timeout(Duration::from_secs(5), bob_handle).await;
+    drop(alice);
+    drop(bob);
+    alice_daemon.stop().await;
+    bob_daemon.stop().await;
+}
+
+// =============================================================
+// Survivor follows rotation (Slice 3e, 3 peers): host + a kept RW
+// survivor + an evicted RW peer. After evicting the bad peer, the
+// surviving peer auto-reimports onto the rotated namespace and keeps
+// round-tripping with the host, while the evicted peer is cut off.
+// =============================================================
+
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines, clippy::items_after_statements)]
+async fn survivor_follows_rotation_evicted_is_cut() {
+    use artel_protocol::capability::Capability;
+
+    // Three daemons sharing one DnsPkarrServer.
+    let pair = spawn_pair().await;
+    let dns_pkarr = Arc::clone(&pair.dns_pkarr);
+    let daemon_c = common::spawn_daemon_with_setup(
+        common::fresh_state(),
+        common::daemon_testing_setup(&dns_pkarr),
+    )
+    .await;
+    common::wait_for_endpoint(&dns_pkarr, &daemon_c.iroh_addr.as_ref().expect("addr").id).await;
+    let Pair {
+        daemon_a, daemon_b, ..
+    } = pair;
+
+    // Alice hosts.
+    let alice = Client::connect(&daemon_a.socket).await.unwrap();
+    let alice_dir = tempfile::tempdir().unwrap();
+    let (alice_ws, _) = Workspace::host_with(
+        &alice,
+        "alice",
+        alice_dir.path().to_path_buf(),
+        AttachPolicy::RequireEmpty,
+        WorkspaceConfig::default()
+            .with_endpoint_setup(testing_setup(&dns_pkarr))
+            .with_daemon_socket(daemon_a.socket.clone()),
+    )
+    .await
+    .expect("host");
+    let session = alice_ws.session_id();
+    let alice_ws = Arc::new(alice_ws);
+    let alice_handle = Arc::clone(&alice_ws).run().await;
+
+    // Helper to join a daemon as an RW peer.
+    async fn join_rw(
+        host: &Client,
+        session: SessionId,
+        daemon: &common::RunningDaemon,
+        dns_pkarr: &Arc<DnsPkarrServer>,
+        name: &str,
+    ) -> (
+        Client,
+        std::sync::Arc<Workspace>,
+        tokio::task::JoinHandle<()>,
+        TempDir,
+    ) {
+        let ticket = match host
+            .request(Request::IssueTicket {
+                session,
+                granted_cap: Capability::Read,
+                expiry_ms: 0,
+            })
+            .await
+            .unwrap()
+        {
+            Response::IssuedTicket { ticket, .. } => ticket,
+            other => panic!("expected IssuedTicket, got {other:?}"),
+        };
+        let client = Client::connect(&daemon.socket).await.unwrap();
+        assert!(matches!(
+            client
+                .request(Request::JoinSession {
+                    display_name: name.into(),
+                    ticket,
+                })
+                .await
+                .unwrap(),
+            Response::JoinSession { .. }
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let (ws, _) = Workspace::join_with(
+            &client,
+            session,
+            dir.path().to_path_buf(),
+            AttachPolicy::RequireEmpty,
+            WorkspaceConfig::default()
+                .with_endpoint_setup(testing_setup(dns_pkarr))
+                .with_daemon_socket(daemon.socket.clone()),
+        )
+        .await
+        .expect("join");
+        let ws = Arc::new(ws);
+        let handle = Arc::clone(&ws).run().await;
+        (client, ws, handle, dir)
+    }
+
+    let (survivor_cli, survivor_ws, survivor_handle, survivor_dir) =
+        join_rw(&alice, session, &daemon_b, &dns_pkarr, "survivor").await;
+    let survivor_peer = survivor_cli.daemon_peer_id();
+    let (evicted_cli, evicted_ws, evicted_handle, evicted_dir) =
+        join_rw(&alice, session, &daemon_c, &dns_pkarr, "evicted").await;
+    let evicted_peer = evicted_cli.daemon_peer_id();
+
+    // Grant RW to each peer and wait for it using a per-peer probe
+    // filename (the shared-name `grant_rw_and_wait` helper races when
+    // two RW joiners write the same probe path).
+    async fn grant_rw_wait_named(
+        host: &Client,
+        session: SessionId,
+        peer: PeerId,
+        joiner_dir: &Path,
+        host_dir: &Path,
+        probe_name: &str,
+    ) {
+        common::grant_rw(host, session, peer).await;
+        let joiner_probe = joiner_dir.join(probe_name);
+        let host_probe = host_dir.join(probe_name);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let _ = tokio::fs::write(&joiner_probe, b"rw").await;
+            sleep(POLL_INTERVAL).await;
+            if tokio::fs::read(&host_probe)
+                .await
+                .is_ok_and(|b| b == b"rw")
+            {
+                let _ = tokio::fs::remove_file(&joiner_probe).await;
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "grant RW for {peer} never propagated"
+            );
+        }
+    }
+    grant_rw_wait_named(
+        &alice,
+        session,
+        survivor_peer,
+        survivor_dir.path(),
+        alice_dir.path(),
+        ".probe_survivor",
+    )
+    .await;
+    grant_rw_wait_named(
+        &alice,
+        session,
+        evicted_peer,
+        evicted_dir.path(),
+        alice_dir.path(),
+        ".probe_evicted",
+    )
+    .await;
+
+    let ns_before = alice_ws.test_current_namespace_bytes();
+
+    // Evict the bad peer. Host auto-rotates.
+    common::revoke(&alice, session, evicted_peer).await;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if alice_ws.test_current_namespace_bytes() != ns_before {
+            break;
+        }
+        assert!(Instant::now() < deadline, "host never auto-rotated");
+        sleep(POLL_INTERVAL).await;
+    }
+
+    // The survivor must follow the rotation: a write from the survivor
+    // after rotation reaches the host on the NEW namespace. Poll a
+    // probe (the survivor needs a beat to receive + reimport).
+    let probe = survivor_dir.path().join("survivor_after.txt");
+    let host_sees = alice_dir.path().join("survivor_after.txt");
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        let _ = tokio::fs::write(&probe, b"survivor-rw").await;
+        sleep(POLL_INTERVAL).await;
+        if tokio::fs::read(&host_sees)
+            .await
+            .is_ok_and(|b| b == b"survivor-rw")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "survivor's post-rotation write never reached host — survivor didn't follow rotation",
+        );
+    }
+
+    // The evicted peer (old secret, live watcher) stays cut off.
+    tokio::fs::write(evicted_dir.path().join("evicted_after.txt"), b"nope")
+        .await
+        .unwrap();
+    sleep(Duration::from_secs(2)).await;
+    assert!(
+        !tokio::fs::try_exists(alice_dir.path().join("evicted_after.txt"))
+            .await
+            .unwrap_or(false),
+        "evicted peer's write reached the host after rotation",
+    );
+
+    alice_ws.shutdown().await.unwrap();
+    survivor_ws.shutdown().await.unwrap();
+    evicted_ws.shutdown().await.unwrap();
+    let _ = timeout(Duration::from_secs(5), alice_handle).await;
+    let _ = timeout(Duration::from_secs(5), survivor_handle).await;
+    let _ = timeout(Duration::from_secs(5), evicted_handle).await;
+    drop(alice);
+    drop(survivor_cli);
+    drop(evicted_cli);
+    daemon_a.stop().await;
+    daemon_b.stop().await;
+    daemon_c.stop().await;
 }
 
 // =============================================================
@@ -1023,14 +1525,15 @@ async fn rotation_drops_revoked_author_entries() {
         .unwrap();
     common::wait_for_file(&alice_dir.path().join("joiner.txt"), b"by joiner").await;
 
-    // Evict Bob and wait for Alice's peer_map to project the revoke
-    // (poll: rotation reads the cap set, so it must reflect the revoke
-    // first). We detect it by the host no longer accepting Bob's RW —
-    // observable as: after revoke, a fresh Bob write doesn't reach
-    // Alice. Simpler + deterministic: poll a bounded delay then rotate,
-    // and assert on the rotation's own drop count.
-    common::revoke(&alice, session, bob_peer).await;
-    // Give the host cap_listener a moment to apply the revoke into its
+    // Demote Bob to Read (NOT Evict): this makes Bob's author non-RW in
+    // the host's peer_map so the rotation snapshot drops his entries,
+    // WITHOUT auto-triggering rotation (only Revoke does that — see
+    // `evict_auto_rotates_and_cuts_off_writes`). That lets this test
+    // drive `rotate_namespace` manually in isolation and assert on its
+    // own drop count. The author-filter treats Read and revoked authors
+    // identically (`endpoint_has_rw` is false for both).
+    common::demote(&alice, session, bob_peer).await;
+    // Give the host cap_listener a moment to apply the demote into its
     // peer_map before we snapshot.
     sleep(Duration::from_secs(2)).await;
 

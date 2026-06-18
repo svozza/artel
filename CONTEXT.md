@@ -66,13 +66,23 @@ holder can sign). The revoked peer's entries are filtered out at snapshot via
 the **author binding**.
 
 **Freeze-drain barrier**:
-The rotation's quiescence protocol. Host broadcasts a freeze (host-sequenced),
-survivors pause their watcher and ack, the host drains in-flight sync and
-snapshots a *provably quiescent* old doc, then re-publishes and ships the new
-secret; survivors import and resume. Eliminates concurrent-write stragglers so
-there is one re-publisher and no cross-doc timestamp reconciliation. A survivor
-that never acks is stranded on the old doc (detected via `namespace_epoch`,
-recovers on reconnect) — the same failure class as a partitioned peer.
+The rotation's quiescence guarantee. **v1 ships the epoch-gated (light)
+shape**: there is no host-coordinated global freeze/ack handshake — the "freeze"
+is each survivor's *own* reimport pausing its watcher (see [[Current
+namespace]] / reimport). On Evict the host snapshots + rotates immediately and
+ships `{new_secret, namespace_epoch}` over the existing `DeliverUpgrade`
+unicast; each survivor, on seeing a higher epoch, reimports (pause watcher →
+swap doc → respawn). The one re-publisher is the host, so there is no cross-doc
+timestamp reconciliation. **Accepted loss**: a *trusted* survivor's in-flight
+write in the sub-second window between the host's snapshot and that survivor's
+reimport lands in the abandoned old doc — identical to a write made during a
+momentary partition, which the system already recovers from via
+`namespace_epoch` on reconnect. This is a durability edge on an honest peer, not
+a security hole: the *evicted* peer is fully cut (never gets the new secret,
+`PeerFilter` blocks it). The heavy host-coordinated freeze/ack barrier remains
+an **additive future upgrade** (the epoch/secret wire is unchanged; only the
+snapshot gets gated behind acks) if a forcing function appears — a workload
+where continuous-writer survivors can't tolerate even sub-second loss.
 
 **namespace_epoch**:
 A monotonic counter carried (opaque) in the workspace ticket envelope, bumped

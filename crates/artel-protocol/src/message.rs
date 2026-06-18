@@ -78,6 +78,19 @@ pub const UPGRADE_ACTION: &str = "workspace.upgrade";
 /// from replay.
 pub const DOWNGRADE_ACTION: &str = "workspace.downgrade";
 
+/// Action string for the FS-layer namespace-rotation message that
+/// delivers a rotated namespace's Write `DocTicket` + epoch to a
+/// surviving RW peer (Evict / write-revocation, Slice 3e).
+///
+/// Mirrors [`UPGRADE_ACTION`] but carries a full `DocTicket`
+/// (capability plus the host's addresses) rather than a bare secret,
+/// because a survivor importing a brand-new namespace needs the host's
+/// addresses to sync it. The host delivers it host→peer over the direct
+/// stream (never gossip), the joiner's daemon injects it as a synthetic
+/// System message, and the FS-layer `cap_listener` consumes it to
+/// reimport onto the rotated namespace. Live-only, excluded from replay.
+pub const ROTATE_ACTION: &str = "workspace.rotate";
+
 /// Action string for the FS-layer workspace-ticket message
 /// (revoked-lurker fix).
 ///

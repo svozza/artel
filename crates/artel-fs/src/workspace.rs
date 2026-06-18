@@ -73,12 +73,20 @@ pub const TICKET_ACTION: &str = artel_protocol::TICKET_ACTION;
 /// raw 32-byte `EndpointId`.
 pub const NODE_ID_ACTION: &str = "workspace.node_id";
 
-use artel_protocol::{DOWNGRADE_ACTION, DowngradePayload, UPGRADE_ACTION};
+use artel_protocol::{
+    DOWNGRADE_ACTION, DowngradePayload, ROTATE_ACTION, RotatePayload, UPGRADE_ACTION,
+};
 
 /// Capacity of the [`Workspace::events`] channel. Modest cap so a
 /// stuck consumer back-pressures the watcher rather than letting
 /// events queue without bound.
 const EVENT_BUFFER: usize = 64;
+
+/// Buffer for the namespace-rotation signal channel (Slice 3e). Small:
+/// rotations are rare (one per Evict) and the rotation task drains
+/// promptly. `try_send` is used at the cap-listener so a full buffer
+/// logs rather than blocking the listener loop.
+const ROTATION_SIGNAL_BUFFER: usize = 16;
 
 /// First retry delay for the cap-listener's reconnect loop. Subsequent
 /// attempts double this (see [`cap_reconnect_backoff`]) up to
@@ -505,6 +513,29 @@ pub struct Workspace {
     /// already had a ticket to get here, the workspace doesn't need
     /// to round-trip it. Read via [`Self::join_ticket`].
     pub(crate) join_ticket: Option<JoinTicket>,
+    /// Host-side context for distributing a rotated namespace's ticket
+    /// to survivors (Slice 3e). `Some` on the host (carries the
+    /// daemon `Client` + session), `None` on joiners (a survivor never
+    /// distributes — it only receives). Reuses the same client the
+    /// host's cap-listener upgrade path uses.
+    pub(crate) rotation_distribute_ctx: Option<RotationDistributeCtx>,
+    /// Current `namespace_epoch` (Slice 3e). Starts at 0 (genesis).
+    /// Bumped by the host on each rotation and by a survivor when it
+    /// reimports onto a higher epoch. A survivor ignores a rotation
+    /// whose epoch is not strictly greater (idempotent re-delivery /
+    /// out-of-order). `Relaxed` — the rotation task is the only writer
+    /// and reads its own writes.
+    pub(crate) namespace_epoch: std::sync::atomic::AtomicU64,
+    /// Receiver for namespace-rotation signals (Slice 3e). The
+    /// cap-listener (which has no `Arc<Workspace>`) sends a
+    /// [`RotationSignal`] here; the rotation task spawned in
+    /// [`Self::run`] drains it and performs the actual rotate / reimport
+    /// (which need the `Arc<Self>`). `Mutex<Option<...>>` so `run` can
+    /// `take` it exactly once even though `run` is re-entrant (reimport
+    /// calls it again — the second take yields `None` and skips
+    /// respawning a duplicate rotation task). Absent ⇒ no rotation
+    /// wiring (e.g. socket-less test workspaces).
+    pub(crate) rotation_rx: std::sync::Mutex<Option<mpsc::Receiver<RotationSignal>>>,
     /// Background task draining session events into the [`PeerMap`]
     /// for the docs gate. Aborted on [`Self::shutdown`].
     _cap_listener: tokio::task::JoinHandle<()>,
@@ -787,7 +818,10 @@ impl Workspace {
         // Spawn the cap-listener on a second Client connection so we
         // don't consume the caller's event stream.
         let shutdown_token = CancellationToken::new();
-        let host_ctx = if let Some(socket) = daemon_socket {
+        // Rotation signal channel (Slice 3e): the host cap-listener
+        // sends HostEvict here; the rotation task in `run` drains it.
+        let (rotation_tx, rotation_rx) = mpsc::channel::<RotationSignal>(ROTATION_SIGNAL_BUFFER);
+        let (host_ctx, rotation_distribute_ctx) = if let Some(socket) = daemon_socket {
             let upgrade_client = Client::connect(socket)
                 .await
                 .map_err(|e| WorkspaceError::Iroh(format!("upgrade-client connect: {e}")))?;
@@ -802,13 +836,23 @@ impl Workspace {
                 })
                 .await
                 .map_err(|e| WorkspaceError::Iroh(format!("upgrade-client host: {e}")))?;
-            Some(HostUpgradeCtx {
-                client: Arc::new(upgrade_client),
+            let upgrade_client = Arc::new(upgrade_client);
+            let host_ctx = Some(HostUpgradeCtx {
+                client: Arc::clone(&upgrade_client),
                 session: session_id,
                 namespace_secret,
-            })
+                rotation_tx: rotation_tx.clone(),
+            });
+            // Rotation distribution reuses the same upgrade client +
+            // session (the host distributes the rotated ticket to
+            // survivors over the same direct-stream path).
+            let distribute = Some(RotationDistributeCtx {
+                client: upgrade_client,
+                session: session_id,
+            });
+            (host_ctx, distribute)
         } else {
-            None
+            (None, None)
         };
         let cap_listener = spawn_cap_listener_from_socket(
             daemon_socket,
@@ -848,6 +892,9 @@ impl Workspace {
                 state_dir,
                 session_id,
                 join_ticket: Some(join_ticket),
+                rotation_distribute_ctx,
+                namespace_epoch: std::sync::atomic::AtomicU64::new(0),
+                rotation_rx: std::sync::Mutex::new(Some(rotation_rx)),
                 _cap_listener: cap_listener,
                 did_shutdown: AtomicBool::new(false),
             },
@@ -1053,10 +1100,14 @@ impl Workspace {
         // reuse it for the listener.
         let shutdown_token = CancellationToken::new();
         let write_halted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Rotation signal channel (Slice 3e): the survivor cap-listener
+        // sends SurvivorRotate here; the rotation task in `run` drains it.
+        let (rotation_tx, rotation_rx) = mpsc::channel::<RotationSignal>(ROTATION_SIGNAL_BUFFER);
         let joiner_ctx = Some(JoinerUpgradeCtx {
             my_peer_id: client.daemon_peer_id(),
             docs: node.docs.clone(),
             write_halted: Arc::clone(&write_halted),
+            rotation_tx: rotation_tx.clone(),
         });
         let listener_socket = join_daemon_socket.unwrap_or_else(|| client.socket_path());
         let cap_listener = spawn_cap_listener_from_socket(
@@ -1115,6 +1166,10 @@ impl Workspace {
                 state_dir,
                 session_id: session,
                 join_ticket: None,
+                // Joiners never distribute a rotation — they only receive.
+                rotation_distribute_ctx: None,
+                namespace_epoch: std::sync::atomic::AtomicU64::new(0),
+                rotation_rx: std::sync::Mutex::new(Some(rotation_rx)),
                 _cap_listener: cap_listener,
                 did_shutdown: AtomicBool::new(false),
             },
@@ -1288,7 +1343,12 @@ impl Workspace {
                 .map_err(|e| WorkspaceError::Doc(format!("rotate: set_hash: {e}")))?;
         }
 
-        // Extract the new secret for distribution.
+        // Build the Write ticket: capability + the host's relay/direct
+        // addresses. Survivors need the addresses to sync a namespace
+        // they've never seen (RelayAndAddresses seeds their addr-book on
+        // the first dial — same rationale as the host's read ticket in
+        // `host_with_inner`). The bare secret is extracted separately for
+        // the host's own reimport, which needs no addresses.
         let write_ticket = new_doc
             .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
             .await
@@ -1299,6 +1359,7 @@ impl Workspace {
                 unreachable!("freshly created namespace always has Write capability")
             }
         };
+        let write_ticket = write_ticket.to_string();
         let new_namespace = new_doc.id();
         let new_epoch = prev_epoch + 1;
 
@@ -1325,6 +1386,7 @@ impl Workspace {
 
         Ok(RotationOutcome {
             new_secret,
+            write_ticket,
             new_namespace,
             new_epoch,
             survivor_entries: survivors.len(),
@@ -1350,22 +1412,55 @@ impl Workspace {
     ///
     /// Takes `Arc<Self>` because it respawns the background tasks, which
     /// capture the workspace.
+    ///
+    /// `source` selects how the namespace is obtained:
+    /// - [`ReimportSource::HostLocal`] — the host owns the namespace
+    ///   locally (it just minted it); import the bare secret, no peer
+    ///   addresses needed.
+    /// - [`ReimportSource::SurvivorTicket`] — a survivor receives the
+    ///   host's Write `DocTicket`; `start_sync(ticket.nodes)` seeds the
+    ///   addr-book so the brand-new namespace can sync from the host.
     #[allow(clippy::significant_drop_tightening)]
     pub(crate) async fn reimport_namespace(
         self: &Arc<Self>,
-        new_secret: [u8; 32],
-        new_namespace: NamespaceId,
+        source: ReimportSource,
     ) -> Result<(), WorkspaceError> {
-        // Import the new namespace as Write and open its doc handle.
+        // Resolve (capability, sync-nodes, expected namespace id, epoch)
+        // from the source.
+        let (capability, sync_nodes, new_namespace, new_epoch_hint) = match source {
+            ReimportSource::HostLocal {
+                new_secret,
+                new_namespace,
+                new_epoch_hint,
+            } => {
+                let secret = iroh_docs::NamespaceSecret::from_bytes(&new_secret);
+                (
+                    iroh_docs::Capability::Write(secret),
+                    Vec::new(),
+                    new_namespace,
+                    new_epoch_hint,
+                )
+            }
+            ReimportSource::SurvivorTicket {
+                doc_ticket,
+                new_epoch_hint,
+            } => {
+                let ticket: DocTicket = doc_ticket.parse().map_err(|e| {
+                    WorkspaceError::Doc(format!("reimport: parse rotation ticket: {e}"))
+                })?;
+                let ns = ticket.capability.id();
+                (ticket.capability, ticket.nodes, ns, new_epoch_hint)
+            }
+        };
+
+        // Import the new namespace and open its doc handle.
         let new_doc = {
             let guard = self.node.lock().await;
             let node = guard
                 .as_ref()
                 .ok_or_else(|| WorkspaceError::Doc("reimport: node torn down".into()))?;
-            let secret = iroh_docs::NamespaceSecret::from_bytes(&new_secret);
-            let cap = iroh_docs::Capability::Write(secret);
             node.docs
-                .import_namespace(cap)
+                .import_namespace(capability)
                 .await
                 .map_err(|e| WorkspaceError::Doc(format!("reimport import_namespace: {e}")))?;
             node.docs
@@ -1376,8 +1471,11 @@ impl Workspace {
                     WorkspaceError::Doc("reimport: namespace absent after import".into())
                 })?
         };
+        // Seed the addr-book from the ticket's nodes (empty for the
+        // host's own reimport) so a survivor can dial the host for the
+        // brand-new namespace on the first try.
         new_doc
-            .start_sync(vec![])
+            .start_sync(sync_nodes)
             .await
             .map_err(|e| WorkspaceError::Doc(format!("reimport start_sync: {e}")))?;
 
@@ -1408,10 +1506,17 @@ impl Workspace {
 
         // Respawn watcher + applier against the new namespace. They
         // select on the fresh doc token (via `doc_token()`) and clone
-        // the swapped doc. The returned JoinHandle is owned by the
-        // spawned tasks' own lifetime; we don't await it here (it only
-        // completes at shutdown).
-        drop(Arc::clone(self).run().await);
+        // the swapped doc. We respawn only the doc tasks (not full
+        // `run`) so we don't re-enter the rotation-task spawn — the
+        // rotation task is already running and survives the doc_token
+        // reset (it lives on `shutdown_token`).
+        drop(Arc::clone(self).spawn_doc_tasks().await);
+
+        // Reflect the new epoch locally so a future stale rotation is
+        // ignored. The host sets this before distributing; a survivor
+        // sets it here on reimport.
+        self.namespace_epoch
+            .store(new_epoch_hint, std::sync::atomic::Ordering::Relaxed);
 
         debug!(
             target: "artel_fs::workspace",
@@ -1419,6 +1524,107 @@ impl Workspace {
             "reimport_namespace: swapped onto rotated namespace",
         );
         Ok(())
+    }
+
+    /// Handle one [`RotationSignal`] (Slice 3e). Host: rotate →
+    /// distribute the new ticket to survivors → reimport locally.
+    /// Survivor: reimport onto the delivered namespace if its epoch is
+    /// newer than what we hold. Errors are logged + surfaced as a
+    /// [`WorkspaceEvent::Error`]; rotation is best-effort at this layer
+    /// (a failed distribution leaves a survivor on the old namespace,
+    /// recovered on its next epoch-bearing delivery).
+    async fn handle_rotation_signal(self: &Arc<Self>, signal: RotationSignal) {
+        match signal {
+            RotationSignal::HostEvict { revoked_peer } => {
+                let prev = self
+                    .namespace_epoch
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let outcome = match self.rotate_namespace(prev).await {
+                    Ok(o) => o,
+                    Err(e) => {
+                        warn!(?e, ?revoked_peer, "rotation: rotate_namespace failed");
+                        emit_event(
+                            &self.events,
+                            WorkspaceEvent::Error(format!("rotation failed: {e}")),
+                        );
+                        return;
+                    }
+                };
+                // Set the epoch before distributing so a concurrent
+                // signal sees the bump.
+                self.namespace_epoch
+                    .store(outcome.new_epoch, std::sync::atomic::Ordering::Relaxed);
+
+                // Distribute the new ticket to every surviving RW peer
+                // (the revoked peer is already gone from the cap set, so
+                // `rw_peers_except_host` excludes it).
+                let survivors = {
+                    let guard = self.node.lock().await;
+                    guard
+                        .as_ref()
+                        .map_or_else(Vec::new, |node| node.peer_map.rw_peers_except_host())
+                };
+                if let Some(ctx) = &self.rotation_distribute_ctx {
+                    for peer in survivors {
+                        if let Err(e) = publish_rotate(
+                            &ctx.client,
+                            ctx.session,
+                            peer,
+                            outcome.new_epoch,
+                            outcome.write_ticket.clone(),
+                        )
+                        .await
+                        {
+                            warn!(?e, ?peer, "rotation: deliver to survivor failed");
+                        }
+                    }
+                }
+
+                // Reimport the host onto the namespace it just minted.
+                if let Err(e) = self
+                    .reimport_namespace(ReimportSource::HostLocal {
+                        new_secret: outcome.new_secret,
+                        new_namespace: outcome.new_namespace,
+                        new_epoch_hint: outcome.new_epoch,
+                    })
+                    .await
+                {
+                    warn!(?e, "rotation: host reimport failed");
+                    emit_event(
+                        &self.events,
+                        WorkspaceEvent::Error(format!("host reimport failed: {e}")),
+                    );
+                }
+            }
+            RotationSignal::SurvivorRotate {
+                namespace_epoch,
+                doc_ticket,
+            } => {
+                let prev = self
+                    .namespace_epoch
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if namespace_epoch <= prev {
+                    debug!(
+                        namespace_epoch,
+                        prev, "rotation: ignoring stale/duplicate survivor rotation",
+                    );
+                    return;
+                }
+                if let Err(e) = self
+                    .reimport_namespace(ReimportSource::SurvivorTicket {
+                        doc_ticket,
+                        new_epoch_hint: namespace_epoch,
+                    })
+                    .await
+                {
+                    warn!(?e, "rotation: survivor reimport failed");
+                    emit_event(
+                        &self.events,
+                        WorkspaceEvent::Error(format!("survivor reimport failed: {e}")),
+                    );
+                }
+            }
+        }
     }
 
     /// The [`AuthorId`] this workspace stamps on its outgoing writes.
@@ -1464,6 +1670,42 @@ impl Workspace {
     #[must_use]
     pub async fn run(self: std::sync::Arc<Self>) -> tokio::task::JoinHandle<()> {
         debug!(target: "artel_fs::workspace", root = %self.root.display(), "run: spawning watcher + applier");
+        // Spawn the rotation task ONCE. `run` is re-entrant — reimport
+        // calls it again to respawn watcher/applier after a doc swap —
+        // so guard on taking `rotation_rx`: the first `run` takes it
+        // (Some → drives the task), later `run`s get `None` and skip
+        // (the existing task keeps running, on `shutdown_token` so the
+        // doc_token reset during reimport doesn't kill it).
+        // Take the receiver in a tight scope so the std MutexGuard is
+        // dropped before any `.await` below (else `run`'s future is
+        // !Send and can't be awaited by the rotation task itself).
+        let taken_rotation_rx = self.rotation_rx.lock().expect("rotation_rx mutex").take();
+        if let Some(mut rotation_rx) = taken_rotation_rx {
+            let rotation_ws = std::sync::Arc::clone(&self);
+            let cancel = self.shutdown_token.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        () = cancel.cancelled() => break,
+                        signal = rotation_rx.recv() => match signal {
+                            Some(s) => rotation_ws.handle_rotation_signal(s).await,
+                            None => break,
+                        },
+                    }
+                }
+            });
+        }
+
+        self.spawn_doc_tasks().await
+    }
+
+    /// Spawn the watcher + applier against the **current** doc, awaiting
+    /// both halves' readiness. Extracted from [`Self::run`] so namespace
+    /// re-import can respawn just the doc tasks without re-entering
+    /// `run` (which also owns the once-only rotation task) — that
+    /// re-entry would make `reimport_namespace`'s future recursively
+    /// reference `run`'s, defeating `Send`.
+    async fn spawn_doc_tasks(self: std::sync::Arc<Self>) -> tokio::task::JoinHandle<()> {
         let watcher_ws = std::sync::Arc::clone(&self);
         let applier_ws = std::sync::Arc::clone(&self);
         let (watcher_ready_tx, watcher_ready_rx) = tokio::sync::oneshot::channel::<()>();
@@ -1618,10 +1860,15 @@ impl Workspace {
             .rotate_namespace(prev_epoch)
             .await
             .map_err(|e| e.to_string())?;
-        self.reimport_namespace(outcome.new_secret, outcome.new_namespace)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(outcome.new_namespace.to_bytes())
+        let new_namespace = outcome.new_namespace;
+        self.reimport_namespace(ReimportSource::HostLocal {
+            new_secret: outcome.new_secret,
+            new_namespace,
+            new_epoch_hint: outcome.new_epoch,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(new_namespace.to_bytes())
     }
 
     /// The `NamespaceId` bytes of the workspace's **current** doc.
@@ -2012,6 +2259,41 @@ async fn publish_downgrade(
     Ok(())
 }
 
+/// Host-side context for distributing a rotated namespace's ticket to
+/// survivors (Slice 3e).
+pub(crate) struct RotationDistributeCtx {
+    pub(crate) client: Arc<Client>,
+    pub(crate) session: SessionId,
+}
+
+impl std::fmt::Debug for RotationDistributeCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RotationDistributeCtx")
+            .field("session", &self.session)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Host-side: ask the daemon to deliver a rotated namespace's Write
+/// `DocTicket` + epoch to `target_peer` over the direct stream.
+async fn publish_rotate(
+    client: &Client,
+    session: SessionId,
+    target_peer: PeerId,
+    namespace_epoch: u64,
+    doc_ticket: String,
+) -> Result<(), ClientError> {
+    client
+        .request(Request::DeliverRotate {
+            session,
+            target_peer,
+            namespace_epoch,
+            doc_ticket,
+        })
+        .await?;
+    Ok(())
+}
+
 /// Wait for `iroh-docs` to finish its first reconciliation pass and
 /// download all pending content. Returns when [`LiveEvent::SyncFinished`]
 /// has been observed *and* a subsequent
@@ -2331,13 +2613,18 @@ fn ensure_state_dir(state_dir: &Path) -> Result<(), WorkspaceError> {
 
 /// Result of [`Workspace::rotate_namespace`].
 pub(crate) struct RotationOutcome {
-    /// The freshly minted `NamespaceSecret` (32 bytes) for host→survivor
-    /// distribution. Never given to the revoked peer. Consumed by the
-    /// freeze-drain orchestration (Slice 3d/3e) that distributes it over
-    /// the existing `DeliverUpgrade` unicast; unread until that wiring
-    /// lands.
-    #[allow(dead_code)]
+    /// The freshly minted `NamespaceSecret` (32 bytes). Used by the
+    /// **host's own** reimport ([`Workspace::reimport_namespace`]) — the
+    /// host owns the namespace locally so it needs no peer addresses.
     pub(crate) new_secret: [u8; 32],
+    /// The Write [`iroh_docs::DocTicket`] string (capability **+** the
+    /// host's relay/direct addresses) for **survivor** distribution: a
+    /// survivor importing a brand-new namespace has no addr-book entry
+    /// for the host, so a bare secret can't sync — it needs
+    /// `start_sync(ticket.nodes)`. Shipped over the `DeliverDowngrade`-
+    /// style rotation unicast (see [`DeliveryFrame::Rotate`]). Never
+    /// given to the revoked peer.
+    pub(crate) write_ticket: String,
     /// The new current `NamespaceId`.
     pub(crate) new_namespace: NamespaceId,
     /// The bumped `namespace_epoch` (prev + 1).
@@ -2348,6 +2635,40 @@ pub(crate) struct RotationOutcome {
     /// How many entries were dropped because their author was no longer
     /// RW (the revoked peer's, plus any unresolvable authors).
     pub(crate) dropped_entries: usize,
+}
+
+/// A namespace-rotation signal sent from the cap-listener (no
+/// `Arc<Workspace>`) to the rotation task in [`Workspace::run`].
+pub(crate) enum RotationSignal {
+    /// Host side: a peer was evicted (`Revoke`); rotate the namespace,
+    /// distribute the new ticket to survivors, and reimport locally.
+    HostEvict { revoked_peer: PeerId },
+    /// Survivor side: the host delivered a rotated namespace; reimport
+    /// onto it if `namespace_epoch` is newer than what we hold.
+    SurvivorRotate {
+        namespace_epoch: u64,
+        doc_ticket: String,
+    },
+}
+
+/// How [`Workspace::reimport_namespace`] obtains the rotated namespace.
+pub(crate) enum ReimportSource {
+    /// The host re-importing a namespace it just minted locally — it
+    /// already owns the replica, so no peer addresses are needed.
+    HostLocal {
+        new_secret: [u8; 32],
+        new_namespace: NamespaceId,
+        /// Epoch to record locally after the swap.
+        new_epoch_hint: u64,
+    },
+    /// A survivor re-importing from the host's Write `DocTicket` string
+    /// (capability + relay/direct addresses). The addresses seed the
+    /// addr-book so the brand-new namespace can sync from the host.
+    SurvivorTicket {
+        doc_ticket: String,
+        /// Epoch to record locally after the swap.
+        new_epoch_hint: u64,
+    },
 }
 
 /// What [`open_or_create_doc`] resolved for a host workspace.
@@ -2546,6 +2867,10 @@ struct HostUpgradeCtx {
     client: Arc<Client>,
     session: SessionId,
     namespace_secret: [u8; 32],
+    /// Sender to the rotation task: on a `Revoke` the host cap-listener
+    /// sends [`RotationSignal::HostEvict`] here (the cap-listener has no
+    /// `Arc<Workspace>`, so it can't rotate directly). Slice 3e.
+    rotation_tx: mpsc::Sender<RotationSignal>,
 }
 
 /// Joiner-side context for receiving `NamespaceSecret` upgrades.
@@ -2555,6 +2880,9 @@ struct JoinerUpgradeCtx {
     /// Shared with [`Workspace::write_halted`]; the `DOWNGRADE_ACTION`
     /// handler flips it so the watcher stops publishing.
     write_halted: Arc<std::sync::atomic::AtomicBool>,
+    /// Sender to the rotation task: on a `ROTATE_ACTION` the survivor
+    /// cap-listener sends [`RotationSignal::SurvivorRotate`] here. Slice 3e.
+    rotation_tx: mpsc::Sender<RotationSignal>,
 }
 
 /// Exponential backoff for the cap-listener's reconnect loop.
@@ -2725,6 +3053,20 @@ fn handle_capability_message(
             }
         });
     }
+
+    // Host: on an Evict (`Revoke`), signal the rotation task to rotate
+    // the namespace (cryptographic write cut-off). The cap-listener has
+    // no `Arc<Workspace>`, so it hands the rotation off via the channel;
+    // the apply above has already removed the revoked peer from the cap
+    // set, so the rotation's survivor set excludes it.
+    if let Some(ctx) = host_ctx
+        && let Ok(CapabilityAction::Revoke { peer }) = CapabilityAction::decode(&message.payload)
+        && let Err(e) = ctx
+            .rotation_tx
+            .try_send(RotationSignal::HostEvict { revoked_peer: peer })
+    {
+        warn!(?e, ?peer, "rotation: failed to enqueue HostEvict signal");
+    }
 }
 
 /// Apply one cap-listener [`Event`] to `peer_map` and trigger any
@@ -2797,6 +3139,24 @@ async fn handle_cap_event(
                         ctx.write_halted
                             .store(true, std::sync::atomic::Ordering::Relaxed);
                         emit_event(events_tx, WorkspaceEvent::Demoted);
+                    }
+                }
+                MessageKind::System if message.action == ROTATE_ACTION => {
+                    // Survivor: the host rotated the namespace and
+                    // delivered the new Write ticket. Verify host origin
+                    // and that we are the target, then hand off to the
+                    // rotation task (the cap-listener has no
+                    // `Arc<Workspace>`). Slice 3e.
+                    if let Some(ctx) = joiner_ctx
+                        && message.peer.id == peer_map.host_peer_id()
+                        && let Ok(payload) = postcard::from_bytes::<RotatePayload>(&message.payload)
+                        && payload.target_peer == ctx.my_peer_id
+                        && let Err(e) = ctx.rotation_tx.try_send(RotationSignal::SurvivorRotate {
+                            namespace_epoch: payload.namespace_epoch,
+                            doc_ticket: payload.doc_ticket,
+                        })
+                    {
+                        warn!(?e, "rotation: failed to enqueue SurvivorRotate signal");
                     }
                 }
                 _ => {}
