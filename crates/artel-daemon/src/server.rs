@@ -659,25 +659,7 @@ async fn dispatch(
                     error: ProtocolError::NotSubscribed(session),
                 };
             };
-            match registry
-                .send(
-                    session,
-                    peer,
-                    kind,
-                    action,
-                    payload,
-                    crate::session::Authoring::Local,
-                )
-                .await
-            {
-                Ok(message) => Response::Sent {
-                    session,
-                    seq: message.seq,
-                },
-                Err(err) => Response::Error {
-                    error: session_error_to_protocol(&err),
-                },
-            }
+            dispatch_send(registry, session, peer, kind, action, payload).await
         }
         Request::LeaveSession { session } => {
             let Some(peer) = memberships.remove(&session) else {
@@ -888,6 +870,82 @@ async fn dispatch_join(
         Err(err) => Response::Error {
             error: session_error_to_protocol(&err),
         },
+    }
+}
+
+/// Handle a `Send` request, transparently recovering from a reloaded
+/// `Remote` mirror that lost its gossip subscription across a daemon
+/// restart.
+///
+/// On the common path this is a single `registry.send`. If the joiner's
+/// mirror was rehydrated from disk but never re-subscribed (the bridge
+/// has no live topic for the session), `send` returns
+/// [`SessionError::RemoteTopicMissing`]; we then re-subscribe the topic
+/// ([`Registry::resubscribe_remote_mirror`]) and retry the send once.
+///
+/// This retry lives here — in the IPC dispatch layer, reached only from
+/// `serve_connection` — rather than inside `Registry::send`, because
+/// `send` is also reachable from the host's gossip forwarder
+/// (`run_host_send`), and a re-subscribe spawns that same forwarder;
+/// calling it from `send` would make `send`'s future type-level
+/// recursive (hence non-`Send`).
+async fn dispatch_send(
+    registry: &Registry,
+    session: SessionId,
+    peer: PeerInfo,
+    kind: artel_protocol::MessageKind,
+    action: String,
+    payload: Vec<u8>,
+) -> Response {
+    // First attempt. Clone the owned args so a retry can re-issue the
+    // same send (`Registry::send` consumes them). The clone is on the
+    // common path; it's a small action string + payload and keeps the
+    // retry branch simple.
+    let first = registry
+        .send(
+            session,
+            peer.clone(),
+            kind,
+            action.clone(),
+            payload.clone(),
+            crate::session::Authoring::Local,
+        )
+        .await;
+
+    let err = match first {
+        Ok(message) => {
+            return Response::Sent {
+                session,
+                seq: message.seq,
+            };
+        }
+        Err(err) => err,
+    };
+
+    #[cfg(feature = "iroh")]
+    if matches!(err, SessionError::RemoteTopicMissing(_)) {
+        // Reloaded mirror: re-establish gossip presence, then retry.
+        if let Err(resub_err) = registry.resubscribe_remote_mirror(session).await {
+            return Response::Error {
+                error: session_error_to_protocol(&resub_err),
+            };
+        }
+        return match registry
+            .send(session, peer, kind, action, payload, crate::session::Authoring::Local)
+            .await
+        {
+            Ok(message) => Response::Sent {
+                session,
+                seq: message.seq,
+            },
+            Err(retry_err) => Response::Error {
+                error: session_error_to_protocol(&retry_err),
+            },
+        };
+    }
+
+    Response::Error {
+        error: session_error_to_protocol(&err),
     }
 }
 

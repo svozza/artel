@@ -109,6 +109,16 @@ pub enum SessionError {
     #[error("send is only supported on the host side in this build")]
     NotHost,
 
+    /// A joiner `Send` found no live gossip topic for the session —
+    /// this daemon reloaded the `Remote` mirror from disk but hasn't
+    /// re-subscribed since the restart. **Recoverable**: the IPC
+    /// dispatch layer re-subscribes ([`Registry::resubscribe_remote_mirror`])
+    /// and retries the send. Not surfaced to clients directly — it's an
+    /// internal signal that triggers the lazy reconnect. See the `Remote`
+    /// arm of [`Registry::send`].
+    #[error("remote session topic missing (needs re-subscribe): {0}")]
+    RemoteTopicMissing(SessionId),
+
     /// `Registry::host(peer, Some(id))` was issued for an `id`
     /// that exists locally but with a different host or as a
     /// remote-mirror session. The caller is asking to resume a
@@ -217,6 +227,7 @@ impl PartialEq for SessionError {
         match (self, other) {
             (Self::UnknownSession(a), Self::UnknownSession(b))
             | (Self::NotMember(a), Self::NotMember(b))
+            | (Self::RemoteTopicMissing(a), Self::RemoteTopicMissing(b))
             | (Self::SessionConflict(a), Self::SessionConflict(b)) => a == b,
             (Self::Storage(a), Self::Storage(b)) => a.kind() == b.kind(),
             (Self::InvalidAddr(a), Self::InvalidAddr(b))
@@ -279,6 +290,12 @@ impl From<&SessionError> for ProtocolError {
             SessionError::InvalidAddr(msg) => Self::Internal(format!("invalid addr: {msg}")),
             SessionError::Internal(msg) => Self::Internal(msg.clone()),
             SessionError::NotHost => Self::NotHost,
+            // Recoverable internally (the dispatch layer re-subscribes
+            // and retries); if it ever reaches the wire the re-subscribe
+            // failed, so a generic Internal is the honest surface.
+            SessionError::RemoteTopicMissing(_) => {
+                Self::Internal("remote session topic missing".into())
+            }
             SessionError::SessionConflict(s) => Self::SessionConflict(*s),
             // Forward the host's verdict verbatim so the caller sees
             // the actual reason (e.g., UnknownSession after a session
@@ -1219,6 +1236,87 @@ impl Registry {
     /// to the host's gossip topic. Inbound gossip messages land in
     /// the mirror's `log` and `events_tx`.
     #[allow(clippy::too_many_arguments)]
+    /// Build the inbound-frame callback the gossip bridge hands every
+    /// `SessionMessage` it decodes for a `Remote` mirror. Shared by the
+    /// fresh-join path ([`Self::materialise_remote_session`]) and the
+    /// reload re-subscribe path ([`Self::resubscribe_remote_mirror`]) so
+    /// both wire identical mirror-apply semantics.
+    ///
+    /// Keeps a strong `Arc` to the mirror in the closure so the session
+    /// outlives the forwarder task until `forget_session` aborts it. The
+    /// store handle is cloned so the callback persists each message —
+    /// without that a daemon restart loses the entire remote-mirror log.
+    #[cfg(feature = "iroh")]
+    fn mirror_on_message(
+        &self,
+        session_id: SessionId,
+        arc: &Arc<Mutex<Session>>,
+    ) -> Box<dyn Fn(SessionMessage) + Send + Sync + 'static> {
+        let mirror = Arc::clone(arc);
+        let store = self.store.clone();
+        Box::new(move |msg: SessionMessage| {
+            let mirror = Arc::clone(&mirror);
+            let store = store.clone();
+            // Spawn so the gossip forwarder doesn't block on each
+            // message. Acceptable for now; if ordering ever matters we
+            // can replace with a per-session mpsc.
+            tokio::spawn(async move {
+                apply_inbound_mirror_message(&store, &mirror, session_id, msg).await;
+            });
+        })
+    }
+
+    /// Re-establish gossip presence for a `Remote` mirror that was
+    /// rehydrated from disk by [`Self::load`] but never re-subscribed to
+    /// its host's topic (a daemon restart leaves the bridge's per-session
+    /// state empty). Reconstructs the host-epoch watermark and the
+    /// mirror-apply callback exactly as the fresh-join path does, then
+    /// drives the bridge's announce-less re-subscribe.
+    ///
+    /// Best-effort and idempotent: a still-live topic is a no-op inside
+    /// the bridge. Called from the IPC `dispatch_send` retry path (NOT
+    /// from [`Self::send`] itself — see that method's `RemoteTopicMissing`
+    /// arm for why the re-subscribe can't live there).
+    #[cfg(feature = "iroh")]
+    pub(crate) async fn resubscribe_remote_mirror(
+        &self,
+        session_id: SessionId,
+    ) -> Result<(), SessionError> {
+        let session_arc = {
+            let guard = self.sessions.read().await;
+            guard
+                .get(&session_id)
+                .cloned()
+                .ok_or(SessionError::UnknownSession(session_id))?
+        };
+        let bridge = self
+            .bridge
+            .as_ref()
+            .ok_or_else(|| {
+                SessionError::Internal("remote re-subscribe requires gossip bridge".into())
+            })?
+            .clone();
+        // Seed the watermark from the persisted mirror, same as the
+        // fresh-join path — the bridge's EpochBeacon arm advances and
+        // persists it from here.
+        let (host_peer, host_epoch) = {
+            let s = session_arc.lock().await;
+            (s.host, s.host_epoch)
+        };
+        let host_epoch_watermark = Arc::new(std::sync::atomic::AtomicU64::new(host_epoch));
+        let on_message = self.mirror_on_message(session_id, &session_arc);
+        bridge
+            .resubscribe_session(session_id, host_peer, host_epoch_watermark, on_message)
+            .await
+            .map_err(|err| match err {
+                crate::gossip_bridge::BridgeError::InvalidAddr(msg) => {
+                    SessionError::InvalidAddr(msg)
+                }
+                other => SessionError::Internal(other.to_string()),
+            })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn materialise_remote_session(
         &self,
         session_id: SessionId,
@@ -1294,21 +1392,7 @@ impl Registry {
             // `Workspace::join_with` hangs in `wait_for_ticket`
             // forever waiting for the host's `workspace.ticket`
             // System message that was never persisted).
-            let mirror = Arc::clone(&arc);
-            let store = self.store.clone();
-            let session_for_log = session_id;
-            let on_message = move |msg: SessionMessage| {
-                let mirror = Arc::clone(&mirror);
-                let store = store.clone();
-                let session_for_log = session_for_log;
-                // Spawn so the gossip forwarder doesn't block on
-                // each message. Acceptable for now; if ordering
-                // ever matters we can replace with a per-session
-                // mpsc.
-                tokio::spawn(async move {
-                    apply_inbound_mirror_message(&store, &mirror, session_for_log, msg).await;
-                });
-            };
+            let on_message = self.mirror_on_message(session_id, &arc);
 
             // Wire `host_addr` is used as a synchronous addr hint to
             // sidestep pkarr propagation: the bridge feeds it into
@@ -2048,28 +2132,22 @@ impl Registry {
                 action,
                 payload,
             };
+            // A `UnknownSession` here means this daemon reloaded the
+            // mirror from disk but never re-subscribed its gossip topic
+            // (the bridge's per-session state is empty after a restart).
+            // Surface it as a distinct, recoverable error so the IPC
+            // dispatch layer can re-subscribe and retry. We deliberately
+            // do NOT re-subscribe inside `send`: `send` is reachable from
+            // the host's gossip forwarder (`run_host_send`), and a
+            // re-subscribe spawns that same forwarder — calling it from
+            // here would make `send`'s future type-level recursive (and
+            // thus non-`Send`). The retry lives in `dispatch_send`, which
+            // only the IPC path reaches. See `resubscribe_remote_mirror`.
             return match bridge.send_remote(session, peer, send_payload).await {
-                Ok(message) => Ok(message),
-                Err(crate::gossip_bridge::BridgeError::HostRejected(err)) => {
-                    Err(SessionError::HostRejected(err))
+                Err(crate::gossip_bridge::BridgeError::UnknownSession(s)) => {
+                    Err(SessionError::RemoteTopicMissing(s))
                 }
-                Err(crate::gossip_bridge::BridgeError::SendTimeout) => Err(SessionError::Internal(
-                    "send_remote: timed out waiting for host ack".into(),
-                )),
-                Err(crate::gossip_bridge::BridgeError::UnknownSession(_)) => Err(
-                    SessionError::Internal("send_remote: bridge missing session topic".into()),
-                ),
-                Err(crate::gossip_bridge::BridgeError::Iroh(msg)) => {
-                    Err(SessionError::Internal(format!("gossip: {msg}")))
-                }
-                // `send_remote` doesn't take a wire-form addr, so
-                // `InvalidAddr` shouldn't surface here today; map it
-                // defensively the same way [`Self::join`] does so a
-                // future refactor that funnels addr-validation
-                // through `send_remote` doesn't silently flatten it.
-                Err(crate::gossip_bridge::BridgeError::InvalidAddr(msg)) => {
-                    Err(SessionError::InvalidAddr(msg))
-                }
+                other => map_send_remote_result(other),
             };
         }
         #[cfg(not(feature = "iroh"))]
@@ -2898,6 +2976,40 @@ fn parse_ticket(ticket: &JoinTicket) -> Result<SessionTicket, SessionError> {
 /// replayed on an unseen seq is dropped by `verify_seq` and never
 /// touches the watermark (`replayed_message_cannot_poison_watermark`).
 #[cfg(feature = "iroh")]
+/// Map a [`crate::gossip_bridge::send_remote`] result onto the
+/// registry's [`SessionError`] surface. Shared by the first-attempt and
+/// post-resubscribe-retry arms of the `Remote` send path so they can't
+/// drift. A lingering `UnknownSession` after a re-subscribe is a genuine
+/// failure (the topic didn't come back), surfaced as `Internal`.
+#[cfg(feature = "iroh")]
+fn map_send_remote_result(
+    result: Result<SessionMessage, crate::gossip_bridge::BridgeError>,
+) -> Result<SessionMessage, SessionError> {
+    match result {
+        Ok(message) => Ok(message),
+        Err(crate::gossip_bridge::BridgeError::HostRejected(err)) => {
+            Err(SessionError::HostRejected(err))
+        }
+        Err(crate::gossip_bridge::BridgeError::SendTimeout) => Err(SessionError::Internal(
+            "send_remote: timed out waiting for host ack".into(),
+        )),
+        Err(crate::gossip_bridge::BridgeError::UnknownSession(_)) => Err(SessionError::Internal(
+            "send_remote: bridge missing session topic".into(),
+        )),
+        Err(crate::gossip_bridge::BridgeError::Iroh(msg)) => {
+            Err(SessionError::Internal(format!("gossip: {msg}")))
+        }
+        // `send_remote` doesn't take a wire-form addr, so `InvalidAddr`
+        // shouldn't surface here today; map it defensively the same way
+        // [`Registry::join`] does so a future refactor that funnels
+        // addr-validation through `send_remote` doesn't silently flatten
+        // it.
+        Err(crate::gossip_bridge::BridgeError::InvalidAddr(msg)) => {
+            Err(SessionError::InvalidAddr(msg))
+        }
+    }
+}
+
 async fn apply_inbound_mirror_message(
     store: &DynStore,
     mirror: &Arc<Mutex<Session>>,
@@ -5172,6 +5284,81 @@ mod tests {
         );
         #[cfg(not(feature = "iroh"))]
         assert_eq!(err, SessionError::NotHost);
+    }
+
+    /// A reloaded `Remote` mirror with a bridge attached but no live
+    /// gossip topic surfaces [`SessionError::RemoteTopicMissing`] from
+    /// `send` — the recoverable signal `dispatch_send` keys its lazy
+    /// re-subscribe + retry on. We can't stand up a live gossip mesh in
+    /// a unit test, so this pins the *error plumbing* (the end-to-end
+    /// re-subscribe-then-write is covered by the real-n0 integration
+    /// suite). Here we drive the no-bridge path, which is the other
+    /// branch of the same arm, and assert it does NOT collapse into the
+    /// recoverable variant (a missing bridge is unrecoverable Internal,
+    /// not a "needs re-subscribe").
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn remote_send_without_bridge_is_internal_not_recoverable() {
+        let daemon_peer = PeerId::from_bytes([7; 32]);
+        let remote_host = peer(1, "alice");
+        let session_id = SessionId::from_bytes([0xab; 16]);
+        let me = peer(2, "bob");
+
+        let store = Arc::new(crate::store::MemoryStore::new());
+        let record = SessionRecord {
+            id: session_id,
+            host: remote_host.id,
+            members: HashSet::from([remote_host.id, me.id]),
+            head: Seq::ZERO,
+            log: Vec::new(),
+            kind: SessionKind::Remote,
+            host_epoch: 0,
+            tickets: Vec::new(),
+            workspace_ticket: None,
+        };
+        store.create(&record).await.unwrap();
+
+        // No bridge attached (None) — the daemon has no transport.
+        let r = Registry::load(
+            daemon_peer,
+            WireEndpointAddr::id_only(daemon_peer),
+            store,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let err = r
+            .send(
+                session_id,
+                me,
+                MessageKind::Chat,
+                "x".into(),
+                vec![],
+                Authoring::Local,
+            )
+            .await
+            .unwrap_err();
+        // Missing bridge is an unrecoverable Internal, distinct from the
+        // RemoteTopicMissing reconnect signal — `dispatch_send` must not
+        // try to re-subscribe a daemon that has no transport at all.
+        assert!(
+            matches!(&err, SessionError::Internal(msg) if msg.contains("remote send")),
+            "expected internal-no-bridge, got {err:?}",
+        );
+        assert!(
+            !matches!(err, SessionError::RemoteTopicMissing(_)),
+            "no-bridge must not masquerade as the recoverable signal",
+        );
+
+        // `resubscribe_remote_mirror` on an unknown session is a clean
+        // UnknownSession, not a panic — guards the dispatch retry against
+        // a session that vanished between send and re-subscribe.
+        let missing = SessionId::from_bytes([0xff; 16]);
+        let resub_err = r.resubscribe_remote_mirror(missing).await.unwrap_err();
+        assert_eq!(resub_err, SessionError::UnknownSession(missing));
     }
 
     // ---- host_closed_session (joiner-side mirror teardown) ----

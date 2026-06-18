@@ -540,6 +540,61 @@ impl GossipBridge {
         Ok(())
     }
 
+    /// Re-subscribe a **reloaded** `Remote` mirror to its host's gossip
+    /// topic, WITHOUT re-running admission.
+    ///
+    /// A daemon restart rehydrates the mirror's record but leaves the
+    /// bridge's per-session topic state empty — the joiner-side analogue
+    /// of [`Self::host_session`]'s resume re-subscribe. This restores
+    /// live gossip so a returning joiner's outbound `Send` (which is
+    /// otherwise rejected with [`BridgeError::UnknownSession`]) can reach
+    /// the host again, and so inbound host broadcasts resume flowing into
+    /// the mirror.
+    ///
+    /// Unlike [`Self::join_session`] this does **not** publish a
+    /// `JoinAnnouncement`: the returning peer is already a durable member
+    /// host-side (`members` survives in the host's `SessionRecord`, and
+    /// the host's send path gates on that durable set), so re-asserting
+    /// admission is unnecessary — and re-announcing with a since-revoked
+    /// claim would be re-rejected anyway. We bootstrap from the host's
+    /// `EndpointId` alone (the ticket's transport hint is not persisted),
+    /// letting iroh discovery resolve the host's addr; the host is
+    /// long-lived so its pkarr/DNS record is published.
+    ///
+    /// After re-subscribing, requests a full replay so any host-side
+    /// messages the mirror missed while the daemon was down are
+    /// backfilled. Idempotent: a still-live slot makes `subscribe_inner`
+    /// a no-op, and the mirror dedups replayed seqs.
+    pub(crate) async fn resubscribe_session(
+        self: &Arc<Self>,
+        session: SessionId,
+        host_peer: PeerId,
+        host_epoch_watermark: Arc<AtomicU64>,
+        on_message: impl Fn(SessionMessage) + Send + Sync + 'static,
+    ) -> Result<(), BridgeError> {
+        let host_endpoint_id = iroh::EndpointId::from_bytes(host_peer.as_bytes())
+            .map_err(|e| BridgeError::Iroh(format!("bad host peer id: {e}")))?;
+        // Track the host id even though we have no transport hint: a
+        // later shutdown snapshot may find iroh learned its addrs via
+        // discovery, giving the next incarnation a head start.
+        self.tracked_peer_ids
+            .lock()
+            .expect("poisoned")
+            .insert(host_endpoint_id);
+        self.subscribe_inner(
+            session,
+            vec![host_endpoint_id],
+            SessionRole::Joiner {
+                on_message: Arc::new(on_message),
+                host_pubkey: host_peer,
+                host_epoch_watermark,
+            },
+        )
+        .await?;
+        self.publish_replay(session, Seq::ZERO).await;
+        Ok(())
+    }
+
     /// Tear down all per-session topic state for `session`. Called
     /// from [`Registry::leave`] (host or joiner) so the forwarder
     /// task exits, the gossip topic is left, and `bridge.sessions`
