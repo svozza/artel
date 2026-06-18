@@ -145,6 +145,19 @@ const CURRENT_NAMESPACE_FILE: &str = "current-namespace";
 /// pre-rotation namespace. Epoch ids aren't secret, so no chmod.
 const NAMESPACE_EPOCH_FILE: &str = "namespace-epoch";
 
+/// File inside `state_dir` that stores the highest `Revoke` log seq the
+/// host has already rotated for, as a little-endian `u64` (C3).
+///
+/// On a host restart the cap-listener re-subscribes with `since: None`,
+/// so the daemon replays the whole session log — including historical
+/// `Revoke` messages. Without a high-water mark, every past eviction
+/// would re-fire the rotation on each restart (re-mint a namespace,
+/// re-distribute, churn survivors). The rotation task skips any
+/// `HostEvict` whose `revoke_seq <=` this water mark, and advances +
+/// persists it after a successful rotation. Seqs aren't secret, so no
+/// chmod.
+const ROTATED_REVOKE_SEQ_FILE: &str = "rotated-revoke-seq";
+
 /// How a [`Workspace::host`] / [`Workspace::join`] call may attach
 /// to its workspace root.
 ///
@@ -540,6 +553,13 @@ pub struct Workspace {
     /// out-of-order). `Relaxed` — the rotation task is the only writer
     /// and reads its own writes.
     pub(crate) namespace_epoch: std::sync::atomic::AtomicU64,
+    /// Highest `Revoke` log seq already rotated for (C3). Seeded from
+    /// [`ROTATED_REVOKE_SEQ_FILE`] on host construction; the rotation
+    /// task skips any `HostEvict` whose `revoke_seq` is `<=` this and
+    /// advances + persists it on a successful rotation. Defeats spurious
+    /// re-rotation when the cap-listener replays historical revokes on
+    /// restart. `Relaxed` — the rotation task is the sole writer/reader.
+    pub(crate) rotated_revoke_seq: std::sync::atomic::AtomicU64,
     /// Receiver for namespace-rotation signals (Slice 3e). The
     /// cap-listener (which has no `Arc<Workspace>`) sends a
     /// [`RotationSignal`] here; the rotation task spawned in
@@ -724,6 +744,24 @@ impl Workspace {
             returning,
             epoch,
         } = open_or_create_doc(node, &doc_id_path, &current_ns_path, &epoch_path).await?;
+        // Recover the rotated-revoke-seq high-water mark (C3) so replayed
+        // historical revokes don't re-rotate. A fresh/recreated genesis
+        // (`!returning`) starts a new session log with no history, so
+        // reset the mark and clear any stale file.
+        let rotated_revoke_seq_path = state_dir.join(ROTATED_REVOKE_SEQ_FILE);
+        let rotated_revoke_seq = if returning {
+            read_u64_file(&rotated_revoke_seq_path, "rotated-revoke-seq")?
+        } else {
+            if let Err(err) = std::fs::remove_file(&rotated_revoke_seq_path)
+                && err.kind() != io::ErrorKind::NotFound
+            {
+                return Err(WorkspaceError::Doc(format!(
+                    "reset rotated-revoke-seq at {}: {err}",
+                    rotated_revoke_seq_path.display(),
+                )));
+            }
+            0
+        };
         doc.start_sync(vec![])
             .await
             .map_err(|e| WorkspaceError::Doc(format!("start_sync: {e}")))?;
@@ -922,6 +960,9 @@ impl Workspace {
                 // Seed from disk so a returning host that had rotated
                 // resumes at its last epoch instead of resetting to 0 (C2).
                 namespace_epoch: std::sync::atomic::AtomicU64::new(epoch),
+                // Seed the rotated-revoke high-water mark from disk (C3)
+                // so replayed historical revokes don't re-rotate.
+                rotated_revoke_seq: std::sync::atomic::AtomicU64::new(rotated_revoke_seq),
                 rotation_rx: std::sync::Mutex::new(Some(rotation_rx)),
                 _cap_listener: cap_listener,
                 did_shutdown: AtomicBool::new(false),
@@ -1197,6 +1238,9 @@ impl Workspace {
                 // Joiners never distribute a rotation — they only receive.
                 rotation_distribute_ctx: None,
                 namespace_epoch: std::sync::atomic::AtomicU64::new(0),
+                // Joiners never act as the rotating host, so the
+                // rotated-revoke mark is unused on this side (C3).
+                rotated_revoke_seq: std::sync::atomic::AtomicU64::new(0),
                 rotation_rx: std::sync::Mutex::new(Some(rotation_rx)),
                 _cap_listener: cap_listener,
                 did_shutdown: AtomicBool::new(false),
@@ -1431,7 +1475,11 @@ impl Workspace {
         // recoverable direction (a survivor re-delivery with a higher
         // epoch still wins); the reverse would advance the epoch past a
         // namespace the host never durably switched to.
-        persist_epoch(&self.state_dir, new_epoch)?;
+        persist_u64(
+            &self.state_dir.join(NAMESPACE_EPOCH_FILE),
+            new_epoch,
+            "namespace-epoch",
+        )?;
 
         debug!(
             target: "artel_fs::workspace",
@@ -1551,7 +1599,11 @@ impl Workspace {
         // Persist the epoch alongside the namespace (C2) so a returning
         // host/survivor recovers it rather than resetting to 0. Same
         // namespace-then-epoch ordering as `rotate_namespace`.
-        persist_epoch(&self.state_dir, new_epoch_hint)?;
+        persist_u64(
+            &self.state_dir.join(NAMESPACE_EPOCH_FILE),
+            new_epoch_hint,
+            "namespace-epoch",
+        )?;
 
         // Swap the live doc handle, then reset the doc token to tear
         // down the old watcher/applier. Order: install the new doc
@@ -1598,7 +1650,29 @@ impl Workspace {
     /// recovered on its next epoch-bearing delivery).
     async fn handle_rotation_signal(self: &Arc<Self>, signal: RotationSignal) {
         match signal {
-            RotationSignal::HostEvict { revoked_peer } => {
+            RotationSignal::HostEvict {
+                revoked_peer,
+                revoke_seq,
+            } => {
+                // Idempotency guard (C3): skip a Revoke we've already
+                // rotated for. On a host restart the cap-listener
+                // re-subscribes `since: None`, so every historical Revoke
+                // replays; without this, each past eviction would
+                // re-rotate (churn the namespace, re-distribute). A
+                // genuinely new live Revoke carries a strictly higher seq
+                // (the daemon assigns monotonic seqs), so it still fires.
+                let watermark = self
+                    .rotated_revoke_seq
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if revoke_seq.get() <= watermark {
+                    debug!(
+                        revoke_seq = revoke_seq.get(),
+                        watermark,
+                        ?revoked_peer,
+                        "rotation: skipping already-rotated (replayed) revoke",
+                    );
+                    return;
+                }
                 let prev = self
                     .namespace_epoch
                     .load(std::sync::atomic::Ordering::Relaxed);
@@ -1617,6 +1691,27 @@ impl Workspace {
                 // signal sees the bump.
                 self.namespace_epoch
                     .store(outcome.new_epoch, std::sync::atomic::Ordering::Relaxed);
+
+                // Advance + persist the rotated-revoke high-water mark
+                // (C3): the rotation succeeded, so this Revoke (and every
+                // earlier one) must never re-rotate on a future restart.
+                // Persist before distribution — distribution failure is
+                // recoverable (survivors re-sync on their next
+                // epoch-bearing delivery), but a re-rotation of this same
+                // revoke is exactly the churn we're preventing. A
+                // persist failure only logs: the in-memory mark still
+                // advances, so this process won't re-rotate; worst case a
+                // crash before the next durable write replays one extra
+                // rotation, which is safe (idempotent at the epoch gate).
+                self.rotated_revoke_seq
+                    .store(revoke_seq.get(), std::sync::atomic::Ordering::Relaxed);
+                if let Err(e) = persist_u64(
+                    &self.state_dir.join(ROTATED_REVOKE_SEQ_FILE),
+                    revoke_seq.get(),
+                    "rotated-revoke-seq",
+                ) {
+                    warn!(?e, "rotation: persist rotated-revoke-seq failed");
+                }
 
                 // Refresh the host's durable distribution state (C1) so
                 // peers that join or are promoted AFTER this rotation land
@@ -2777,7 +2872,14 @@ pub(crate) struct RotationOutcome {
 pub(crate) enum RotationSignal {
     /// Host side: a peer was evicted (`Revoke`); rotate the namespace,
     /// distribute the new ticket to survivors, and reimport locally.
-    HostEvict { revoked_peer: PeerId },
+    /// `revoke_seq` is the sequence number of the `Revoke` log message,
+    /// used as a monotonic high-water idempotency key so a replayed
+    /// historical revoke (re-delivered on every host restart's
+    /// `Subscribe { since: None }`) doesn't re-fire the rotation (C3).
+    HostEvict {
+        revoked_peer: PeerId,
+        revoke_seq: Seq,
+    },
     /// Survivor side: the host delivered a rotated namespace; reimport
     /// onto it if `namespace_epoch` is newer than what we hold.
     SurvivorRotate {
@@ -2848,15 +2950,16 @@ fn read_namespace_file(path: &Path) -> Result<Option<NamespaceId>, WorkspaceErro
     }
 }
 
-/// Read the persisted `namespace_epoch` from a state-dir file.
-/// `Ok(0)` if the file is absent (absent ⇒ genesis epoch 0); `Err` if
-/// present-but-corrupt or unreadable.
-fn read_epoch_file(path: &Path) -> Result<u64, WorkspaceError> {
+/// Read a persisted little-endian `u64` from a state-dir file.
+/// `Ok(0)` if the file is absent; `Err` if present-but-corrupt or
+/// unreadable. `label` names the value in error messages. Shared by the
+/// `namespace_epoch` (C2) and `rotated-revoke-seq` (C3) recovery paths.
+fn read_u64_file(path: &Path, label: &str) -> Result<u64, WorkspaceError> {
     match std::fs::read(path) {
         Ok(bytes) => {
             let arr: [u8; 8] = bytes.as_slice().try_into().map_err(|_| {
                 WorkspaceError::Doc(format!(
-                    "namespace-epoch file at {} is corrupt: expected 8 bytes, got {}",
+                    "{label} file at {} is corrupt: expected 8 bytes, got {}",
                     path.display(),
                     bytes.len(),
                 ))
@@ -2865,22 +2968,18 @@ fn read_epoch_file(path: &Path) -> Result<u64, WorkspaceError> {
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(0),
         Err(err) => Err(WorkspaceError::Doc(format!(
-            "read namespace-epoch file at {}: {err}",
+            "read {label} file at {}: {err}",
             path.display(),
         ))),
     }
 }
 
-/// Atomically persist `epoch` to the [`NAMESPACE_EPOCH_FILE`] in
-/// `state_dir`. Called on each rotation/reimport so a returning host
-/// recovers the live epoch instead of resetting to 0 (C2).
-fn persist_epoch(state_dir: &Path, epoch: u64) -> Result<(), WorkspaceError> {
-    let path = state_dir.join(NAMESPACE_EPOCH_FILE);
-    crate::keystore::write_atomic(&path, &epoch.to_le_bytes(), None).map_err(|e| {
-        WorkspaceError::Doc(format!(
-            "persist namespace-epoch at {}: {e}",
-            path.display(),
-        ))
+/// Atomically persist a little-endian `u64` to `path`. `label` names the
+/// value in error messages. Used for `namespace_epoch` (C2) and
+/// `rotated-revoke-seq` (C3).
+fn persist_u64(path: &Path, value: u64, label: &str) -> Result<(), WorkspaceError> {
+    crate::keystore::write_atomic(path, &value.to_le_bytes(), None).map_err(|e| {
+        WorkspaceError::Doc(format!("persist {label} at {}: {e}", path.display()))
     })
 }
 
@@ -2918,7 +3017,7 @@ async fn open_or_create_doc(
     // anything pre-crash anyway.
     if let Ok(Some(doc)) = node.docs.open(current).await {
         // Recover the persisted epoch (C2): absent ⇒ 0 (never rotated).
-        let epoch = read_epoch_file(epoch_path)?;
+        let epoch = read_u64_file(epoch_path, "namespace-epoch")?;
         Ok(OpenedDoc {
             doc,
             genesis,
@@ -3260,9 +3359,14 @@ fn handle_capability_message(
     // set, so the rotation's survivor set excludes it.
     if let Some(ctx) = host_ctx
         && let Ok(CapabilityAction::Revoke { peer }) = CapabilityAction::decode(&message.payload)
-        && let Err(e) = ctx
-            .rotation_tx
-            .try_send(RotationSignal::HostEvict { revoked_peer: peer })
+        && let Err(e) = ctx.rotation_tx.try_send(RotationSignal::HostEvict {
+            revoked_peer: peer,
+            // Carry the Revoke's log seq as the idempotency key: the
+            // rotation task skips any HostEvict whose seq it has already
+            // rotated for, so a replayed historical revoke doesn't
+            // re-rotate (C3).
+            revoke_seq: message.seq,
+        })
     {
         warn!(?e, ?peer, "rotation: failed to enqueue HostEvict signal");
     }

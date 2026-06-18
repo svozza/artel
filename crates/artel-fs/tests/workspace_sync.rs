@@ -1151,6 +1151,162 @@ async fn namespace_epoch_survives_host_restart() {
     daemon.stop().await;
 }
 
+// =============================================================
+// Replayed-revoke idempotency (C3): when a host workspace restarts, its
+// cap-listener re-subscribes from scratch and the daemon replays the
+// session log — including historical Revoke messages. A replayed Revoke
+// must NOT re-fire the rotation: the namespace + epoch must stay put.
+// Without the fix, every past eviction re-rotates on each restart.
+// =============================================================
+
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn replayed_revoke_does_not_re_rotate_on_workspace_restart() {
+    use artel_protocol::capability::Capability;
+
+    let dns_pkarr = Arc::new(DnsPkarrServer::run().await.expect("dns_pkarr"));
+    // Alice's daemon stays up across the workspace restart, so its
+    // session log (with the Revoke) persists. Alice's workspace state
+    // dir is persistent so the re-host resumes the same session.
+    let alice_daemon = common::spawn_daemon_with_setup(
+        common::fresh_state(),
+        daemon_testing_setup(&dns_pkarr),
+    )
+    .await;
+    let bob_daemon = common::spawn_daemon_with_setup(
+        common::fresh_state(),
+        daemon_testing_setup(&dns_pkarr),
+    )
+    .await;
+
+    let alice_dir = tempfile::tempdir().unwrap();
+    let alice_state = tempfile::tempdir().unwrap();
+
+    let session;
+    let epoch_after_evict;
+    let ns_after_evict;
+    {
+        let alice = Client::connect(&alice_daemon.socket).await.unwrap();
+        let (alice_ws, alice_ev) = Workspace::host_with(
+            &alice,
+            "alice",
+            alice_dir.path().to_path_buf(),
+            AttachPolicy::AllowExisting,
+            WorkspaceConfig::default()
+                .with_state_dir(alice_state.path().to_path_buf())
+                .with_endpoint_setup(testing_setup(&dns_pkarr))
+                .with_daemon_socket(alice_daemon.socket.clone()),
+        )
+        .await
+        .expect("host phase 1");
+        common::drain_ws_events(alice_ev);
+        session = alice_ws.session_id();
+        let alice_ws = Arc::new(alice_ws);
+        let alice_handle = Arc::clone(&alice_ws).run().await;
+
+        // Bob joins + RW, then evict → one rotation (epoch 1).
+        let bob = Client::connect(&bob_daemon.socket).await.unwrap();
+        let bob_peer = bob.daemon_peer_id();
+        let read_ticket = match alice
+            .request(Request::IssueTicket {
+                session,
+                granted_cap: Capability::Read,
+                expiry_ms: 0,
+            })
+            .await
+            .unwrap()
+        {
+            Response::IssuedTicket { ticket, .. } => ticket,
+            other => panic!("expected IssuedTicket, got {other:?}"),
+        };
+        assert!(matches!(
+            bob.request(Request::JoinSession {
+                display_name: "bob".into(),
+                ticket: read_ticket,
+            })
+            .await
+            .unwrap(),
+            Response::JoinSession { .. }
+        ));
+        let bob_dir = tempfile::tempdir().unwrap();
+        let (bob_ws, bob_ev) = Workspace::join_with(
+            &bob,
+            session,
+            bob_dir.path().to_path_buf(),
+            AttachPolicy::RequireEmpty,
+            WorkspaceConfig::default()
+                .with_endpoint_setup(testing_setup(&dns_pkarr))
+                .with_daemon_socket(bob_daemon.socket.clone()),
+        )
+        .await
+        .expect("bob join");
+        common::drain_ws_events(bob_ev);
+        let bob_ws = Arc::new(bob_ws);
+        let bob_handle = Arc::clone(&bob_ws).run().await;
+        common::grant_rw_and_wait(&alice, session, bob_peer, bob_dir.path(), alice_dir.path())
+            .await;
+
+        let ns_before = alice_ws.test_current_namespace_bytes();
+        common::revoke(&alice, session, bob_peer).await;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if alice_ws.test_current_namespace_bytes() != ns_before {
+                break;
+            }
+            assert!(Instant::now() < deadline, "host never auto-rotated");
+            sleep(POLL_INTERVAL).await;
+        }
+        epoch_after_evict = alice_ws.namespace_epoch();
+        ns_after_evict = alice_ws.test_current_namespace_bytes();
+        assert_eq!(epoch_after_evict, 1, "one eviction ⇒ epoch 1");
+
+        alice_ws.shutdown().await.unwrap();
+        bob_ws.shutdown().await.unwrap();
+        let _ = timeout(Duration::from_secs(5), alice_handle).await;
+        let _ = timeout(Duration::from_secs(5), bob_handle).await;
+        drop(bob);
+    }
+
+    // Re-host alice against the SAME state dir + SAME daemon. The
+    // daemon replays the historical Revoke to the new cap-listener.
+    let alice = Client::connect(&alice_daemon.socket).await.unwrap();
+    let (alice_ws, alice_ev) = Workspace::host_with(
+        &alice,
+        "alice",
+        alice_dir.path().to_path_buf(),
+        AttachPolicy::AllowExisting,
+        WorkspaceConfig::default()
+            .with_state_dir(alice_state.path().to_path_buf())
+            .with_endpoint_setup(testing_setup(&dns_pkarr))
+            .with_daemon_socket(alice_daemon.socket.clone()),
+    )
+    .await
+    .expect("host phase 2");
+    common::drain_ws_events(alice_ev);
+    let alice_ws = Arc::new(alice_ws);
+    let alice_handle = Arc::clone(&alice_ws).run().await;
+
+    // Give the replayed Revoke ample time to (wrongly) drive a rotation.
+    sleep(Duration::from_secs(3)).await;
+
+    assert_eq!(
+        alice_ws.namespace_epoch(),
+        epoch_after_evict,
+        "replayed Revoke must not bump the epoch (no spurious re-rotation)",
+    );
+    assert_eq!(
+        alice_ws.test_current_namespace_bytes(),
+        ns_after_evict,
+        "replayed Revoke must not change the current namespace",
+    );
+
+    alice_ws.shutdown().await.unwrap();
+    let _ = timeout(Duration::from_secs(5), alice_handle).await;
+    drop(alice);
+    alice_daemon.stop().await;
+    bob_daemon.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn touching_empty_file_does_not_error_and_does_not_publish() {
     let (daemon, client, ws, handle, events, dir, _dns_pkarr) =
