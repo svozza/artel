@@ -82,11 +82,6 @@ use artel_protocol::{
 /// events queue without bound.
 const EVENT_BUFFER: usize = 64;
 
-/// Buffer for the namespace-rotation signal channel (Slice 3e). Small:
-/// rotations are rare (one per Evict) and the rotation task drains
-/// promptly. `try_send` is used at the cap-listener so a full buffer
-/// logs rather than blocking the listener loop.
-const ROTATION_SIGNAL_BUFFER: usize = 16;
 
 /// First retry delay for the cap-listener's reconnect loop. Subsequent
 /// attempts double this (see [`cap_reconnect_backoff`]) up to
@@ -569,7 +564,15 @@ pub struct Workspace {
     /// calls it again — the second take yields `None` and skips
     /// respawning a duplicate rotation task). Absent ⇒ no rotation
     /// wiring (e.g. socket-less test workspaces).
-    pub(crate) rotation_rx: std::sync::Mutex<Option<mpsc::Receiver<RotationSignal>>>,
+    ///
+    /// **Unbounded (C4):** the sender is called from the cap-listener's
+    /// sync context, so it can't `await` back-pressure. A bounded
+    /// `try_send` silently dropped signals on a full buffer — and a
+    /// dropped `HostEvict` leaves the evicted peer cryptographically
+    /// un-cut (no rotation). Rotations are rare and the signal is tiny,
+    /// so an unbounded channel trades a negligible memory ceiling for
+    /// guaranteed delivery.
+    pub(crate) rotation_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<RotationSignal>>>,
     /// Background task draining session events into the [`PeerMap`]
     /// for the docs gate. Aborted on [`Self::shutdown`].
     _cap_listener: tokio::task::JoinHandle<()>,
@@ -874,7 +877,8 @@ impl Workspace {
         let shutdown_token = CancellationToken::new();
         // Rotation signal channel (Slice 3e): the host cap-listener
         // sends HostEvict here; the rotation task in `run` drains it.
-        let (rotation_tx, rotation_rx) = mpsc::channel::<RotationSignal>(ROTATION_SIGNAL_BUFFER);
+        // Unbounded so a burst of evictions never drops a signal (C4).
+        let (rotation_tx, rotation_rx) = mpsc::unbounded_channel::<RotationSignal>();
         let (host_ctx, rotation_distribute_ctx) = if let Some(socket) = daemon_socket {
             let upgrade_client = Client::connect(socket)
                 .await
@@ -1171,7 +1175,8 @@ impl Workspace {
         let write_halted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // Rotation signal channel (Slice 3e): the survivor cap-listener
         // sends SurvivorRotate here; the rotation task in `run` drains it.
-        let (rotation_tx, rotation_rx) = mpsc::channel::<RotationSignal>(ROTATION_SIGNAL_BUFFER);
+        // Unbounded so a burst of deliveries never drops a signal (C4).
+        let (rotation_tx, rotation_rx) = mpsc::unbounded_channel::<RotationSignal>();
         let joiner_ctx = Some(JoinerUpgradeCtx {
             my_peer_id: client.daemon_peer_id(),
             docs: node.docs.clone(),
@@ -3167,7 +3172,7 @@ struct HostUpgradeCtx {
     /// Sender to the rotation task: on a `Revoke` the host cap-listener
     /// sends [`RotationSignal::HostEvict`] here (the cap-listener has no
     /// `Arc<Workspace>`, so it can't rotate directly). Slice 3e.
-    rotation_tx: mpsc::Sender<RotationSignal>,
+    rotation_tx: mpsc::UnboundedSender<RotationSignal>,
 }
 
 /// Joiner-side context for receiving `NamespaceSecret` upgrades.
@@ -3179,7 +3184,7 @@ struct JoinerUpgradeCtx {
     write_halted: Arc<std::sync::atomic::AtomicBool>,
     /// Sender to the rotation task: on a `ROTATE_ACTION` the survivor
     /// cap-listener sends [`RotationSignal::SurvivorRotate`] here. Slice 3e.
-    rotation_tx: mpsc::Sender<RotationSignal>,
+    rotation_tx: mpsc::UnboundedSender<RotationSignal>,
 }
 
 /// Exponential backoff for the cap-listener's reconnect loop.
@@ -3359,7 +3364,7 @@ fn handle_capability_message(
     // set, so the rotation's survivor set excludes it.
     if let Some(ctx) = host_ctx
         && let Ok(CapabilityAction::Revoke { peer }) = CapabilityAction::decode(&message.payload)
-        && let Err(e) = ctx.rotation_tx.try_send(RotationSignal::HostEvict {
+        && let Err(e) = ctx.rotation_tx.send(RotationSignal::HostEvict {
             revoked_peer: peer,
             // Carry the Revoke's log seq as the idempotency key: the
             // rotation task skips any HostEvict whose seq it has already
@@ -3368,6 +3373,8 @@ fn handle_capability_message(
             revoke_seq: message.seq,
         })
     {
+        // Unbounded send (C4) only errors if the rotation task is gone
+        // (workspace shutting down) — never on back-pressure.
         warn!(?e, ?peer, "rotation: failed to enqueue HostEvict signal");
     }
 }
@@ -3454,11 +3461,13 @@ async fn handle_cap_event(
                         && message.peer.id == peer_map.host_peer_id()
                         && let Ok(payload) = postcard::from_bytes::<RotatePayload>(&message.payload)
                         && payload.target_peer == ctx.my_peer_id
-                        && let Err(e) = ctx.rotation_tx.try_send(RotationSignal::SurvivorRotate {
+                        && let Err(e) = ctx.rotation_tx.send(RotationSignal::SurvivorRotate {
                             namespace_epoch: payload.namespace_epoch,
                             doc_ticket: payload.doc_ticket,
                         })
                     {
+                        // Unbounded send (C4): only errors if the rotation
+                        // task is gone, never on back-pressure.
                         warn!(?e, "rotation: failed to enqueue SurvivorRotate signal");
                     }
                 }

@@ -1307,6 +1307,74 @@ async fn replayed_revoke_does_not_re_rotate_on_workspace_restart() {
     bob_daemon.stop().await;
 }
 
+// =============================================================
+// Rotation-signal losslessness (C4): a burst of evictions enqueues many
+// HostEvict signals faster than the rotation task drains them. Each must
+// drive a rotation — a dropped HostEvict would leave that evicted peer
+// cryptographically un-cut (the security failure the feature exists to
+// prevent). With an unbounded signal channel every revoke rotates, so
+// the epoch advances by exactly the number of distinct evictions.
+// =============================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn burst_of_evictions_all_rotate_no_signal_dropped() {
+    let dns_pkarr = Arc::new(DnsPkarrServer::run().await.expect("dns_pkarr"));
+    let daemon = common::spawn_daemon_with_setup(
+        common::fresh_state(),
+        daemon_testing_setup(&dns_pkarr),
+    )
+    .await;
+    let client = Client::connect(&daemon.socket).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // Wire the daemon socket so the cap-listener observes the host's own
+    // Capability revokes and drives the rotation task.
+    let (ws, events) = Workspace::host_with(
+        &client,
+        "host",
+        dir.path().to_path_buf(),
+        AttachPolicy::RequireEmpty,
+        WorkspaceConfig::default()
+            .with_endpoint_setup(testing_setup(&dns_pkarr))
+            .with_daemon_socket(daemon.socket.clone()),
+    )
+    .await
+    .expect("host_with");
+    common::drain_ws_events(events);
+    let ws = Arc::new(ws);
+    let handle = Arc::clone(&ws).run().await;
+
+    // Far exceed the old bounded buffer (16) so a lossy try_send would
+    // drop signals. Each Revoke targets a distinct synthetic PeerId, so
+    // each gets a strictly higher log seq and clears the C3 watermark —
+    // a genuine rotation per revoke.
+    const BURST: u64 = 40;
+    let session = ws.session_id();
+    for i in 0..BURST {
+        let mut bytes = [0u8; 32];
+        bytes[0..8].copy_from_slice(&(i + 1).to_le_bytes());
+        common::revoke(&client, session, PeerId::from_bytes(bytes)).await;
+    }
+
+    // The rotation task drains serially; wait for the epoch to settle at
+    // exactly BURST. Unbounded ⇒ no signal lost ⇒ every revoke rotated.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let epoch = ws.namespace_epoch();
+        if epoch == BURST {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "epoch settled at {epoch}, expected {BURST} — a rotation signal was dropped",
+        );
+        sleep(POLL_INTERVAL).await;
+    }
+
+    ws.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), handle).await;
+    daemon.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn touching_empty_file_does_not_error_and_does_not_publish() {
     let (daemon, client, ws, handle, events, dir, _dns_pkarr) =
