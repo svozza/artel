@@ -191,11 +191,21 @@ impl WorkspaceNode {
         docs.author_import(author)
             .await
             .map_err(|e| WorkspaceError::Doc(format!("author_import: {e}")))?;
-        debug_assert_eq!(
-            author_id.as_bytes(),
-            endpoint_id.as_bytes(),
-            "same-seed author must equal endpoint id",
-        );
+        // Hard-assert the same-seed binding (not just debug_assert): it is
+        // security-load-bearing. Namespace rotation's author-filter keeps
+        // an entry only if `peer_map.endpoint_has_rw(entry.author)`, which
+        // resolves *because* `AuthorId == endpoint_id`. If a future
+        // iroh-docs change made `Author::from_bytes` derive its id
+        // differently, the binding would silently break in release and the
+        // fail-closed filter would drop *every* survivor's entries on the
+        // next rotation. Fail loudly at spawn instead, before any data
+        // depends on it. Runs once per node — the cost is irrelevant.
+        if author_id.as_bytes() != endpoint_id.as_bytes() {
+            return Err(WorkspaceError::Iroh(format!(
+                "same-seed author binding broken: author id {author_id} != endpoint id \
+                 {endpoint_id}; namespace-rotation author-filter would fail closed",
+            )));
+        }
 
         let router = Router::builder(endpoint.clone())
             .accept(iroh_gossip::ALPN, gossip)
@@ -278,5 +288,87 @@ impl WorkspaceNode {
             .map_err(|err| WorkspaceError::Iroh(format!("router shutdown: {err}")))?;
         tracing::debug!(target: "artel_fs::node", "shutdown: router done, dropping node resources");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use iroh_docs::sync::{Entry, Record, RecordIdentifier};
+    use iroh_docs::{AuthorId, NamespaceId};
+
+    /// Cross-protocol key-reuse safety (Slice 1 / D4).
+    ///
+    /// We reuse one ed25519 secret across two signing domains: the iroh
+    /// transport (TLS 1.3 raw-public-key handshake) and iroh-docs entry
+    /// authorship. Reuse is only sound if the two domains sign provably
+    /// disjoint byte-strings, so a signature minted in one can never be
+    /// replayed as a valid signature in the other.
+    ///
+    /// - **TLS 1.3 CertificateVerify** (RFC 8446 §4.4.3): the signed
+    ///   content begins with exactly **64 octets of `0x20`** (a fixed
+    ///   padding prefix), followed by a context string, a `0x00`
+    ///   separator, and the transcript hash.
+    /// - **iroh-docs author signature**: the author signs
+    ///   `Entry::to_vec()`, which begins with the `RecordIdentifier` —
+    ///   whose first 32 bytes are the **`NamespaceId`** (the namespace
+    ///   ed25519 *public* key), followed by the 32-byte `AuthorId` and
+    ///   the key.
+    ///
+    /// This test pins the iroh-docs half — that the signed payload starts
+    /// with the 32-byte namespace pubkey — and asserts that prefix can
+    /// never collide with the TLS 64×`0x20` prefix. The first 32 bytes of
+    /// a TLS payload are all `0x20`; a 32-byte ed25519 public key equal to
+    /// `[0x20; 32]` is not a structural possibility an attacker controls,
+    /// and even if it were, the *next* 32 bytes of the TLS payload are
+    /// still `0x20` while the docs payload carries the author id — so the
+    /// 64-byte windows are disjoint by construction. If a future iroh-docs
+    /// release reorders `Entry::to_vec()` so the namespace no longer leads,
+    /// this test fails and the key-reuse safety argument must be revisited.
+    #[test]
+    fn author_signed_payload_prefix_is_disjoint_from_tls_certificate_verify() {
+        // A distinctive namespace id so we can find it as the prefix.
+        let namespace = NamespaceId::from(&[0x37u8; 32]);
+        let author = AuthorId::from(&[0x99u8; 32]);
+        let id = RecordIdentifier::new(namespace, author, b"path/some-file.txt");
+        let record = Record::new(iroh_blobs::Hash::EMPTY, 0, 0);
+        let entry = Entry::new(id, record);
+
+        let signed = entry.to_vec();
+
+        // The author-signed payload begins with the 32-byte namespace
+        // pubkey (the prefix the cross-protocol-safety claim rests on).
+        assert!(
+            signed.len() >= 64,
+            "signed entry payload shorter than the 64-byte TLS prefix window",
+        );
+        assert_eq!(
+            &signed[..32],
+            &[0x37u8; 32],
+            "iroh-docs author-signed payload must begin with the NamespaceId; \
+             if this changed, cross-protocol key-reuse safety must be re-proven",
+        );
+        // The next 32 bytes are the author id, NOT more padding — the
+        // 64-byte window can't be all `0x20` the way a TLS CertificateVerify
+        // payload's leading 64 octets are.
+        assert_eq!(
+            &signed[32..64],
+            &[0x99u8; 32],
+            "bytes 32..64 must be the AuthorId, keeping the 64-byte window \
+             distinct from TLS's 64×0x20 prefix",
+        );
+
+        // The TLS 1.3 CertificateVerify signed content (RFC 8446 §4.4.3)
+        // begins with 64 octets of 0x20. Our author payload's 64-byte
+        // window is (namespace || author) — for it to collide, BOTH the
+        // namespace pubkey and the author id would have to be all-0x20,
+        // and even then the domains differ in the trailing context. Pin
+        // the disjointness explicitly: a realistic namespace/author pair
+        // is not 64 bytes of 0x20.
+        let tls_prefix = [0x20u8; 64];
+        assert_ne!(
+            &signed[..64],
+            &tls_prefix,
+            "author payload's 64-byte window must not equal TLS's 64×0x20 prefix",
+        );
     }
 }
