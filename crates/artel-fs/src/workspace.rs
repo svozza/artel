@@ -131,6 +131,20 @@ const DOC_ID_FILE: &str = "doc-id";
 /// "Current namespace".
 const CURRENT_NAMESPACE_FILE: &str = "current-namespace";
 
+/// File inside `state_dir` that stores the host's **current**
+/// `namespace_epoch` — the monotonic rotation counter, as a little-endian
+/// `u64`. Absent until the first rotation (absent ⇒ epoch 0, i.e.
+/// genesis); rewritten alongside [`CURRENT_NAMESPACE_FILE`] on each
+/// rotation/reimport.
+///
+/// **Load-bearing across restart (C2):** the epoch lives in an in-memory
+/// `AtomicU64` at runtime, but a returning host must recover it from
+/// disk. Without persistence the counter resets to 0 and a second
+/// eviction re-mints epoch 1, which any survivor already at epoch 1
+/// ignores as stale/duplicate — silently stranding it on the
+/// pre-rotation namespace. Epoch ids aren't secret, so no chmod.
+const NAMESPACE_EPOCH_FILE: &str = "namespace-epoch";
+
 /// How a [`Workspace::host`] / [`Workspace::join`] call may attach
 /// to its workspace root.
 ///
@@ -703,11 +717,13 @@ impl Workspace {
 
         let doc_id_path = state_dir.join(DOC_ID_FILE);
         let current_ns_path = state_dir.join(CURRENT_NAMESPACE_FILE);
+        let epoch_path = state_dir.join(NAMESPACE_EPOCH_FILE);
         let OpenedDoc {
             doc,
             genesis,
             returning,
-        } = open_or_create_doc(node, &doc_id_path, &current_ns_path).await?;
+            epoch,
+        } = open_or_create_doc(node, &doc_id_path, &current_ns_path, &epoch_path).await?;
         doc.start_sync(vec![])
             .await
             .map_err(|e| WorkspaceError::Doc(format!("start_sync: {e}")))?;
@@ -893,7 +909,9 @@ impl Workspace {
                 session_id,
                 join_ticket: Some(join_ticket),
                 rotation_distribute_ctx,
-                namespace_epoch: std::sync::atomic::AtomicU64::new(0),
+                // Seed from disk so a returning host that had rotated
+                // resumes at its last epoch instead of resetting to 0 (C2).
+                namespace_epoch: std::sync::atomic::AtomicU64::new(epoch),
                 rotation_rx: std::sync::Mutex::new(Some(rotation_rx)),
                 _cap_listener: cap_listener,
                 did_shutdown: AtomicBool::new(false),
@@ -1385,6 +1403,14 @@ impl Workspace {
                 ))
             },
         )?;
+        // Persist the bumped epoch alongside the namespace so a returning
+        // host recovers it instead of resetting to 0 (C2). Order:
+        // namespace first, then epoch — a crash between the two leaves a
+        // recorded namespace at a stale (lower) epoch, which is the
+        // recoverable direction (a survivor re-delivery with a higher
+        // epoch still wins); the reverse would advance the epoch past a
+        // namespace the host never durably switched to.
+        persist_epoch(&self.state_dir, new_epoch)?;
 
         debug!(
             target: "artel_fs::workspace",
@@ -1500,6 +1526,10 @@ impl Workspace {
                 ))
             },
         )?;
+        // Persist the epoch alongside the namespace (C2) so a returning
+        // host/survivor recovers it rather than resetting to 0. Same
+        // namespace-then-epoch ordering as `rotate_namespace`.
+        persist_epoch(&self.state_dir, new_epoch_hint)?;
 
         // Swap the live doc handle, then reset the doc token to tear
         // down the old watcher/applier. Order: install the new doc
@@ -2698,6 +2728,12 @@ struct OpenedDoc {
     /// `true` if we opened an existing doc (caller must reconcile
     /// against disk); `false` if we created a fresh one.
     returning: bool,
+    /// The persisted `namespace_epoch` recovered from disk (C2). `0` for
+    /// a fresh host or one that never rotated; the last persisted epoch
+    /// for a returning host that had rotated. Seeds the workspace's
+    /// in-memory `AtomicU64` so a second eviction doesn't re-mint an
+    /// epoch survivors already passed.
+    epoch: u64,
 }
 
 /// Read a 32-byte `NamespaceId` from a state-dir file. `Ok(None)` if
@@ -2722,6 +2758,42 @@ fn read_namespace_file(path: &Path) -> Result<Option<NamespaceId>, WorkspaceErro
     }
 }
 
+/// Read the persisted `namespace_epoch` from a state-dir file.
+/// `Ok(0)` if the file is absent (absent ⇒ genesis epoch 0); `Err` if
+/// present-but-corrupt or unreadable.
+fn read_epoch_file(path: &Path) -> Result<u64, WorkspaceError> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let arr: [u8; 8] = bytes.as_slice().try_into().map_err(|_| {
+                WorkspaceError::Doc(format!(
+                    "namespace-epoch file at {} is corrupt: expected 8 bytes, got {}",
+                    path.display(),
+                    bytes.len(),
+                ))
+            })?;
+            Ok(u64::from_le_bytes(arr))
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(err) => Err(WorkspaceError::Doc(format!(
+            "read namespace-epoch file at {}: {err}",
+            path.display(),
+        ))),
+    }
+}
+
+/// Atomically persist `epoch` to the [`NAMESPACE_EPOCH_FILE`] in
+/// `state_dir`. Called on each rotation/reimport so a returning host
+/// recovers the live epoch instead of resetting to 0 (C2).
+fn persist_epoch(state_dir: &Path, epoch: u64) -> Result<(), WorkspaceError> {
+    let path = state_dir.join(NAMESPACE_EPOCH_FILE);
+    crate::keystore::write_atomic(&path, &epoch.to_le_bytes(), None).map_err(|e| {
+        WorkspaceError::Doc(format!(
+            "persist namespace-epoch at {}: {e}",
+            path.display(),
+        ))
+    })
+}
+
 /// Open the host's persisted doc, or create a fresh one.
 ///
 /// Identity decoupling (Slice 2): `doc-id` holds the **genesis**
@@ -2734,11 +2806,12 @@ async fn open_or_create_doc(
     node: &WorkspaceNode,
     doc_id_path: &Path,
     current_ns_path: &Path,
+    epoch_path: &Path,
 ) -> Result<OpenedDoc, WorkspaceError> {
     let Some(genesis) = read_namespace_file(doc_id_path)? else {
         // No genesis yet ⇒ first host. Create a fresh namespace; it is
         // both genesis and current.
-        return create_and_persist(node, doc_id_path).await;
+        return create_and_persist(node, doc_id_path, epoch_path).await;
     };
 
     // The namespace to actually open is the current one if recorded,
@@ -2754,10 +2827,13 @@ async fn open_or_create_doc(
     // resume, which is acceptable since they wouldn't have synced
     // anything pre-crash anyway.
     if let Ok(Some(doc)) = node.docs.open(current).await {
+        // Recover the persisted epoch (C2): absent ⇒ 0 (never rotated).
+        let epoch = read_epoch_file(epoch_path)?;
         Ok(OpenedDoc {
             doc,
             genesis,
             returning: true,
+            epoch,
         })
     } else {
         tracing::warn!(
@@ -2765,7 +2841,7 @@ async fn open_or_create_doc(
             "stale namespace at {}: not in store, recreating",
             current_ns_path.display(),
         );
-        create_and_persist(node, doc_id_path).await
+        create_and_persist(node, doc_id_path, epoch_path).await
     }
 }
 
@@ -2775,6 +2851,7 @@ async fn open_or_create_doc(
 async fn create_and_persist(
     node: &WorkspaceNode,
     doc_id_path: &Path,
+    epoch_path: &Path,
 ) -> Result<OpenedDoc, WorkspaceError> {
     let doc = node
         .docs
@@ -2786,10 +2863,22 @@ async fn create_and_persist(
     crate::keystore::write_atomic(doc_id_path, &genesis.to_bytes(), None).map_err(|e| {
         WorkspaceError::Doc(format!("persist doc-id at {}: {e}", doc_id_path.display()))
     })?;
+    // A fresh genesis is epoch 0. Clear any stale epoch file so a
+    // self-heal recreate (new genesis at the same state dir) doesn't
+    // inherit a higher rotation count from the abandoned namespace.
+    if let Err(err) = std::fs::remove_file(epoch_path)
+        && err.kind() != io::ErrorKind::NotFound
+    {
+        return Err(WorkspaceError::Doc(format!(
+            "reset namespace-epoch at {}: {err}",
+            epoch_path.display(),
+        )));
+    }
     Ok(OpenedDoc {
         doc,
         genesis,
         returning: false,
+        epoch: 0,
     })
 }
 

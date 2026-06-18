@@ -221,6 +221,12 @@ async fn workspace_state_survives_graceful_restart() {
         !alice_wstate.path().join("current-namespace").exists(),
         "no rotation yet ⇒ current-namespace must be absent (equals genesis)",
     );
+    // Likewise the epoch file is only written on rotation (C2); at
+    // genesis it must be absent (absent ⇒ epoch 0).
+    assert!(
+        !alice_wstate.path().join("namespace-epoch").exists(),
+        "no rotation yet ⇒ namespace-epoch must be absent (equals genesis epoch 0)",
+    );
     assert!(
         bob_wstate.path().join("iroh.key").exists(),
         "bob iroh.key should persist"

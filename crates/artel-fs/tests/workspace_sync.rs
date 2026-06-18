@@ -863,6 +863,95 @@ async fn reimport_swaps_namespace_and_keeps_workspace_live() {
     daemon.stop().await;
 }
 
+// =============================================================
+// Epoch persistence (C2 regression): namespace_epoch must survive a
+// host restart. Without on-disk persistence the counter resets to 0,
+// and a second eviction re-mints epoch 1 — which every survivor that
+// already reached epoch 1 then *ignores* (stale/duplicate guard),
+// silently stranding it on the pre-rotation namespace.
+// =============================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn namespace_epoch_survives_host_restart() {
+    let dns_pkarr = Arc::new(DnsPkarrServer::run().await.expect("dns_pkarr"));
+    // Content root + state dir live in tempdirs that outlive both
+    // host lifetimes so the restart re-opens the same on-disk state.
+    let root = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+
+    let epoch_after_rotation = {
+        let daemon = common::spawn_daemon_with_setup(
+            common::fresh_state(),
+            daemon_testing_setup(&dns_pkarr),
+        )
+        .await;
+        let client = Client::connect(&daemon.socket).await.unwrap();
+        let cfg = WorkspaceConfig::default()
+            .with_state_dir(state.path().to_path_buf())
+            .with_endpoint_setup(testing_setup(&dns_pkarr));
+        let (ws, events) = Workspace::host_with(
+            &client,
+            "host",
+            root.path().to_path_buf(),
+            AttachPolicy::AllowExisting,
+            cfg,
+        )
+        .await
+        .expect("host phase 1");
+        common::drain_ws_events(events);
+        let ws = Arc::new(ws);
+        let handle = Arc::clone(&ws).run().await;
+
+        assert_eq!(ws.namespace_epoch(), 0, "fresh host starts at epoch 0");
+        // Host self-rotation: bumps the epoch to 1 and persists it.
+        ws.test_rotate_and_reimport(0)
+            .await
+            .expect("rotate_and_reimport");
+        let epoch = ws.namespace_epoch();
+        assert_eq!(epoch, 1, "rotation bumps the live epoch to 1");
+
+        ws.shutdown().await.expect("shutdown phase 1");
+        let _ = timeout(Duration::from_secs(5), handle).await;
+        daemon.stop().await;
+        epoch
+    };
+    assert_eq!(epoch_after_rotation, 1);
+
+    // Phase 2: re-host the same state dir under a fresh daemon. The
+    // epoch must be recovered from disk, not reset to 0.
+    let daemon = common::spawn_daemon_with_setup(
+        common::fresh_state(),
+        daemon_testing_setup(&dns_pkarr),
+    )
+    .await;
+    let client = Client::connect(&daemon.socket).await.unwrap();
+    let cfg = WorkspaceConfig::default()
+        .with_state_dir(state.path().to_path_buf())
+        .with_endpoint_setup(testing_setup(&dns_pkarr));
+    let (ws, events) = Workspace::host_with(
+        &client,
+        "host",
+        root.path().to_path_buf(),
+        AttachPolicy::AllowExisting,
+        cfg,
+    )
+    .await
+    .expect("host phase 2");
+    common::drain_ws_events(events);
+    let ws = Arc::new(ws);
+    let handle = Arc::clone(&ws).run().await;
+
+    assert_eq!(
+        ws.namespace_epoch(),
+        1,
+        "namespace_epoch must be recovered from disk after restart, not reset to 0",
+    );
+
+    ws.shutdown().await.expect("shutdown phase 2");
+    let _ = timeout(Duration::from_secs(5), handle).await;
+    daemon.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn touching_empty_file_does_not_error_and_does_not_publish() {
     let (daemon, client, ws, handle, events, dir, _dns_pkarr) =
