@@ -1224,3 +1224,68 @@ async fn concurrent_shutdowns_both_return_ok_within_budget() {
     daemon_a.stop().await;
     daemon_b.stop().await;
 }
+
+// =============================================================
+// Crash-durability guard (default-author dangling-reference).
+//
+// `WorkspaceNode::spawn` imports a same-seed author into the docs
+// store but deliberately does NOT call `author_set_default`. iroh-docs
+// persists the `docs/default-author` pointer file *immediately* while
+// the imported author row is only committed to redb on a batched
+// (~500ms) delay, so setting our author as default would leave a
+// durable pointer to an uncommitted row — a SIGKILL in that window
+// makes the next spawn hard-fail with "The default author is missing
+// from the docs store" (the Tier-C crash_recovery `mid_scan`/`mid_write`
+// failures). This fast in-process guard pins the invariant without a
+// real crash: the persisted default-author pointer (if iroh-docs wrote
+// one for its own random author) must never name OUR same-seed author.
+// Re-introducing `author_set_default` flips this and fails here.
+// =============================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spawn_does_not_set_same_seed_author_as_store_default() {
+    let harness = LocalDaemon::spawn().await;
+    let client = Client::connect(&harness.socket).await.unwrap();
+    let dns_pkarr = common::shared_dns_pkarr().await;
+
+    let ws_dir = TempDir::new().unwrap();
+    let state_dir = TempDir::new().unwrap();
+    let (ws, _events) = Workspace::host_with(
+        &client,
+        host_peer(),
+        ws_dir.path().to_path_buf(),
+        AttachPolicy::RequireEmpty,
+        WorkspaceConfig::default()
+            .with_state_dir(state_dir.path().to_path_buf())
+            .with_endpoint_setup(testing_setup(&dns_pkarr)),
+    )
+    .await
+    .expect("host_with");
+
+    // Our same-seed author id (== endpoint id).
+    let author_id = ws
+        .test_endpoint_id_bytes()
+        .await
+        .expect("node live: endpoint id available");
+    let author_hex = iroh_docs::AuthorId::from(author_id).to_string();
+
+    // The default-author pointer, if present, must not be our author.
+    // (iroh-docs may write one for its own random default — that's
+    // fine; it goes through a flush-safe path. What must never happen
+    // is the pointer naming our freshly-imported, possibly-uncommitted
+    // same-seed author.)
+    let pointer = state_dir.path().join("docs").join("default-author");
+    if let Ok(contents) = tokio::fs::read_to_string(&pointer).await {
+        assert_ne!(
+            contents.trim(),
+            author_hex,
+            "docs/default-author must not point at our same-seed author \
+             (dangling-reference crash hazard — see node.rs); re-adding \
+             author_set_default reintroduces the SIGKILL bug",
+        );
+    }
+
+    ws.shutdown().await.expect("shutdown");
+    drop(client);
+    harness.stop().await;
+}

@@ -164,19 +164,33 @@ impl WorkspaceNode {
         let endpoint_id = endpoint.id();
 
         // Same-seed author binding: import an author keyed by the
-        // endpoint's own secret bytes and make it the default, so every
-        // write this node stamps carries `AuthorId == endpoint_id`. The
-        // `peer_map` already maps `endpoint_id → daemon PeerId`, so this
-        // binds doc-entry authorship to the capability-tracked peer with
-        // no announcement. Replaces the random `author_default()`.
+        // endpoint's own secret bytes, so every write this node stamps
+        // carries `AuthorId == endpoint_id`. The `peer_map` already maps
+        // `endpoint_id → daemon PeerId`, so this binds doc-entry
+        // authorship to the capability-tracked peer with no announcement.
+        // Replaces the random `author_default()`.
+        //
+        // We deliberately do NOT call `author_set_default`. Every write
+        // path (`set_bytes` / `del` / `set_hash`) passes `self.author`
+        // explicitly, so the store's *default* author is never read —
+        // making it dead weight. Worse, setting it is a crash hazard:
+        // iroh-docs' `DefaultAuthor::set` writes the `docs/default-author`
+        // pointer file immediately, but `author_import` only writes the
+        // author row into redb, which redb commits on a batched (~500ms)
+        // delay. A SIGKILL in that window leaves a durable pointer file
+        // referencing an author row that never committed; the next
+        // `Docs::persistent().spawn()` then hard-fails in
+        // `DefaultAuthor::load` with "The default author is missing from
+        // the docs store" (it is a dangling reference). iroh-docs' own
+        // fresh-author path guards this with a `flush_store()` between
+        // import and persist (see iroh_docs::engine `DefaultAuthorStorage::load`),
+        // but `author_set_default` exposes no such flush — so we avoid the
+        // pointer file entirely rather than race the commit.
         let author = iroh_docs::Author::from_bytes(&secret_bytes);
         let author_id = author.id();
         docs.author_import(author)
             .await
             .map_err(|e| WorkspaceError::Doc(format!("author_import: {e}")))?;
-        docs.author_set_default(author_id)
-            .await
-            .map_err(|e| WorkspaceError::Doc(format!("author_set_default: {e}")))?;
         debug_assert_eq!(
             author_id.as_bytes(),
             endpoint_id.as_bytes(),
