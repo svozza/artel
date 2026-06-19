@@ -112,10 +112,10 @@ pub enum SessionError {
     /// A joiner `Send` found no live gossip topic for the session —
     /// this daemon reloaded the `Remote` mirror from disk but hasn't
     /// re-subscribed since the restart. **Recoverable**: the IPC
-    /// dispatch layer re-subscribes ([`Registry::resubscribe_remote_mirror`])
+    /// dispatch layer re-subscribes (`Registry::resubscribe_remote_mirror`)
     /// and retries the send. Not surfaced to clients directly — it's an
     /// internal signal that triggers the lazy reconnect. See the `Remote`
-    /// arm of [`Registry::send`].
+    /// arm of `Registry::send`.
     #[error("remote session topic missing (needs re-subscribe): {0}")]
     RemoteTopicMissing(SessionId),
 

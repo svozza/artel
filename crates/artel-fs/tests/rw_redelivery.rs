@@ -148,7 +148,13 @@ async fn joiner_daemon_restart_resyncs_both_ways_real_n0() {
 
     phase(
         "grant bob RW",
-        grant_rw_and_wait(&alice, session, bob_peer_id, bob_root.path(), alice_root.path()),
+        grant_rw_and_wait(
+            &alice,
+            session,
+            bob_peer_id,
+            bob_root.path(),
+            alice_root.path(),
+        ),
     )
     .await;
 
@@ -353,7 +359,13 @@ async fn returning_rw_member_offline_across_rotation_regains_write_real_n0() {
     let bob_handle = Arc::clone(&bob_ws).run().await;
     phase(
         "grant bob RW",
-        grant_rw_and_wait(&alice, session, bob_peer_id, bob_root.path(), alice_root.path()),
+        grant_rw_and_wait(
+            &alice,
+            session,
+            bob_peer_id,
+            bob_root.path(),
+            alice_root.path(),
+        ),
     )
     .await;
 
@@ -421,7 +433,11 @@ async fn returning_rw_member_offline_across_rotation_regains_write_real_n0() {
 
     // While bob is down, alice evicts carol → namespace rotation. Bob's
     // persisted secret is now for the abandoned namespace.
-    phase("alice revokes carol (triggers rotation)", revoke(&alice, session, carol_peer_id)).await;
+    phase(
+        "alice revokes carol (triggers rotation)",
+        revoke(&alice, session, carol_peer_id),
+    )
+    .await;
     // Let the rotation + survivor re-distribution settle on alice's side.
     // (carol is the only other survivor and she's being evicted, so this
     // is really just giving alice's rotation task time to mint + reimport
@@ -635,7 +651,11 @@ async fn offline_read_to_write_promotion_delivers_secret_on_return_real_n0() {
     // Host grants bob RW while he is down. No rotation: the cap-set just
     // gains bob@RW. The live upgrade delivery has no receiver (bob's
     // gone), so the secret is lost — recovery must happen on his return.
-    phase("alice grants bob RW (while offline)", grant_rw(&alice, session, bob_peer_id)).await;
+    phase(
+        "alice grants bob RW (while offline)",
+        grant_rw(&alice, session, bob_peer_id),
+    )
+    .await;
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Bob's daemon restarts and reattaches.

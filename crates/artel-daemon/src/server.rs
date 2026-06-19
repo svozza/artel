@@ -931,7 +931,14 @@ async fn dispatch_send(
             };
         }
         return match registry
-            .send(session, peer, kind, action, payload, crate::session::Authoring::Local)
+            .send(
+                session,
+                peer,
+                kind,
+                action,
+                payload,
+                crate::session::Authoring::Local,
+            )
             .await
         {
             Ok(message) => Response::Sent {
