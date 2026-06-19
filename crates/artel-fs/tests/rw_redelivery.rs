@@ -36,8 +36,8 @@ use tempfile::TempDir;
 use tokio::time::timeout;
 
 use common::{
-    DaemonPaths, drain_ws_events, fresh_state, grant_rw_and_wait, init_tracing, phase_budgeted,
-    revoke, spawn_daemon_at, wait_for_file,
+    DaemonPaths, drain_ws_events, fresh_state, grant_rw, grant_rw_and_wait, init_tracing,
+    phase_budgeted, revoke, spawn_daemon_at, wait_for_file,
 };
 
 const PHASE_BUDGET: Duration = Duration::from_secs(45);
@@ -520,4 +520,194 @@ async fn returning_rw_member_offline_across_rotation_regains_write_real_n0() {
     phase("alice_daemon.stop()", alice_daemon.stop()).await;
     phase("bob_daemon.stop()", bob_daemon.stop()).await;
     phase("carol_daemon.stop()", carol_daemon.stop()).await;
+}
+
+/// Offline READ->WRITE promotion: bob joins Read-only, goes offline, the
+/// host grants him RW *while he is down* (no rotation), then his daemon
+/// restarts and reattaches. Bob must gain write with no second grant.
+///
+/// This is the case that motivated host-side detection (decision B in the
+/// plan): a peer promoted while offline holds NO prior secret, so a
+/// joiner-side "is my secret stale?" check has nothing to compare — only
+/// the host knows bob is now RW. It is also exactly the `emit_upgrade`
+/// INVARIANT's "offline promotion" shoe; this fix subsumes it.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::large_futures, clippy::too_many_lines)]
+async fn offline_read_to_write_promotion_delivers_secret_on_return_real_n0() {
+    init_tracing();
+
+    let alice_root_d = TempDir::new().unwrap();
+    let alice_paths = DaemonPaths::at(alice_root_d.path());
+    let alice_root = TempDir::new().unwrap();
+    let alice_wstate = TempDir::new().unwrap();
+
+    let bob_root_d = TempDir::new().unwrap();
+    let bob_paths = DaemonPaths::at(bob_root_d.path());
+    let bob_root = TempDir::new().unwrap();
+    let bob_wstate = TempDir::new().unwrap();
+
+    let alice_daemon = phase(
+        "spawn alice daemon",
+        spawn_daemon_at(&alice_paths, daemon_prod()),
+    )
+    .await;
+    let bob_daemon = phase(
+        "spawn bob daemon (initial)",
+        spawn_daemon_at(&bob_paths, daemon_prod()),
+    )
+    .await;
+
+    // alice hosts.
+    let alice = Client::connect(&alice_daemon.socket).await.unwrap();
+    let alice_cfg = WorkspaceConfig::default()
+        .with_state_dir(alice_wstate.path().to_path_buf())
+        .with_daemon_socket(alice_daemon.socket.clone())
+        .with_endpoint_setup(prod());
+    let (alice_ws, alice_ws_events) = phase(
+        "alice Workspace::host_with",
+        Workspace::host_with(
+            &alice,
+            "alice",
+            alice_root.path().to_path_buf(),
+            AttachPolicy::AllowExisting,
+            alice_cfg,
+        ),
+    )
+    .await
+    .expect("host_with");
+    drain_ws_events(alice_ws_events);
+    let session = alice_ws.session_id();
+    let ticket = alice_ws.join_ticket().expect("host ticket").clone();
+    let alice_ws = Arc::new(alice_ws);
+    let alice_handle = Arc::clone(&alice_ws).run().await;
+
+    // bob joins READ-ONLY (no grant).
+    let bob = Client::connect(&bob_daemon.socket).await.unwrap();
+    let bob_peer_id = bob.daemon_peer_id();
+    let resp = phase(
+        "bob JoinSession (read-only, initial)",
+        bob.request(Request::JoinSession {
+            display_name: "bob".into(),
+            ticket: ticket.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(resp, Response::JoinSession { .. }), "{resp:?}");
+    let bob_cfg = WorkspaceConfig::default()
+        .with_state_dir(bob_wstate.path().to_path_buf())
+        .with_daemon_socket(bob_daemon.socket.clone())
+        .with_endpoint_setup(prod());
+    let (bob_ws, bob_ws_events) = phase(
+        "bob Workspace::join_with (read-only)",
+        Workspace::join_with(
+            &bob,
+            session,
+            bob_root.path().to_path_buf(),
+            AttachPolicy::RequireEmpty,
+            bob_cfg,
+        ),
+    )
+    .await
+    .expect("join_with");
+    drain_ws_events(bob_ws_events);
+    let bob_ws = Arc::new(bob_ws);
+    let bob_handle = Arc::clone(&bob_ws).run().await;
+
+    // Baseline: alice -> bob read sync works (bob holds Read).
+    tokio::fs::write(alice_root.path().join("pre_a.txt"), b"a1")
+        .await
+        .unwrap();
+    phase(
+        "pre: alice -> bob (bob is Read-only)",
+        wait_for_file(&bob_root.path().join("pre_a.txt"), b"a1"),
+    )
+    .await;
+
+    // Bob goes fully offline BEFORE any RW grant — he holds no secret.
+    phase("bob_ws.shutdown()", bob_ws.shutdown())
+        .await
+        .expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), bob_handle).await;
+    drop(bob);
+    phase("bob_daemon.stop()", bob_daemon.stop()).await;
+
+    // Host grants bob RW while he is down. No rotation: the cap-set just
+    // gains bob@RW. The live upgrade delivery has no receiver (bob's
+    // gone), so the secret is lost — recovery must happen on his return.
+    phase("alice grants bob RW (while offline)", grant_rw(&alice, session, bob_peer_id)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Bob's daemon restarts and reattaches.
+    let bob_daemon = phase(
+        "spawn bob daemon (post-restart)",
+        spawn_daemon_at(&bob_paths, daemon_prod()),
+    )
+    .await;
+    let bob = Client::connect(&bob_daemon.socket).await.unwrap();
+    let resp = phase(
+        "bob JoinSession (post-restart)",
+        bob.request(Request::JoinSession {
+            display_name: "bob".into(),
+            ticket,
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(resp, Response::JoinSession { .. }), "{resp:?}");
+    let bob_cfg = WorkspaceConfig::default()
+        .with_state_dir(bob_wstate.path().to_path_buf())
+        .with_daemon_socket(bob_daemon.socket.clone())
+        .with_endpoint_setup(prod());
+    let (bob_ws, bob_ws_events) = phase(
+        "bob Workspace::join_with (post-restart, now RW)",
+        Workspace::join_with(
+            &bob,
+            session,
+            bob_root.path().to_path_buf(),
+            AttachPolicy::AllowExisting,
+            bob_cfg,
+        ),
+    )
+    .await
+    .expect("join_with post-restart");
+    drain_ws_events(bob_ws_events);
+    let bob_ws = Arc::new(bob_ws);
+    let bob_handle = Arc::clone(&bob_ws).run().await;
+
+    // LOAD-BEARING: bob writes and it reaches alice, proving the secret
+    // was delivered on his NODE_ID re-announce (host-side detection of a
+    // peer it promoted while offline). Unique content per tick (echo-guard)
+    // + fixed path polled to arrival (round-trip), as in the rotation test.
+    let deadline = std::time::Instant::now() + Duration::from_secs(40);
+    let target = alice_root.path().join("promo_bob.txt");
+    let mut tick = 0u32;
+    loop {
+        let content = format!("promo-{tick}");
+        let _ = tokio::fs::write(bob_root.path().join("promo_bob.txt"), content.as_bytes()).await;
+        if let Ok(bytes) = tokio::fs::read(&target).await
+            && bytes.starts_with(b"promo-")
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "offline-promoted member never gained write on return",
+        );
+        tick += 1;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    phase("alice_ws.shutdown()", alice_ws.shutdown())
+        .await
+        .expect("shutdown");
+    phase("bob_ws.shutdown() (final)", bob_ws.shutdown())
+        .await
+        .expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), alice_handle).await;
+    let _ = timeout(Duration::from_secs(5), bob_handle).await;
+    drop(alice);
+    drop(bob);
+    phase("alice_daemon.stop()", alice_daemon.stop()).await;
+    phase("bob_daemon.stop()", bob_daemon.stop()).await;
 }
