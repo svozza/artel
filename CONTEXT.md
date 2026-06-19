@@ -88,6 +88,22 @@ where continuous-writer survivors can't tolerate even sub-second loss.
 A monotonic counter carried (opaque) in the workspace ticket envelope, bumped
 on each rotation, so a peer detects it is on a stale namespace and re-imports.
 
+**Rejoin re-delivery** (offline-across-rotation recovery):
+The recovery path for an RW member that was *offline* when a rotation happened
+(so it missed the live-only secret unicast AND its mirror replays its own stale
+genesis ticket). On the returning peer's `NODE_ID` re-announce, the host's
+cap-listener re-delivers **both** the current `NamespaceSecret` (`publish_upgrade`)
+**and** the current rotated Write ticket (`publish_rotate` → the joiner's
+`SurvivorRotate`/`reimport_namespace` consumer), gated on `has_rw`, idempotent
+(monotonic-epoch guard drops a no-op; inert at genesis epoch 0). Complemented by
+a daemon-side lazy gossip re-subscribe: a reloaded `Remote` mirror re-subscribes
+its topic on its first post-restart send, so the `NODE_ID` announce reaches the
+host at all. Subsumes the "offline promotion" case (a peer promoted to RW while
+offline holds no prior secret — only the host knows it is now RW). `NODE_ID` is
+the ordering-safe trigger: a joiner emits it only *after* its cap-listener is
+live, so the live-only re-delivery cannot outrun its receiver. Stays entirely in
+`artel-fs` (daemon couriers opaque bytes) per [[Namespace-agnostic daemon]].
+
 ### Layer boundary (invariant)
 
 **Namespace-agnostic daemon**:

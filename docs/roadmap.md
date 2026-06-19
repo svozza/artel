@@ -12,16 +12,16 @@ along the way.
 
 ## Status
 
-(Last refreshed 2026-06-12.)
+(Last refreshed 2026-06-19.)
 
 | Crate | State |
 |---|---|
 | `artel-protocol` | Wire types + Unix-socket transport. Done. `PROTOCOL_VERSION` `9` (workspace-ticket unicast), `MESSAGE_FORMAT` `3`, `TICKET_VERSION` `4` (tiered tickets), `GOSSIP_WIRE_VERSION` `1`, upgrade ALPN `artel/upgrade/2`. |
-| `artel-daemon` | Persistent daemon + binary + flock-based pidfile (orphan-leak fix `9a1a773`) + issued-ticket ledger with revocation. Done. |
+| `artel-daemon` | Persistent daemon + binary + flock-based pidfile (orphan-leak fix `9a1a773`) + issued-ticket ledger with revocation + lazy gossip re-subscribe for reloaded joiner mirrors (re-delivery after restart). Done. |
 | `artel-client` | Stateless multiplexed client + `artel` CLI binary + `connect_or_spawn`. Done. |
-| `artel-fs` | Phase 3a (MVP) + 3b-1 (persistence) + 3b-3 (crash recovery) + host/join safety + PeerFilter shipped. Watcher new-subtree rescan landed (`e8244fe`, closes the inotify backfill race). Author identity (3b-2) and configurable filter (3b-4) remain. |
+| `artel-fs` | Phase 3a (MVP) + 3b-1 (persistence) + 3b-3 (crash recovery) + host/join safety + PeerFilter shipped. Watcher new-subtree rescan landed (`e8244fe`, closes the inotify backfill race). Tier-1 write-revocation: namespace-secret rotation on evict + offline-peer re-delivery on rejoin (2026-06). Author identity (3b-2) and configurable filter (3b-4) remain. |
 
-708 tests passing on Tier A+B (`make test`), 12 more on Tier C
+798 tests passing on Tier A+B (`make test`), 16 more on Tier C
 (`make test-n0`, real n0). fmt + clippy clean in both feature modes.
 CI runs ubuntu + macos on stable; workspace `rust-version` is 1.95.
 
@@ -785,17 +785,35 @@ Listed for completeness, no detailed plan yet:
      `docs/brainstorms/2026-06-04-auth-slice-c-l2-delivery-rethink-brainstorm.md`).
   2. **Read cut-off** — stop them pulling new state. Today: works
      (`PeerFilter` rejects their connection).
-  3. **Write cut-off** — stop them *producing* valid state. Today:
-     **does not hold.** Revoke does not rotate the `NamespaceSecret`, and
-     local `set_bytes` has no cap check, so a revoked peer keeps authoring
-     valid, signed doc entries with the secret it already holds. Revoke
-     only suspends *delivery*: on any re-grant (or other sync path) the
-     CRDT reconciles the peer's whole replica, so **everything written
-     during the revoke window flushes wholesale** — cooperative
-     demote→re-promote loses nothing, but adversarial revoke is not a real
-     write-revocation. The true fix is **namespace-secret rotation +
-     redistribution to the remaining RW peers**, a separate (harder)
-     mechanism from notification or cap-propagation.
+  3. **~~Write cut-off~~ — stop them *producing* valid state. DONE
+     2026-06-18 (Tier-1 host-centric rotation).** An `Evict` (`Revoke`)
+     now rotates the namespace: the host mints a fresh `NamespaceSecret` +
+     `NamespaceId`, carries the survivors' latest-per-key entries into the
+     new doc, redistributes the rotated Write ticket to the remaining RW
+     peers, and never gives it to the revoked peer. The revoked peer keeps
+     the *old* secret, which is now worthless — its post-revoke writes land
+     in the abandoned doc nobody feeds, so the "flushes wholesale on
+     re-grant" bug is gone. Shipped as slices C1–C4 (durable distribution
+     state, persisted `namespace_epoch`, replayed-revoke idempotency,
+     never-drop rotation signal) and D1–D4 (host-first reimport,
+     unresolvable-author surfacing, same-seed binding) — the C/D commit
+     series on the `fix/tier1-revocation-blockers` effort.
+
+     **RW peer offline across a rotation — DONE 2026-06-18.** A member
+     that is offline when a rotation happens used to come back stuck: its
+     persisted secret + replayed workspace ticket are both for the
+     abandoned namespace, and the live-only re-delivery it would have
+     received was lost. Now, on the returning peer's `NODE_ID` re-announce,
+     the host re-delivers **both** the current secret *and* the current
+     rotated ticket; a reloaded joiner daemon also lazily re-subscribes its
+     gossip topic on its first post-restart send. This subsumes the
+     `emit_upgrade` INVARIANT's "offline promotion" case (a peer promoted
+     while offline). See `docs/plans/2026-06-18-rw-redelivery.md` and the
+     real-n0 regressions in `crates/artel-fs/tests/rw_redelivery.rs`.
+
+     What remains genuinely deferred here is **P2P** write-revocation (no
+     host to drive a rotation) — that needs per-author authorization at
+     project-at-merge (Tier 2), below.
 
   Whether to "fix" notification at all is partly threat-model dependent:
   for an **adversarial** kick, staying silent is arguably correct (don't
@@ -804,8 +822,9 @@ Listed for completeness, no detailed plan yet:
   bad UX. v1 conflates both into one `Revoke`; distinguishing them is its
   own design question.
 
-  **What namespace-secret rotation actually costs (the write cut-off
-  fix).** Write capability *is* possession of the `NamespaceSecret` (the
+  **What namespace-secret rotation cost (the write cut-off fix — now
+  shipped, retained as the rationale for how it was built).** Write
+  capability *is* possession of the `NamespaceSecret` (the
   iroh-docs document write key, one symmetric secret shared by all RW
   peers). The only way to make a revoked peer's secret worthless is to
   rotate the namespace — mint a new secret, give it to survivors, never
@@ -855,18 +874,21 @@ Listed for completeness, no detailed plan yet:
   **not** reduce the identity decoupling or the quiescence barrier; those
   are intrinsic.
 
-  **Strategic fork — don't build rotation reflexively.** This host-centric
-  rotation (Tier 1) keeps the host-as-sequencer model and is achievable
-  now, but it is **partially throwaway** if the symmetric-P2P rethink is
-  near: per-author authorization that rejects revoked authors at
-  *project-at-merge* (Tier 2 — see `l2-host-only-enforcement-v1` and the
-  delivery-rethink brainstorm) supersedes namespace rotation and is the
-  only thing that works when there's no single gatekeeper to drive a
-  rotation. Recommendation: **ship the downgrade notification (slice 4)
-  now** regardless — cheap, closes the silent-partition UX gap, makes the
-  chat-harness send-gate honest — and hold slices 1–3 until a concrete
-  forcing function (first multi-tenant / untrusted-peer deployment), then
-  re-ask Tier 1 vs Tier 2 against the P2P timeline.
+  **Strategic fork — resolved: Tier 1 shipped (2026-06).** This was
+  originally held pending a forcing function, with the caveat that
+  host-centric rotation (Tier 1) is **partially throwaway** if the
+  symmetric-P2P rethink lands: per-author authorization that rejects
+  revoked authors at *project-at-merge* (Tier 2 — see
+  `l2-host-only-enforcement-v1` and the delivery-rethink brainstorm)
+  supersedes namespace rotation and is the only thing that works when
+  there's no single gatekeeper to drive a rotation. We went ahead and
+  built Tier 1 (slices 1–3 + the downgrade notification, slice 4): the
+  `SessionId`/`NamespaceId` decoupling, `namespace_epoch` in the envelope,
+  and the freeze-drain-snapshot barrier are all done, plus offline-peer
+  re-delivery on rejoin. Tier 2 remains the eventual end-state for the
+  P2P (no-host) case and still supersedes this when it lands; until then,
+  Tier-1 rotation is the working write-revocation for the host-sequencer
+  model.
 
   **What P2P revocation *additionally* pulls in (beyond project-at-merge).**
   The host model collapses three problems into "the host said so, in

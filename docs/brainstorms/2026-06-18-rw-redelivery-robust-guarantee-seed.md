@@ -1,8 +1,16 @@
 # Seed: re-deliver the RW secret to a member returning AFTER a rotation
 
 date: 2026-06-18
-status: SEED — abandoned a first attempt (`PeerReannounced`); reframed below.
-         For a future grill-with-docs / brainstorm session. Not yet designed.
+status: RESOLVED 2026-06-19 — designed via grill-with-docs and SHIPPED. See
+         `docs/plans/2026-06-18-rw-redelivery.md` for the final design and
+         `crates/artel-fs/tests/rw_redelivery.rs` for the real-n0 regressions.
+         This seed is kept for the reasoning trail (and the corrected
+         understanding that invalidated the first `PeerReannounced` attempt).
+         NOTE: the plan extended this seed in one material way the seed missed —
+         the rotated *read/write ticket* has the same reload re-delivery gap as
+         the secret, so the fix re-delivers BOTH on the returning peer's
+         `NODE_ID` announce, not just the secret. See the plan's
+         "Implementation discovery" block.
 relates-to:
   - ADR-003 (daemon stays namespace-agnostic)
   - CONTEXT.md "namespace_epoch", "Namespace rotation"
