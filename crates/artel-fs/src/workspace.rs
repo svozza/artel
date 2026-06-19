@@ -900,21 +900,31 @@ impl Workspace {
             // afterwards. Both the cap-listener's `HostUpgradeCtx` and the
             // rotation task's `RotationDistributeCtx` hold the same cell.
             let upgrade_secret = Arc::new(std::sync::Mutex::new(namespace_secret));
+            // Genesis value of the shared rotated-ticket cell: the genesis
+            // Write ticket at epoch 0. Overwritten on each rotation so the
+            // cap-listener can re-deliver the *current* namespace to a
+            // returning RW member (the read-plane analogue of the C1
+            // secret cell).
+            let current_write_ticket =
+                Arc::new(std::sync::Mutex::new((write_ticket.to_string(), 0u64)));
             let host_ctx = Some(HostUpgradeCtx {
                 client: Arc::clone(&upgrade_client),
                 session: session_id,
                 namespace_secret: Arc::clone(&upgrade_secret),
+                current_write_ticket: Arc::clone(&current_write_ticket),
                 rotation_tx: rotation_tx.clone(),
             });
             // Rotation distribution reuses the same upgrade client +
             // session (the host distributes the rotated ticket to
             // survivors over the same direct-stream path) and shares the
-            // upgrade-secret cell + rules so it can refresh both the
-            // promotion secret and the published read envelope on rotate.
+            // upgrade-secret + rotated-ticket cells + rules so it can
+            // refresh the promotion secret, the published read envelope,
+            // and the returning-member re-delivery ticket on rotate.
             let distribute = Some(RotationDistributeCtx {
                 client: upgrade_client,
                 session: session_id,
                 upgrade_secret,
+                current_write_ticket,
                 rules: rules.clone(),
             });
             (host_ctx, distribute)
@@ -1890,6 +1900,12 @@ impl Workspace {
             return;
         };
         *ctx.upgrade_secret.lock().expect("upgrade_secret mutex") = outcome.new_secret;
+        // Refresh the returning-member re-delivery cell with the rotated
+        // Write ticket + epoch (read-plane analogue of the secret above).
+        *ctx.current_write_ticket
+            .lock()
+            .expect("current_write_ticket mutex") =
+            (outcome.write_ticket.clone(), outcome.new_epoch);
         let envelope = WorkspaceTicketEnvelope::at_epoch(
             outcome.read_ticket.clone(),
             ctx.rules.clone(),
@@ -2598,6 +2614,12 @@ pub(crate) struct RotationDistributeCtx {
     /// peer promoted to RW *after* the rotation receives the new secret,
     /// not the stale genesis one (C1).
     pub(crate) upgrade_secret: Arc<std::sync::Mutex<[u8; 32]>>,
+    /// Shared with the cap-listener's [`HostUpgradeCtx::current_write_ticket`].
+    /// On rotation the rotation task overwrites this with the rotated
+    /// Write ticket + epoch so the cap-listener can re-deliver the rotated
+    /// namespace to a *returning* RW member whose mirror reloaded a stale
+    /// envelope across a restart.
+    pub(crate) current_write_ticket: Arc<std::sync::Mutex<(String, u64)>>,
     /// The host's path rules, needed to rebuild the `workspace.ticket`
     /// envelope re-published on rotation so late joiners import the
     /// rotated namespace (C1).
@@ -3304,6 +3326,18 @@ struct HostUpgradeCtx {
     /// promoted after a rotation receives the rotated secret, not the
     /// stale genesis one (C1).
     namespace_secret: Arc<std::sync::Mutex<[u8; 32]>>,
+    /// The *current* rotated Write ticket + `namespace_epoch`, shared
+    /// (and mutated on rotation) with [`RotationDistributeCtx`]. Used to
+    /// re-deliver the rotated namespace to a *returning* RW member whose
+    /// daemon reloaded a stale (genesis-or-older) `workspace.ticket`
+    /// across a restart: the live-only unicast it would have received on
+    /// rotation was lost while it was offline, and its mirror's replayed
+    /// envelope is its own stale copy, so without this re-delivery the
+    /// returner writes to the abandoned namespace. Genesis value is the
+    /// genesis Write ticket at epoch 0; the joiner's monotonic-epoch
+    /// guard ([`RotationSignal::SurvivorRotate`]) drops it as a no-op when
+    /// the returner is already current.
+    current_write_ticket: Arc<std::sync::Mutex<(String, u64)>>,
     /// Sender to the rotation task: on a `Revoke` the host cap-listener
     /// sends [`RotationSignal::HostEvict`] here (the cap-listener has no
     /// `Arc<Workspace>`, so it can't rotate directly). Slice 3e.
@@ -3428,20 +3462,28 @@ enum CapOutcome {
 
 /// Handle a `NODE_ID_ACTION` System message: register the announcing
 /// peer's workspace `EndpointId` -> daemon `PeerId` mapping, and — on the
-/// host — re-deliver the current `NamespaceSecret` if that peer holds RW.
+/// host — re-deliver BOTH the current `NamespaceSecret` AND the current
+/// rotated Write ticket to that peer if it holds RW.
 ///
-/// The re-delivery is the recovery path for a member that was offline
-/// across a namespace rotation: its persisted secret is for the abandoned
-/// namespace, the live-only upgrade broadcast it would have received is
-/// long gone, and `PeerJoined` does not re-fire for a reloaded mirror (no
-/// fresh gossip announce). `NODE_ID` is the correct trigger because a
-/// joiner emits it only *after* its own cap-listener is live (see
-/// `join_with`), so the re-delivered secret cannot outrun its receiver —
-/// the property the live-only `emit_upgrade` broadcast requires.
+/// This is the recovery path for a member that was offline across a
+/// namespace rotation. Two things were lost while it was down, with the
+/// same root cause (no re-delivery trigger fires for a reloaded mirror —
+/// `PeerJoined`/`ensure_member` only run on a *fresh* gossip announce):
+/// 1. the new secret (live-only upgrade broadcast, long gone), and
+/// 2. the rotated *namespace* — its mirror replays its own stale
+///    `workspace.ticket`, so without re-delivery it imports the abandoned
+///    genesis namespace and writes where the host never sees it.
 ///
-/// Fires on every reattach. Idempotent: the joiner's import is a
-/// monotonic Read->Write merge onto the already-imported current
-/// namespace. Gated on `has_rw` *after* `register`, so a since-revoked
+/// `NODE_ID` is the correct trigger because a joiner emits it only
+/// *after* its own cap-listener is live (see `join_with`), so neither
+/// re-delivery can outrun its receiver. The rotated ticket rides the
+/// existing `publish_rotate`/`SurvivorRotate` path the joiner already
+/// consumes (`reimport_namespace`).
+///
+/// Fires on every reattach. Idempotent: the secret import is a monotonic
+/// Read->Write merge; the rotated ticket is dropped by the joiner's
+/// monotonic-epoch guard when already current (and is inert at genesis
+/// epoch 0). Gated on `has_rw` *after* `register`, so a since-revoked
 /// peer gets nothing. Best-effort spawn.
 fn handle_node_id_message(
     message: &SessionMessage,
@@ -3464,9 +3506,27 @@ fn handle_node_id_message(
         let peer = message.peer.id;
         // Read the live secret (refreshed on rotation, C1).
         let secret = *ctx.namespace_secret.lock().expect("upgrade_secret mutex");
+        // Read the live rotated ticket + epoch. A returning member that
+        // was offline across a rotation reloaded a stale `workspace.ticket`
+        // (its mirror's own genesis-or-older copy) and would otherwise
+        // write to the abandoned namespace. Re-delivering the current
+        // Write ticket here — alongside the secret — swaps it onto the
+        // rotated namespace via the joiner's `SurvivorRotate` consumer,
+        // which drops it as a no-op (monotonic-epoch guard) when already
+        // current. At genesis the epoch is 0, so this is inert for a
+        // never-rotated session.
+        let (write_ticket, namespace_epoch) = ctx
+            .current_write_ticket
+            .lock()
+            .expect("current_write_ticket mutex")
+            .clone();
         tokio::spawn(async move {
             if let Err(e) = publish_upgrade(&client, sess, peer, secret).await {
                 warn!(?e, ?peer, "upgrade re-delivery on node_id failed");
+            }
+            if let Err(e) = publish_rotate(&client, sess, peer, namespace_epoch, write_ticket).await
+            {
+                warn!(?e, ?peer, "rotated-ticket re-delivery on node_id failed");
             }
         });
     }

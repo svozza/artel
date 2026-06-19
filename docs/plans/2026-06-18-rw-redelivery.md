@@ -97,7 +97,29 @@ the fix below uses an existing signal instead.
 This also independently fixes **live chat after a joiner daemon restart**, which
 is currently silently broken and untested.
 
-### Part 2 (artel-fs host cap-listener): re-deliver the secret on `NODE_ID_ACTION`
+### Part 2 (artel-fs host cap-listener): re-deliver the secret AND the rotated ticket on `NODE_ID_ACTION`
+
+> **Implementation discovery (2026-06-19):** the secret was only half the
+> gap. The rotated **read/write *ticket*** has the identical reload
+> re-delivery hole: on reload a joiner's `Subscribe` replays its *own
+> mirror's* stale `workspace.ticket` (genesis), not the host's rotated
+> one — the host's rotated envelope only reaches it via `ensure_member`'s
+> announce-gated re-unicast, which a reloaded joiner never triggers. So a
+> returning member imported the secret for the rotated namespace but
+> stayed on the *genesis doc*, writing where the host never sees it. Fix:
+> the NODE_ID host handler re-delivers **both** the current secret
+> (`publish_upgrade`) **and** the current rotated Write ticket
+> (`publish_rotate` → the joiner's existing `SurvivorRotate` /
+> `reimport_namespace` consumer). This required a C1-style shared cell
+> for `(write_ticket, namespace_epoch)` in `HostUpgradeCtx` /
+> `RotationDistributeCtx`, seeded at genesis (epoch 0) and overwritten in
+> `refresh_distribution_state`. Both re-deliveries stay artel-fs-side
+> (daemon couriers opaque bytes) — the namespace-agnostic-daemon tenet
+> forces this; a daemon-side NODE_ID trigger would leak the artel-fs
+> action constant into the lower layer. Fires always; the joiner's
+> monotonic-epoch guard drops the ticket as a no-op when already current
+> (and at genesis epoch 0).
+
 
 - At the host's `NODE_ID_ACTION` handler (`workspace.rs:3551`), after
   `peer_map.register(workspace_id, message.peer.id)`, add: if
