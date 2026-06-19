@@ -4,6 +4,14 @@ topic: revoked-lurker-unicast-ticket
 status: BRAINSTORM — key decisions user-confirmed 2026-06-12, ready for plan
 parent: docs/brainstorms/2026-06-11-ticket-revocation-brainstorm.md (§ Residual gaps, "Gossip-lurker parity")
 demo: wsdemo smoke test 2026-06-12 (memory `revoked-ticket-lurker-reads-files`)
+superseded-note: 2026-06-19 — the verified-claims table below is a snapshot as
+  of 2026-06-12 (stale line numbers; ALPN was still `artel/upgrade/1`). Two
+  rows it recorded as gaps have since been CLOSED: "`PeerJoined` does not
+  re-fire for an existing member" and "restarted joiner daemon does NOT
+  resubscribe gossip" — both are now addressed by the offline-rejoin
+  re-delivery work (`docs/plans/2026-06-18-rw-redelivery.md`): a reloaded
+  mirror lazily re-subscribes, and re-delivery is triggered off the joiner's
+  `NODE_ID` re-announce rather than `PeerJoined`. Read the table as history.
 ---
 
 # Revoked-ticket lurker reads files — unicast the workspace ticket
