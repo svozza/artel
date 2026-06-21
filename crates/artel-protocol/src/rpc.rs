@@ -342,6 +342,29 @@ pub enum Request {
         /// Rotated namespace's `DocTicket::to_string()`.
         doc_ticket: String,
     },
+
+    /// Host-authority removal of another peer from a hosted session's
+    /// durable membership.
+    ///
+    /// Distinct from [`Self::LeaveSession`], which removes the *caller*
+    /// (membership keyed to this connection). This removes a *different*
+    /// peer named by `target_peer` — the host evicting a member. The
+    /// workspace layer issues it when it observes a capability `Revoke`,
+    /// so the host stops serving the evicted peer gossip (notably the
+    /// membership-gated log `Replay`). The daemon is told only to drop a
+    /// member; it does not parse capabilities (ADR-003).
+    ///
+    /// Only the host of a `SessionKind::Local` session may call this;
+    /// [`ProtocolError::NotHost`] otherwise. Idempotent: removing a
+    /// non-member is success. Removing the host itself is a no-op
+    /// (the cap-log root stays a member). Returns
+    /// [`Response::MemberRemoved`]. Append-only variant — keep last.
+    RemoveSessionMember {
+        /// Session to remove the member from.
+        session: SessionId,
+        /// Peer to evict from the session's membership.
+        target_peer: PeerId,
+    },
 }
 
 /// Fields of a [`Request::Send`] that the client supplies.
@@ -539,8 +562,12 @@ pub enum Response {
 
     /// Reply to [`Request::DeliverRotate`]. Confirms the survivor
     /// received and acknowledged the rotated namespace ticket.
-    /// Append-only variant — keep last.
     RotateDelivered,
+
+    /// Reply to [`Request::RemoveSessionMember`] (success, including the
+    /// idempotent non-member and self-targeted-host no-op cases).
+    /// Append-only variant — keep last.
+    MemberRemoved,
 }
 
 /// One entry in [`Response::Attachments`].

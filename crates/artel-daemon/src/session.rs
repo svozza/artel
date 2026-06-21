@@ -1230,12 +1230,6 @@ impl Registry {
         Ok((session_id, head))
     }
 
-    /// Stand up a local mirror of a session whose authoritative log
-    /// lives on another daemon. Inserts a new [`Session`] keyed by
-    /// `session_id`, persists it, and asks the bridge to subscribe
-    /// to the host's gossip topic. Inbound gossip messages land in
-    /// the mirror's `log` and `events_tx`.
-    #[allow(clippy::too_many_arguments)]
     /// Build the inbound-frame callback the gossip bridge hands every
     /// `SessionMessage` it decodes for a `Remote` mirror. Shared by the
     /// fresh-join path ([`Self::materialise_remote_session`]) and the
@@ -1316,6 +1310,11 @@ impl Registry {
             })
     }
 
+    /// Stand up a local mirror of a session whose authoritative log
+    /// lives on another daemon. Inserts a new [`Session`] keyed by
+    /// `session_id`, persists it, and asks the bridge to subscribe
+    /// to the host's gossip topic. Inbound gossip messages land in
+    /// the mirror's `log` and `events_tx`.
     #[allow(clippy::too_many_arguments)]
     async fn materialise_remote_session(
         &self,
@@ -1615,6 +1614,56 @@ impl Registry {
                 bridge.forget_session(session);
             }
         }
+        Ok(())
+    }
+
+    /// Host-authority removal of a member from a `Local` session.
+    ///
+    /// Distinct from [`Self::leave`], which is a peer removing *itself*
+    /// (membership keyed to the caller's own connection). This is the
+    /// host evicting *another* peer: the workspace layer observed a
+    /// capability `Revoke` and asks the substrate to drop that peer's
+    /// durable membership, so the host stops serving it gossip — most
+    /// importantly the membership-gated log `Replay`, which an
+    /// announce-less re-subscribe would otherwise still hand a
+    /// revoked-but-still-member peer on reattach.
+    ///
+    /// The substrate stays ignorant of *why*: it's told to drop a
+    /// member, a verb it already owns. The decision that a `Revoke`
+    /// means "drop membership" lives in the workspace layer (the caller),
+    /// keeping the daemon free of capability/namespace semantics
+    /// (ADR-003).
+    ///
+    /// Authority: only the host of a `SessionKind::Local` session —
+    /// [`SessionError::NotHost`] otherwise. Idempotent: removing a
+    /// non-member (already gone, or never joined) is `Ok(())`. Refuses
+    /// to remove the host itself (the cap-log root must stay a member);
+    /// such a request is a no-op `Ok(())`. A re-admission later requires
+    /// a fresh `JoinAnnouncement` carrying an admissible ticket — exactly
+    /// the re-verification eviction should force.
+    pub async fn remove_member(
+        &self,
+        session: SessionId,
+        peer: PeerId,
+    ) -> Result<(), SessionError> {
+        let mut s = self.lock_local_session(session).await?;
+        // The host is the cap-log root and must always remain a member
+        // (mirrors the H3 host-RW floor in `apply_capability`). A
+        // self-targeted removal is inert rather than an error.
+        if peer == s.host {
+            return Ok(());
+        }
+        if !s.members.contains(&peer) {
+            return Ok(());
+        }
+        // Store-before-memory, same discipline as `leave`.
+        self.store
+            .remove_member(session, peer)
+            .await
+            .map_err(SessionError::Storage)?;
+        s.members.remove(&peer);
+        let _ = s.events_tx.send(Event::PeerLeft { session, peer });
+        drop(s);
         Ok(())
     }
 
@@ -5174,6 +5223,108 @@ mod tests {
         let bogus = SessionId::new_random();
         let err = r.leave(bogus, peer(1, "alice").id).await.unwrap_err();
         assert_eq!(err, SessionError::UnknownSession(bogus));
+    }
+
+    // ---- remove_member (host-authority eviction) ----
+
+    #[tokio::test]
+    async fn remove_member_drops_membership_and_emits_peer_left() {
+        let r = registry();
+        let host = peer(1, "alice");
+        let bob = peer(2, "bob");
+        let (id, ticket) = r.host_rw(host, None).await.unwrap();
+        r.join(&ticket, bob.clone()).await.unwrap();
+        assert_eq!(r.is_member(id, bob.id).await, Some(true));
+
+        let mut sub = r.subscribe(id, None).await.unwrap();
+        r.remove_member(id, bob.id).await.unwrap();
+
+        let event = timeout(Duration::from_millis(100), sub.events.recv())
+            .await
+            .expect("event")
+            .unwrap();
+        match event {
+            Event::PeerLeft { session, peer } => {
+                assert_eq!(session, id);
+                assert_eq!(peer, bob.id);
+            }
+            other => panic!("expected PeerLeft, got {other:?}"),
+        }
+        // Membership is gone, but the session lives on (unlike a host
+        // self-leave, which closes it).
+        assert_eq!(r.is_member(id, bob.id).await, Some(false));
+        assert_eq!(r.list().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remove_member_is_idempotent_for_non_member() {
+        // Removing a peer that never joined (or was already removed) is a
+        // clean no-op success — eviction must not error just because the
+        // peer is already gone.
+        let r = registry();
+        let (id, _) = r.host_rw(peer(1, "alice"), None).await.unwrap();
+        r.remove_member(id, peer(9, "ghost").id).await.unwrap();
+        assert_eq!(r.list().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remove_member_refuses_to_remove_the_host() {
+        // The host is the cap-log root and must stay a member. A
+        // self-targeted removal is an inert no-op, NOT a session close.
+        let r = registry();
+        let host = peer(1, "alice");
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
+        r.remove_member(id, host.id).await.unwrap();
+        assert_eq!(r.is_member(id, host.id).await, Some(true));
+        assert_eq!(r.list().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remove_member_unknown_session_errors() {
+        let r = registry();
+        let bogus = SessionId::new_random();
+        let err = r.remove_member(bogus, peer(2, "bob").id).await.unwrap_err();
+        assert_eq!(err, SessionError::UnknownSession(bogus));
+    }
+
+    #[tokio::test]
+    async fn remove_member_on_remote_mirror_is_not_host() {
+        // Only the host of a Local session may evict; a Remote mirror
+        // (joiner side) has no authority to remove members.
+        let daemon_peer = PeerId::from_bytes([0xfe; 32]);
+        let remote_host = peer(1, "alice");
+        let me = peer(2, "bob");
+        let id = SessionId::from_bytes([0xce; 16]);
+
+        let store = Arc::new(crate::store::MemoryStore::new());
+        let record = SessionRecord {
+            id,
+            host: remote_host.id,
+            members: HashSet::from([remote_host.id, me.id]),
+            head: Seq::ZERO,
+            log: Vec::new(),
+            kind: SessionKind::Remote,
+            host_epoch: 0,
+            tickets: Vec::new(),
+            workspace_ticket: None,
+        };
+        store.create(&record).await.unwrap();
+        let r = Registry::load(
+            daemon_peer,
+            WireEndpointAddr::id_only(daemon_peer),
+            store,
+            #[cfg(feature = "iroh")]
+            None,
+            #[cfg(feature = "iroh")]
+            None,
+            #[cfg(feature = "iroh")]
+            None,
+        )
+        .await
+        .unwrap();
+
+        let err = r.remove_member(id, me.id).await.unwrap_err();
+        assert_eq!(err, SessionError::NotHost);
     }
 
     // ---- list ----

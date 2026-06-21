@@ -737,6 +737,22 @@ async fn dispatch(
                 },
             }
         }
+        Request::RemoveSessionMember {
+            session,
+            target_peer,
+        } => {
+            if !memberships.contains_key(&session) {
+                return Response::Error {
+                    error: ProtocolError::NotSubscribed(session),
+                };
+            }
+            match registry.remove_member(session, target_peer).await {
+                Ok(()) => Response::MemberRemoved,
+                Err(err) => Response::Error {
+                    error: session_error_to_protocol(&err),
+                },
+            }
+        }
         #[cfg(feature = "iroh")]
         Request::DeliverUpgrade {
             session,

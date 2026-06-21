@@ -900,13 +900,20 @@ impl Workspace {
             // afterwards. Both the cap-listener's `HostUpgradeCtx` and the
             // rotation task's `RotationDistributeCtx` hold the same cell.
             let upgrade_secret = Arc::new(std::sync::Mutex::new(namespace_secret));
-            // Genesis value of the shared rotated-ticket cell: the genesis
-            // Write ticket at epoch 0. Overwritten on each rotation so the
-            // cap-listener can re-deliver the *current* namespace to a
-            // returning RW member (the read-plane analogue of the C1
-            // secret cell).
+            // Seed the shared rotated-ticket cell with the CURRENT write
+            // ticket + the epoch recovered from disk (C2), not a hard-coded
+            // 0. On a fresh host these coincide (genesis ticket, epoch 0);
+            // on a returning host that had rotated, `write_ticket` is the
+            // rotated namespace's ticket and `epoch` is its rotation count.
+            // Hard-coding 0 here re-opened the gap Part 2 closes: a
+            // returning RW member (offline across the rotation, so at a
+            // lower epoch) would receive `publish_rotate(epoch = 0)`, which
+            // its monotonic-epoch guard drops as stale — leaving it writing
+            // to the abandoned namespace with no live re-delivery to swap
+            // it onto the rotated one. The cell is overwritten on each
+            // subsequent rotation by `refresh_distribution_state`.
             let current_write_ticket =
-                Arc::new(std::sync::Mutex::new((write_ticket.to_string(), 0u64)));
+                Arc::new(std::sync::Mutex::new((write_ticket.to_string(), epoch)));
             let host_ctx = Some(HostUpgradeCtx {
                 client: Arc::clone(&upgrade_client),
                 session: session_id,
@@ -2654,6 +2661,27 @@ async fn publish_rotate(
     Ok(())
 }
 
+/// Host-side: ask the daemon to drop `target_peer` from the session's
+/// durable membership (the host evicting an evicted peer). Issued when
+/// the cap-listener observes a capability `Revoke`, so the host stops
+/// serving the evicted peer gossip — most importantly the
+/// membership-gated log `Replay` an announce-less re-subscribe would
+/// otherwise still hand it on reattach. The daemon is told only to drop
+/// a member; the capability semantics stay artel-fs-side (ADR-003).
+async fn publish_remove_member(
+    client: &Client,
+    session: SessionId,
+    target_peer: PeerId,
+) -> Result<(), ClientError> {
+    client
+        .request(Request::RemoveSessionMember {
+            session,
+            target_peer,
+        })
+        .await?;
+    Ok(())
+}
+
 /// Wait for `iroh-docs` to finish its first reconciliation pass and
 /// download all pending content. Returns when [`LiveEvent::SyncFinished`]
 /// has been observed *and* a subsequent
@@ -3605,18 +3633,37 @@ fn handle_capability_message(
     // set, so the rotation's survivor set excludes it.
     if let Some(ctx) = host_ctx
         && let Ok(CapabilityAction::Revoke { peer }) = CapabilityAction::decode(&message.payload)
-        && let Err(e) = ctx.rotation_tx.send(RotationSignal::HostEvict {
+    {
+        if let Err(e) = ctx.rotation_tx.send(RotationSignal::HostEvict {
             revoked_peer: peer,
             // Carry the Revoke's log seq as the idempotency key: the
             // rotation task skips any HostEvict whose seq it has already
             // rotated for, so a replayed historical revoke doesn't
             // re-rotate (C3).
             revoke_seq: message.seq,
-        })
-    {
-        // Unbounded send (C4) only errors if the rotation task is gone
-        // (workspace shutting down) — never on back-pressure.
-        warn!(?e, ?peer, "rotation: failed to enqueue HostEvict signal");
+        }) {
+            // Unbounded send (C4) only errors if the rotation task is gone
+            // (workspace shutting down) — never on back-pressure.
+            warn!(?e, ?peer, "rotation: failed to enqueue HostEvict signal");
+        }
+
+        // Drop the evicted peer from the substrate's durable membership
+        // so the host stops serving it gossip — notably the
+        // membership-gated log `Replay` that an announce-less
+        // re-subscribe (the reload re-delivery path) would otherwise
+        // still hand it on reattach. The crypto cut (rotation, above) and
+        // the transport block (`PeerFilter`) already deny it reads and
+        // writes; this closes the residual gossip-chatter aperture. The
+        // daemon is told only to drop a member — the decision that a
+        // `Revoke` means "drop membership" stays here (ADR-003).
+        // Idempotent + host-only daemon-side; best-effort spawn.
+        let client = Arc::clone(&ctx.client);
+        let sess = ctx.session;
+        tokio::spawn(async move {
+            if let Err(e) = publish_remove_member(&client, sess, peer).await {
+                warn!(?e, ?peer, "evict: remove_member IPC failed");
+            }
+        });
     }
 }
 
