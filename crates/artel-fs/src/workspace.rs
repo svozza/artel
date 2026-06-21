@@ -919,6 +919,9 @@ impl Workspace {
                 session: session_id,
                 namespace_secret: Arc::clone(&upgrade_secret),
                 current_write_ticket: Arc::clone(&current_write_ticket),
+                redelivered_epoch: Arc::new(
+                    std::sync::Mutex::new(std::collections::HashMap::new()),
+                ),
                 rotation_tx: rotation_tx.clone(),
             });
             // Rotation distribution reuses the same upgrade client +
@@ -3366,6 +3369,24 @@ struct HostUpgradeCtx {
     /// guard ([`RotationSignal::SurvivorRotate`]) drops it as a no-op when
     /// the returner is already current.
     current_write_ticket: Arc<std::sync::Mutex<(String, u64)>>,
+    /// Per-peer high-water mark of the namespace epoch we have already
+    /// re-delivered (secret + rotated ticket) to on a `NODE_ID` announce.
+    ///
+    /// `NODE_ID` is a logged, replayed message, so on a host cap-listener
+    /// restart every historical announce replays and would re-fan-out a
+    /// delivery to each RW peer that ever announced — wasteful chatter
+    /// (each a direct-stream unicast), most of it to peers not even online
+    /// now. This map suppresses the storm: a `(peer, epoch)` already
+    /// delivered is skipped. It does NOT suppress a genuine recovery — a
+    /// returning member that was offline across a rotation has no entry at
+    /// the current epoch, so it still gets the re-delivery.
+    ///
+    /// Robustness: the entry is advanced only when delivery *succeeds*,
+    /// and rolled back (CAS-guarded) on failure, so a transient delivery
+    /// failure never durably suppresses a later retry — that would
+    /// recreate the silent-stuck-on-stale-namespace bug this whole feature
+    /// exists to prevent.
+    redelivered_epoch: Arc<std::sync::Mutex<std::collections::HashMap<PeerId, u64>>>,
     /// Sender to the rotation task: on a `Revoke` the host cap-listener
     /// sends [`RotationSignal::HostEvict`] here (the cap-listener has no
     /// `Arc<Workspace>`, so it can't rotate directly). Slice 3e.
@@ -3548,15 +3569,84 @@ fn handle_node_id_message(
             .lock()
             .expect("current_write_ticket mutex")
             .clone();
+
+        // De-storm (finding #4): `NODE_ID` is logged + replayed, so a host
+        // cap-listener restart replays every historical announce and would
+        // re-fan-out a unicast to each RW peer that ever announced. Skip if
+        // we have already delivered this peer the current (or a newer)
+        // epoch. We claim the high-water mark up front so concurrent
+        // replays of the same announce collapse to one delivery, then roll
+        // it back if the delivery fails — a transient failure must never
+        // durably suppress a genuine later re-delivery (that would recreate
+        // the silent-stuck-on-stale-namespace bug).
+        let redelivered = Arc::clone(&ctx.redelivered_epoch);
+        if !claim_redelivery_epoch(&redelivered, peer, namespace_epoch) {
+            debug!(
+                ?peer,
+                namespace_epoch, "node_id re-delivery: already current, skipping",
+            );
+            return;
+        }
         tokio::spawn(async move {
-            if let Err(e) = publish_upgrade(&client, sess, peer, secret).await {
-                warn!(?e, ?peer, "upgrade re-delivery on node_id failed");
-            }
-            if let Err(e) = publish_rotate(&client, sess, peer, namespace_epoch, write_ticket).await
-            {
-                warn!(?e, ?peer, "rotated-ticket re-delivery on node_id failed");
+            // Run both deliveries (don't short-circuit — the rotate is
+            // useful even if the upgrade failed and vice versa), tracking
+            // whether either failed.
+            let upgrade_ok = match publish_upgrade(&client, sess, peer, secret).await {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!(?e, ?peer, "upgrade re-delivery on node_id failed");
+                    false
+                }
+            };
+            let rotate_ok =
+                match publish_rotate(&client, sess, peer, namespace_epoch, write_ticket).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        warn!(?e, ?peer, "rotated-ticket re-delivery on node_id failed");
+                        false
+                    }
+                };
+            if !(upgrade_ok && rotate_ok) {
+                // Roll the high-water mark back so the next announce
+                // retries (only if no later delivery overtook us).
+                rollback_redelivery_epoch(&redelivered, peer, namespace_epoch);
             }
         });
+    }
+}
+
+/// Claim the per-peer `NODE_ID` re-delivery high-water mark for
+/// `epoch` (finding #4 de-storm). Returns `true` if the caller should
+/// proceed with delivery — i.e. this peer had not already been delivered
+/// `epoch` or newer — and records `epoch` as claimed. Returns `false`
+/// (no mutation) when a delivery at `epoch` or higher already happened,
+/// so a replayed `NODE_ID` is suppressed. A peer with no entry is treated
+/// as never-delivered and always proceeds.
+fn claim_redelivery_epoch(
+    redelivered: &std::sync::Mutex<std::collections::HashMap<PeerId, u64>>,
+    peer: PeerId,
+    epoch: u64,
+) -> bool {
+    let mut seen = redelivered.lock().expect("redelivered_epoch mutex");
+    if seen.get(&peer).is_some_and(|&e| e >= epoch) {
+        return false;
+    }
+    seen.insert(peer, epoch);
+    true
+}
+
+/// Roll back a [`claim_redelivery_epoch`] claim after a failed delivery,
+/// so the next `NODE_ID` announce retries. Only clears the entry if it is
+/// still exactly `epoch` — a concurrent higher-epoch delivery that
+/// overtook us must keep its progress, never be clobbered back.
+fn rollback_redelivery_epoch(
+    redelivered: &std::sync::Mutex<std::collections::HashMap<PeerId, u64>>,
+    peer: PeerId,
+    epoch: u64,
+) {
+    let mut seen = redelivered.lock().expect("redelivered_epoch mutex");
+    if seen.get(&peer) == Some(&epoch) {
+        seen.remove(&peer);
     }
 }
 
@@ -4149,6 +4239,65 @@ mod tests {
             cap: Capability::ReadWrite,
         }
         .encode()
+    }
+
+    // ---- NODE_ID re-delivery de-storm (finding #4) ----
+
+    #[test]
+    fn claim_redelivery_first_time_proceeds_then_dedups() {
+        let map = std::sync::Mutex::new(std::collections::HashMap::new());
+        let peer = PeerId::from_bytes([0xd0; 32]);
+
+        // First announce at epoch 2: proceed (no prior delivery).
+        assert!(claim_redelivery_epoch(&map, peer, 2));
+        // A replayed announce at the same epoch: suppressed.
+        assert!(!claim_redelivery_epoch(&map, peer, 2));
+        // And at a *lower* epoch (a stale replay): also suppressed.
+        assert!(!claim_redelivery_epoch(&map, peer, 1));
+    }
+
+    #[test]
+    fn claim_redelivery_proceeds_on_higher_epoch() {
+        // A genuine recovery: the peer was delivered epoch 1, then a
+        // rotation bumped to epoch 2. The next announce must proceed so the
+        // returning member gets the new namespace — the dedup must not
+        // mistake "delivered epoch 1" for "current".
+        let map = std::sync::Mutex::new(std::collections::HashMap::new());
+        let peer = PeerId::from_bytes([0xd1; 32]);
+        assert!(claim_redelivery_epoch(&map, peer, 1));
+        assert!(claim_redelivery_epoch(&map, peer, 2));
+        assert!(!claim_redelivery_epoch(&map, peer, 2));
+    }
+
+    #[test]
+    fn rollback_redelivery_restores_retry_after_failure() {
+        // A failed delivery rolls the claim back so the next announce
+        // retries — a transient failure must never durably suppress a
+        // genuine re-delivery (that would strand the member on a stale
+        // namespace, the bug this feature prevents).
+        let map = std::sync::Mutex::new(std::collections::HashMap::new());
+        let peer = PeerId::from_bytes([0xd2; 32]);
+        assert!(claim_redelivery_epoch(&map, peer, 3));
+        rollback_redelivery_epoch(&map, peer, 3);
+        // Retry now proceeds again.
+        assert!(claim_redelivery_epoch(&map, peer, 3));
+    }
+
+    #[test]
+    fn rollback_redelivery_does_not_clobber_a_newer_delivery() {
+        // If a higher-epoch delivery overtook us between claim and the
+        // failed-delivery rollback, the rollback must leave that newer
+        // progress intact rather than wiping the entry.
+        let map = std::sync::Mutex::new(std::collections::HashMap::new());
+        let peer = PeerId::from_bytes([0xd3; 32]);
+        assert!(claim_redelivery_epoch(&map, peer, 1));
+        // A concurrent newer delivery lands at epoch 2.
+        assert!(claim_redelivery_epoch(&map, peer, 2));
+        // The epoch-1 task now fails and tries to roll back — must be a
+        // no-op, since the live mark is the newer epoch 2.
+        rollback_redelivery_epoch(&map, peer, 1);
+        // Epoch 2 is still claimed: a replay at 2 stays suppressed.
+        assert!(!claim_redelivery_epoch(&map, peer, 2));
     }
 
     /// End-to-end recovery proof (M3): a cap-listener whose connection
