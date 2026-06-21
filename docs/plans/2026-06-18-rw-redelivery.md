@@ -182,3 +182,41 @@ via `host_ctx`; confirm `host_ctx` is threaded into `handle_*` for that arm
 
 - Joiner-side cap projection / joiner-pull re-delivery (Tier-2 P2P).
 - The chat-harness `can_write = is_host` UI wart (harness-only, gitignored).
+
+### Eviction does not compose ticket revocation (known boundary, 2026-06-21)
+
+Surfaced during the post-merge review. `Evict` (a `Revoke{peer}`) now drops
+the peer's daemon **membership** (`RemoveSessionMember`, the #2 fix) on top of
+the cap revoke + namespace rotation + `PeerFilter`. It does **not** revoke the
+*ticket* the peer joined with. So an evicted peer holding a still-`Active` join
+ticket can re-admit itself:
+
+1. evicted → dropped from `members`, cap gone, namespace rotated, transport
+   blocked;
+2. it still holds its original signed `SessionTicket`, still `Active` in the
+   host's issued-ticket ledger;
+3. a fresh `JoinAnnouncement` carrying that claim passes `ensure_member`'s
+   ledger gate (`session.rs`, `ticket_admissible`) and re-adds it to `members`
+   — regaining the membership-gated gossip log **Replay**.
+
+Reads/writes stay denied (crypto cut + `PeerFilter`); the regained surface is
+the same chatter-replay #2 closed for the *announce-less* path. The difference:
+a full re-announce is *gated* (must present an admissible ticket), it just
+isn't *automatically* gated by the eviction.
+
+**Why deferred, not a bug:** ticket lifecycle (`RevokeTicket`) and capability
+lifecycle (`Revoke`) are deliberately separate operator tools (see CONTEXT.md
+Revoke/Evict). The narrower hole the re-delivery work opened — re-delivery with
+*zero* ticket re-verification — is fully closed. Forcing ticket revocation on
+every evict couples the two lifecycles and would break legitimate
+evict-then-reinstate.
+
+**The open decision:** should `Evict` *compose* `RevokeTicket` — walk the
+ledger (the `used_by` metadata already names the admitting tickets) and revoke
+whatever admitted the evicted peer? That's a workspace-layer host-policy choice,
+not a substrate bug, and it interacts with the "reopen grant authority when
+read-only tickets land" constraint.
+
+**Revisit when:** operator eviction UX is built, or sub-RW ticket tiers land
+(whichever first). Until then an operator who wants a *permanent* eviction must
+call `RevokeTicket` on the peer's ticket(s) in addition to `Revoke{peer}`.
