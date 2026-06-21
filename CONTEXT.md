@@ -104,6 +104,21 @@ the ordering-safe trigger: a joiner emits it only *after* its cap-listener is
 live, so the live-only re-delivery cannot outrun its receiver. Stays entirely in
 `artel-fs` (daemon couriers opaque bytes) per [[Namespace-agnostic daemon]].
 
+Two correctness conditions this path depends on:
+- **Host-restart cell re-seed.** The rotated Write ticket the host re-delivers
+  is read from a shared `(write_ticket, namespace_epoch)` cell, seeded on
+  `host_with` and overwritten on each rotation. It MUST seed the epoch from the
+  value recovered from disk (the persisted `namespace_epoch`), not a hard-coded
+  0 — a returning host that had rotated otherwise re-delivers `epoch 0`, which a
+  returning member's monotonic-epoch guard drops as stale, silently stranding it
+  on the abandoned namespace.
+- **De-storm.** `NODE_ID` is a *logged, replayed* message, so a host cap-listener
+  restart replays every historical announce and would re-fan-out a unicast to
+  every RW peer that ever announced. A per-peer "epoch already re-delivered"
+  high-water mark suppresses the storm without suppressing a genuine recovery
+  (claimed up front so concurrent replays collapse; rolled back on delivery
+  failure so a transient failure never durably blocks a later retry).
+
 ### Layer boundary (invariant)
 
 **Namespace-agnostic daemon**:
@@ -137,7 +152,17 @@ under a cooperative threat model.
 An *adversarial* removal. Wire form `Revoke{peer}` (`PeerFilter` blocks the
 connection). The only true **cryptographic** write cut-off: `PeerFilter` block
 + freeze-drain namespace rotation, so the peer's retained `NamespaceSecret`
-becomes worthless. Use when the peer is not trusted to self-halt.
+becomes worthless. Use when the peer is not trusted to self-halt. On a `Revoke`
+the host also drops the peer from the daemon's durable session *membership* (a
+host-authority `RemoveSessionMember` IPC — distinct from a peer's own
+`LeaveSession`): membership is the gate on the gossip log **Replay**, and a
+capability `Revoke` alone leaves membership intact, so without this an evicted
+peer could still pull the session-log replay on an announce-less re-subscribe
+(see [[Rejoin re-delivery]]). The daemon is told only to drop a member — the
+"`Revoke` means drop membership" decision stays in `artel-fs`
+([[Namespace-agnostic daemon]]). Chatter-only residual closed; reads/writes were
+already denied by `PeerFilter` + the crypto cut. A later re-admission still
+requires a fresh `JoinAnnouncement` with an admissible ticket.
 
 **Revoke**:
 The `Revoke{peer}` wire verb underlying **Evict**. Historically (pre-rotation)
