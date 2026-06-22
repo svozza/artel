@@ -12,16 +12,16 @@ along the way.
 
 ## Status
 
-(Last refreshed 2026-06-19.)
+(Last refreshed 2026-06-22.)
 
 | Crate | State |
 |---|---|
-| `artel-protocol` | Wire types + Unix-socket transport. Done. `PROTOCOL_VERSION` `9` (workspace-ticket unicast), `MESSAGE_FORMAT` `3`, `TICKET_VERSION` `4` (tiered tickets), `GOSSIP_WIRE_VERSION` `1`, upgrade ALPN `artel/upgrade/2`. |
-| `artel-daemon` | Persistent daemon + binary + flock-based pidfile (orphan-leak fix `9a1a773`) + issued-ticket ledger with revocation + lazy gossip re-subscribe for reloaded joiner mirrors (re-delivery after restart). Done. |
+| `artel-protocol` | Wire types + Unix-socket transport. Done. `PROTOCOL_VERSION` `12` (`9` workspace-ticket unicast → `10` `Event::Gap` lag-recovery → `11` cooperative-demote downgrade → `12` host-authority `RemoveSessionMember`), `MESSAGE_FORMAT` `3`, `TICKET_VERSION` `4` (tiered tickets), `GOSSIP_WIRE_VERSION` `1`, upgrade ALPN `artel/upgrade/2`. |
+| `artel-daemon` | Persistent daemon + binary + flock-based pidfile (orphan-leak fix `9a1a773`) + issued-ticket ledger with revocation + lazy gossip re-subscribe for reloaded joiner mirrors (re-delivery after restart) + host-authority member removal (`RemoveSessionMember`, drops an evicted peer from durable membership). Done. |
 | `artel-client` | Stateless multiplexed client + `artel` CLI binary + `connect_or_spawn`. Done. |
-| `artel-fs` | Phase 3a (MVP) + 3b-1 (persistence) + 3b-3 (crash recovery) + host/join safety + PeerFilter shipped. Watcher new-subtree rescan landed (`e8244fe`, closes the inotify backfill race). Tier-1 write-revocation: namespace-secret rotation on evict + offline-peer re-delivery on rejoin (2026-06). Author identity (3b-2) and configurable filter (3b-4) remain. |
+| `artel-fs` | Phase 3a (MVP) + 3b-1 (persistence) + 3b-3 (crash recovery) + host/join safety + PeerFilter shipped. Watcher new-subtree rescan landed (`e8244fe`, closes the inotify backfill race). Tier-1 write-revocation: namespace-secret rotation on evict + offline-peer re-delivery on rejoin, hardened 2026-06-21 (host-restart re-seed, `NODE_ID` re-delivery de-storm, evict drops daemon membership). Author identity (3b-2) and configurable filter (3b-4) remain. |
 
-798 tests passing on Tier A+B (`make test`), 16 more on Tier C
+807 tests passing on Tier A+B (`make test`), 17 more on Tier C
 (`make test-n0`, real n0). fmt + clippy clean in both feature modes.
 CI runs ubuntu + macos on stable; workspace `rust-version` is 1.95.
 
