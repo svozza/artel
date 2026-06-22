@@ -41,6 +41,8 @@ pub use attachment::{
 };
 pub use echo_guard::EchoGuard;
 pub use endpoint_setup::EndpointSetup;
+#[cfg(feature = "test-utils")]
+pub use endpoint_setup::TEST_DNS_ORIGIN;
 pub use error::{PolicyViolation, WorkspaceError};
 pub use filter::{FilterDecision, MAX_FILE_SIZE, SkipReason, WorkspaceFilter};
 pub use keys::{KEY_PREFIX, key_to_path, path_to_key};

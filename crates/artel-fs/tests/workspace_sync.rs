@@ -177,7 +177,7 @@ async fn spawn_host_workspace_for_empty_test() -> (
     TempDir,
     Arc<DnsPkarrServer>,
 ) {
-    let dns_pkarr = Arc::new(DnsPkarrServer::run().await.expect("dns_pkarr"));
+    let dns_pkarr = Arc::new(DnsPkarrServer::run_with_origin(artel_fs::TEST_DNS_ORIGIN.to_string()).await.expect("dns_pkarr"));
     let daemon =
         common::spawn_daemon_with_setup(common::fresh_state(), daemon_testing_setup(&dns_pkarr))
             .await;
@@ -1069,7 +1069,7 @@ async fn reimport_swaps_namespace_and_keeps_workspace_live() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn namespace_epoch_survives_host_restart() {
-    let dns_pkarr = Arc::new(DnsPkarrServer::run().await.expect("dns_pkarr"));
+    let dns_pkarr = Arc::new(DnsPkarrServer::run_with_origin(artel_fs::TEST_DNS_ORIGIN.to_string()).await.expect("dns_pkarr"));
     // Content root + state dir live in tempdirs that outlive both
     // host lifetimes so the restart re-opens the same on-disk state.
     let root = tempfile::tempdir().unwrap();
@@ -1159,7 +1159,7 @@ async fn namespace_epoch_survives_host_restart() {
 async fn replayed_revoke_does_not_re_rotate_on_workspace_restart() {
     use artel_protocol::capability::Capability;
 
-    let dns_pkarr = Arc::new(DnsPkarrServer::run().await.expect("dns_pkarr"));
+    let dns_pkarr = Arc::new(DnsPkarrServer::run_with_origin(artel_fs::TEST_DNS_ORIGIN.to_string()).await.expect("dns_pkarr"));
     // Alice's daemon stays up across the workspace restart, so its
     // session log (with the Revoke) persists. Alice's workspace state
     // dir is persistent so the re-host resumes the same session.
@@ -1315,7 +1315,7 @@ async fn burst_of_evictions_all_rotate_no_signal_dropped() {
     // a genuine rotation per revoke.
     const BURST: u64 = 40;
 
-    let dns_pkarr = Arc::new(DnsPkarrServer::run().await.expect("dns_pkarr"));
+    let dns_pkarr = Arc::new(DnsPkarrServer::run_with_origin(artel_fs::TEST_DNS_ORIGIN.to_string()).await.expect("dns_pkarr"));
     let daemon =
         common::spawn_daemon_with_setup(common::fresh_state(), daemon_testing_setup(&dns_pkarr))
             .await;

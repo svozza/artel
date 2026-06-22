@@ -22,6 +22,8 @@ pub(crate) mod upgrade_protocol;
 
 #[cfg(feature = "iroh")]
 pub use endpoint_setup::EndpointSetup;
+#[cfg(all(feature = "iroh", feature = "test-utils"))]
+pub use endpoint_setup::TEST_DNS_ORIGIN;
 #[cfg(feature = "iroh")]
 pub use server::IrohRuntime;
 pub use server::{Daemon, DaemonConfig, StartError};

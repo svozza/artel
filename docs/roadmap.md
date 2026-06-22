@@ -31,8 +31,8 @@ messaging round-trips through ack-correlated signed gossip frames,
 sessions persist across restarts, `artel-fs::Workspace` mirrors a
 directory between peers, and hosts can mint capability-scoped
 tickets (Read / ReadWrite, with expiry) whose grants are enforced
-end-to-end. What's left is the iroh 1.0 upgrade, observability, and
-the consumer-driven 3b leftovers.
+end-to-end, on iroh 1.0. What's left is observability and the
+consumer-driven 3b leftovers.
 
 ## Phase 1: client auto-spawn — DONE
 
@@ -624,23 +624,33 @@ What's still on the table:
 
 ## Near-term
 
-- **iroh 1.0 upgrade.** iroh 0.98.2's QUIC layer (noq-proto 0.17.0)
-  has a handshake path-poisoning bug that deterministically wedges
-  acceptor-side handshakes when the dialer reaches a localhost relay
-  and same-machine direct addrs simultaneously (diagnosed 2026-06-11;
-  case study in `docs/diagnosing-flaky-tests.md`). Fixed upstream in
-  noq-proto 1.0.0-rc (iroh#4273/#4281 four-tuple rework). Interim:
-  the two-peer `_n0` tests dial n0's public relay (commit `59c7ab5`).
-  The upgrade path is the 1.0 RC line or stable when it lands —
-  companion crates (iroh-docs 0.100 / iroh-gossip 0.100 /
-  iroh-blobs 0.102) pin `=1.0.0-rc.1`, so the whole family moves
-  together. Known breaking changes from the rc1 notes:
-  `IncomingLocalAddr` → `LocalTransportAddr`, `PathEvent`
-  non-exhaustive, `CustomSender::poll_send` gains a `src` arg.
-  After upgrading: grep `INTERIM (iroh 0.98.2)` and revert those
-  sites to the localhost relay, then run the n0 tier 10×. An iroh
-  v2 workshop with the n0 devs is being scheduled (2026-06-05) —
-  check migration guidance before starting.
+- **~~iroh 1.0 upgrade.~~** DONE (2026-06-22). The whole family
+  moved to stable together: `iroh` 0.98 → `1.0`, `iroh-relay` 0.98 →
+  `1.0`, `iroh-gossip`/`iroh-docs` 0.98 → `0.101`, `iroh-blobs`
+  0.100 → `0.103`; `n0-error` 0.1 → `1.0` to match iroh's. The
+  upgrade pulls in the noq-proto 1.0.0 four-tuple rework
+  (iroh#4273/#4281) that fixes the handshake path-poisoning bug —
+  iroh 0.98.2's noq-proto 0.17.0 deterministically wedged
+  acceptor-side handshakes when the dialer reached a localhost relay
+  and same-machine direct addrs simultaneously (diagnosed
+  2026-06-11; case study in `docs/diagnosing-flaky-tests.md`). All
+  four `INTERIM (iroh 0.98.2)` sites — `workspace_restart.rs`,
+  `revoked_lurker.rs`, `auth_b5_control_frames.rs`, `identity.rs` —
+  were reverted from n0's public relay (`Production`) back to the
+  localhost shared relay (`ProductionCustomRelay`), so Tier C no
+  longer depends on n0's public infra. The rc1-era breaking changes
+  the notes warned about (`IncomingLocalAddr` → `LocalTransportAddr`,
+  `PathEvent` non-exhaustive, `CustomSender::poll_send` `src` arg)
+  don't touch any of our call sites. What actually broke and was
+  fixed: `iroh::tls::CaRootsConfig` → `CaTlsConfig` (the
+  `ca_roots_config` builder method is deprecated, renamed
+  `ca_tls_config`); `iroh::endpoint::ConnectionInfo` removed —
+  `EndpointHooks::after_handshake` now takes `&Connection`;
+  `DnsPkarrServer`'s `endpoint_origin` / `pkarr_url` fields are now
+  private (only `pkarr_url()` has an accessor), so the test DNS
+  origin is owned via `endpoint_setup::TEST_DNS_ORIGIN` and the
+  fixture is constructed with `run_with_origin(TEST_DNS_ORIGIN)`
+  rather than the argless `run()`.
 
 ## Future
 

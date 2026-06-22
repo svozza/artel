@@ -17,6 +17,19 @@
 #![cfg(feature = "iroh")]
 #![allow(clippy::redundant_pub_crate)]
 
+/// DNS origin domain for the `Testing` fixture's [`iroh::test_utils::DnsPkarrServer`].
+///
+/// Mirror of `artel_fs::endpoint_setup::TEST_DNS_ORIGIN`. iroh 1.0
+/// made `DnsPkarrServer`'s `endpoint_origin` field private (no
+/// accessor) and its argless `run()` hardcodes `"dns.iroh.test"`
+/// internally. We own the value here and construct the fixture via
+/// `DnsPkarrServer::run_with_origin(TEST_DNS_ORIGIN)`, so the origin
+/// the server serves on and the origin [`EndpointSetup::apply`]
+/// resolves against are the same string rather than coupling to
+/// iroh's private default.
+#[cfg(feature = "test-utils")]
+pub const TEST_DNS_ORIGIN: &str = "dns.iroh.test";
+
 /// How the daemon's iroh endpoint discovers peers.
 #[derive(Clone, Default)]
 pub enum EndpointSetup {
@@ -78,11 +91,15 @@ impl EndpointSetup {
                 // See `artel_fs::endpoint_setup` for why the
                 // `AddrFilter::ip_only` lives on the publisher
                 // builder rather than on the endpoint builder.
-                let dns_address_lookup = iroh::address_lookup::DnsAddressLookup::builder(
-                    dns_pkarr.endpoint_origin.clone(),
-                );
+                // `endpoint_origin` / `pkarr_url` became private in
+                // iroh 1.0 (only `pkarr_url()` is public). Own the
+                // origin via [`TEST_DNS_ORIGIN`] so it matches the
+                // `run_with_origin` the fixture is built with, rather
+                // than depending on iroh's internal `run()` default.
+                let dns_address_lookup =
+                    iroh::address_lookup::DnsAddressLookup::builder(TEST_DNS_ORIGIN.to_string());
                 let pkarr_publisher =
-                    iroh::address_lookup::PkarrPublisher::builder(dns_pkarr.pkarr_url.clone())
+                    iroh::address_lookup::PkarrPublisher::builder(dns_pkarr.pkarr_url().clone())
                         .addr_filter(iroh::address_lookup::AddrFilter::ip_only());
                 builder
                     .address_lookup(dns_address_lookup)
@@ -106,7 +123,7 @@ impl EndpointSetup {
                 let builder = iroh::endpoint::presets::N0.apply(builder);
                 builder
                     .relay_mode(iroh::RelayMode::custom([relay_url.clone()]))
-                    .ca_roots_config(iroh::tls::CaRootsConfig::insecure_skip_verify())
+                    .ca_tls_config(iroh::tls::CaTlsConfig::insecure_skip_verify())
             }
         }
     }

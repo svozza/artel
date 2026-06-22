@@ -308,7 +308,7 @@ async fn join_require_empty_rejects_non_empty_dir_without_creating_state() {
 async fn join_init_from_existing_is_rejected() {
     // No host needed — the policy check fires before the joiner
     // does any session work.
-    let dns_pkarr = Arc::new(DnsPkarrServer::run().await.unwrap());
+    let dns_pkarr = Arc::new(DnsPkarrServer::run_with_origin(artel_fs::TEST_DNS_ORIGIN.to_string()).await.unwrap());
     let daemon =
         common::spawn_daemon_with_setup(common::fresh_state(), daemon_testing_setup(&dns_pkarr))
             .await;
@@ -612,7 +612,7 @@ async fn applier_subscribed_when_run_resolves() {
 #[tokio::test(flavor = "multi_thread")]
 async fn host_workspace_registers_attachment_via_ipc() {
     let harness = LocalDaemon::spawn().await;
-    let dns_pkarr = Arc::new(DnsPkarrServer::run().await.unwrap());
+    let dns_pkarr = Arc::new(DnsPkarrServer::run_with_origin(artel_fs::TEST_DNS_ORIGIN.to_string()).await.unwrap());
 
     let alice = Client::connect(&harness.socket).await.unwrap();
 
@@ -735,7 +735,7 @@ async fn join_workspace_registers_attachment_via_ipc() {
 #[tokio::test(flavor = "multi_thread")]
 async fn list_known_workspaces_helper_returns_typed_view() {
     let harness = LocalDaemon::spawn().await;
-    let dns_pkarr = Arc::new(DnsPkarrServer::run().await.unwrap());
+    let dns_pkarr = Arc::new(DnsPkarrServer::run_with_origin(artel_fs::TEST_DNS_ORIGIN.to_string()).await.unwrap());
 
     let alice = Client::connect(&harness.socket).await.unwrap();
     let ws_root = TempDir::new().unwrap();
@@ -784,7 +784,7 @@ async fn attachment_persists_across_daemon_restart() {
     // (cloned into each daemon and into each workspace) so the
     // pkarr publish from phase 1 outlives the daemon restart and
     // phase 2 republishes against the same fixture.
-    let dns_pkarr = Arc::new(DnsPkarrServer::run().await.unwrap());
+    let dns_pkarr = Arc::new(DnsPkarrServer::run_with_origin(artel_fs::TEST_DNS_ORIGIN.to_string()).await.unwrap());
 
     let alice_root = TempDir::new().unwrap();
     let alice_wstate = TempDir::new().unwrap();
@@ -901,7 +901,7 @@ async fn attachment_persists_across_daemon_restart() {
 #[tokio::test(flavor = "multi_thread")]
 async fn attachment_removed_on_host_leave_session() {
     let harness = LocalDaemon::spawn().await;
-    let dns_pkarr = Arc::new(DnsPkarrServer::run().await.unwrap());
+    let dns_pkarr = Arc::new(DnsPkarrServer::run_with_origin(artel_fs::TEST_DNS_ORIGIN.to_string()).await.unwrap());
 
     let alice = Client::connect(&harness.socket).await.unwrap();
     let ws_root = TempDir::new().unwrap();

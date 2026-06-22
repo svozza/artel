@@ -413,7 +413,7 @@ async fn alice_post_restart_writes_reach_bob() {
     // spawn alice's daemon at caller-owned paths so the same on-disk
     // state (including iroh secret) survives the mid-test restart.
     // Bob's daemon uses `fresh_state()` since it doesn't restart.
-    let dns_pkarr = Arc::new(DnsPkarrServer::run().await.expect("DnsPkarrServer::run"));
+    let dns_pkarr = Arc::new(DnsPkarrServer::run_with_origin(artel_fs::TEST_DNS_ORIGIN.to_string()).await.expect("DnsPkarrServer::run"));
     let alice_daemon = spawn_daemon_at(&alice_paths, daemon_testing_setup(&dns_pkarr)).await;
     let bob_daemon = spawn_daemon_with_setup(fresh_state(), daemon_testing_setup(&dns_pkarr)).await;
 
@@ -621,28 +621,30 @@ async fn capture_ticket_n0(events: &mut EventStream, session: SessionId) -> DocT
 // the `n0` nextest profile (filter `test(/_n0$/)`); the default
 // profile filters it out via `not test(/_n0$/)`.
 //
-// INTERIM (iroh 0.98.2): this test dials through n0's public relay
-// (`Production`) instead of the localhost shared relay. noq-proto
-// 0.17.0 has a handshake path-poisoning bug (diagnosed 2026-06-11,
-// 0/12 against a localhost relay; deterministic sibling green): when
-// a dialer knows both a relay URL and same-machine-reachable direct
-// addrs, its Initial packet reaches the acceptor over BOTH
-// transports. noq-proto learns the direct copy's local IP onto the
-// handshake path whose remote is the synthetic relay mapped-addr
-// (fd15...:12345), producing a four-tuple no transport can ever
-// match again; every later relay-delivered handshake packet is
-// discarded ("unexpected remote during handshake") and the
-// server-side handshake never completes. Symptoms by phase: gossip
-// JOIN_READY timeout, iroh-docs "initial sync did not complete", or
-// upgrade-probe stalls — same mechanism, whichever connection loses
-// the relay-vs-direct race. Against the public relay the
-// same-machine direct packet always wins the race, so the bug stays
-// dormant. Fixed upstream in noq-proto 1.0.0-rc (handshake check
-// uses is_probably_same_path; local-IP learning gated on
-// handshake-confirmed; iroh#4273/#4281 four-tuple rework). When the
-// iroh 1.0 upgrade lands, revert to `common::shared_relay_url()` +
-// `ProductionCustomRelay` so Tier C stops depending on n0's relay.
-// Full writeup: docs/diagnosing-flaky-tests.md case study.
+// Dials across the localhost shared relay (`ProductionCustomRelay`):
+// n0 DNS/pkarr for discovery, self-signed localhost relay for the
+// QUIC transport. Previously this dialed n0's public relay to dodge
+// the noq-proto 0.17.0 handshake path-poisoning bug (diagnosed
+// 2026-06-11; full writeup in docs/diagnosing-flaky-tests.md), which
+// deterministically wedged acceptor-side handshakes against a
+// localhost relay. Fixed upstream in noq-proto 1.0.0 (handshake
+// check uses is_probably_same_path; local-IP learning gated on
+// handshake-confirmed; iroh#4273/#4281 four-tuple rework), shipped
+// with the iroh 1.0 upgrade, so Tier C no longer depends on n0's
+// public relay.
+
+/// Daemon-side localhost-relay setup for the Tier C test below.
+async fn daemon_custom_relay_setup() -> artel_daemon::EndpointSetup {
+    let relay_url: iroh::RelayUrl = common::shared_relay_url().await.parse().unwrap();
+    artel_daemon::EndpointSetup::ProductionCustomRelay { relay_url }
+}
+
+/// Workspace-side companion to [`daemon_custom_relay_setup`].
+async fn fs_custom_relay_setup() -> artel_fs::EndpointSetup {
+    let relay_url: iroh::RelayUrl = common::shared_relay_url().await.parse().unwrap();
+    artel_fs::EndpointSetup::ProductionCustomRelay { relay_url }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::large_futures, clippy::too_many_lines)]
 async fn alice_post_restart_writes_reach_bob_real_n0() {
@@ -657,14 +659,14 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
 
     let alice_daemon = phase(
         "spawn alice daemon (initial)",
-        spawn_daemon_at(&alice_paths, artel_daemon::EndpointSetup::Production),
+        spawn_daemon_at(&alice_paths, daemon_custom_relay_setup().await),
     )
     .await;
     let bob_daemon_state = fresh_state();
     let bob_paths = DaemonPaths::at(bob_daemon_state.root.path());
     let bob_daemon = phase(
         "spawn bob daemon",
-        spawn_daemon_at(&bob_paths, artel_daemon::EndpointSetup::Production),
+        spawn_daemon_at(&bob_paths, daemon_custom_relay_setup().await),
     )
     .await;
 
@@ -673,7 +675,7 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
     let alice_cfg = WorkspaceConfig::default()
         .with_state_dir(alice_wstate.path().to_path_buf())
         .with_daemon_socket(alice_daemon.socket.clone())
-        .with_endpoint_setup(artel_fs::EndpointSetup::Production);
+        .with_endpoint_setup(fs_custom_relay_setup().await);
     let (alice_ws, alice_ws_events) = phase(
         "alice Workspace::host_with (phase 1)",
         Workspace::host_with(
@@ -730,7 +732,7 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
     let bob_cfg = WorkspaceConfig::default()
         .with_state_dir(bob_wstate.path().to_path_buf())
         .with_daemon_socket(bob_daemon.socket.clone())
-        .with_endpoint_setup(artel_fs::EndpointSetup::Production);
+        .with_endpoint_setup(fs_custom_relay_setup().await);
     let (bob_ws, bob_ws_events) = phase(
         "bob Workspace::join_with (doc import + bulk_export)",
         Workspace::join_with(
@@ -789,14 +791,14 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
     // workspace-state dirs.
     let alice_daemon = phase(
         "spawn alice daemon (post-restart)",
-        spawn_daemon_at(&alice_paths, artel_daemon::EndpointSetup::Production),
+        spawn_daemon_at(&alice_paths, daemon_custom_relay_setup().await),
     )
     .await;
     let alice = Client::connect(&alice_daemon.socket).await.unwrap();
     let alice_cfg = WorkspaceConfig::default()
         .with_state_dir(alice_wstate.path().to_path_buf())
         .with_daemon_socket(alice_daemon.socket.clone())
-        .with_endpoint_setup(artel_fs::EndpointSetup::Production);
+        .with_endpoint_setup(fs_custom_relay_setup().await);
     let (alice_ws, alice_ws_events) = phase(
         "alice Workspace::host_with (phase 2 — post-restart)",
         Workspace::host_with(
@@ -958,7 +960,7 @@ async fn host_once_and_capture_ticket(harness: &LocalDaemon, root: PathBuf) -> D
 #[allow(clippy::too_many_lines, clippy::used_underscore_binding)]
 #[tokio::test(flavor = "multi_thread")]
 async fn re_hosting_recovers_session_id_and_resumes_message_flow() {
-    let dns_pkarr = Arc::new(DnsPkarrServer::run().await.unwrap());
+    let dns_pkarr = Arc::new(DnsPkarrServer::run_with_origin(artel_fs::TEST_DNS_ORIGIN.to_string()).await.unwrap());
 
     // Alice's persistent state: workspace root, workspace state dir,
     // and daemon state (iroh.key + sessions). All three outlive the

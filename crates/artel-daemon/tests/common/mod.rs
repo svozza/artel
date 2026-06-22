@@ -53,7 +53,7 @@ async fn shared_dns_pkarr() -> Arc<DnsPkarrServer> {
     SHARED_DNS_PKARR
         .get_or_init(|| async {
             Arc::new(
-                DnsPkarrServer::run()
+                DnsPkarrServer::run_with_origin(artel_daemon::TEST_DNS_ORIGIN.to_string())
                     .await
                     .expect("DnsPkarrServer::run for shared local-daemon fixture"),
             )
@@ -249,7 +249,7 @@ async fn spawn_with_state(config: DaemonConfig, state: Option<State>) -> Running
 /// are queryable before returning so the first dial doesn't race
 /// the publish.
 pub async fn spawn_pair() -> (RunningDaemon, RunningDaemon, Arc<DnsPkarrServer>) {
-    let dns_pkarr = Arc::new(DnsPkarrServer::run().await.expect("DnsPkarrServer::run"));
+    let dns_pkarr = Arc::new(DnsPkarrServer::run_with_origin(artel_daemon::TEST_DNS_ORIGIN.to_string()).await.expect("DnsPkarrServer::run"));
 
     // Box::pin the spawn futures so `tokio::join!` doesn't stack two
     // copies of the (large) `Daemon::start` state machine into one

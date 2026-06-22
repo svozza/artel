@@ -31,7 +31,7 @@ async fn shared_dns_pkarr() -> Arc<DnsPkarrServer> {
     SHARED_DNS_PKARR
         .get_or_init(|| async {
             Arc::new(
-                DnsPkarrServer::run()
+                DnsPkarrServer::run_with_origin(artel_daemon::TEST_DNS_ORIGIN.to_string())
                     .await
                     .expect("DnsPkarrServer::run for shared local-daemon fixture"),
             )

@@ -301,7 +301,7 @@ async fn expired_ticket_rejected_at_admission() {
 #[allow(clippy::too_many_lines)]
 async fn direct_stream_upgrade_delivers_secret() {
     let dns_pkarr = std::sync::Arc::new(
-        iroh::test_utils::DnsPkarrServer::run()
+        iroh::test_utils::DnsPkarrServer::run_with_origin(artel_daemon::TEST_DNS_ORIGIN.to_string())
             .await
             .expect("DnsPkarrServer::run"),
     );
@@ -471,7 +471,7 @@ async fn direct_stream_upgrade_delivers_secret() {
 #[allow(clippy::too_many_lines)]
 async fn revoked_ticket_rejected_live_ticket_admits() {
     let dns_pkarr = std::sync::Arc::new(
-        iroh::test_utils::DnsPkarrServer::run()
+        iroh::test_utils::DnsPkarrServer::run_with_origin(artel_daemon::TEST_DNS_ORIGIN.to_string())
             .await
             .expect("DnsPkarrServer::run"),
     );

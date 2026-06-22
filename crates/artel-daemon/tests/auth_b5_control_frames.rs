@@ -43,19 +43,13 @@ use iroh_gossip::api::Event as GossipEvent;
 use pretty_assertions::assert_eq;
 use tokio::time::timeout;
 
-// INTERIM (iroh 0.98.2): the `_n0` tests below dial through n0's
-// public relay (`Production`) instead of the localhost shared relay.
-// noq-proto 0.17.0 has a handshake path-poisoning bug: when a dialer
-// knows both a relay URL and same-machine direct addrs, the relay
-// copy of the Initial packet wins the race to a localhost relay and
-// wedges the acceptor's handshake (gossip JOIN_READY timeouts).
-// Against the public relay the direct packet always wins, so the bug
-// stays dormant. Fixed upstream in noq-proto 1.0.0-rc. When the iroh
-// 1.0 upgrade lands, revert to `common::shared_relay_url()` +
-// `ProductionCustomRelay` so Tier C stops depending on n0's relay.
-// Full writeup: docs/diagnosing-flaky-tests.md case study 2026-06-11.
-const fn n0_relay_setup() -> EndpointSetup {
-    EndpointSetup::Production
+/// Tier C endpoint setup: localhost shared relay + n0 DNS/pkarr,
+/// skipping TLS cert verification for the self-signed localhost
+/// relay. The two-daemon `_n0` tests below dial each other across
+/// this real-QUIC localhost relay rather than n0's public infra.
+async fn custom_relay_setup() -> EndpointSetup {
+    let relay_url: iroh::RelayUrl = common::shared_relay_url().await.parse().unwrap();
+    EndpointSetup::ProductionCustomRelay { relay_url }
 }
 
 use common::topic_for;
@@ -753,8 +747,8 @@ async fn legit_host_frames_accepted() {
 /// queryable, mirroring `common::spawn_pair` but on
 /// `EndpointSetup::Production`.
 async fn spawn_pair_n0() -> (common::RunningDaemon, common::RunningDaemon) {
-    let a = common::spawn_daemon(common::fresh_state(), n0_relay_setup()).await;
-    let b = common::spawn_daemon(common::fresh_state(), n0_relay_setup()).await;
+    let a = common::spawn_daemon(common::fresh_state(), custom_relay_setup().await).await;
+    let b = common::spawn_daemon(common::fresh_state(), custom_relay_setup().await).await;
     (a, b)
 }
 
@@ -788,8 +782,8 @@ async fn capability_survives_host_restart_n0() {
     let host_paths = common::RestartState::under(host_root.path());
 
     // 1. Spawn host + joiner (both Production/n0).
-    let daemon_a = common::spawn_daemon_at(&host_paths, n0_relay_setup()).await;
-    let daemon_b = common::spawn_daemon(common::fresh_state(), n0_relay_setup()).await;
+    let daemon_a = common::spawn_daemon_at(&host_paths, custom_relay_setup().await).await;
+    let daemon_b = common::spawn_daemon(common::fresh_state(), custom_relay_setup().await).await;
 
     // Alice hosts, bob joins → auto-granted RW.
     let (session_id, alice_client, bob_client, _bob_events) =
@@ -817,7 +811,7 @@ async fn capability_survives_host_restart_n0() {
     daemon_a.stop().await;
 
     // 3. Respawn host at the SAME paths (cold start from disk).
-    let daemon_a = common::spawn_daemon_at(&host_paths, n0_relay_setup()).await;
+    let daemon_a = common::spawn_daemon_at(&host_paths, custom_relay_setup().await).await;
 
     // 4. Alice resumes the session (host(Some(id))).
     let alice_client = Client::connect(&daemon_a.socket).await.unwrap();
@@ -836,7 +830,7 @@ async fn capability_survives_host_restart_n0() {
     // 5. Bob re-joins via a fresh ticket (his mirror was torn down).
     drop(bob_client);
     daemon_b.stop().await;
-    let daemon_b = common::spawn_daemon(common::fresh_state(), n0_relay_setup()).await;
+    let daemon_b = common::spawn_daemon(common::fresh_state(), custom_relay_setup().await).await;
     let bob_client = Client::connect(&daemon_b.socket).await.unwrap();
     let join_resp = bob_client
         .request(Request::JoinSession {

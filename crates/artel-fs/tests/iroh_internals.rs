@@ -21,7 +21,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use artel_client::Client;
-use artel_fs::{AttachPolicy, EndpointSetup, Workspace, WorkspaceConfig, WorkspaceError};
+use artel_fs::{
+    AttachPolicy, EndpointSetup, TEST_DNS_ORIGIN, Workspace, WorkspaceConfig, WorkspaceError,
+};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use iroh::address_lookup::{AddrFilter, DnsAddressLookup, PkarrPublisher};
@@ -299,12 +301,16 @@ impl PkarrNode {
         // dial the host's direct socket. iroh-docs's own `tests/util.rs`
         // paves over the same constraint by spinning a test relay; we
         // don't want a relay in the test.
-        let pkarr_publisher =
-            PkarrPublisher::builder(dns_pkarr.pkarr_url.clone()).addr_filter(AddrFilter::ip_only());
+        // `pkarr_url` / `endpoint_origin` became private in iroh 1.0
+        // (only `pkarr_url()` is public). Own the origin via
+        // `TEST_DNS_ORIGIN`, matching the `run_with_origin` the fixture
+        // is constructed with below.
+        let pkarr_publisher = PkarrPublisher::builder(dns_pkarr.pkarr_url().clone())
+            .addr_filter(AddrFilter::ip_only());
         let endpoint = Endpoint::builder(presets::Empty)
             .secret_key(secret)
             .preset(presets::Minimal)
-            .address_lookup(DnsAddressLookup::builder(dns_pkarr.endpoint_origin.clone()))
+            .address_lookup(DnsAddressLookup::builder(TEST_DNS_ORIGIN.to_string()))
             .address_lookup(pkarr_publisher)
             .dns_resolver(dns_pkarr.dns_resolver())
             .bind()
@@ -349,7 +355,11 @@ impl PkarrNode {
 async fn doc_ticket_round_trips_via_localhost_pkarr_dns() {
     init_n0_tracing();
 
-    let dns_pkarr = Arc::new(DnsPkarrServer::run().await.expect("DnsPkarrServer::run"));
+    let dns_pkarr = Arc::new(
+        DnsPkarrServer::run_with_origin(TEST_DNS_ORIGIN.to_string())
+            .await
+            .expect("DnsPkarrServer::run_with_origin"),
+    );
 
     let host = pkarr_phase("host node spawn", PkarrNode::spawn(&dns_pkarr)).await;
     let joiner = pkarr_phase("joiner node spawn", PkarrNode::spawn(&dns_pkarr)).await;
