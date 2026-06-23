@@ -371,7 +371,7 @@ pub enum TicketEnvelopeError {
 }
 ```
 
-`PolicyViolation` carries up to 5 offending entries so the user error is actionable: "refused to host /Users/svozza: contains Documents/, Pictures/, .ssh/, ...". This is the actual UX win of `RequireEmpty`.
+`PolicyViolation` carries up to 5 offending entries so the user error is actionable: "refused to host /Users/alice: contains Documents/, Pictures/, .ssh/, ...". This is the actual UX win of `RequireEmpty`.
 
 ### Postcard encoding for `PathRules`
 
