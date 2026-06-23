@@ -1,0 +1,65 @@
+name: Nightly
+
+# The slow / expensive / network-dependent coverage that we keep off
+# the per-PR path:
+#   - macOS hermetic tests (artel targets both Unix platforms, but
+#     macOS runner minutes are ~10x on a private repo).
+#   - the real-n0 tier (Tier C): dials n0's public relay +
+#     pkarr.iroh.computer, so it is network-dependent and subject to
+#     the documented noq-proto handshake flakiness — not something we
+#     want gating PRs. See docs/diagnosing-flaky-tests.md.
+#
+# Runs on a nightly schedule and on demand. A red run here is a signal
+# to investigate (real regression vs. n0-infra flake), not a merge
+# blocker.
+
+on:
+  schedule:
+    # 04:00 UTC daily. Cron has no access to repo secrets on forks, but
+    # this runs on the base repo so that is not a concern here.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  RUST_BACKTRACE: 1
+
+jobs:
+  # macOS hermetic (Tier A + B). Mirrors the per-PR `test` job but on
+  # macOS, which the per-PR path skips to save metered minutes.
+  macos-hermetic:
+    name: test (macos / hermetic)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - run: cargo build --workspace --all-targets --all-features
+      - run: cargo nextest run --workspace --profile ci
+      - run: cargo nextest run --workspace --profile ci --all-features
+      - run: cargo test --workspace --doc --all-features
+
+  # Real-n0 tier (Tier C) on both Unix platforms. Serial within the
+  # tier (the n0 nextest profile pins test-threads=1). Allowed to fail
+  # without failing the whole workflow run is NOT set — a red n0 run
+  # should be visible — but it never blocks a PR because it only runs
+  # here, not on the per-PR `CI` workflow.
+  n0:
+    name: test-n0 (${{ matrix.os }} / real n0)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - run: cargo nextest run --workspace --profile n0

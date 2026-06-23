@@ -5,6 +5,14 @@ on:
     branches: [main]
   pull_request:
 
+# Cancel superseded runs on the same ref (a force-push or a second push
+# to a PR) so we don't burn metered private-repo minutes finishing a
+# run nobody is waiting on. The main-branch push runs are keyed by SHA
+# so they are never cancelled.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
@@ -30,22 +38,36 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      # Both feature modes, mirroring `make clippy`.
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-  test:
-    name: test (${{ matrix.os }} / ${{ matrix.rust }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-        rust: [stable]
+  doc:
+    name: rustdoc
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ matrix.rust }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Catches broken intra-doc links in both feature modes (`make doc`).
+      - run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - run: cargo doc --workspace --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # Per-PR test tier: hermetic only (Tier A + B), Linux only. Fast,
+  # deterministic, no real network. The real-n0 tier and macOS coverage
+  # run in the scheduled `nightly` workflow instead — they are slower,
+  # network-dependent (n0 dials the public relay), and macOS minutes are
+  # ~10x on a private repo.
+  test:
+    name: test (ubuntu / hermetic)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
@@ -53,5 +75,4 @@ jobs:
       - run: cargo build --workspace --all-targets --all-features
       - run: cargo nextest run --workspace --profile ci
       - run: cargo nextest run --workspace --profile ci --all-features
-      - run: cargo nextest run --workspace --profile n0
       - run: cargo test --workspace --doc --all-features

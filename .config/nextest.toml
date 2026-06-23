@@ -30,10 +30,11 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 default-filter = "not test(/_n0$/)"
 
 [profile.ci]
-# CI runs Tier A + B + C across two invocations: this profile
-# covers A + B with fail-fast so a failing fast-tier test doesn't
-# burn the slow C tier. The C tier is launched as a separate
-# `cargo nextest run --profile n0` invocation by the CI script.
+# Per-PR tier (Tier A + B), used by the `CI` workflow's `test` job.
+# fail-fast so a failing fast-tier test doesn't burn the rest of the
+# run. The real-n0 tier (Tier C) is NOT run per-PR — it runs in the
+# `Nightly` workflow via `--profile n0` (network-dependent + flaky;
+# see .github/workflows/nightly.yml and docs/diagnosing-flaky-tests.md).
 fail-fast = true
 slow-timeout = { period = "60s", terminate-after = 2 }
 default-filter = "not test(/_n0$/)"
