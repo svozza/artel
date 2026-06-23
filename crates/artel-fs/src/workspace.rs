@@ -4360,7 +4360,11 @@ mod tests {
             }
         }
 
-        let dns_pkarr = Arc::new(DnsPkarrServer::run_with_origin(artel_fs::TEST_DNS_ORIGIN.to_string()).await.expect("DnsPkarrServer::run"));
+        let dns_pkarr = Arc::new(
+            DnsPkarrServer::run_with_origin(artel_fs::TEST_DNS_ORIGIN.to_string())
+                .await
+                .expect("DnsPkarrServer::run"),
+        );
         let dir = TempDir::new().unwrap();
         let socket = dir.path().join("daemon.sock");
         let pid = dir.path().join("daemon.pid");
@@ -4536,7 +4540,11 @@ mod tests {
         use artel_daemon::{Daemon, DaemonConfig, EndpointSetup as DaemonEndpointSetup};
         use iroh::test_utils::DnsPkarrServer;
 
-        let dns_pkarr = Arc::new(DnsPkarrServer::run_with_origin(artel_fs::TEST_DNS_ORIGIN.to_string()).await.expect("DnsPkarrServer::run"));
+        let dns_pkarr = Arc::new(
+            DnsPkarrServer::run_with_origin(artel_fs::TEST_DNS_ORIGIN.to_string())
+                .await
+                .expect("DnsPkarrServer::run"),
+        );
         let dir = TempDir::new().unwrap();
         let socket = dir.path().join("daemon.sock");
         let daemon = Daemon::start(DaemonConfig {

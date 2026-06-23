@@ -432,7 +432,11 @@ pub struct Pair {
 /// can't race the publish. Eliminates the propagation-window
 /// flakes that the old `MemoryLookup` fixture papered over.
 pub async fn spawn_pair() -> Pair {
-    let dns_pkarr = Arc::new(DnsPkarrServer::run_with_origin(artel_fs::TEST_DNS_ORIGIN.to_string()).await.expect("DnsPkarrServer::run"));
+    let dns_pkarr = Arc::new(
+        DnsPkarrServer::run_with_origin(artel_fs::TEST_DNS_ORIGIN.to_string())
+            .await
+            .expect("DnsPkarrServer::run"),
+    );
 
     // Box::pin the spawn futures so `tokio::join!` doesn't stack two
     // copies of the (large) `Daemon::start` state machine into one

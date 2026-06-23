@@ -413,7 +413,11 @@ async fn alice_post_restart_writes_reach_bob() {
     // spawn alice's daemon at caller-owned paths so the same on-disk
     // state (including iroh secret) survives the mid-test restart.
     // Bob's daemon uses `fresh_state()` since it doesn't restart.
-    let dns_pkarr = Arc::new(DnsPkarrServer::run_with_origin(artel_fs::TEST_DNS_ORIGIN.to_string()).await.expect("DnsPkarrServer::run"));
+    let dns_pkarr = Arc::new(
+        DnsPkarrServer::run_with_origin(artel_fs::TEST_DNS_ORIGIN.to_string())
+            .await
+            .expect("DnsPkarrServer::run"),
+    );
     let alice_daemon = spawn_daemon_at(&alice_paths, daemon_testing_setup(&dns_pkarr)).await;
     let bob_daemon = spawn_daemon_with_setup(fresh_state(), daemon_testing_setup(&dns_pkarr)).await;
 
@@ -960,7 +964,11 @@ async fn host_once_and_capture_ticket(harness: &LocalDaemon, root: PathBuf) -> D
 #[allow(clippy::too_many_lines, clippy::used_underscore_binding)]
 #[tokio::test(flavor = "multi_thread")]
 async fn re_hosting_recovers_session_id_and_resumes_message_flow() {
-    let dns_pkarr = Arc::new(DnsPkarrServer::run_with_origin(artel_fs::TEST_DNS_ORIGIN.to_string()).await.unwrap());
+    let dns_pkarr = Arc::new(
+        DnsPkarrServer::run_with_origin(artel_fs::TEST_DNS_ORIGIN.to_string())
+            .await
+            .unwrap(),
+    );
 
     // Alice's persistent state: workspace root, workspace state dir,
     // and daemon state (iroh.key + sessions). All three outlive the

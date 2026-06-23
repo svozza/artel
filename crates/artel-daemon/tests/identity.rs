@@ -144,7 +144,11 @@ async fn missing_iroh_key_path_under_iroh_feature_errors() {
         sessions_dir: root.path().join("sessions"),
         iroh_key_path: None,
         endpoint_setup: EndpointSetup::Testing {
-            dns_pkarr: std::sync::Arc::new(DnsPkarrServer::run_with_origin(artel_daemon::TEST_DNS_ORIGIN.to_string()).await.expect("DnsPkarrServer")),
+            dns_pkarr: std::sync::Arc::new(
+                DnsPkarrServer::run_with_origin(artel_daemon::TEST_DNS_ORIGIN.to_string())
+                    .await
+                    .expect("DnsPkarrServer"),
+            ),
         },
     })
     .await

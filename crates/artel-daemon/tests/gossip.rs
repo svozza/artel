@@ -96,7 +96,11 @@ impl SmokeDaemon {
 
 #[tokio::test]
 async fn two_daemons_exchange_a_payload_over_gossip() {
-    let dns_pkarr = Arc::new(DnsPkarrServer::run_with_origin(artel_daemon::TEST_DNS_ORIGIN.to_string()).await.expect("dns_pkarr"));
+    let dns_pkarr = Arc::new(
+        DnsPkarrServer::run_with_origin(artel_daemon::TEST_DNS_ORIGIN.to_string())
+            .await
+            .expect("dns_pkarr"),
+    );
     let state_a = common::fresh_state();
     let state_b = common::fresh_state();
 
