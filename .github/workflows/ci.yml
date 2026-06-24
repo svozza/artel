@@ -37,6 +37,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # mold: a much faster linker than the default bfd. Link time
+      # dominates rebuilds of this multi-crate workspace + its test
+      # binaries; mold cuts it with no change to compiled output.
+      - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
         with:
           # Only the main-branch build writes the cache; PR builds
@@ -78,13 +82,22 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
-      - run: cargo build --workspace --all-targets --all-features
-      - run: cargo nextest run --workspace --profile ci
+      # Verify the default-feature config compiles (the clippy job only
+      # lints it; this catches a default-only build break). `iroh` and
+      # `test-utils` are unified on for the test build via each crate's
+      # self dev-dependency, so the *test set* is identical in both
+      # feature modes (confirmed: same 808 tests) — `--all-features` is
+      # the strict superset. We therefore run the suite ONCE, under
+      # all-features, rather than twice; the default-feature build above
+      # preserves the "does it still compile without the extras" signal
+      # without paying for a second full 800-test run.
+      - run: cargo build --workspace --all-targets
       - run: cargo nextest run --workspace --profile ci --all-features
       - run: cargo test --workspace --doc --all-features
