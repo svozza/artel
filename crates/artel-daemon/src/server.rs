@@ -89,7 +89,7 @@ pub struct DaemonConfig {
     /// Real deployments use [`EndpointSetup::Production`] (default
     /// — `presets::N0`, pkarr publish + DNS resolve via n0
     /// infrastructure). Integration tests use
-    /// [`EndpointSetup::Testing`] with a shared
+    /// `EndpointSetup::Testing` with a shared
     /// `Arc<DnsPkarrServer>` so two in-process daemons share a
     /// localhost pkarr+DNS pair instead of paying n0's external
     /// rate limits.
@@ -186,7 +186,7 @@ pub struct IrohRuntime {
     /// shutdown-snapshot: at graceful shutdown the daemon walks
     /// this set, looks up each id's current `RemoteInfo` from the
     /// endpoint, and persists the result to
-    /// [`Self::peer_addr_cache`]. iroh 0.98.2 has no public
+    /// `Self::peer_addr_cache`. iroh 0.98.2 has no public
     /// `remote_info_iter`, so the daemon maintains this shadow.
     ///
     /// **Invariant**: every `addr_hint.add_endpoint_info(addr)` call
@@ -1634,7 +1634,11 @@ mod tests {
         let key_path = dir.path().join("iroh.key");
         // Hermetic relay/pkarr so we don't reach n0; the test is
         // about the *key bytes*, not network traffic.
-        let dns_pkarr = Arc::new(DnsPkarrServer::run_with_origin(crate::TEST_DNS_ORIGIN.to_string()).await.expect("dns_pkarr server"));
+        let dns_pkarr = Arc::new(
+            DnsPkarrServer::run_with_origin(crate::TEST_DNS_ORIGIN.to_string())
+                .await
+                .expect("dns_pkarr server"),
+        );
         let setup = EndpointSetup::Testing {
             dns_pkarr: Arc::clone(&dns_pkarr),
         };
@@ -1669,7 +1673,11 @@ mod tests {
     async fn deliver_frame_times_out_against_undialable_peer() {
         let dir = tempfile::tempdir().unwrap();
         let key_path = dir.path().join("iroh.key");
-        let dns_pkarr = Arc::new(DnsPkarrServer::run_with_origin(crate::TEST_DNS_ORIGIN.to_string()).await.expect("dns_pkarr server"));
+        let dns_pkarr = Arc::new(
+            DnsPkarrServer::run_with_origin(crate::TEST_DNS_ORIGIN.to_string())
+                .await
+                .expect("dns_pkarr server"),
+        );
         let setup = EndpointSetup::Testing {
             dns_pkarr: Arc::clone(&dns_pkarr),
         };

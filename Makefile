@@ -41,8 +41,8 @@ clippy:
 # (default + all-features) so a feature-gated link or item failure
 # is caught in either build.
 doc:
-	cargo doc --workspace --no-deps
-	cargo doc --workspace --no-deps --all-features
+	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 
 # Coverage via cargo-llvm-cov. Requires `cargo install
 # cargo-llvm-cov` once (instrumented binaries need llvm-tools and

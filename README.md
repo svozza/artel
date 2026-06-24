@@ -1,5 +1,7 @@
 # artel
 
+[![CI](https://github.com/svozza/artel/actions/workflows/ci.yml/badge.svg)](https://github.com/svozza/artel/actions/workflows/ci.yml)
+
 A peer-to-peer collaborative substrate for Rust applications.
 
 `artel` is a long-running local daemon plus a Rust client crate that gives apps:

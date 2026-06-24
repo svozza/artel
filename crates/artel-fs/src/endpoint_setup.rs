@@ -40,7 +40,7 @@
 /// internally. To avoid silently coupling to that private default we
 /// own the value here and construct the fixture via
 /// `DnsPkarrServer::run_with_origin(TEST_DNS_ORIGIN)`, so the origin
-/// the server serves on and the origin [`EndpointSetup::apply`]
+/// the server serves on and the origin `EndpointSetup::apply`
 /// resolves against are the same string.
 #[cfg(feature = "test-utils")]
 pub const TEST_DNS_ORIGIN: &str = "dns.iroh.test";
@@ -71,7 +71,7 @@ pub enum EndpointSetup {
     },
     /// Testing-with-an-unreachable-relay: [`iroh::endpoint::presets::Minimal`]
     /// plus a custom [`iroh::RelayMode`] pointed at an RFC 5737
-    /// TEST-NET-1 address. [`Self::awaits_relay`] returns `true` so
+    /// TEST-NET-1 address. `Self::awaits_relay` returns `true` so
     /// the caller hits [`iroh::Endpoint::online`]; the relay
     /// handshake never completes. Sole consumer is the integration
     /// test that pins the timeout-and-typed-error contract for

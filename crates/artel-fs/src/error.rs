@@ -34,7 +34,7 @@ pub enum WorkspaceError {
     /// resolve within the configured budget. Surfaces when the
     /// configured relay is unreachable — e.g. user offline (flight,
     /// captive portal), n0 outage, or an explicit
-    /// [`crate::EndpointSetup::TestingUnreachableRelay`] fixture.
+    /// `EndpointSetup::TestingUnreachableRelay` fixture.
     /// The substrate fails fast instead of hanging
     /// [`crate::Workspace::host_with`] / `join_with` forever.
     #[error("relay unreachable: home-relay handshake did not complete within {0:?}")]

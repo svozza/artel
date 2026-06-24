@@ -3,7 +3,7 @@
 //! See `docs/brainstorms/2026-05-30-auth-story-brainstorm.md` § L3 and
 //! `docs/plans/2026-06-02-auth-slice-b-l3-signing-plan.md` § B1. The
 //! signature scope is intentionally narrower than the full struct —
-//! [`Seq`](crate::ids::Seq) is host-assigned and excluded so a joiner
+//! [`Seq`] is host-assigned and excluded so a joiner
 //! can sign its body before the host stamps the seq.
 //!
 //! ## Canonical bytes

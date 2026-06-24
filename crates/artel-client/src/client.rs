@@ -109,7 +109,8 @@ impl Client {
     /// nothing is listening, the daemon binary at
     /// [`SpawnOptions::daemon_binary`] is spawned detached, the client
     /// waits for the socket to come up, and a fresh `connect` is
-    /// retried. See [`crate::spawn`] for the lifecycle details.
+    /// retried. See [`SpawnOptions`](crate::SpawnOptions) for the
+    /// lifecycle details.
     ///
     /// [`SpawnOptions::daemon_binary`]: crate::SpawnOptions::daemon_binary
     pub async fn connect_or_spawn(opts: crate::SpawnOptions) -> Result<Self, ClientError> {

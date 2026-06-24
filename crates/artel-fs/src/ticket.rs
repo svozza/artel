@@ -32,7 +32,7 @@ const ENVELOPE_VERSION: u8 = 2;
 
 /// Versioned envelope shipped as the `workspace.ticket` payload.
 ///
-/// `doc_ticket` is the [`iroh_docs::DocTicket::to_string()`] form so
+/// `doc_ticket` is the `iroh_docs::DocTicket::to_string()` form so
 /// the joiner can `DocTicket::from_str` it after decoding the
 /// envelope. `rules` are the host's [`PathRules`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,7 +110,7 @@ pub fn encode(env: &WorkspaceTicketEnvelope) -> Result<Vec<u8>, TicketEnvelopeEr
 ///   decode as the envelope shape (covers old raw `DocTicket`
 ///   strings — they fail this branch).
 /// - [`TicketEnvelopeError::UnsupportedVersion`] if the version byte
-///   is not [`ENVELOPE_VERSION`].
+///   is not `ENVELOPE_VERSION`.
 /// - [`TicketEnvelopeError::PathRules`] if the embedded rules don't
 ///   pass [`PathRules::validate`].
 pub fn decode(bytes: &[u8]) -> Result<WorkspaceTicketEnvelope, TicketEnvelopeError> {
