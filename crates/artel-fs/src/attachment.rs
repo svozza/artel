@@ -109,6 +109,12 @@ impl WorkspaceAttachmentV1 {
     /// raw payload bytes (mirrors [`crate::ticket::decode`]'s shape).
     ///
     /// [`Attachment::payload`]: artel_protocol::Attachment::payload
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceError::Iroh`] if `bytes` is not a valid
+    /// postcard encoding of [`WorkspaceAttachmentV1`] — e.g. truncated
+    /// input or a field-count mismatch from a different schema version.
     pub fn decode(bytes: &[u8]) -> Result<Self, WorkspaceError> {
         postcard::from_bytes(bytes)
             .map_err(|e| WorkspaceError::Iroh(format!("attachment decode: {e}")))
@@ -140,6 +146,13 @@ pub struct KnownWorkspace {
 /// payload shouldn't take down enumeration. A future
 /// `list_known_workspaces_strict` helper could surface decode errors
 /// instead, additively.
+///
+/// # Errors
+///
+/// Returns [`WorkspaceError::Client`] if the [`Request::ListAttachments`]
+/// round-trip to the daemon fails, or [`WorkspaceError::Iroh`] if the
+/// daemon answers with an unexpected response variant. Per-entry decode
+/// failures are warn-and-skipped, not propagated.
 pub async fn list_known_workspaces(client: &Client) -> Result<Vec<KnownWorkspace>, WorkspaceError> {
     let resp = client
         .request(Request::ListAttachments {

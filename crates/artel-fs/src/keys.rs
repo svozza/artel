@@ -20,6 +20,8 @@ pub const KEY_PREFIX: &str = "path/";
 
 /// Convert an absolute path inside `root` into a doc key.
 ///
+/// # Errors
+///
 /// Returns [`WorkspaceError::InvalidPath`] if the path is not under
 /// `root`, contains a parent-directory component, has non-UTF-8
 /// components, or somehow ended up absolute after stripping `root`.
@@ -72,9 +74,11 @@ pub fn path_to_key(root: &Path, abs_path: &Path) -> Result<Vec<u8>, WorkspaceErr
 
 /// Convert a doc key back into an absolute path inside `root`.
 ///
-/// Rejects anything that does not start with [`KEY_PREFIX`], is not
-/// valid UTF-8, would escape `root` via parent traversal, or
-/// represents an absolute path / Windows drive prefix.
+/// # Errors
+///
+/// Returns [`WorkspaceError::InvalidPath`] if `key` does not start with
+/// [`KEY_PREFIX`], is not valid UTF-8, would escape `root` via parent
+/// traversal, or represents an absolute path / Windows drive prefix.
 pub fn key_to_path(root: &Path, key: &[u8]) -> Result<PathBuf, WorkspaceError> {
     let prefix_bytes = KEY_PREFIX.as_bytes();
     if !key.starts_with(prefix_bytes) {

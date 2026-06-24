@@ -18,6 +18,8 @@
 //! - The pure-logic helpers ([`keys`], [`filter`], [`echo_guard`])
 //!   are public so apps and tests can reuse them.
 
+#![warn(clippy::missing_errors_doc, clippy::missing_panics_doc)]
+
 mod applier;
 pub mod attachment;
 mod docs_gate;
