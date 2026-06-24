@@ -24,6 +24,8 @@
 //! - [`MessageFormat`] / [`MESSAGE_FORMAT`] — the per-message envelope
 //!   version stamped on every [`SessionMessage`].
 
+#![warn(clippy::missing_errors_doc, clippy::missing_panics_doc)]
+
 pub mod capability;
 pub mod error;
 pub mod gossip;
