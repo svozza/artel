@@ -1620,6 +1620,11 @@ impl Workspace {
         self: &Arc<Self>,
         source: ReimportSource,
     ) -> Result<(), WorkspaceError> {
+        // The host re-importing a namespace it just minted owns the
+        // authoritative on-disk state and must run a catch-up scan after
+        // the respawn (see the scan call below). A survivor must not.
+        let is_host_local = matches!(source, ReimportSource::HostLocal { .. });
+
         // Resolve (capability, sync-nodes, expected namespace id, epoch)
         // from the source.
         let (capability, sync_nodes, new_namespace, new_epoch_hint) = match source {
@@ -1712,8 +1717,45 @@ impl Workspace {
         // the swapped doc. We respawn only the doc tasks (not full
         // `run`) so we don't re-enter the rotation-task spawn — the
         // rotation task is already running and survives the doc_token
-        // reset (it lives on `shutdown_token`).
+        // reset (it lives on `shutdown_token`). `spawn_doc_tasks`
+        // awaits the watcher's `ready` signal, so the OS-level watch is
+        // attached by the time it returns.
         drop(Arc::clone(self).spawn_doc_tasks().await);
+
+        // Catch-up scan (host only). Between the old watcher exiting on
+        // the doc-token cancel above and the new watcher's recursive
+        // watch attaching, there is a window in which a local write to
+        // the host's tree produces no filesystem event for *either*
+        // watcher — `notify` does no initial scan on attach, so a file
+        // created in that gap is never published to the rotated
+        // namespace and is lost (the auto-rotation write cut-off tests
+        // hit this under load: the host's post-rotation write never
+        // landed). Mirror `host_with`'s construction-time
+        // `scan_and_publish_existing` to republish the current tree into
+        // the new namespace; re-publishing a carried-forward survivor is
+        // a no-op at the doc layer (same host author, same content hash),
+        // so the scan only adds entries the watcher missed. Host-only:
+        // the host's disk is authoritative for its own writes, whereas a
+        // survivor scanning here could resurrect a path the host
+        // tombstoned in the rotation but whose delete the survivor's
+        // applier hasn't yet laid down.
+        if is_host_local {
+            debug!(
+                target: "artel_fs::workspace",
+                %new_namespace,
+                "reimport_namespace: catch-up scan of host tree into rotated namespace",
+            );
+            let scan_doc = self.doc();
+            scan_and_publish_existing(
+                &self.root,
+                &scan_doc,
+                self.author,
+                &self.compiled_rules,
+                &self.echo_guard,
+                &self.events,
+            )
+            .await?;
+        }
 
         // Reflect the new epoch locally so a future stale rotation is
         // ignored. The host sets this before distributing; a survivor

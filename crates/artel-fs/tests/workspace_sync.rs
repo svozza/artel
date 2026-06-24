@@ -1081,6 +1081,85 @@ async fn reimport_swaps_namespace_and_keeps_workspace_live() {
 }
 
 // =============================================================
+// Reimport catch-up scan (rotation dead-window regression): a host
+// write that lands on disk during the watcher teardown→reattach window
+// of a rotation must still reach the rotated namespace.
+//
+// The bug: `reimport_namespace` cancels the old watcher, swaps the doc,
+// then respawns a forward-only watcher. `notify` does no initial scan
+// on attach, so a file that already exists when the new watch attaches
+// produces no event — ever. If that file also wasn't published to the
+// OLD namespace before the rotation snapshot, it is in neither the
+// carried-forward survivor set nor any future watcher event, and is
+// silently lost from the live namespace. This surfaced under load as
+// `evict_auto_rotates_and_cuts_off_writes` /
+// `late_joiner_lands_on_rotated_namespace_and_can_be_promoted` failing
+// with "host post-rotation write never landed in the new namespace".
+//
+// This reproduces the window deterministically WITHOUT relying on load:
+// write `unpublished.txt`, then rotate *within* the 300ms watcher
+// debounce so the file is provably absent from the old doc's rotation
+// snapshot (not a survivor) and pre-exists the respawned watch (no
+// event). The catch-up scan in `reimport_namespace` is the only path
+// that can carry it into the rotated namespace; without it this test
+// fails.
+// =============================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reimport_catch_up_scan_recovers_write_in_rotation_window() {
+    // `_dir` held only for liveness; paths use `ws.root` (canonical) so
+    // `path_to_key` strip_prefix works on macOS (/var -> /private/var).
+    let (daemon, _client, ws, handle, _events, _dir, _dns_pkarr) =
+        spawn_host_workspace_for_empty_test().await;
+
+    // A survivor that IS published before rotation, so we also confirm
+    // the catch-up scan doesn't disturb the carry-forward path.
+    tokio::fs::write(ws.root.join("kept.txt"), b"keep me")
+        .await
+        .unwrap();
+    assert!(
+        wait_for_doc_entry(&ws, &ws.root.join("kept.txt"), WAIT_BUDGET).await,
+        "seed file never landed pre-rotation",
+    );
+
+    // Write a file but do NOT wait for the watcher's 300ms debounce to
+    // publish it, then rotate immediately. The rotation snapshot reads
+    // the old doc synchronously, well within the debounce window, so
+    // `unpublished.txt` is provably NOT a carried-forward survivor — and
+    // because it already exists on disk when the respawned watcher
+    // attaches, no filesystem event will ever publish it. The catch-up
+    // scan is the only thing that can land it in the new namespace.
+    tokio::fs::write(ws.root.join("unpublished.txt"), b"in the window")
+        .await
+        .unwrap();
+    let ns_after = ws
+        .test_rotate_and_reimport(0)
+        .await
+        .expect("rotate_and_reimport");
+
+    // Both files must be present in the rotated namespace: kept.txt via
+    // the survivor carry-forward, unpublished.txt via the catch-up scan.
+    assert!(
+        wait_for_doc_entry(&ws, &ws.root.join("unpublished.txt"), WAIT_BUDGET).await,
+        "write in the rotation dead-window never reached the rotated \
+         namespace — catch-up scan missing",
+    );
+    let keys = ws.test_namespace_keys(ns_after).await;
+    assert!(
+        keys.iter().any(|k| k.ends_with("kept.txt")),
+        "rotated namespace must still carry forward kept.txt; keys={keys:?}",
+    );
+    assert!(
+        keys.iter().any(|k| k.ends_with("unpublished.txt")),
+        "rotated namespace must contain the dead-window write; keys={keys:?}",
+    );
+
+    ws.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), handle).await;
+    daemon.stop().await;
+}
+
+// =============================================================
 // Epoch persistence (C2 regression): namespace_epoch must survive a
 // host restart. Without on-disk persistence the counter resets to 0,
 // and a second eviction re-mints epoch 1 — which every survivor that
