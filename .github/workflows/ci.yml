@@ -32,14 +32,21 @@ jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-latest
+    # mold: a much faster linker than the default bfd. Link time
+    # dominates rebuilds of this multi-crate workspace + its test
+    # binaries. `setup-mold` installs it, but rustc links via `cc` and
+    # won't pick mold up from the /usr/bin/ld symlink alone — it must be
+    # told `-fuse-ld=mold` explicitly. We set it in RUSTFLAGS here
+    # (re-including the global `-D warnings`, since a job-level env
+    # REPLACES the workflow-level one). Note this changes the rust-cache
+    # key, so the first run on this config is cold; main then re-warms.
+    env:
+      RUSTFLAGS: "-D warnings -C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      # mold: a much faster linker than the default bfd. Link time
-      # dominates rebuilds of this multi-crate workspace + its test
-      # binaries; mold cuts it with no change to compiled output.
       - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
         with:
@@ -79,6 +86,11 @@ jobs:
   test:
     name: test (ubuntu / hermetic)
     runs-on: ubuntu-latest
+    # See the clippy job: tell rustc to link with mold explicitly.
+    # Job-level env replaces the workflow-level one, so re-include
+    # `-D warnings`.
+    env:
+      RUSTFLAGS: "-D warnings -C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
