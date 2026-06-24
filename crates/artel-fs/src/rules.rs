@@ -119,6 +119,15 @@ impl PathRules {
     /// and on the joiner after decoding it. Belt-and-braces — a corrupt
     /// host refuses to publish bad rules; a corrupt wire is rejected
     /// at decode.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`PathRulesError`] hit while checking each
+    /// rule's glob: [`PathRulesError::EmptyGlob`],
+    /// [`PathRulesError::AbsoluteGlob`],
+    /// [`PathRulesError::ParentTraversalGlob`], or
+    /// [`PathRulesError::InvalidGlob`] for a glob the matcher won't
+    /// compile.
     pub fn validate(&self) -> Result<(), PathRulesError> {
         for rule in &self.rules {
             validate_glob(&rule.glob)?;
@@ -132,6 +141,13 @@ impl PathRules {
     ///
     /// Validates as a side-effect; the returned [`CompiledPathRules`]
     /// is guaranteed to have well-formed globs.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same [`PathRulesError`] variants as
+    /// [`Self::validate`] for a malformed glob, plus
+    /// [`PathRulesError::InvalidGlob`] if the underlying [`GlobSet`]
+    /// fails to build.
     pub fn compile(&self) -> Result<CompiledPathRules, PathRulesError> {
         let mut builder = GlobSetBuilder::new();
         let mut modes = Vec::with_capacity(self.rules.len());
@@ -173,6 +189,13 @@ pub struct CompiledPathRules {
 
 impl CompiledPathRules {
     /// Default-permissive runtime rules.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: [`PathRules::read_write`] carries an empty
+    /// rule set, so [`PathRules::compile`] has no globs to validate and
+    /// the empty [`GlobSet`] always builds. The `expect` guards an
+    /// invariant that cannot be violated by this input.
     #[must_use]
     pub fn read_write() -> Self {
         PathRules::read_write()

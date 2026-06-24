@@ -608,6 +608,11 @@ impl Workspace {
     /// the [`WorkspaceEvent`] stream. Call [`Self::run`] to start
     /// the watcher + applier. Read the workspace's session id via
     /// [`Self::session_id`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates every failure of [`Self::host_with`], which it calls
+    /// with [`WorkspaceConfig::default`].
     pub async fn host(
         client: &Client,
         display_name: impl Into<String>,
@@ -639,9 +644,22 @@ impl Workspace {
     /// remaining on-disk files. The resulting ticket is byte-stable
     /// across restarts so any joiner with the old ticket can resume.
     ///
-    /// Errors with [`WorkspaceError::SessionConflict`] when the daemon
-    /// already owns the derived id with a different host peer or as a
-    /// remote-mirror session — see [`ProtocolError::SessionConflict`].
+    /// # Errors
+    ///
+    /// - [`WorkspaceError::Policy`] if `policy` rejects the existing
+    ///   `root` / `state_dir` (e.g. a non-empty dir under a strict
+    ///   policy); checked before any on-disk artefacts are created.
+    /// - [`WorkspaceError::PathRules`] / the rules error type if the
+    ///   configured [`PathRules`] fail to compile.
+    /// - [`WorkspaceError::Io`] / [`WorkspaceError::Iroh`] if the state
+    ///   directory or iroh node can't be created, or [`WorkspaceError::Doc`]
+    ///   for iroh-docs failures (doc open/create, sync, share, import).
+    /// - [`WorkspaceError::SessionConflict`] when the daemon already
+    ///   owns the derived id with a different host peer or as a
+    ///   remote-mirror session — see [`ProtocolError::SessionConflict`].
+    ///
+    /// On any failure the rollback guard tears down the daemon-side
+    /// session and the acquired iroh node before returning.
     pub async fn host_with(
         client: &Client,
         display_name: impl Into<String>,
@@ -1014,6 +1032,11 @@ impl Workspace {
     /// **Side effect:** consumes the client's [`Client::take_events`]
     /// channel. Callers that need to observe other session events
     /// from the same connection should open a second [`Client`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates every failure of [`Self::join_with`], which it calls
+    /// with [`WorkspaceConfig::default`].
     pub async fn join(
         client: &Client,
         session: SessionId,
@@ -1030,6 +1053,22 @@ impl Workspace {
     /// the existing replica; if the host's namespace has changed
     /// since last time, the joiner imports the new ticket alongside
     /// the old one without losing what it already had on disk.
+    ///
+    /// # Errors
+    ///
+    /// - [`WorkspaceError::Policy`] if `policy` rejects the existing
+    ///   `root` / `state_dir`; checked before any on-disk or IPC state.
+    /// - [`WorkspaceError::Io`] / [`WorkspaceError::Iroh`] if the state
+    ///   directory or iroh node can't be created.
+    /// - [`WorkspaceError::Iroh`] if the daemon's event stream closes or
+    ///   times out (15 s) before the `workspace.ticket` envelope
+    ///   arrives, or if [`Client::take_events`] was already consumed.
+    /// - [`WorkspaceError::Doc`] for iroh-docs failures importing the
+    ///   ticket or bulk-exporting the doc into `root`.
+    ///
+    /// On any failure the rollback guard shuts down the iroh node and
+    /// forgets the joiner-side attachment; session membership (a
+    /// precondition) is left untouched.
     pub async fn join_with(
         client: &Client,
         session: SessionId,
@@ -1321,6 +1360,11 @@ impl Workspace {
     /// to it directly; use the filesystem path instead. `Doc` is a
     /// cheap `Clone` handle; callers get a snapshot of the *current*
     /// namespace (rotation may swap the underlying handle).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `doc` mutex is poisoned — i.e. another
+    /// thread panicked while holding it.
     #[must_use]
     pub fn doc(&self) -> Doc {
         self.doc.lock().expect("doc mutex").clone()
@@ -2030,6 +2074,11 @@ impl Workspace {
     ///
     /// Both tasks honour the workspace's shutdown token. The
     /// returned `JoinHandle` resolves once both have exited.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `rotation_rx` mutex is poisoned — i.e.
+    /// another thread panicked while holding it.
     #[must_use]
     pub async fn run(self: std::sync::Arc<Self>) -> tokio::task::JoinHandle<()> {
         debug!(target: "artel_fs::workspace", root = %self.root.display(), "run: spawning watcher + applier");
@@ -2159,6 +2208,12 @@ impl Workspace {
     /// parallel tests in the same integration binary trip each
     /// other's fault injection. Sole consumer is
     /// `tests/workspace_shutdown_contract.rs`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(())` if the node slot is already empty — shutdown
+    /// has run or rollback consumed the node — so there is no
+    /// `shutdown_failure_flag` left to arm.
     #[cfg(feature = "test-utils")]
     pub async fn test_arm_shutdown_failure(&self) -> Result<(), ()> {
         // Clone the flag handle out from under the lock so the
@@ -2192,6 +2247,13 @@ impl Workspace {
     /// entry counts. For tests that exercise the rotation core without
     /// the full freeze-drain orchestration (the live doc swap is
     /// Slice 3d).
+    ///
+    /// # Errors
+    ///
+    /// Returns the stringified error if the underlying
+    /// `rotate_namespace` fails — e.g. the node has been torn down or
+    /// an iroh-docs operation (snapshot, create namespace, `set_hash`,
+    /// share) errors.
     #[cfg(feature = "test-utils")]
     pub async fn test_rotate_namespace(
         &self,
@@ -2214,6 +2276,13 @@ impl Workspace {
     /// namespace (host self-rotation). Returns the new `NamespaceId`
     /// bytes. For tests exercising the rotate→reimport round-trip
     /// without the full host→survivor distribution wiring (Slice 3e).
+    ///
+    /// # Errors
+    ///
+    /// Returns the stringified error if either half fails: the
+    /// `rotate_namespace` step (see [`Self::test_rotate_namespace`]) or
+    /// the subsequent `reimport_namespace` (e.g. node torn down,
+    /// `import_namespace` / open / `start_sync` errors).
     #[cfg(feature = "test-utils")]
     pub async fn test_rotate_and_reimport(
         self: &Arc<Self>,
@@ -2244,6 +2313,13 @@ impl Workspace {
     /// (excluding tombstones) in the namespace `namespace_id_bytes`,
     /// opened through this node's docs store. For tests asserting which
     /// entries survived a rotation into a freshly minted namespace.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the node has been torn down (`node live`), or if the
+    /// namespace can't be opened or is absent in this node's docs
+    /// store, or if the `get_many` query errors. A test-only helper —
+    /// these are bugs in the test setup, not recoverable conditions.
     #[cfg(feature = "test-utils")]
     #[allow(clippy::significant_drop_tightening)]
     pub async fn test_namespace_keys(&self, namespace_id_bytes: [u8; 32]) -> Vec<String> {
@@ -2277,6 +2353,13 @@ impl Workspace {
     /// delete was carried forward into a rotated namespace (D3) rather
     /// than silently dropped (which would let an offline survivor
     /// resurrect the deleted path on reimport).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the node has been torn down (`node live`), or if the
+    /// namespace can't be opened or is absent in this node's docs
+    /// store, or if the `get_many` query errors. A test-only helper —
+    /// these are bugs in the test setup, not recoverable conditions.
     #[cfg(feature = "test-utils")]
     #[allow(clippy::significant_drop_tightening)]
     pub async fn test_namespace_tombstone_keys(&self, namespace_id_bytes: [u8; 32]) -> Vec<String> {

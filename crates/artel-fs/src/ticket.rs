@@ -82,6 +82,15 @@ impl WorkspaceTicketEnvelope {
 /// Validates `env.rules` first — a malformed rule set is rejected
 /// here rather than producing a payload that the joiner would refuse
 /// to decode.
+///
+/// # Errors
+///
+/// Returns:
+/// - [`TicketEnvelopeError::PathRules`] if `env.rules` fails
+///   [`PathRules::validate`].
+/// - [`TicketEnvelopeError::Malformed`] if postcard encoding fails.
+/// - [`TicketEnvelopeError::TooLarge`] if the encoded envelope exceeds
+///   [`artel_protocol::upgrade::WORKSPACE_TICKET_ENVELOPE_MAX`].
 pub fn encode(env: &WorkspaceTicketEnvelope) -> Result<Vec<u8>, TicketEnvelopeError> {
     env.rules
         .validate()
@@ -104,6 +113,8 @@ pub fn encode(env: &WorkspaceTicketEnvelope) -> Result<Vec<u8>, TicketEnvelopeEr
 }
 
 /// Decode `bytes` into a [`WorkspaceTicketEnvelope`].
+///
+/// # Errors
 ///
 /// Returns:
 /// - [`TicketEnvelopeError::Malformed`] if the bytes don't postcard-

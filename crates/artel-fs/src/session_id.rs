@@ -35,6 +35,12 @@ const DOMAIN_TAG: &[u8; 32] = b"artel-fs/session-id/v1\0\0\0\0\0\0\0\0\0\0";
 /// - **UUID v8**: the variant + version bits per RFC 9562 §5.8 are
 ///   stamped so the resulting id is a valid UUID v8 in addition to
 ///   being a 16-byte session id.
+///
+/// # Panics
+///
+/// Never in practice: the `expect` converts a fixed 16-byte slice of a
+/// 32-byte blake3 digest into a `[u8; 16]`, a conversion whose length
+/// is a compile-time constant and so always succeeds.
 #[must_use]
 pub fn session_id_for(ns: NamespaceId) -> SessionId {
     let hash = blake3::keyed_hash(DOMAIN_TAG, ns.as_bytes());
