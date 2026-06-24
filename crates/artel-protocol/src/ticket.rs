@@ -197,6 +197,12 @@ struct Wire {
 }
 
 /// Encode `ticket` to its `artel:<base32>` text form.
+///
+/// # Panics
+///
+/// Panics if postcard fails to encode the `Wire` body. Its fields are
+/// all fixed-size types that always serialize, so this is unreachable
+/// in practice.
 #[must_use]
 pub fn encode(ticket: &SessionTicket) -> String {
     let wire = Wire {
@@ -216,6 +222,16 @@ pub fn encode(ticket: &SessionTicket) -> String {
 
 /// Decode a ticket from its text form. Whitespace inside the input
 /// is ignored — paste-friendly.
+///
+/// # Errors
+///
+/// Returns [`TicketError::MissingPrefix`] if the trimmed input does not
+/// start with [`TICKET_PREFIX`], [`TicketError::InvalidBase32`] if the
+/// body is not valid base32, [`TicketError::Malformed`] if the decoded
+/// bytes do not postcard-decode into a `Wire` body or if its
+/// `host_addr.peer_id` disagrees with its `host_peer_id`, and
+/// [`TicketError::UnsupportedVersion`] if the wire version is not
+/// [`TICKET_VERSION`].
 pub fn decode(raw: &str) -> Result<SessionTicket, TicketError> {
     let trimmed: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
     let body = trimmed

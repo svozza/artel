@@ -39,18 +39,33 @@ pub const PID_FILE: &str = "daemon.pid";
 /// 2. Otherwise, `$HOME/.artel`.
 ///
 /// Returns [`io::ErrorKind::NotFound`] if neither is available.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::NotFound`] if neither [`ARTEL_HOME_ENV`] nor
+/// `HOME` is set to a non-empty value.
 pub fn default_dir() -> io::Result<PathBuf> {
     resolve_dir(&ProcessEnv)
 }
 
 /// Compute the default IPC socket path: [`default_dir`] joined with
 /// [`SOCKET_FILE`].
+///
+/// # Errors
+///
+/// Propagates the [`default_dir`] error — [`io::ErrorKind::NotFound`]
+/// when neither [`ARTEL_HOME_ENV`] nor `HOME` is set.
 pub fn default_socket_path() -> io::Result<PathBuf> {
     Ok(default_dir()?.join(SOCKET_FILE))
 }
 
 /// Compute the default PID file path: [`default_dir`] joined with
 /// [`PID_FILE`].
+///
+/// # Errors
+///
+/// Propagates the [`default_dir`] error — [`io::ErrorKind::NotFound`]
+/// when neither [`ARTEL_HOME_ENV`] nor `HOME` is set.
 pub fn default_pid_path() -> io::Result<PathBuf> {
     Ok(default_dir()?.join(PID_FILE))
 }

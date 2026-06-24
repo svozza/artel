@@ -79,6 +79,12 @@ const fn kind_tag(kind: MessageKind) -> u8 {
 /// Used by both signers and verifiers — they MUST agree byte-for-byte.
 /// Length-prefix every variable field to foreclose
 /// extension/truncation collisions.
+///
+/// # Panics
+///
+/// Panics if `action` or `payload` is 4 GiB or larger, since their
+/// lengths are written as `u32` prefixes. Real messages are bounded
+/// far below that, so this is unreachable in practice.
 #[must_use]
 pub fn canonical_bytes(
     session_id: SessionId,
@@ -349,6 +355,12 @@ pub fn verify_seq(
 /// `ACK_DOMAIN_TAG || session_id(16) || req_id(16) || disc(1) ||
 /// postcard(result)`. The 1-byte discriminant (`0`=Ok, `1`=Err) plus the
 /// postcard-encoded `result` bind the verdict so Ok↔Err cannot be flipped.
+///
+/// # Panics
+///
+/// Panics if postcard fails to encode the [`SessionMessage`] or
+/// [`ProtocolError`] inside `result`. Both are fixed-shape wire types
+/// that always serialize, so this is unreachable in practice.
 #[must_use]
 pub fn ack_canonical_bytes(
     session_id: SessionId,

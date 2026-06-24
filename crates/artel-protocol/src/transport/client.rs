@@ -15,6 +15,13 @@ use super::framed::{Framed, new as new_framed};
 
 /// Connect to a daemon listening at `path` and return a framed
 /// transport over the resulting stream.
+///
+/// # Errors
+///
+/// Returns the OS error from connecting the Unix socket unchanged —
+/// notably [`io::ErrorKind::NotFound`] if no socket file exists at
+/// `path` and [`io::ErrorKind::ConnectionRefused`] if the file exists
+/// but no daemon is listening.
 pub async fn connect(path: impl AsRef<Path>) -> io::Result<Framed<UnixStream>> {
     let stream = UnixStream::connect(path).await?;
     Ok(new_framed(stream))

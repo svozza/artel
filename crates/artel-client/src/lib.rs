@@ -6,6 +6,8 @@
 //! ergonomic layer (session handles, typed payload helpers, etc.)
 //! build on top of this.
 
+#![warn(clippy::missing_errors_doc, clippy::missing_panics_doc)]
+
 mod client;
 mod error;
 mod spawn;

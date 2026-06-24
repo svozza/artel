@@ -95,6 +95,17 @@ impl Client {
     ///
     /// The handshake exchange happens inside this call; callers do not
     /// (and should not) issue [`Request::Hello`] manually.
+    ///
+    /// # Errors
+    ///
+    /// - [`ClientError::Transport`] if the socket cannot be reached
+    ///   (missing, no listener, framing/I/O failure).
+    /// - [`ClientError::Protocol`] if the daemon answers the `Hello`
+    ///   with a [`Response::Error`].
+    /// - [`ClientError::ConnectionClosed`] if the connection EOFs
+    ///   before the handshake response arrives.
+    /// - [`ClientError::UnexpectedResponse`] if the daemon answers
+    ///   with anything other than a `Hello` response for the handshake.
     pub async fn connect(path: impl AsRef<Path>) -> Result<Self, ClientError> {
         let path = path.as_ref();
         let framed = transport_connect(path)
@@ -113,6 +124,20 @@ impl Client {
     /// lifecycle details.
     ///
     /// [`SpawnOptions::daemon_binary`]: crate::SpawnOptions::daemon_binary
+    ///
+    /// # Errors
+    ///
+    /// - Anything [`Self::connect`] surfaces, for the initial attempt
+    ///   and the post-spawn retry, when the failure is not the
+    ///   recoverable "no daemon yet" kind.
+    /// - [`ClientError::Spawn`] wrapping [`SpawnError::Launch`] if the
+    ///   daemon binary cannot be executed, or [`SpawnError::Timeout`]
+    ///   if the socket never becomes connectable within
+    ///   [`SpawnOptions::spawn_timeout`].
+    ///
+    /// [`SpawnError::Launch`]: crate::SpawnError::Launch
+    /// [`SpawnError::Timeout`]: crate::SpawnError::Timeout
+    /// [`SpawnOptions::spawn_timeout`]: crate::SpawnOptions::spawn_timeout
     pub async fn connect_or_spawn(opts: crate::SpawnOptions) -> Result<Self, ClientError> {
         crate::spawn::connect_or_spawn(opts).await
     }
@@ -193,6 +218,14 @@ impl Client {
     /// `Response::Error { error }` is converted into
     /// [`ClientError::Protocol`] so the happy path always sees a
     /// non-error variant.
+    ///
+    /// # Errors
+    ///
+    /// - [`ClientError::ConnectionClosed`] if the connection is already
+    ///   known closed, the writer queue is gone, or the reader exits
+    ///   (EOF / transport error) before the response is delivered.
+    /// - [`ClientError::Protocol`] if the daemon answers with a
+    ///   [`Response::Error`].
     pub async fn request(&self, request: Request) -> Result<Response, ClientError> {
         // Cheap fast path: if the connection is already known closed,
         // don't bother allocating a oneshot or pushing onto the queue.

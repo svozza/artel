@@ -41,6 +41,13 @@ impl Listener {
     /// keeps the listener honest about double-bind: a second daemon
     /// trying to bind the same path will get `AddrInUse` rather than
     /// silently stealing the socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`io::Error`] if creating the parent directory fails,
+    /// if binding the socket fails (notably [`io::ErrorKind::AddrInUse`]
+    /// when a stale or live socket already occupies `path`), or if
+    /// reading/setting the socket's permissions to `0600` fails.
     pub async fn bind(path: impl Into<PathBuf>) -> io::Result<Self> {
         let path = path.into();
 
@@ -69,6 +76,11 @@ impl Listener {
     }
 
     /// Accept the next incoming connection and wrap it in [`Framed`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`io::Error`] from the underlying accept if the OS
+    /// fails to hand back a connected stream.
     pub async fn accept(&self) -> io::Result<Framed<UnixStream>> {
         let (stream, _addr) = self.inner.accept().await?;
         Ok(new_framed(stream))

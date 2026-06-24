@@ -235,6 +235,13 @@ pub enum GossipFrameError {
 /// Wire form is `[version: u8][postcard(body)]` — the leading
 /// [`GOSSIP_WIRE_VERSION`] byte lets [`decode`] reject a frame from an
 /// incompatible mesh before postcard touches it.
+///
+/// # Panics
+///
+/// Panics if postcard fails to encode `body`. The wire types are
+/// fixed-shape and always serializable, so this is unreachable in
+/// practice; a panic here would mean a programming error, not bad
+/// input.
 #[must_use]
 pub fn encode(body: &GossipBody) -> Vec<u8> {
     let mut out = Vec::new();
@@ -250,6 +257,14 @@ pub fn encode(body: &GossipBody) -> Vec<u8> {
 /// Rejects an empty frame ([`GossipFrameError::Empty`]) or an unknown
 /// leading version byte ([`GossipFrameError::UnsupportedVersion`]) before
 /// attempting a postcard decode of the remainder.
+///
+/// # Errors
+///
+/// Returns [`GossipFrameError::Empty`] if `bytes` has no leading version
+/// byte, [`GossipFrameError::UnsupportedVersion`] if that byte is not
+/// [`GOSSIP_WIRE_VERSION`], or [`GossipFrameError::Malformed`] if the
+/// remaining bytes do not postcard-decode into a [`GossipBody`] (e.g.
+/// they are truncated or otherwise corrupt).
 pub fn decode(bytes: &[u8]) -> Result<GossipBody, GossipFrameError> {
     let (&version, rest) = bytes.split_first().ok_or(GossipFrameError::Empty)?;
     if version != GOSSIP_WIRE_VERSION {
