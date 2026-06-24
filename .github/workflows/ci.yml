@@ -38,6 +38,14 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Only the main-branch build writes the cache; PR builds
+          # restore-only. A cancelled or partial PR build must never
+          # save a half-populated target/ under the (Cargo.lock-stable,
+          # hence immutable) key — once a bad cache wins that key, every
+          # later run restores it, says "up-to-date", and silently
+          # recompiles all deps. main always produces a complete cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Both feature modes, mirroring `make clippy`.
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -49,6 +57,8 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Catches broken intra-doc links in both feature modes (`make doc`).
       - run: cargo doc --workspace --no-deps
         env:
@@ -69,6 +79,8 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
