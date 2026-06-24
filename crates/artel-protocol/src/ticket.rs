@@ -34,7 +34,7 @@ use crate::ids::{PeerId, SessionId, TicketId};
 use crate::message::SigBytes;
 
 /// Current ticket envelope version. Incremented when the structure
-/// of the [`Wire`] payload changes in a way old daemons can't
+/// of the `Wire` payload changes in a way old daemons can't
 /// understand.
 ///
 /// Bumped to `4` on 2026-06-05 when tiered tickets landed:
@@ -170,7 +170,7 @@ pub enum TicketError {
     #[error("invalid base32 in ticket: {0}")]
     InvalidBase32(String),
 
-    /// The decoded bytes didn't deserialize as a [`Wire`] payload.
+    /// The decoded bytes didn't deserialize as a `Wire` payload.
     #[error("malformed ticket payload: {0}")]
     Malformed(String),
 

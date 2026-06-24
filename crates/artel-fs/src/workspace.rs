@@ -214,7 +214,7 @@ pub struct WorkspaceConfig {
     /// `workspace.ticket` to arrive on the artel session before
     /// giving up. `None` (the default) means wait forever — useful
     /// for long-lived joiners that may attach minutes or hours
-    /// after the host first published. Set [`Some(duration)`] when
+    /// after the host first published. Set `Some(duration)` when
     /// you'd rather fail fast on a misconfigured session (e.g.
     /// wrong ticket, daemons that can't reach each other).
     pub join_ticket_timeout: Option<Duration>,
@@ -224,12 +224,12 @@ pub struct WorkspaceConfig {
     /// `presets::N0`, pkarr publish + DNS resolve via n0
     /// infrastructure, with home-relay readiness on `online()`).
     /// Integration tests that spin up many workspace nodes in
-    /// rapid succession use [`EndpointSetup::Testing`] with a
+    /// rapid succession use `EndpointSetup::Testing` with a
     /// shared `Arc<DnsPkarrServer>` so discovery runs against a
     /// localhost pkarr+DNS pair — deterministic, fast, no n0
     /// rate-limit exposure.
     ///
-    /// Mirrors the daemon's [`DaemonConfig::endpoint_setup`] —
+    /// Mirrors the daemon's `DaemonConfig::endpoint_setup` —
     /// daemons and workspaces share the same shape so test fixtures
     /// can hand one `Arc<DnsPkarrServer>` to both. See
     /// `tests/common/mod.rs` (`spawn_pair`) for the canonical use.
@@ -253,7 +253,7 @@ pub struct WorkspaceConfig {
     /// Path to the daemon's IPC socket. When set, the workspace
     /// opens a **second** [`Client`] connection to subscribe to
     /// session events (capability grants/revokes, node-id
-    /// announcements) and project them into the [`PeerMap`] that
+    /// announcements) and project them into the `PeerMap` that
     /// backs the docs gate. Without this, the gate still rejects
     /// connections from already-revoked peers (seeded at
     /// construction) but cannot observe revocations that happen
@@ -279,7 +279,7 @@ impl WorkspaceConfig {
 
     /// Pick the workspace endpoint's discovery layer. See
     /// [`Self::endpoint_setup`] for variant semantics. Production
-    /// is the default; tests pass an [`EndpointSetup::Testing`]
+    /// is the default; tests pass an `EndpointSetup::Testing`
     /// constructed from a shared `Arc<DnsPkarrServer>`.
     #[allow(clippy::missing_const_for_fn)]
     #[must_use]
@@ -587,7 +587,7 @@ impl Workspace {
     ///
     /// Steps:
     /// 1. Spawn a fresh iroh node (Endpoint + Gossip + Docs/Blobs +
-    ///    Router) — see [`WorkspaceNode`].
+    ///    Router) — see `WorkspaceNode`.
     /// 2. Open (or create) the workspace's `iroh-docs` document and
     ///    derive a stable [`SessionId`] from its `NamespaceId` via
     ///    [`crate::session_id_for`].
@@ -1334,7 +1334,7 @@ impl Workspace {
     /// joiner configured). Surfaced for tests and consumers that
     /// want to inspect the configured rules; the hot path
     /// (watcher / applier / scan / bulk-export) uses
-    /// [`Self::compiled_rules`] internally for matcher-once
+    /// `Self::compiled_rules` internally for matcher-once
     /// performance.
     #[must_use]
     pub const fn rules(&self) -> &PathRules {
@@ -2055,7 +2055,7 @@ impl Workspace {
     /// Trigger graceful shutdown.
     ///
     /// Cancels the shutdown token (stopping the watcher + applier
-    /// loops) and consumes the underlying [`WorkspaceNode`] —
+    /// loops) and consumes the underlying `WorkspaceNode` —
     /// `Router::shutdown` walks down to `Endpoint::close`, which is
     /// the load-bearing call: without it the iroh QUIC + n0 relay
     /// session leaks until n0's stale-session timeout fires, and

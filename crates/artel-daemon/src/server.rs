@@ -89,7 +89,7 @@ pub struct DaemonConfig {
     /// Real deployments use [`EndpointSetup::Production`] (default
     /// — `presets::N0`, pkarr publish + DNS resolve via n0
     /// infrastructure). Integration tests use
-    /// [`EndpointSetup::Testing`] with a shared
+    /// `EndpointSetup::Testing` with a shared
     /// `Arc<DnsPkarrServer>` so two in-process daemons share a
     /// localhost pkarr+DNS pair instead of paying n0's external
     /// rate limits.
@@ -186,7 +186,7 @@ pub struct IrohRuntime {
     /// shutdown-snapshot: at graceful shutdown the daemon walks
     /// this set, looks up each id's current `RemoteInfo` from the
     /// endpoint, and persists the result to
-    /// [`Self::peer_addr_cache`]. iroh 0.98.2 has no public
+    /// `Self::peer_addr_cache`. iroh 0.98.2 has no public
     /// `remote_info_iter`, so the daemon maintains this shadow.
     ///
     /// **Invariant**: every `addr_hint.add_endpoint_info(addr)` call

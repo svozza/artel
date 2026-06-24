@@ -656,7 +656,7 @@ pub enum WireMessage {
     },
     /// Daemon → client, in reply to a request with this id.
     Response {
-        /// Echoes the [`Request::Request`] id this is replying to.
+        /// Echoes the [`WireMessage::Request`] id this is replying to.
         id: RequestId,
         /// Response payload.
         response: Response,

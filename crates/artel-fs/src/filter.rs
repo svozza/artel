@@ -10,7 +10,7 @@
 //!    `ignore` crate. Honoured for everything *except* the
 //!    `.gitignore` file itself.
 //! 4. Size cap (1 MiB). Larger files are surfaced to consumers as
-//!    [`FilterDecision::Skip(SkipReason::TooLarge)`] so they can decide
+//!    `FilterDecision::Skip(SkipReason::TooLarge)` so they can decide
 //!    whether to log/notify.
 
 use std::fs;

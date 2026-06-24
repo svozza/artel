@@ -24,7 +24,7 @@
 /// accessor) and its argless `run()` hardcodes `"dns.iroh.test"`
 /// internally. We own the value here and construct the fixture via
 /// `DnsPkarrServer::run_with_origin(TEST_DNS_ORIGIN)`, so the origin
-/// the server serves on and the origin [`EndpointSetup::apply`]
+/// the server serves on and the origin `EndpointSetup::apply`
 /// resolves against are the same string rather than coupling to
 /// iroh's private default.
 #[cfg(feature = "test-utils")]

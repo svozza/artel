@@ -645,7 +645,7 @@ async fn ensure_can_write(
     })
 }
 
-/// In-memory session registry, backed by a [`crate::store::SessionStore`]
+/// In-memory session registry, backed by a `crate::store::SessionStore`
 /// for durability.
 #[derive(Debug)]
 pub struct Registry {
@@ -1023,7 +1023,7 @@ impl Registry {
 
     /// Issue an additional ticket for an existing locally-hosted session.
     ///
-    /// Authority: [`Self::lock_local_session`]. Returns
+    /// Authority: `Self::lock_local_session`. Returns
     /// `SessionError::NotHost` if the session is a remote mirror, and
     /// `SessionError::UnknownSession` if it doesn't exist.
     pub async fn issue_ticket(
@@ -1522,7 +1522,7 @@ impl Registry {
     }
 
     /// Remove `peer` from `session`. Three cases, distinguished by
-    /// session [`SessionKind`] and whether the leaver is the host:
+    /// session `SessionKind` and whether the leaver is the host:
     ///
     /// 1. **Host of a `Local` session leaves** → the entire session is
     ///    closed: `store.delete(session)` (cascades any consumer
@@ -1540,7 +1540,7 @@ impl Registry {
     ///    fully: `store.delete(session)` (cascading attachments),
     ///    in-memory entry removed, [`Event::SessionClosed`] emitted,
     ///    bridge per-session state forgotten. Symmetric with
-    ///    [`Self::host_closed_session`] — same teardown shape, just
+    ///    `Self::host_closed_session` — same teardown shape, just
     ///    triggered by a local IPC leave instead of a gossip
     ///    `SessionClosed` from the host.
     pub async fn leave(&self, session: SessionId, peer: PeerId) -> Result<(), SessionError> {
@@ -2538,7 +2538,7 @@ impl Registry {
     /// work (`Workspace::join_with` issues `Subscribe { since: None }`
     /// and drains for `TICKET_ACTION`; the live unicast may have
     /// happened before the workspace attached). IPC-subscribe only:
-    /// the envelope never enters [`Self::log_since`] (the gossip
+    /// the envelope never enters `Self::log_since` (the gossip
     /// replay surface) — re-broadcasting the capability on the topic
     /// is exactly the leak this slice closes.
     pub async fn subscribe(
