@@ -221,7 +221,16 @@ fn collect_errors(
 }
 
 async fn doc_has_entry_at(ws: &Workspace, path: &Path) -> bool {
-    let key = path_to_key(ws.root.as_path(), path).expect("path_to_key");
+    // `ws.root` is canonicalised by `host_with`; tests build `path` from
+    // raw `TempDir` paths, which on macOS live under `/var/...` that
+    // canonicalises to `/private/var/...`. Canonicalise here so
+    // `path_to_key`'s strip_prefix matches the root. Fall back to the
+    // raw path when canonicalisation fails (e.g. an intentionally-absent
+    // file): such a path can't be in the doc, so the lookup is false.
+    let resolved = tokio::fs::canonicalize(path)
+        .await
+        .unwrap_or_else(|_| path.to_path_buf());
+    let key = path_to_key(ws.root.as_path(), &resolved).expect("path_to_key");
     let stream = ws
         .doc()
         .get_many(Query::key_exact(key))
@@ -251,7 +260,9 @@ async fn wait_for_doc_entry(ws: &Workspace, path: &Path, budget: Duration) -> bo
 
 #[tokio::test(flavor = "multi_thread")]
 async fn author_id_equals_endpoint_id_and_stamps_entries() {
-    let (daemon, _client, ws, handle, _events, dir, _dns_pkarr) =
+    // `_dir` (the TempDir) is held only to keep the workspace root alive
+    // for the test; paths are built from `ws.root` (the canonical form).
+    let (daemon, _client, ws, handle, _events, _dir, _dns_pkarr) =
         spawn_host_workspace_for_empty_test().await;
 
     // (1) The author the workspace stamps equals its endpoint id.
@@ -267,7 +278,11 @@ async fn author_id_equals_endpoint_id_and_stamps_entries() {
 
     // (2) A real authored entry carries that same author — proving the
     // binding holds on the write path, not just at construction.
-    let file = dir.path().join("authored.txt");
+    // Build the path from `ws.root` (canonicalised by `host_with`), not
+    // the raw `dir.path()`: on macOS the tempdir is under `/var/...`
+    // which canonicalises to `/private/var/...`, so a `dir.path()`-based
+    // path fails `path_to_key`'s strip_prefix against the canonical root.
+    let file = ws.root.join("authored.txt");
     tokio::fs::write(&file, b"by me").await.unwrap();
     assert!(
         wait_for_doc_entry(&ws, &file, WAIT_BUDGET).await,
@@ -1004,17 +1019,19 @@ async fn late_joiner_lands_on_rotated_namespace_and_can_be_promoted() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn reimport_swaps_namespace_and_keeps_workspace_live() {
-    let (daemon, _client, ws, handle, _events, dir, _dns_pkarr) =
+    // `_dir` held only for liveness; paths use `ws.root` (canonical) so
+    // `path_to_key` strip_prefix works on macOS (/var -> /private/var).
+    let (daemon, _client, ws, handle, _events, _dir, _dns_pkarr) =
         spawn_host_workspace_for_empty_test().await;
 
     let session_before = ws.session_id();
 
     // Seed a file and wait for it into the doc.
-    tokio::fs::write(dir.path().join("kept.txt"), b"keep me")
+    tokio::fs::write(ws.root.join("kept.txt"), b"keep me")
         .await
         .unwrap();
     assert!(
-        wait_for_doc_entry(&ws, &dir.path().join("kept.txt"), WAIT_BUDGET).await,
+        wait_for_doc_entry(&ws, &ws.root.join("kept.txt"), WAIT_BUDGET).await,
         "seed file never landed pre-rotation",
     );
 
@@ -1044,11 +1061,11 @@ async fn reimport_swaps_namespace_and_keeps_workspace_live() {
 
     // The respawned watcher must be live on the new namespace: a write
     // made AFTER re-import lands in the new doc.
-    tokio::fs::write(dir.path().join("post_rotate.txt"), b"after")
+    tokio::fs::write(ws.root.join("post_rotate.txt"), b"after")
         .await
         .unwrap();
     assert!(
-        wait_for_doc_entry(&ws, &dir.path().join("post_rotate.txt"), WAIT_BUDGET).await,
+        wait_for_doc_entry(&ws, &ws.root.join("post_rotate.txt"), WAIT_BUDGET).await,
         "post-rotation write never landed — respawned watcher not live on new namespace",
     );
     // And the carried-forward entry is present in the new namespace.
@@ -2098,26 +2115,28 @@ async fn rotation_drops_revoked_author_entries() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn rotation_carries_tombstones_forward() {
-    let (daemon, _client, ws, handle, _events, dir, _dns_pkarr) =
+    // `_dir` held only for liveness; paths use `ws.root` (canonical) so
+    // `path_to_key` strip_prefix works on macOS (/var -> /private/var).
+    let (daemon, _client, ws, handle, _events, _dir, _dns_pkarr) =
         spawn_host_workspace_for_empty_test().await;
 
     // Create then delete a file: the doc ends with a tombstone for it,
     // and a live, surviving file alongside it.
-    tokio::fs::write(dir.path().join("kept.txt"), b"keep")
+    tokio::fs::write(ws.root.join("kept.txt"), b"keep")
         .await
         .unwrap();
-    tokio::fs::write(dir.path().join("deleted.txt"), b"bye")
+    tokio::fs::write(ws.root.join("deleted.txt"), b"bye")
         .await
         .unwrap();
     assert!(
-        wait_for_doc_entry(&ws, &dir.path().join("deleted.txt"), WAIT_BUDGET).await,
+        wait_for_doc_entry(&ws, &ws.root.join("deleted.txt"), WAIT_BUDGET).await,
         "deleted.txt never landed before delete",
     );
     assert!(
-        wait_for_doc_entry(&ws, &dir.path().join("kept.txt"), WAIT_BUDGET).await,
+        wait_for_doc_entry(&ws, &ws.root.join("kept.txt"), WAIT_BUDGET).await,
         "kept.txt never landed",
     );
-    tokio::fs::remove_file(dir.path().join("deleted.txt"))
+    tokio::fs::remove_file(ws.root.join("deleted.txt"))
         .await
         .unwrap();
     // Wait for the tombstone to land in the current namespace.
