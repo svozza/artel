@@ -56,7 +56,7 @@ jobs:
           # hence immutable) key — once a bad cache wins that key, every
           # later run restores it, says "up-to-date", and silently
           # recompiles all deps. main always produces a complete cache.
-          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci/bench-mold-cache' }}
+          save-if: ${{ github.ref == 'refs/heads/main' || github.head_ref == 'ci/bench-mold-cache' }}
       # Both feature modes, mirroring `make clippy`.
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -69,7 +69,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci/bench-mold-cache' }}
+          save-if: ${{ github.ref == 'refs/heads/main' || github.head_ref == 'ci/bench-mold-cache' }}
       # Catches broken intra-doc links in both feature modes (`make doc`).
       - run: cargo doc --workspace --no-deps
         env:
@@ -97,7 +97,7 @@ jobs:
       - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci/bench-mold-cache' }}
+          save-if: ${{ github.ref == 'refs/heads/main' || github.head_ref == 'ci/bench-mold-cache' }}
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
