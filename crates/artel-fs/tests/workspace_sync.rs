@@ -138,6 +138,154 @@ async fn alice_delete_propagates_to_bob() {
 }
 
 // =============================================================
+// Delete-then-recreate with identical bytes must propagate.
+//
+// Regression trap for the echo guard's `last_published` map
+// surviving a delete (found via
+// `returning_rw_member_offline_across_rotation_regains_write_real_n0`
+// in the 2026-07-01 nightly): the applier records the blake3 of
+// every peer-driven write so the watcher can skip the resulting
+// filesystem echo, but nothing cleared that hash when the path was
+// later tombstoned. A file re-created with the *same bytes* after
+// a delete then hashed equal to the stale entry and the watcher
+// swallowed the publish forever — the doc's latest entry stayed a
+// tombstone while disk state diverged.
+//
+// Two acts, one per forget site:
+// - Act 1 (applier-side `mark_remote_delete`): bob's hash for the
+//   path came from his applier applying alice's write; alice
+//   deletes; bob re-creates the identical bytes and alice must see
+//   the file again.
+// - Act 2 (watcher-side `forget` in `on_removed`): bob's hash came
+//   from his own watcher publishing the act-1 write; bob deletes
+//   locally and re-creates the identical bytes; alice must see the
+//   file again. (Bob deletes — not alice — so the delete is from
+//   steady state; see the in-test comment on Linux debouncer
+//   Create+Remove annihilation.)
+// =============================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recreating_identical_bytes_after_delete_propagates() {
+    const BYTES: &[u8] = b"rises from the ashes";
+    common::init_tracing();
+
+    let Pair {
+        daemon_a,
+        daemon_b,
+        dns_pkarr,
+    } = spawn_pair().await;
+
+    // Alice hosts with the seed file already present so bob's
+    // bulk_export applies it (populating his last_published map).
+    let alice = Client::connect(&daemon_a.socket).await.unwrap();
+    let alice_dir = tempfile::tempdir().unwrap();
+    tokio::fs::write(alice_dir.path().join("phoenix.txt"), BYTES)
+        .await
+        .unwrap();
+
+    let (alice_ws, _) = Workspace::host_with(
+        &alice,
+        "alice",
+        alice_dir.path().to_path_buf(),
+        AttachPolicy::AllowExisting,
+        WorkspaceConfig::default()
+            .with_endpoint_setup(testing_setup(&dns_pkarr))
+            .with_daemon_socket(daemon_a.socket.clone()),
+    )
+    .await
+    .expect("Workspace::host");
+    let session = alice_ws.session_id();
+    let ticket = alice_ws
+        .join_ticket()
+        .expect("host has join_ticket")
+        .clone();
+    let alice_ws = Arc::new(alice_ws);
+    let alice_handle = Arc::clone(&alice_ws).run().await;
+
+    let bob = Client::connect(&daemon_b.socket).await.unwrap();
+    let bob_peer = bob.daemon_peer_id();
+    let resp = bob
+        .request(Request::JoinSession {
+            display_name: "bob".into(),
+            ticket,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(resp, Response::JoinSession { .. }), "{resp:?}");
+
+    let bob_dir = tempfile::tempdir().unwrap();
+    let (bob_ws, _) = Workspace::join_with(
+        &bob,
+        session,
+        bob_dir.path().to_path_buf(),
+        AttachPolicy::RequireEmpty,
+        WorkspaceConfig::default()
+            .with_endpoint_setup(testing_setup(&dns_pkarr))
+            .with_daemon_socket(daemon_b.socket.clone()),
+    )
+    .await
+    .expect("Workspace::join");
+    let bob_ws = Arc::new(bob_ws);
+    let bob_handle = Arc::clone(&bob_ws).run().await;
+
+    let alice_path = alice_ws.root.join("phoenix.txt");
+    let bob_path = bob_ws.root.join("phoenix.txt");
+    common::wait_for_file(&bob_path, BYTES).await;
+
+    // Bob needs write capability for both acts.
+    common::grant_rw_and_wait(&alice, session, bob_peer, bob_dir.path(), alice_dir.path()).await;
+
+    // --- Act 1: applier-side forget (bob's hash came from applying
+    // alice's seed write). Alice deletes; the tombstone removes
+    // bob's copy; bob re-creates the identical bytes; alice must
+    // see the file come back.
+    eprintln!("--- act 1: peer delete, joiner re-creates identical bytes ---");
+    tokio::fs::remove_file(&alice_path).await.unwrap();
+    common::wait_for_missing(&bob_path).await;
+
+    tokio::fs::write(&bob_path, BYTES).await.unwrap();
+    common::wait_for_file(&alice_path, BYTES).await;
+
+    // --- Act 2: watcher-side forget (bob's hash for this path came
+    // from his own `record_local_publish` when his watcher published
+    // the act-1 write). Bob deletes locally — his watcher's
+    // `on_removed` fires and must forget the hash — then re-creates
+    // the identical bytes; alice must see the file come back.
+    //
+    // The deleting node is bob, NOT alice, on purpose. Act 1 ended
+    // with alice's applier re-creating alice's copy, and on Linux a
+    // Remove arriving while that Create is still queued in the same
+    // debounce window is annihilated by design — the debouncer's
+    // model is "created then removed within one window = never
+    // existed" (notify-debouncer-full 0.6, test case
+    // `add_remove_event_after_create_event.hjson`: Remove after
+    // queued Create ⇒ expected: {}); no event fires, no tombstone is
+    // ever published, and the test deadlocks (this PR's first ubuntu
+    // CI run captured exactly that — macOS was immune because
+    // FSEvents' post-unlink Modify events reach the on_modified
+    // NotFound→tombstone fallback regardless). Bob's side has no
+    // such queued Create: act 1's wait_for_file(alice_path) proves
+    // his watcher already flushed and published it — the file cannot
+    // reach alice otherwise — so his delete is from steady state by
+    // construction, no settling sleep needed.
+    eprintln!("--- act 2: local delete on joiner, re-creates identical bytes ---");
+    tokio::fs::remove_file(&bob_path).await.unwrap();
+    common::wait_for_missing(&alice_path).await;
+
+    tokio::fs::write(&bob_path, BYTES).await.unwrap();
+    common::wait_for_file(&alice_path, BYTES).await;
+
+    alice_ws.shutdown().await.expect("shutdown");
+    bob_ws.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), alice_handle).await;
+    let _ = timeout(Duration::from_secs(5), bob_handle).await;
+    drop(alice);
+    drop(bob);
+    daemon_a.stop().await;
+    daemon_b.stop().await;
+}
+
+// =============================================================
 // An empty file in the workspace must not propagate as a doc
 // entry — iroh-docs reserves zero-length entries for tombstones,
 // so a naive `set_bytes(_, _, &[])` is rejected with
@@ -461,7 +609,9 @@ async fn evict_auto_rotation_body(dns_pkarr: Arc<DnsPkarrServer>, pair: Pair) {
 async fn evict_auto_rotates_and_cuts_off_writes() {
     let pair = spawn_pair().await;
     let dns_pkarr = Arc::clone(&pair.dns_pkarr);
-    evict_auto_rotation_body(dns_pkarr, pair).await;
+    // Box: the body's future sits at clippy::large_futures' 16 KiB
+    // threshold on newer toolchains (CI's 1.96 flags it; 1.95 doesn't).
+    Box::pin(evict_auto_rotation_body(dns_pkarr, pair)).await;
 }
 
 // Real-n0 variant of the auto-rotation write cut-off (Tier C). Binds
@@ -703,50 +853,23 @@ async fn survivor_follows_rotation_evicted_is_cut() {
         join_rw(&alice, session, &daemon_c, &dns_pkarr, "evicted").await;
     let evicted_peer = evicted_cli.daemon_peer_id();
 
-    // Grant RW to each peer and wait for it using a per-peer probe
-    // filename (the shared-name `grant_rw_and_wait` helper races when
-    // two RW joiners write the same probe path).
-    async fn grant_rw_wait_named(
-        host: &Client,
-        session: SessionId,
-        peer: PeerId,
-        joiner_dir: &Path,
-        host_dir: &Path,
-        probe_name: &str,
-    ) {
-        common::grant_rw(host, session, peer).await;
-        let joiner_probe = joiner_dir.join(probe_name);
-        let host_probe = host_dir.join(probe_name);
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            let _ = tokio::fs::write(&joiner_probe, b"rw").await;
-            sleep(POLL_INTERVAL).await;
-            if tokio::fs::read(&host_probe).await.is_ok_and(|b| b == b"rw") {
-                let _ = tokio::fs::remove_file(&joiner_probe).await;
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "grant RW for {peer} never propagated"
-            );
-        }
-    }
-    grant_rw_wait_named(
+    // Grant RW to each peer and wait for it. `grant_rw_and_wait`'s
+    // probe filename embeds the peer id, so consecutive grants don't
+    // race on a shared probe path.
+    common::grant_rw_and_wait(
         &alice,
         session,
         survivor_peer,
         survivor_dir.path(),
         alice_dir.path(),
-        ".probe_survivor",
     )
     .await;
-    grant_rw_wait_named(
+    common::grant_rw_and_wait(
         &alice,
         session,
         evicted_peer,
         evicted_dir.path(),
         alice_dir.path(),
-        ".probe_evicted",
     )
     .await;
 

@@ -2978,6 +2978,11 @@ async fn bulk_export(
         }
 
         if entry.content_len() == 0 {
+            // Same marking as the applier's tombstone branch: the
+            // guard is handed to the watcher/applier right after this
+            // bulk pass, and an unlink of a pre-existing file here can
+            // surface as a watcher event after the watch attaches.
+            echo_guard.mark_remote_delete(&path).await;
             let _ = tokio::fs::remove_file(&path).await;
             let _ = events.send(WorkspaceEvent::PeerDeleted { path }).await;
             continue;

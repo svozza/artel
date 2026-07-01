@@ -6,7 +6,7 @@
 //!   `foo.txt` to disk → watcher sees the disk change → publishes a
 //!   *new* doc entry → other peers see a duplicate → 💥
 //!
-//! Two complementary defences:
+//! Three complementary defences:
 //!
 //! 1. **Pending set.** Right before the applier writes a peer-driven
 //!    file, it inserts the path into a shared `HashSet`. The watcher
@@ -21,6 +21,19 @@
 //!    that path; if they match it's an echo of *something we caused*
 //!    and we skip. Hashes are blake3 — fast and collision-immune in
 //!    practice.
+//!
+//! 3. **Last-removed set.** The delete-side analogue of (2). When the
+//!    applier removes a file for a peer tombstone, the watcher sees
+//!    the removal after the debounce window — too late for the
+//!    pending set (grace 250 ms < debounce 300 ms), and there are no
+//!    bytes to hash. Without a marker the watcher republishes the
+//!    delete as a *new* tombstone with a newer timestamp, which syncs
+//!    back out and ping-pongs between peers — and any legitimate
+//!    write racing that storm is deleted by an echo tombstone that
+//!    post-dates it. Entries persist until the path is re-created
+//!    (locally or by a peer); they are not timer-released, because a
+//!    removal event for a peer-deleted path is an echo no matter how
+//!    late it fires.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -38,13 +51,17 @@ use tokio::sync::Mutex;
 /// arrive.
 pub const PENDING_RELEASE_GRACE: Duration = Duration::from_millis(250);
 
-/// Tracks pending peer writes and last-published bytes per path.
+/// Tracks pending peer writes, last-published bytes, and peer-driven
+/// deletes per path.
 ///
-/// Cheap to clone — both maps are inside `Arc<Mutex<…>>`.
+/// Cheap to clone — all state is inside `Arc<Mutex<…>>`, so clones
+/// share it. The watcher and applier each hold a clone of the
+/// workspace's guard.
 #[derive(Clone, Debug)]
 pub struct EchoGuard {
     pending: Arc<Mutex<HashSet<PathBuf>>>,
     last_published: Arc<Mutex<HashMap<PathBuf, Hash>>>,
+    peer_deleted: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 impl EchoGuard {
@@ -54,31 +71,48 @@ impl EchoGuard {
         Self {
             pending: Arc::new(Mutex::new(HashSet::new())),
             last_published: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
-    /// Build a guard that shares the supplied state. Used so the
-    /// watcher and applier each carry a cheap handle to the same
-    /// pending-set + hash map.
-    #[must_use]
-    pub const fn shared(
-        pending: Arc<Mutex<HashSet<PathBuf>>>,
-        last_published: Arc<Mutex<HashMap<PathBuf, Hash>>>,
-    ) -> Self {
-        Self {
-            pending,
-            last_published,
+            peer_deleted: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
     /// Record that a peer-driven write is about to land on disk for
     /// `path`. Inserts the path into the pending set and records the
-    /// hash of the bytes we're about to write.
+    /// hash of the bytes we're about to write. The path exists again,
+    /// so any peer-delete marker is cleared.
     pub async fn mark_remote_write(&self, path: &Path, bytes: &[u8]) {
         let owned = path.to_path_buf();
         let hash = blake3::hash(bytes);
         self.pending.lock().await.insert(owned.clone());
+        self.peer_deleted.lock().await.remove(&owned);
         self.last_published.lock().await.insert(owned, hash);
+    }
+
+    /// Record that a peer-driven delete (tombstone) is about to be
+    /// applied to disk for `path`.
+    ///
+    /// Marks the path so [`Self::should_skip_removal`] suppresses the
+    /// watcher's resulting removal event, and drops the
+    /// `last_published` hash — the file is gone, and a stale hash
+    /// would swallow a later re-creation with identical bytes as an
+    /// echo (see the module docs, defences 2 and 3).
+    pub async fn mark_remote_delete(&self, path: &Path) {
+        self.last_published.lock().await.remove(path);
+        self.peer_deleted.lock().await.insert(path.to_path_buf());
+    }
+
+    /// Should the watcher skip a local *removal* event for `path`?
+    /// `true` while the path is marked peer-deleted — i.e. the
+    /// removal is the filesystem echo of a tombstone this node's
+    /// applier laid down, not a user delete.
+    ///
+    /// Deliberately does NOT consume the marker: one unlink can fan
+    /// out into several debounced watcher events (macOS `FSEvents`
+    /// reports post-unlink `Modify(...)` pairs), and every one of
+    /// them is an echo. The marker is cleared only when the path
+    /// exists again ([`Self::mark_remote_write`] /
+    /// [`Self::record_local_publish`]).
+    pub async fn should_skip_removal(&self, path: &Path) -> bool {
+        self.peer_deleted.lock().await.contains(path)
     }
 
     /// Schedule removal of `path` from the pending set after `grace`.
@@ -107,27 +141,37 @@ impl EchoGuard {
 
     /// Note that we just published `bytes` for `path`. Future watcher
     /// events with the same hash will be skipped via
-    /// [`Self::should_skip_local`].
+    /// [`Self::should_skip_local`]. The path exists again, so any
+    /// peer-delete marker is cleared.
     pub async fn record_local_publish(&self, path: &Path, bytes: &[u8]) {
         let hash = blake3::hash(bytes);
+        self.peer_deleted.lock().await.remove(path);
         self.last_published
             .lock()
             .await
             .insert(path.to_path_buf(), hash);
     }
 
-    /// Clone of the pending set's `Arc<Mutex<…>>`. Hands out shared
-    /// ownership to the watcher / applier so they can call
-    /// [`Self::shared`] later.
-    #[must_use]
-    pub fn pending_handle(&self) -> Arc<Mutex<HashSet<PathBuf>>> {
-        Arc::clone(&self.pending)
-    }
-
-    /// Same as [`Self::pending_handle`] for the last-published map.
-    #[must_use]
-    pub fn last_published_handle(&self) -> Arc<Mutex<HashMap<PathBuf, Hash>>> {
-        Arc::clone(&self.last_published)
+    /// Drop the `last_published` hash for `path`. Call when the file
+    /// is deleted — tombstone applied from a peer, or local removal
+    /// observed by the watcher.
+    ///
+    /// Without this, the hash outlives the file: a later re-creation
+    /// with the *same bytes* hashes equal to the stale entry and
+    /// [`Self::should_skip_local`] swallows the publish forever,
+    /// leaving the doc's latest entry a tombstone while disk state
+    /// diverges. (Found via the rw-redelivery n0 tests, whose shared
+    /// probe file is deleted and re-created with identical bytes per
+    /// grant.)
+    ///
+    /// The pending set is deliberately left alone: entries there
+    /// expire on their own timer ([`release_after`]), and evicting
+    /// one early from a removal event could unsuppress the echo of
+    /// an applier write racing the same debounce window.
+    ///
+    /// [`release_after`]: Self::release_after
+    pub async fn forget(&self, path: &Path) {
+        self.last_published.lock().await.remove(path);
     }
 }
 
@@ -206,14 +250,99 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_handles_share_state() {
+    async fn forget_clears_last_published() {
+        let guard = EchoGuard::new();
+        let path = p("/w/a.txt");
+        let bytes = b"same bytes before and after delete";
+        guard.record_local_publish(&path, bytes).await;
+
+        guard.forget(&path).await;
+        assert!(
+            !guard.should_skip_local(&path, bytes).await,
+            "after forget, re-creating identical bytes must publish, not be deduped",
+        );
+    }
+
+    #[tokio::test]
+    async fn forget_leaves_pending_intact() {
+        let guard = EchoGuard::new();
+        let path = p("/w/a.txt");
+        guard.mark_remote_write(&path, b"v1").await;
+
+        guard.forget(&path).await;
+        assert!(
+            guard.should_skip_local(&path, b"v2").await,
+            "forget must not evict a pending remote write still inside its grace window",
+        );
+    }
+
+    #[tokio::test]
+    async fn forget_unknown_path_is_noop() {
+        let guard = EchoGuard::new();
+        guard.record_local_publish(&p("/w/a.txt"), b"x").await;
+
+        guard.forget(&p("/w/never-seen.txt")).await;
+        assert!(
+            guard.should_skip_local(&p("/w/a.txt"), b"x").await,
+            "forgetting an unknown path must not disturb other entries",
+        );
+    }
+
+    #[tokio::test]
+    async fn clones_share_state() {
         let original = EchoGuard::new();
         original.mark_remote_write(&p("/w/x"), b"v").await;
+        original.mark_remote_delete(&p("/w/y")).await;
 
-        let shared = EchoGuard::shared(original.pending_handle(), original.last_published_handle());
+        let clone = original.clone();
         assert!(
-            shared.should_skip_local(&p("/w/x"), b"v").await,
-            "shared handle must observe the original's state",
+            clone.should_skip_local(&p("/w/x"), b"v").await,
+            "a clone must observe the original's write state",
+        );
+        assert!(
+            clone.should_skip_removal(&p("/w/y")).await,
+            "a clone must observe the original's delete state",
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_delete_suppresses_removal_until_recreated() {
+        let guard = EchoGuard::new();
+        let path = p("/w/a.txt");
+
+        assert!(
+            !guard.should_skip_removal(&path).await,
+            "an unmarked path's removal is a user delete and must publish",
+        );
+
+        guard.mark_remote_delete(&path).await;
+        assert!(
+            guard.should_skip_removal(&path).await,
+            "removal right after a peer tombstone is an echo",
+        );
+        assert!(
+            guard.should_skip_removal(&path).await,
+            "the marker must survive repeated events (macOS fans one unlink into several)",
+        );
+
+        guard.mark_remote_write(&path, b"recreated").await;
+        assert!(
+            !guard.should_skip_removal(&path).await,
+            "a peer re-creation clears the marker; the next removal is meaningful again",
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_delete_clears_last_published() {
+        let guard = EchoGuard::new();
+        let path = p("/w/a.txt");
+        let bytes = b"same bytes before and after delete";
+        guard.record_local_publish(&path, bytes).await;
+
+        guard.mark_remote_delete(&path).await;
+        assert!(
+            !guard.should_skip_local(&path, bytes).await,
+            "after a peer delete, re-creating identical bytes must publish, not be deduped",
         );
     }
 }
