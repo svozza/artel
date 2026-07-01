@@ -80,6 +80,11 @@ pub(crate) trait SessionStore: Send + Sync + std::fmt::Debug {
     /// (postcard-encoded `WorkspaceTicketEnvelope`); disk-backed
     /// implementations keep them `0600` — capability-bearing, same
     /// posture as `tickets.json`.
+    ///
+    /// Part of the store contract in both feature modes (the slot is
+    /// loaded by `load_all` either way); only *written* from
+    /// iroh-gated delivery paths, hence the no-iroh dead-code allow.
+    #[cfg_attr(not(feature = "iroh"), allow(dead_code))]
     async fn put_workspace_ticket(&self, session: SessionId, envelope: &[u8]) -> io::Result<()>;
 
     /// Add a peer to a session's member set.

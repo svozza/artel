@@ -3472,11 +3472,6 @@ async fn reconcile_doc_against_disk(
     Ok(())
 }
 
-/// Open a second [`Client`] connection, subscribe to `session`, and
-/// spawn the cap-listener task on that independent event stream.
-///
-/// Returns a no-op handle if `socket` is `None` (the gate still
-/// rejects based on the seed state populated at construction).
 /// Host-side context for delivering `NamespaceSecret` upgrades when a
 /// peer is granted RW. `None` on the joiner side.
 struct HostUpgradeCtx {
@@ -3605,6 +3600,11 @@ async fn cap_resubscribe(
     Ok((Arc::new(client), events))
 }
 
+/// Open a second [`Client`] connection, subscribe to `session`, and
+/// spawn the cap-listener task on that independent event stream.
+///
+/// Returns a no-op handle if `socket` is `None` (the gate still
+/// rejects based on the seed state populated at construction).
 async fn spawn_cap_listener_from_socket(
     socket: Option<&Path>,
     session: SessionId,

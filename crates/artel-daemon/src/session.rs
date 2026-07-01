@@ -19,12 +19,17 @@ use std::sync::Arc;
 
 use artel_protocol::capability::{Capability, CapabilityAction};
 use artel_protocol::ids::TicketId;
-use artel_protocol::message::{MESSAGE_FORMAT, SIGNATURE_UNSIGNED, SigBytes};
+#[cfg(feature = "iroh")]
+use artel_protocol::message::MESSAGE_FORMAT;
+use artel_protocol::message::{SIGNATURE_UNSIGNED, SigBytes};
+#[cfg(feature = "iroh")]
 use artel_protocol::signing::{self, verify_reason};
 use artel_protocol::ticket::{self, SessionTicket, TicketEntry, TicketStatus, WireEndpointAddr};
+#[cfg(feature = "iroh")]
+use artel_protocol::{DowngradePayload, RotatePayload, UpgradePayload};
 use artel_protocol::{
-    DowngradePayload, Event, JoinTicket, MessageKind, PeerId, PeerInfo, ProtocolError,
-    RotatePayload, Seq, SessionId, SessionMessage, SessionSummary, UpgradePayload,
+    Event, JoinTicket, MessageKind, PeerId, PeerInfo, ProtocolError, Seq, SessionId,
+    SessionMessage, SessionSummary,
 };
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, broadcast};
@@ -62,7 +67,9 @@ const WORKSPACE_TICKET_DELIVERY_RETRIES: u32 = 5;
 #[cfg(feature = "iroh")]
 const WORKSPACE_TICKET_DELIVERY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(3);
 
-use artel_protocol::{DOWNGRADE_ACTION, ROTATE_ACTION, TICKET_ACTION, UPGRADE_ACTION};
+#[cfg(feature = "iroh")]
+use artel_protocol::{DOWNGRADE_ACTION, ROTATE_ACTION};
+use artel_protocol::{TICKET_ACTION, UPGRADE_ACTION};
 
 /// Wall-clock millis since the Unix epoch. The `Local` arm of
 /// [`Authoring`] stamps this onto every body it signs.
@@ -809,6 +816,7 @@ impl Registry {
     /// Returns `Some(true)` if the session exists and is `Local` (we
     /// are the host), `Some(false)` if it exists but is `Remote`, or
     /// `None` if the session is unknown.
+    #[cfg(feature = "iroh")]
     pub(crate) async fn is_local_session(&self, session: SessionId) -> Option<bool> {
         let guard = self.sessions.read().await;
         let session_arc = guard.get(&session)?.clone();
@@ -876,6 +884,9 @@ impl Registry {
                 // against a joiner whose beacon-advanced watermark has
                 // moved past it. A fresh create (below) leaves epoch 0.
                 let (ticket, ticket_id) = self.mint_ticket(id, granted_cap, expiry_ms);
+                // Read by the bridge re-subscribe below, which only
+                // exists with iroh on.
+                #[cfg_attr(not(feature = "iroh"), allow(unused_variables))]
                 let host_epoch = {
                     let mut s = arc.lock().await;
                     if s.host != host_peer.id || s.kind != SessionKind::Local {
@@ -1107,6 +1118,7 @@ impl Registry {
         expiry_ms: u64,
     ) -> (JoinTicket, TicketId) {
         let tid = TicketId::new_random();
+        #[cfg(feature = "iroh")]
         let cap_sig = self.signing_key.as_ref().map_or(SIGNATURE_UNSIGNED, |key| {
             signing::sign_ticket_cap(
                 key.as_signing_key(),
@@ -1116,6 +1128,8 @@ impl Registry {
                 expiry_ms,
             )
         });
+        #[cfg(not(feature = "iroh"))]
+        let cap_sig = SIGNATURE_UNSIGNED;
         let ticket = JoinTicket::from(ticket::encode(&SessionTicket {
             ticket_id: tid,
             session_id,
@@ -1316,6 +1330,7 @@ impl Registry {
     /// to the host's gossip topic. Inbound gossip messages land in
     /// the mirror's `log` and `events_tx`.
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(feature = "iroh"), allow(clippy::unused_async))]
     async fn materialise_remote_session(
         &self,
         session_id: SessionId,
@@ -1345,7 +1360,7 @@ impl Registry {
                 ?session_id,
                 "remote ticket received but iroh feature is off",
             );
-            return Err(SessionError::InvalidTicket);
+            Err(SessionError::InvalidTicket)
         }
 
         #[cfg(feature = "iroh")]
@@ -1559,6 +1574,9 @@ impl Registry {
         let host;
         let kind;
         let drop_session;
+        // Read by the bridge teardown below, which only exists with
+        // iroh on.
+        #[cfg(feature = "iroh")]
         let host_epoch;
         {
             let mut s = session_arc.lock().await;
@@ -1567,7 +1585,10 @@ impl Registry {
             }
             host = s.host;
             kind = s.kind;
-            host_epoch = s.host_epoch;
+            #[cfg(feature = "iroh")]
+            {
+                host_epoch = s.host_epoch;
+            }
             // The session's local lifetime ends in two cases: the
             // host is leaving a Local session (case 1), or the
             // (sole local) joiner is leaving a Remote mirror
@@ -2308,6 +2329,10 @@ impl Registry {
     /// once and either signs (Local) or verifies (Remote); returns
     /// the `(timestamp_ms, signature)` pair the [`SessionMessage`]
     /// will carry.
+    ///
+    /// Without iroh only the infallible `Local` arm exists; keep the
+    /// `Result` so callers are identical in both feature modes.
+    #[cfg_attr(not(feature = "iroh"), allow(clippy::unnecessary_wraps))]
     fn resolve_authoring(
         &self,
         authoring: Authoring,
@@ -2344,6 +2369,14 @@ impl Registry {
     /// authoring arms. Under no-iroh / no-key returns the sentinel —
     /// the same lit-fuse posture as [`Self::author_local`]: a joiner's
     /// `verify_seq` rejects the sentinel loudly once enforcement is on.
+    ///
+    /// Without iroh there is no signing key and this always returns
+    /// the sentinel; keep the method shape identical in both feature
+    /// modes so call sites don't fork.
+    #[cfg_attr(
+        not(feature = "iroh"),
+        allow(clippy::unused_self, clippy::missing_const_for_fn)
+    )]
     fn sign_seq_for(&self, session: SessionId, seq: Seq, author_sig: &SigBytes) -> SigBytes {
         #[cfg(feature = "iroh")]
         {
@@ -2368,6 +2401,10 @@ impl Registry {
     /// keep that test path working by falling back to the sentinel,
     /// which the verifier rejects loudly the moment any receive
     /// path actually verifies.
+    ///
+    /// `self` is only read with iroh on (the signing key); the
+    /// signature stays method-shaped so call sites don't fork.
+    #[cfg_attr(not(feature = "iroh"), allow(clippy::unused_self))]
     fn author_local(
         &self,
         peer: &PeerInfo,
@@ -3006,25 +3043,6 @@ fn parse_ticket(ticket: &JoinTicket) -> Result<SessionTicket, SessionError> {
     })
 }
 
-/// Apply an inbound `Message` to a `Remote` mirror, with the full
-/// joiner-side acceptance pipeline (Auth Slice B.5.3): **dedup →
-/// author signature → host sequencing signature → persist → emit**.
-///
-/// Extracted from `materialise_remote_session`'s `on_message` closure
-/// so the ordering invariant is unit-testable without a live gossip
-/// bridge. The order is load-bearing:
-/// - **Dedup first** so routine at-least-once / replay-backfill
-///   duplicates don't re-pay ed25519 (review-fix #5).
-/// - **Author sig** (`verify_message`) against the body's `peer.id`.
-/// - **Host seq-sig** (`verify_seq`) against `s.host` (= the ticket's
-///   `host_peer_id`), binding *this seq* to *this author sig* — so a
-///   genuine frame replayed under a different seq (finding #1) drops.
-///
-/// **No watermark interaction here** — the `host_epoch` watermark is
-/// moved only by the bridge's `EpochBeacon` arm. A genuine `Message`
-/// replayed on an unseen seq is dropped by `verify_seq` and never
-/// touches the watermark (`replayed_message_cannot_poison_watermark`).
-#[cfg(feature = "iroh")]
 /// Map a [`crate::gossip_bridge::send_remote`] result onto the
 /// registry's [`SessionError`] surface. Shared by the first-attempt and
 /// post-resubscribe-retry arms of the `Remote` send path so they can't
@@ -3059,6 +3077,25 @@ fn map_send_remote_result(
     }
 }
 
+/// Apply an inbound `Message` to a `Remote` mirror, with the full
+/// joiner-side acceptance pipeline: **dedup → author signature → host
+/// sequencing signature → persist → emit**.
+///
+/// Extracted from `materialise_remote_session`'s `on_message` closure
+/// so the ordering invariant is unit-testable without a live gossip
+/// bridge. The order is load-bearing:
+/// - **Dedup first** so routine at-least-once / replay-backfill
+///   duplicates don't re-pay ed25519.
+/// - **Author sig** (`verify_message`) against the body's `peer.id`.
+/// - **Host seq-sig** (`verify_seq`) against `s.host` (= the ticket's
+///   `host_peer_id`), binding *this seq* to *this author sig* — so a
+///   genuine frame replayed under a different seq drops.
+///
+/// **No watermark interaction here** — the `host_epoch` watermark is
+/// moved only by the bridge's `EpochBeacon` arm. A genuine `Message`
+/// replayed on an unseen seq is dropped by `verify_seq` and never
+/// touches the watermark (`replayed_message_cannot_poison_watermark`).
+#[cfg(feature = "iroh")]
 async fn apply_inbound_mirror_message(
     store: &DynStore,
     mirror: &Arc<Mutex<Session>>,

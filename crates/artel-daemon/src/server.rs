@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(feature = "iroh")]
 use std::time::Duration;
 
 use artel_protocol::transport::{self, Framed, server::Listener};
@@ -1451,9 +1452,6 @@ fn iroh_endpoint_to_wire(addr: &iroh::EndpointAddr) -> artel_protocol::WireEndpo
     }
 }
 
-/// Spawn a task that forwards events from `sub.events` as
-/// [`WireMessage::Event`] frames into `sink`. Backfills `sub.replay`
-/// first.
 /// Per-connection owner of subscription forwarder tasks, keyed by
 /// session.
 ///
@@ -1498,6 +1496,9 @@ impl Drop for ForwarderSet {
     }
 }
 
+/// Spawn a task that forwards events from `sub.events` as
+/// [`WireMessage::Event`] frames into `sink`. Backfills `sub.replay`
+/// first.
 fn spawn_subscription_forwarder(
     session: SessionId,
     sub: Subscription,

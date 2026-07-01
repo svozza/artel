@@ -59,20 +59,26 @@ workspace = true
 
 # Helper binary used by `tests/crash_recovery.rs` only. Locating it
 # via `env!("CARGO_BIN_EXE_crash_child")` is the standard pattern;
-# the test fails fast if the binary isn't built.
+# the test fails fast if the binary isn't built. `required-features`
+# keeps the bin out of non-test builds: it uses the `test-utils`-gated
+# `EndpointSetup::TestingWithRelay`, and test builds always have the
+# feature on via the self dev-dependency.
 [[bin]]
 name = "crash_child"
 path = "tests/bin/crash_child.rs"
 test = false
 doctest = false
 bench = false
+required-features = ["test-utils"]
 
 # Helper binary used by `tests/drop_bomb.rs` to verify
 # `Workspace::Drop` fires (resp. stays quiet) on the ungraceful
-# (resp. graceful) shutdown path. Same `CARGO_BIN_EXE_*` pattern.
+# (resp. graceful) shutdown path. Same `CARGO_BIN_EXE_*` pattern and
+# same `required-features` rationale as `crash_child` above.
 [[bin]]
 name = "drop_bomb_child"
 path = "tests/bin/drop_bomb_child.rs"
 test = false
 doctest = false
 bench = false
+required-features = ["test-utils"]

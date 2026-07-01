@@ -33,9 +33,18 @@ test-fallback:
 fmt:
 	cargo fmt --all --check
 
+# Three feature modes: default, everything on, everything off. The
+# no-default-features pass is what catches an iroh-gated item used
+# without its cfg — that mode has no test tier of its own, so lint
+# coverage here is its only signal. It deliberately omits
+# `--all-targets`: pulling test targets into the build graph activates
+# each crate's self dev-dependency (`features = ["test-utils"]`), and
+# feature unification turns `iroh` back on for the lib — hiding
+# exactly the breakage this pass exists to catch.
 clippy:
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
+	cargo clippy --workspace --no-default-features -- -D warnings
 
 # Build rustdoc for the workspace. Mirrors the clippy two-mode shape
 # (default + all-features) so a feature-gated link or item failure

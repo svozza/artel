@@ -46,9 +46,15 @@ jobs:
           # later run restores it, says "up-to-date", and silently
           # recompiles all deps. main always produces a complete cache.
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # Both feature modes, mirroring `make clippy`.
+      # All three feature modes, mirroring `make clippy`. The
+      # no-default-features pass has no test tier of its own, so this
+      # lint is the only CI signal for that build mode. It must NOT use
+      # `--all-targets`: test targets activate the self dev-dependency
+      # (`features = ["test-utils"]`) and feature unification turns
+      # `iroh` back on for the lib, masking no-iroh breakage.
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo clippy --workspace --no-default-features -- -D warnings
 
   doc:
     name: rustdoc
