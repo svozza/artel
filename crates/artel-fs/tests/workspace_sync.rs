@@ -1905,9 +1905,9 @@ async fn join_with_no_timeout_stays_pending_when_no_ticket_published() {
 
     // Real wall-clock wait — `tokio::time::pause` would also pause
     // the daemon's internal timers and risk false positives. 3s is
-    // enough to be meaningful (the old hard-coded ceiling was 15s,
-    // recently bumped to 60s; wall-time evidence at 3s shows the
-    // wait is genuinely unbounded).
+    // enough to be meaningful (the old hard-coded ceiling was 15s
+    // until 979ddb8 made it configurable; wall-time evidence at 3s
+    // shows the wait is genuinely unbounded).
     sleep(Duration::from_secs(3)).await;
     assert!(
         (&mut join_fut).now_or_never().is_none(),

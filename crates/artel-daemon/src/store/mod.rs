@@ -105,7 +105,7 @@ pub(crate) trait SessionStore: Send + Sync + std::fmt::Debug {
     /// concurrent [`Self::put_attachment`] calls for the same session
     /// — a put that races a delete may land an attachment whose
     /// session has just been removed. Callers (today: only
-    /// [`super::super::session::Registry`]) MUST hold the per-session
+    /// [`super::session::Registry`]) MUST hold the per-session
     /// `Mutex<Session>` across both calls so cascade and put cannot
     /// interleave at the store boundary.
     async fn delete(&self, session: SessionId) -> io::Result<()>;

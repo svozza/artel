@@ -6,8 +6,8 @@
 //! alongside the doc ticket.
 //!
 //! The envelope's version byte is **not** related to
-//! `artel-protocol`'s `TICKET_VERSION` (the artel-session ticket).
-//! That stays at v2; this is a fresh `WorkspaceTicketEnvelope` v1
+//! `artel-protocol`'s `TICKET_VERSION` (the artel-session ticket) —
+//! the two version independently; this one is `ENVELOPE_VERSION`
 //! around the `workspace.ticket` payload.
 //!
 //! Wire compatibility: pre-1.0, no consumers in the wild. We
@@ -18,8 +18,10 @@
 //! [`crate::AttachPolicy::RequireEmpty`] closes.
 //!
 //! Encoded size: postcard, ~`len(glob) + 1 byte mode + ~2 bytes
-//! length prefix` per rule. Practically unbounded ceiling — gossip
-//! frames carry the message, not a base32 URL.
+//! length prefix` per rule. [`encode`] hard-rejects an envelope over
+//! [`artel_protocol::upgrade::WORKSPACE_TICKET_ENVELOPE_MAX`] — the
+//! shared cap the daemon's store, loader, and unicast delivery all
+//! enforce.
 
 use serde::{Deserialize, Serialize};
 
@@ -37,8 +39,9 @@ const ENVELOPE_VERSION: u8 = 2;
 /// envelope. `rules` are the host's [`PathRules`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceTicketEnvelope {
-    /// Envelope version byte. `1` today; future revisions increment
-    /// and are rejected by older joiners with
+    /// Envelope version byte, stamped from `ENVELOPE_VERSION`
+    /// (currently 2); future revisions increment and are rejected by
+    /// older joiners with
     /// [`TicketEnvelopeError::UnsupportedVersion`].
     pub version: u8,
     /// `iroh_docs::DocTicket::to_string()`. The joiner re-parses via
@@ -144,8 +147,8 @@ pub enum TicketEnvelopeError {
     /// from a host that hasn't been upgraded.
     #[error("workspace ticket envelope: malformed bytes ({0})")]
     Malformed(String),
-    /// Version byte unrecognised. Older joiners against newer hosts
-    /// will see this once a v2 envelope ships.
+    /// Version byte unrecognised. What an older joiner sees when a
+    /// newer host ships a bumped envelope version.
     #[error("workspace ticket envelope: unsupported version {0}")]
     UnsupportedVersion(u8),
     /// Encoded envelope exceeds the shared delivery/persistence cap

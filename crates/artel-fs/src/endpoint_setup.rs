@@ -1,32 +1,40 @@
 //! Substrate's endpoint-discovery hook.
 //!
 //! [`EndpointSetup`] picks how the per-`Workspace` iroh `Endpoint`
-//! finds peers. Two variants:
+//! finds peers. One production variant plus four `test-utils`-gated
+//! fixtures:
 //!
 //! - [`EndpointSetup::Production`] — the [`presets::N0`] preset,
 //!   which adds n0's pkarr publish + DNS resolve + relay default.
 //!   Real deployments use this.
-//! - [`EndpointSetup::Testing`] (only with `feature = "test-utils"`)
-//!   — [`presets::Minimal`] + the caller's [`DnsPkarrServer`]. A
-//!   localhost pkarr-publish HTTP server + a localhost DNS server
-//!   with shared state, run for the test's lifetime. Deterministic
-//!   (no propagation race against `dns.iroh.link`), localhost-fast,
-//!   exercises the same code paths as production except the
-//!   physical infrastructure. iroh-docs uses the same fixture in
-//!   its own tests; this is the upstream-recommended pattern.
+//! - [`EndpointSetup::Testing`] — [`presets::Minimal`] + the
+//!   caller's [`DnsPkarrServer`]. A localhost pkarr-publish HTTP
+//!   server + a localhost DNS server with shared state, run for the
+//!   test's lifetime. Deterministic (no propagation race against
+//!   `dns.iroh.link`), localhost-fast, exercises the same code paths
+//!   as production except the physical infrastructure. iroh-docs
+//!   uses the same fixture in its own tests; this is the
+//!   upstream-recommended pattern.
+//! - [`EndpointSetup::TestingUnreachableRelay`] — the inverse
+//!   fixture: Minimal + a deliberately-unrouteable relay URL
+//!   ([RFC 5737] TEST-NET-1 `192.0.2.1`). `awaits_relay()` returns
+//!   `true`, so callers enter [`iroh::Endpoint::online`] and the
+//!   relay handshake never completes — exercising the timeout
+//!   wrapper that surfaces
+//!   [`crate::WorkspaceError::RelayUnreachable`] instead of hanging
+//!   forever.
+//! - [`EndpointSetup::ProductionCustomRelay`] — the N0 preset with
+//!   the relay overridden to a caller-supplied URL (self-signed TLS
+//!   accepted). Points real-network tests at a localhost
+//!   `iroh-relay` instead of n0's public relay.
+//! - [`EndpointSetup::TestingWithRelay`] — Minimal + a custom relay
+//!   only (no pkarr/DNS), for cross-process tests that can share a
+//!   localhost relay but not an in-process `DnsPkarrServer`.
 //!
 //! [`presets::Minimal`] has no relay, so a `Testing` endpoint must
 //! NOT call [`iroh::Endpoint::online`] (which awaits relay
 //! readiness — Minimal would hang forever). [`Self::awaits_relay`]
 //! is the gate.
-//!
-//! [`EndpointSetup::TestingUnreachableRelay`] (test-utils only) is
-//! the inverse fixture: Minimal + a deliberately-unrouteable relay
-//! URL ([RFC 5737] TEST-NET-1 `192.0.2.1`). `awaits_relay()`
-//! returns `true`, so callers enter [`iroh::Endpoint::online`] and
-//! the relay handshake never completes — exercising the timeout
-//! wrapper that surfaces [`crate::WorkspaceError::RelayUnreachable`]
-//! instead of hanging forever.
 //!
 //! [RFC 5737]: https://datatracker.ietf.org/doc/html/rfc5737
 
@@ -127,20 +135,19 @@ impl EndpointSetup {
             #[cfg(feature = "test-utils")]
             Self::Testing { dns_pkarr } => {
                 let builder = iroh::endpoint::presets::Minimal.apply(builder);
-                // `DnsPkarrServer::preset()` defaults the
-                // PkarrPublisher's `AddrFilter` to `relay_only`
-                // because the upstream fixture is paired with a
-                // test relay. Our tests run direct UDP between
-                // localhost peers (no relay), so the publisher
-                // must use `ip_only` instead — otherwise it
-                // publishes nothing (no relay url to publish)
-                // and the joiner's DNS lookup returns empty.
-                // The filter lives on the publisher builder, NOT
-                // on the endpoint builder. iroh-docs's
-                // `tests/util.rs` works around the same
-                // constraint by spinning up a test relay; we
-                // don't want a relay in the loop, so we publish
-                // direct IPs instead.
+                // The PkarrPublisher builder's own default
+                // `AddrFilter` is `relay_only`, because the upstream
+                // fixture is normally paired with a test relay. Our
+                // tests run direct UDP between localhost peers (no
+                // relay), so the publisher must use `ip_only`
+                // instead — otherwise it publishes nothing (no relay
+                // url to publish) and the joiner's DNS lookup
+                // returns empty. Hence the explicit `.addr_filter`
+                // override on the publisher builder below.
+                // iroh-docs's `tests/util.rs` works around the same
+                // constraint by spinning up a test relay; we don't
+                // want a relay in the loop, so we publish direct IPs
+                // instead.
                 // `DnsPkarrServer`'s `endpoint_origin` / `pkarr_url`
                 // fields became private in iroh 1.0; only `pkarr_url()`
                 // has a public accessor. We own the origin ourselves

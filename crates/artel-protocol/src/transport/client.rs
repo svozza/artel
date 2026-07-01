@@ -2,9 +2,9 @@
 //!
 //! [`connect`] surfaces OS errors unchanged — `NotFound` (socket absent)
 //! and `ConnectionRefused` (no listener) are the two the caller cares
-//! about. Stale-socket recovery (delete file + spawn daemon + retry)
-//! lives in a higher layer that knows about the daemon lifecycle, not
-//! here.
+//! about. Stale-socket recovery lives elsewhere: the daemon removes a
+//! stale socket file before binding, and the client's spawn layer
+//! retries the connect while the daemon starts.
 
 use std::io;
 use std::path::Path;

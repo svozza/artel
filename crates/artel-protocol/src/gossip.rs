@@ -30,15 +30,16 @@
 //!   host can admit them to membership and emit `PeerJoined`
 //!   eagerly, rather than waiting for their first `SendRequest`.
 //!
-//! ## No wire versioning yet
+//! ## Wire versioning
 //!
-//! Pre-1.0, both daemons rebuild together; we have zero on-the-wire
-//! compatibility surface to defend. Adding a wire-version envelope
-//! later is ~30 lines (struct + decode check + error variant) and
-//! by then we'll have a real story for capability negotiation
-//! anyway. Until then, an unrecognised frame surfaces as
-//! [`GossipFrameError::Malformed`] from postcard and is dropped at
-//! the bridge with a warn log.
+//! Every encoded frame leads with a [`GOSSIP_WIRE_VERSION`] byte;
+//! decode rejects an unknown version with
+//! [`GossipFrameError::UnsupportedVersion`] before postcard ever
+//! sees the body, so a mixed-version mesh fails cleanly at the
+//! version byte instead of mis-decoding bytes into the wrong
+//! variant. A frame whose body then fails postcard decode surfaces
+//! as [`GossipFrameError::Malformed`] and is dropped at the bridge
+//! with a warn log.
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

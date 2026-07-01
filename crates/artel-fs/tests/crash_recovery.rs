@@ -12,10 +12,12 @@
 //! 1. **Steady-state crash** — full publish completed, peer in
 //!    sync, then SIGKILL. Restart should reproduce identical disk
 //!    state on both sides.
-//! 2. **Mid scan-and-publish** — workspace starts with N seeded
-//!    files; SIGKILL between `WORKSPACE_UP` and `READY`, before
-//!    the initial scan finishes. Reconcile + rescan must finish
-//!    the job on next start.
+//! 2. **Post scan, pre steady-state** — workspace starts with N
+//!    seeded files; SIGKILL between `WORKSPACE_UP` and `READY`.
+//!    The initial scan completes inside `Workspace::host_with`
+//!    (before `WORKSPACE_UP`), so the kill lands after all N are
+//!    published but before the peer has synced. Reconcile + rescan
+//!    must converge everything on next start.
 //! 3. **Mid live write** — after `READY`, the host writes new
 //!    files in a loop; SIGKILL during the watcher's debounce
 //!    window. The rescan on restart must include any file that's
@@ -236,20 +238,14 @@ async fn wait_for_file(path: &Path, expected: &[u8]) {
 /// state and live sync should resume.
 #[tokio::test(flavor = "multi_thread")]
 async fn steady_state_sigkill_preserves_state_n0() {
-    // Crash-recovery tests deliberately don't override the workspace
-    // address-lookup: the child binary runs in a separate process
-    // and an in-memory MemoryLookup can't be shared across the
-    // process boundary. These tests therefore exercise the n0
-    // discovery path. They're slower and flakier than the in-process
-    // tests because of it; that's the price of testing a real
-    // SIGKILL → restart cycle. See `docs/handoff-stale-daemon.md`.
-    // Crash-recovery tests are inherently real-n0: the child binary
-    // runs in a separate process, so it can't share an in-process
-    // `DnsPkarrServer` (or any other in-process discovery fixture)
-    // with the parent. Both sides go through n0's production
-    // discovery path. Slower and flakier than the in-process suite
-    // — that's the price of testing a real SIGKILL → restart cycle.
-    // See `docs/handoff-stale-daemon.md`.
+    // Crash-recovery tests are real-n0: the child binary runs in a
+    // separate process, so it can't share an in-process
+    // `DnsPkarrServer` with the parent. Both sides go through n0's
+    // production discovery path. (`TestingWithRelay` + the
+    // `ARTEL_RELAY_URL` hook could make this hermetic — drop_bomb.rs
+    // uses them — at the cost of no pkarr/DNS coverage.) Slower and
+    // flakier than the in-process suite — the price of testing a
+    // real SIGKILL → restart cycle.
     let daemon_a = common::spawn_daemon_with_setup(
         common::fresh_state(),
         artel_daemon::EndpointSetup::Production,
@@ -291,9 +287,9 @@ async fn steady_state_sigkill_preserves_state_n0() {
     child.sigkill().await;
 
     // Tear Bob down before phase 2: the artel session is gone with
-    // Alice's daemon-state for that session, and the next host
-    // restart starts a fresh artel session. Bob will rejoin via
-    // the new ticket.
+    // Alice's daemon-state for that session. The restart resumes the
+    // same genesis-derived session id but mints a fresh ticket; Bob
+    // rejoins via that new ticket.
     bob_ws.shutdown().await.expect("shutdown");
     let _ = tokio::time::timeout(Duration::from_secs(5), bob_handle).await;
     drop(bob);
@@ -344,24 +340,27 @@ async fn steady_state_sigkill_preserves_state_n0() {
     daemon_b.stop().await;
 }
 
-/// Test 2 — kill mid scan-and-publish.
+/// Test 2 — kill after the initial scan, before steady state.
 ///
 /// Pre-seed N files. Spawn the child in `mid_scan` mode. SIGKILL
-/// as soon as `WORKSPACE_UP` arrives, before `READY` — the child
-/// is mid-scan. The exact set of files it managed to publish is
-/// non-deterministic. Restart it and assert that all N files
-/// converge into the doc and onto Bob's disk.
+/// as soon as `WORKSPACE_UP` arrives, before `READY`. The scan
+/// completes inside `Workspace::host_with`, so all N files are
+/// already published when the kill lands; what the crash interrupts
+/// is everything after (peer sync, ticket delivery, steady-state
+/// loop). Restart it and assert that all N files converge into the
+/// doc and onto Bob's disk.
 #[tokio::test(flavor = "multi_thread")]
 async fn mid_scan_sigkill_recovers_via_reconcile_n0() {
     const N: usize = 16;
 
-    // Crash-recovery tests are inherently real-n0: the child binary
-    // runs in a separate process, so it can't share an in-process
-    // `DnsPkarrServer` (or any other in-process discovery fixture)
-    // with the parent. Both sides go through n0's production
-    // discovery path. Slower and flakier than the in-process suite
-    // — that's the price of testing a real SIGKILL → restart cycle.
-    // See `docs/handoff-stale-daemon.md`.
+    // Crash-recovery tests are real-n0: the child binary runs in a
+    // separate process, so it can't share an in-process
+    // `DnsPkarrServer` with the parent. Both sides go through n0's
+    // production discovery path. (`TestingWithRelay` + the
+    // `ARTEL_RELAY_URL` hook could make this hermetic — drop_bomb.rs
+    // uses them — at the cost of no pkarr/DNS coverage.) Slower and
+    // flakier than the in-process suite — the price of testing a
+    // real SIGKILL → restart cycle.
     let daemon_a = common::spawn_daemon_with_setup(
         common::fresh_state(),
         artel_daemon::EndpointSetup::Production,
@@ -448,13 +447,14 @@ async fn mid_scan_sigkill_recovers_via_reconcile_n0() {
 /// the prior process didn't get to publish.
 #[tokio::test(flavor = "multi_thread")]
 async fn mid_write_sigkill_resyncs_on_restart_n0() {
-    // Crash-recovery tests are inherently real-n0: the child binary
-    // runs in a separate process, so it can't share an in-process
-    // `DnsPkarrServer` (or any other in-process discovery fixture)
-    // with the parent. Both sides go through n0's production
-    // discovery path. Slower and flakier than the in-process suite
-    // — that's the price of testing a real SIGKILL → restart cycle.
-    // See `docs/handoff-stale-daemon.md`.
+    // Crash-recovery tests are real-n0: the child binary runs in a
+    // separate process, so it can't share an in-process
+    // `DnsPkarrServer` with the parent. Both sides go through n0's
+    // production discovery path. (`TestingWithRelay` + the
+    // `ARTEL_RELAY_URL` hook could make this hermetic — drop_bomb.rs
+    // uses them — at the cost of no pkarr/DNS coverage.) Slower and
+    // flakier than the in-process suite — the price of testing a
+    // real SIGKILL → restart cycle.
     let daemon_a = common::spawn_daemon_with_setup(
         common::fresh_state(),
         artel_daemon::EndpointSetup::Production,

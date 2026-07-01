@@ -129,7 +129,7 @@ async fn host_outbound_dial_blocked_after_revocation() {
 
     // --- Phase 3: restart Alice's workspace. ---
     // The restart forces Alice's iroh-docs engine to establish fresh
-    // outbound connections. The OutboundDialFilter should block dials
+    // outbound connections. The PeerFilter should block dials
     // to Bob's workspace endpoint because the PeerMap (rebuilt from
     // the cap-listener's session-log replay) marks Bob as revoked.
     alice_ws.shutdown().await.expect("alice phase-1 shutdown");
@@ -162,7 +162,7 @@ async fn host_outbound_dial_blocked_after_revocation() {
     let alice_blocked = alice_dir.path().join("after_revoke.txt");
     assert!(
         !alice_blocked.exists(),
-        "post-revoke write leaked to host via outbound sync — OutboundDialFilter did not block",
+        "post-revoke write leaked to host via outbound sync — PeerFilter did not block",
     );
 
     // Cleanup

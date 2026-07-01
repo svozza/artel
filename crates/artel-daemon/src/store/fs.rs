@@ -600,9 +600,12 @@ fn load_one(dir: &Path) -> io::Result<SessionRecord> {
     // (corruption or schema skew) must neither be silently treated as
     // empty in place — the next mint's rewrite would destroy the
     // evidence — nor fail the whole session load: a skipped session
-    // is unrecoverable through any API (resume falls through to the
-    // create path and dies on AlreadyExists), which is a far larger
-    // blast radius than the ledger itself. Instead, quarantine the
+    // drops out of the registry, and the only way back is a resume
+    // that falls through to the create path, which succeeds (`create`
+    // is idempotent) but rewrites meta from a fresh record — resetting
+    // head and host epoch and orphaning the log's existing entries.
+    // That is a far larger blast radius than the ledger itself.
+    // Instead, quarantine the
     // file (rename preserves the bytes for manual repair), warn, and
     // load with an empty ledger: fail closed — every outstanding
     // ticket stops admitting until the host re-mints — while the
@@ -1728,9 +1731,10 @@ mod tests {
         // Issued-only admission makes the ledger load-bearing, but it
         // is a *sidecar*: corruption must not take the session's
         // intact log and membership down with it (a skipped session
-        // can never be resumed — host() falls through to the create
-        // path and hits AlreadyExists, with no API able to delete or
-        // repair it). Instead: quarantine the corrupt file so the
+        // drops out of the registry; a resume falls through to the
+        // idempotent create path, which rewrites meta from a fresh
+        // record and loses head + host epoch). Instead: quarantine
+        // the corrupt file so the
         // bytes survive for manual repair, load the session with an
         // EMPTY ledger — fail closed, every outstanding ticket stops
         // admitting — and warn. The next mint writes a fresh ledger.

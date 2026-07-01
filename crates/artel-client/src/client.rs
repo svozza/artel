@@ -70,7 +70,7 @@ pub struct Client {
     /// Daemon's reported peer id, captured at handshake.
     daemon_peer_id: PeerId,
     /// Socket path this client connected on. Retained so recovery
-    /// loops (e.g. `artel-fs`'s cap-listener lag recovery) can open a
+    /// loops (e.g. `artel-fs`'s cap-listener EOF recovery) can open a
     /// fresh connection to the same daemon without the caller having
     /// to thread the path separately.
     socket_path: PathBuf,
@@ -291,8 +291,10 @@ impl Client {
     ///
     /// Exposed so recovery loops can reconnect to the same daemon by
     /// opening a fresh [`Client::connect`] — see `artel-fs`'s
-    /// cap-listener lag recovery, which re-`Subscribe`s after the
-    /// daemon tears the connection down on subscriber lag (M3).
+    /// cap-listener EOF recovery. (Subscriber lag itself no longer
+    /// closes the connection: the daemon sends an in-band
+    /// `Event::Gap` and the subscriber re-`Subscribe`s on the same
+    /// connection.)
     #[must_use]
     pub fn socket_path(&self) -> &Path {
         &self.socket_path

@@ -56,9 +56,9 @@ use tokio::time::timeout;
 //
 // Sync-retry on dial failure: iroh-docs's `Docs::import` triggers a
 // single dial attempt. If the host's pkarr publish hasn't propagated
-// to `dns.iroh.link` yet, the joiner sleeps 50 ms between
-// `Doc::get_one` calls and relies on iroh-docs eventually noticing
-// the host once pkarr propagates. Best read as a happy-path canary.
+// to `dns.iroh.link` yet, the joiner polls `get_many(Query::all())`
+// and relies on iroh-docs eventually noticing the host once pkarr
+// propagates. Best read as a happy-path canary.
 // =============================================================
 
 /// Per-phase deadline for the n0 smoke test. Generous so a slow-
@@ -462,8 +462,8 @@ async fn doc_ticket_round_trips_via_localhost_pkarr_dns() {
 // =============================================================
 // `Workspace::host_with` against `EndpointSetup::TestingUnreachableRelay`
 // must return `WorkspaceError::RelayUnreachable` within a budget,
-// NOT hang forever in `iroh::Endpoint::online`. Pre-fix the call at
-// `crates/artel-fs/src/node.rs:125` was a bare
+// NOT hang forever in `iroh::Endpoint::online`. Pre-fix the call in
+// `WorkspaceNode::spawn` (node.rs) was a bare
 // `endpoint.online().await` with no wrapper — this test hangs in
 // that state until the harness-side timeout panics with the phase
 // name (per `docs/diagnosing-flaky-tests.md`).

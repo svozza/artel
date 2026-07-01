@@ -1,8 +1,8 @@
 //! `artel-daemon` foreground entry point.
 //!
 //! Minimal v1: parse a few flags, init tracing, start the daemon, run
-//! until shutdown. Status / stop / list will move into the
-//! `artel-client` crate alongside the rest of the client surface.
+//! until shutdown. Status / stop / list live in the `artel-client`
+//! crate (`bin/artel.rs`) alongside the rest of the client surface.
 
 use std::path::PathBuf;
 use std::process::ExitCode;

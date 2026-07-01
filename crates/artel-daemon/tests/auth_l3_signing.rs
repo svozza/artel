@@ -13,8 +13,10 @@
 //! - A signed body for session A cannot be replayed on session B —
 //!   `session_id` is in the signed scope.
 //!
-//! All tests Tier B (hermetic against `DnsPkarrServer`) and use the
-//! `common::spawn_pair` fixture. See
+//! All tests Tier B (hermetic against `DnsPkarrServer`). Most use the
+//! `common::spawn_pair` fixture; the replay-verify test uses
+//! `common::spawn_local_daemon_at` for a restart of the same state
+//! dir. See
 //! `docs/plans/2026-06-02-auth-slice-b-l3-signing-plan.md` § B2 and
 //! `docs/brainstorms/2026-05-30-auth-story-brainstorm.md` § L3.
 
@@ -396,7 +398,8 @@ async fn log_replay_drops_tampered_frames() {
     // `[len=64][signature 64][len=64][host_sig 64]`; the author
     // signature's last byte sits 65 bytes before the frame end (64
     // host_sig bytes + 1 length-prefix byte). host_sig itself is not
-    // checked by this replay verify path (Slice B.5.3 adds that).
+    // checked by this replay verify path (`read_log` verifies the
+    // author signature only; host seq-sig verification is live-path).
     let target = frame2_start + 4 + len2 - 1 - 65;
     bytes[target] ^= 0xff;
     std::fs::write(&log_path, &bytes).unwrap();

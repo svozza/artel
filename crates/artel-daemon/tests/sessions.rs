@@ -465,8 +465,9 @@ async fn two_clients_chat_end_to_end() {
 /// daemon (same authenticated id) is a no-op — the daemon's
 /// idempotent self-rejoin path returns Ok without firing a second
 /// `PeerJoined`. Pins the load-bearing semantic that closes the
-/// `crash_recovery::steady_state_sigkill_preserves_state` failure
-/// mode named in `docs/handoff-auth-l1-review-fixes.md`.
+/// `crash_recovery::steady_state_sigkill_preserves_state_n0`
+/// failure mode: a restarted host rejoining its own session must
+/// not wedge on "already a member".
 #[tokio::test]
 async fn repeated_join_against_same_daemon_is_idempotent() {
     let (daemon_a, daemon_b, _dns) = common::spawn_pair().await;
@@ -599,9 +600,10 @@ async fn subscribe_replays_history() {
 // Host resume: a host that supplies an existing `SessionId`
 // reattaches to its previously-persisted session verbatim. A
 // different host trying to claim the same id is rejected with
-// `ProtocolError::SessionConflict`. iroh-disabled — the resume
-// contract is about the `Registry` + `SessionStore` round trip; the
-// gossip bridge has its own coverage.
+// `ProtocolError::SessionConflict`. The daemon here is iroh-enabled
+// (this bin is `#![cfg(feature = "iroh")]`), but the contract under
+// test is the `Registry` + `SessionStore` round trip; the gossip
+// bridge has its own coverage.
 // =============================================================
 
 /// Re-hosting with a previously-minted `SessionId` recovers the
@@ -955,8 +957,8 @@ async fn hello_version_mismatch_returns_error_then_closes() {
 
     let mut framed = transport_connect(&state.socket).await.expect("connect");
 
-    // The daemon's `PROTOCOL_VERSION` is 4 at time of writing; pick a
-    // value the daemon is guaranteed not to recognise.
+    // Pick a version far above the daemon's `PROTOCOL_VERSION` so it
+    // is guaranteed not to be recognised.
     let bogus = ProtocolVersion::new(99);
     framed
         .send(WireMessage::Request {

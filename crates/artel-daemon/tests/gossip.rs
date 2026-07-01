@@ -932,7 +932,8 @@ const SYSTEM_ACTION: &str = "workspace.fixture";
 
 // `used_underscore_binding`: rebuild a fresh `State` from
 // `RunningDaemon._state` to give the second daemon the same on-disk
-// paths. Same shape as `host_resume_session_id.rs` in artel-fs.
+// paths. Same shape as the resume tests in artel-fs's
+// `workspace_restart.rs`.
 #[tokio::test]
 #[allow(clippy::used_underscore_binding)]
 async fn joiner_replays_system_message_after_daemon_restart() {

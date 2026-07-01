@@ -86,8 +86,9 @@ pub enum WorkspaceError {
 ///
 /// Surfaces inside [`WorkspaceError::Policy`] from
 /// [`crate::Workspace::host`] / [`crate::Workspace::join`] (and their
-/// `_with` variants) before any disk state is created. A `Policy`
-/// error guarantees no state directory was written.
+/// `_with` variants). The root directory itself may already have been
+/// created (`create_dir_all` runs first), but a `Policy` error
+/// guarantees no state directory was written.
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyViolation {
     /// The workspace root was non-empty under [`crate::AttachPolicy::RequireEmpty`].

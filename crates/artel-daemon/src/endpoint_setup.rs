@@ -128,10 +128,11 @@ impl EndpointSetup {
         }
     }
 
-    /// Whether this setup connects to a relay. Mirrors
-    /// `artel_fs::EndpointSetup::awaits_relay`. `Production` and
-    /// `TestingUnreachableRelay` do; `Testing` (Minimal +
-    /// `DnsPkarrServer`) does not — calling
+    /// Whether this setup connects to a relay. Counterpart of
+    /// `artel_fs::EndpointSetup::awaits_relay` (the fs enum has extra
+    /// variants with no daemon equivalent). `Production`,
+    /// `ProductionCustomRelay`, and `TestingUnreachableRelay` do;
+    /// `Testing` (Minimal + `DnsPkarrServer`) does not — calling
     /// [`iroh::Endpoint::online`] on a `Testing` endpoint hangs
     /// forever because Minimal has no relay configured.
     pub(crate) const fn awaits_relay(&self) -> bool {

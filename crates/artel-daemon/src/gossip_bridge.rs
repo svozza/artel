@@ -142,12 +142,12 @@ pub(crate) struct GossipBridge {
     addr_hint: MemoryLookup,
     /// Shared tracker of `EndpointId`s that have been seeded into
     /// [`Self::addr_hint`] (or are otherwise worth surveying at
-    /// shutdown). The daemon's [`IrohRuntime`] owns the canonical
-    /// reference; the bridge gets a clone so its inserts are
-    /// visible to the shutdown-snapshot path. iroh 0.98.2 has no
-    /// public iterator over `MemoryLookup` entries, so this
-    /// shadow is the daemon's only enumerable source. Drives
-    /// finding #5c's host-restart peer-addr cache.
+    /// shutdown). The daemon's [`crate::server::IrohRuntime`] owns the
+    /// canonical reference; the bridge gets a clone so its inserts are
+    /// visible to the shutdown-snapshot path. iroh (still true on
+    /// 1.0) has no public iterator over `MemoryLookup` entries, so
+    /// this shadow is the daemon's only enumerable source. Feeds the
+    /// host-restart peer-addr cache.
     tracked_peer_ids: Arc<std::sync::Mutex<std::collections::BTreeSet<iroh::EndpointId>>>,
     /// The daemon's own iroh `EndpointId`, cached as a [`PeerId`]
     /// for cheap reads at outbound-stamp sites.
@@ -182,13 +182,14 @@ struct SessionState {
 /// resurrected a live forwarder for a session the registry had already
 /// torn down.
 ///
-/// Fix: claim the slot *before* the awaits. [`reserve`] atomically marks
-/// the slot occupied and hands back a [`SlotReservation`]; a second
-/// `reserve` (or a resume re-subscribe) sees the slot taken and backs
-/// off. After its awaits the caller [`finalize`](SlotReservation::finalize)s
-/// the reservation with the real payload — which *fails* if a
-/// [`forget`] invalidated the reservation meanwhile, handing the payload
-/// back so the caller aborts the just-spawned task. All transitions are
+/// Fix: claim the slot *before* the awaits. [`SessionSlots::reserve`]
+/// atomically marks the slot occupied and hands back a
+/// [`SlotReservation`]; a second `reserve` (or a resume re-subscribe)
+/// sees the slot taken and backs off. After its awaits the caller
+/// [`finalize`](SlotReservation::finalize)s the reservation with the
+/// real payload — which *fails* if a [`SessionSlots::forget`]
+/// invalidated the reservation meanwhile, handing the payload back so
+/// the caller aborts the just-spawned task. All transitions are
 /// under one `std::sync::Mutex` with no `.await` held, so the protocol
 /// is a pure state machine — unit-tested payload-generically in this
 /// module's tests, since there is no in-process gossip harness to drive
@@ -1027,15 +1028,14 @@ impl GossipBridge {
 /// [`SessionMessage`] bodies whose `peer.id` is the *original
 /// sender's* id, not the host that re-published the frame. Verifying
 /// `body.peer.id == delivered_from` would be wrong; the correct
-/// invariant is "the host vouches for the message", which needs L3
-/// per-message signatures to enforce. Joiner-side enforcement of
-/// `Message` / `SendAck::Ok` is therefore deferred to Slice B of the
-/// auth story (see
-/// `docs/brainstorms/2026-05-30-auth-story-brainstorm.md`). Until B
-/// lands, joiners trust their host (the existing model).
+/// invariant is "the host vouches for the message", enforced with
+/// per-message signatures: the `SendAck` arm calls
+/// `signing::verify_ack` against the host key, and the `Message` arm
+/// verifies the author signature plus the host's sequencing signature
+/// (via `apply_inbound_mirror_message`).
 // One `match (role, body)` dispatcher: every arm is a distinct
 // role×frame case and the verify-then-act logic reads best inline
-// rather than scattered across per-arm helpers. The Slice B.5 joiner
+// rather than scattered across per-arm helpers. The joiner
 // verification arms pushed it past the line lint.
 #[allow(clippy::too_many_lines)]
 async fn handle_inbound_frame(
@@ -1428,8 +1428,10 @@ async fn run_host_replay(bridge: &Arc<GossipBridge>, session: SessionId, since: 
     }
 }
 
-/// Wall-clock millis since the Unix epoch. The host stamps its own
-/// clock on messages (joiners trust the host as sequencer here).
+/// Wall-clock millis since the Unix epoch. Stamped joiner-side onto
+/// bodies this daemon authors (`send_remote`,
+/// `publish_join_announcement`); the host preserves the joiner's
+/// stamp verbatim when sequencing.
 fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()

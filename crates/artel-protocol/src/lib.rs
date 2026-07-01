@@ -1,17 +1,18 @@
 //! Wire protocol shared between `artel-daemon` and `artel-client`.
 //!
-//! This crate is dependency-free of `iroh` and of any IPC transport. It
-//! defines the over-the-socket types and version constants the two sides
-//! agree on. See `docs/adr/001-collab-substrate-platform.md` for the
+//! This crate is dependency-free of `iroh`. It defines the
+//! over-the-socket types and version constants the two sides agree on,
+//! plus the IPC framing itself in the `transport` module (feature
+//! `tokio`). See `docs/adr/001-collab-substrate-platform.md` for the
 //! motivating design.
 //!
 //! # Wire format
 //!
-//! - **Binary IPC frames** are serialized with `postcard` and prefixed with
-//!   their length by the framing layer (defined separately in
-//!   `artel-client` / `artel-daemon`). All wire-form enums in this crate
-//!   use serde's default *external* tagging because postcard does not
-//!   implement adjacently- or internally-tagged enums.
+//! - **Binary IPC frames** are serialized with `postcard` and prefixed
+//!   with their length by the framing layer (`transport`). All
+//!   wire-form enums in this crate use serde's default *external*
+//!   tagging because postcard does not implement adjacently- or
+//!   internally-tagged enums.
 //! - **Human-readable rendering** (CLI output, logs, fixtures) uses
 //!   `serde_json`. Round-trips through both formats are verified by tests.
 //!

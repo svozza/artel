@@ -3,14 +3,13 @@
 //! with **no file content and no doc replica** after driving the
 //! full `Workspace::join_with` flow.
 //!
-//! Written FIRST against the broadcast-ticket code (2026-06-12
-//! revoked-lurker plan): today the host broadcasts the
-//! read-capability `WorkspaceTicketEnvelope` on the session log and
-//! `run_host_replay` serves the backlog to any topic subscriber, so
-//! both tests FAIL — the lurker materialises a live read replica.
-//! The unicast-ticket slices (1–4) turn them green: the envelope is
-//! delivered host→peer over direct QUIC at admission only, and the
-//! Replay path is membership-gated.
+//! Pins the unicast-ticket design (2026-06-12 revoked-lurker plan):
+//! the read-capability `WorkspaceTicketEnvelope` is delivered
+//! host→peer over direct QUIC at admission only — never broadcast on
+//! the session log — and the Replay path is membership-gated. Under
+//! the pre-fix broadcast design both tests failed: `run_host_replay`
+//! served the backlog to any topic subscriber and the lurker
+//! materialised a live read replica.
 
 #![cfg(feature = "test-utils")]
 

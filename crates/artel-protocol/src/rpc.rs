@@ -38,7 +38,7 @@ impl RequestId {
         self.0
     }
 
-    /// Allocate the next request id, panicking on overflow.
+    /// Allocate the next request id, returning `None` on overflow.
     ///
     /// At one request per nanosecond a `u64` lasts 584 years, so overflow
     /// in practice means a connection-id-recycling bug.
@@ -53,9 +53,13 @@ impl RequestId {
 
 /// An opaque join ticket distributed out-of-band.
 ///
-/// Today this is the iroh `NodeAddr` + topic encoded by the daemon. The
-/// protocol crate treats it as an opaque string; the daemon parses and
-/// validates it. Tickets are bearer credentials — anyone with one can join.
+/// The `artel:` text codec and payload are defined in [`crate::ticket`]
+/// ([`crate::ticket::SessionTicket`]: ticket id, session id, host peer
+/// id + wire address, granted capability tier, expiry, capability
+/// signature — the gossip topic is not carried; it is derived from the
+/// session id). This type keeps the string opaque for RPC plumbing; the
+/// daemon decodes and validates it. Tickets are bearer credentials —
+/// anyone with one can join.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct JoinTicket(pub String);
@@ -90,7 +94,8 @@ pub struct SessionSummary {
     pub id: SessionId,
     /// Whether this daemon is the host of the session.
     pub is_host: bool,
-    /// Number of currently-connected peers, including ourself.
+    /// Number of admitted members, including ourself. Durable
+    /// membership, not live connectivity.
     pub peer_count: u32,
     /// Highest sequence number seen so far.
     pub last_seq: Option<Seq>,
@@ -161,7 +166,9 @@ pub enum Request {
         /// Session to subscribe to.
         session: SessionId,
         /// If set, replay messages with `seq > since` before live delivery
-        /// resumes. If `None`, the daemon delivers only future messages.
+        /// resumes. If `None`, the daemon replays the full log (treated
+        /// as `Seq::ZERO`); artel-fs's join path relies on this to
+        /// observe the workspace ticket.
         since: Option<Seq>,
     },
 
@@ -330,8 +337,7 @@ pub enum Request {
     /// write-revocation, Slice 3e). Host-only. The daemon opens a stream
     /// on [`crate::upgrade::UPGRADE_ALPN`], sends a
     /// [`crate::upgrade::DeliveryFrame::Rotate`], and waits for an ACK.
-    /// Returns [`Response::RotateDelivered`] on success. Append-only
-    /// variant — keep last.
+    /// Returns [`Response::RotateDelivered`] on success.
     DeliverRotate {
         /// Session the rotation applies to.
         session: SessionId,
@@ -392,9 +398,6 @@ pub struct SendPayload {
 /// `signature` verbatim into the broadcast [`SessionMessage`];
 /// receivers verify against the joiner's `peer.id` (which is the
 /// `peer` field on the carrying frame).
-///
-/// Slice B1 introduces the type with [`crate::message::SIGNATURE_UNSIGNED`]
-/// as its sentinel value; Slice B2 turns signing on at the bridge.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedSendPayload {
     /// Authoring time, stamped by the joiner's daemon at the moment

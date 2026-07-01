@@ -262,23 +262,21 @@ async fn forged_session_closed_dropped() {
 // =============================================================
 
 /// Drive a forged-ack scenario for one `result` shape. Returns once
-/// the assertions hold. Deterministic: the forged ack is the ONLY ack
-/// bob can resolve against, because we inject it for a `req_id` we
-/// own — bob's genuine send (a separate, real IPC send) runs in
-/// parallel and must resolve on the host's *genuine* ack, never on our
-/// forged frame.
+/// the assertions hold.
 ///
 /// Design (per `docs/diagnosing-flaky-tests.md`: gate on events, never
 /// sleep). iroh-gossip does not surface a node's *inbound* frames to a
 /// sibling raw subscription on the same endpoint, so we cannot observe
-/// bob's real `req_id` from a third-party sub. Instead we assert the
-/// load-bearing primitive directly at the wire boundary: the host's
-/// genuine `SendAck` (captured off daemon B's mesh-joined receiver)
-/// passes `verify_ack` under the host pubkey, while an attacker-signed
-/// ack for the same `req_id` and `result` does NOT — which is exactly
-/// the check the joiner's `SendAck` arm runs before resolving. The
-/// bridge's resolve-only-after-verify behaviour is unit-tested in
-/// `session.rs`; this pins it end-to-end over real transport.
+/// bob's real `req_id` from a third-party sub — and nothing is
+/// injected onto the wire. Instead we assert the load-bearing
+/// primitive directly at the wire boundary: the host's genuine
+/// `SendAck` (captured off daemon B's mesh-joined receiver) passes
+/// `verify_ack` under the host pubkey, while an attacker-signed ack
+/// for the same `req_id` and `result` does NOT — which is exactly the
+/// check the joiner's `SendAck` arm (`gossip_bridge.rs`) runs before
+/// resolving. `verify_ack` itself is unit-tested in
+/// artel-protocol's `signing.rs`; this pins the property over real
+/// transport.
 async fn forged_ack_rejected_for(payload: &[u8], forged_result_is_err: bool) {
     let (daemon_a, daemon_b, _dns, session_id, alice_client, bob_client, _bob_events) =
         host_and_join().await;
@@ -634,13 +632,14 @@ async fn replayed_session_closed_across_epoch_bump_dropped() {
 // pure proactive-delivery assertion was flaky (~20%) because (b) is a
 // real, latent, best-effort-by-design race (the host broadcasts
 // `SessionClosed` eager-only, then tears the topic down in the same
-// breath — iroh-gossip 0.98 has no graceful-leave/flush primitive).
+// breath — iroh-gossip (still true on 0.101) has no
+// graceful-leave/flush primitive).
 // Slice C's host-private auto-grant `send` runs on the host's gossip
 // forwarder task (JoinAnnouncement → ensure_member → send: a disk
 // append + ed25519 sign, serial on that task), which shifts when the
 // host services bob's traffic and nudges the prune to land — exposing
 // the race more often. It does NOT add gossip traffic. See
-// docs/brainstorms/2026-06-04-auth-slice-c-l2-delivery-rethink-brainstorm.md
+// docs/brainstorms/2026-06-03-auth-slice-c-l2-capabilities-seed.md
 // (D4: close-vs-teardown is a separate latent bug, tracked outside L2).
 //
 // The genuine-close *acceptance* security property (verify_ctrl passes,
@@ -743,9 +742,9 @@ async fn legit_host_frames_accepted() {
 // Functions suffixed `_n0` run only under the `n0` nextest profile.
 // =============================================================
 
-/// Spawn two real-n0 daemons and wait until both pkarr records are
-/// queryable, mirroring `common::spawn_pair` but on
-/// `EndpointSetup::Production`.
+/// Spawn two real-network daemons on the localhost shared relay
+/// (`ProductionCustomRelay`), mirroring `common::spawn_pair`'s shape
+/// but over real n0 DNS/pkarr discovery.
 async fn spawn_pair_n0() -> (common::RunningDaemon, common::RunningDaemon) {
     let a = common::spawn_daemon(common::fresh_state(), custom_relay_setup().await).await;
     let b = common::spawn_daemon(common::fresh_state(), custom_relay_setup().await).await;

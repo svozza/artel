@@ -8,11 +8,11 @@
 //! handshake rather than the message).
 //!
 //! [`JoinTicket`]s emitted here use the `artel:` text format defined
-//! in [`artel_protocol::ticket`]. Phase 2c will extend the payload
-//! with iroh `NodeAddr` and topic info; today the ticket carries the
-//! session id and the host daemon's peer id, which is enough for a
-//! local-only daemon to route a join request and rejects all
-//! pre-2b ticket forms.
+//! in [`artel_protocol::ticket`]. The payload is a [`SessionTicket`]:
+//! ticket id, session id, the host's peer id and wire address (relay
+//! url + direct addrs, used as a dial hint on join), the granted
+//! capability tier, expiry, and the host's capability signature.
+//! Older ticket forms are rejected on decode.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -50,13 +50,14 @@ use crate::store::{DynStore, SessionKind, SessionRecord, StoredAttachment};
 /// closing the connection (the client then sees EOF and reconnects).
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
-/// How many times the spawned workspace-ticket delivery retries a
-/// failed dial before giving up. A joiner never re-announces on its
-/// own, so the admission-time delivery is the only path that backfills
-/// its late attach — a single transient holepunch failure must not
-/// strand it in `wait_for_ticket` forever. Each attempt is itself
-/// bounded by the `deliver_frame` timeout; the retries cover a peer
-/// that becomes dialable a moment later.
+/// Total dial attempts (initial + retries) the spawned
+/// workspace-ticket delivery makes before giving up: 5 = 1 initial +
+/// 4 retries. A joiner never re-announces on its own, so the
+/// admission-time delivery is the only path that backfills its late
+/// attach — a single transient holepunch failure must not strand it
+/// in `wait_for_ticket` forever. Each attempt is itself bounded by
+/// the `deliver_frame` timeout; the retries cover a peer that becomes
+/// dialable a moment later.
 #[cfg(feature = "iroh")]
 const WORKSPACE_TICKET_DELIVERY_RETRIES: u32 = 5;
 
@@ -109,11 +110,15 @@ pub enum SessionError {
     #[error("internal: {0}")]
     Internal(String),
 
-    /// `Send` issued for a session whose host is a different
-    /// daemon AND the daemon is built without the `iroh` feature
-    /// (so there's no transport to forward through). With `iroh`
-    /// on, joiner sends are routed through the gossip bridge.
-    #[error("send is only supported on the host side in this build")]
+    /// The operation requires hosting the session but this daemon
+    /// holds only a `Remote` mirror. Surfaces from every host-only
+    /// authority path (`lock_local_session`): issue/revoke/list
+    /// tickets, `remove_member`, `publish_workspace_ticket`. Also
+    /// returned by `send` on a `Remote` mirror when the daemon is
+    /// built without the `iroh` feature (no transport to forward
+    /// through); with `iroh` on, joiner sends are forwarded to the
+    /// host via the gossip bridge instead.
+    #[error("operation requires hosting the session (this daemon holds a remote mirror)")]
     NotHost,
 
     /// A joiner `Send` found no live gossip topic for the session —
@@ -162,15 +167,17 @@ pub enum SessionError {
     },
 
     /// The authoring peer lacked the capability required to author a
-    /// message at its seq (Auth Slice C / L2). For a non-`Capability`
-    /// message that means `peer` did not hold `ReadWrite`; for a
-    /// `Capability` grant/revoke it means the author did not hold
-    /// `ReadWrite` (the right to grant rides on `ReadWrite`, brainstorm
-    /// Q2). The host rejects at `send` (the message never gets a seq);
-    /// the joiner mirror drops+logs the same way. Maps to
+    /// message at its seq. For a non-`Capability` message that means
+    /// `peer` did not hold `ReadWrite`; for a `Capability`
+    /// grant/revoke it means the author did not hold `ReadWrite` (the
+    /// right to grant rides on `ReadWrite`). The host rejects at
+    /// `send`, so the message never gets a seq — enforcement is
+    /// host-only in v1; joiner mirrors deliberately do not re-enforce
+    /// (see the NO L2 CAPABILITY ENFORCEMENT block in
+    /// `apply_inbound_mirror_message`). Maps to
     /// [`artel_protocol::ProtocolError::Capability`] over the wire on
     /// the host-side `SendRequest` rejection path. `had`/`needed` name
-    /// the cap gap for telemetry (Q5) and never leak payload bytes.
+    /// the cap gap for telemetry and never leak payload bytes.
     #[error("capability denied for peer {peer_id}: had {had:?}, needs {needed:?}")]
     CapabilityDenied {
         /// The author whose write was denied.
@@ -357,8 +364,13 @@ pub(crate) struct CapClaim {
 /// replay, plus a live event receiver for everything that follows.
 #[derive(Debug)]
 pub struct Subscription {
-    /// Log entries with `seq > since` at the moment of subscription.
-    /// Empty if the caller already had everything.
+    /// What `subscribe` snapshots for backfill: a synthetic
+    /// `TICKET_ACTION` message minted from the persisted workspace
+    /// ticket envelope (at `Seq::ZERO`, not a log entry) when one
+    /// exists, followed by log entries with `seq > since` — minus
+    /// reserved daemon-injected System actions, which never
+    /// legitimately ride the log. Empty if there is no envelope and
+    /// the caller already had everything.
     pub replay: Vec<SessionMessage>,
     /// Live event stream. The first event is whatever happens *after*
     /// the last entry in `replay`.
@@ -512,7 +524,7 @@ impl Session {
     /// floor, so an unknown peer cannot write.
     ///
     /// **v1 is host-only enforcement** (Auth Slice C delivery rethink,
-    /// `docs/brainstorms/2026-06-04-auth-slice-c-l2-delivery-rethink-brainstorm.md`):
+    /// `docs/brainstorms/2026-06-03-auth-slice-c-l2-capabilities-seed.md`):
     /// this is consulted on the host's `Registry::send` path, which is
     /// the sole sequencer and thus the mandatory enforcement chokepoint.
     /// Joiner mirrors do **not** re-enforce — see the loud note at
@@ -586,7 +598,7 @@ fn project_caps(host: PeerId, log: &[SessionMessage]) -> HashMap<PeerId, Capabil
 /// "any RW holder" (Q2) to prevent malicious joiners from revoking
 /// peers. For P2P (no single host) this must become a quorum or
 /// causal-authority rule; see
-/// `docs/brainstorms/2026-06-04-auth-slice-c-l2-delivery-rethink-brainstorm.md`.
+/// `docs/brainstorms/2026-06-03-auth-slice-c-l2-capabilities-seed.md`.
 fn apply_capability_to(caps: &mut HashMap<PeerId, Capability>, host: PeerId, msg: &SessionMessage) {
     // Authority check: only the host may issue grants/revokes.
     if msg.peer.id != host {
@@ -664,13 +676,14 @@ pub struct Registry {
     daemon_addr: WireEndpointAddr,
     sessions: RwLock<HashMap<SessionId, Arc<Mutex<Session>>>>,
     store: DynStore,
-    /// Plumbing to the iroh gossip substrate. `Some` when the daemon
-    /// is running with the `iroh` feature on and an `iroh_key_path`
-    /// supplied; `None` for local-only embeds and unit tests.
+    /// Plumbing to the iroh gossip substrate. `None` only for unit
+    /// tests that build a registry without an iroh runtime — in an
+    /// iroh build a missing `iroh_key_path` is a hard `StartError`,
+    /// so every production daemon has a bridge.
     #[cfg(feature = "iroh")]
     bridge: Option<Arc<crate::gossip_bridge::GossipBridge>>,
     /// Daemon's iroh secret key, used to sign every locally-authored
-    /// `SessionMessage` (Auth Slice B). `None` only for unit tests
+    /// `SessionMessage`. `None` only for unit tests
     /// that build a registry via the test-only [`Registry::new`]
     /// without an iroh runtime in scope; every production path
     /// populates it from [`crate::server::IrohRuntime::signing_key`]
@@ -686,9 +699,9 @@ pub struct Registry {
     #[cfg(feature = "iroh")]
     signing_key: Option<Arc<iroh::SecretKey>>,
     /// The daemon's iroh `Endpoint`, needed by the direct-stream
-    /// upgrade delivery path (`DeliverUpgrade`) to dial target peers.
-    /// `None` only for unit tests that don't wire up a full iroh
-    /// runtime.
+    /// delivery paths (upgrade / downgrade / rotate dispatch and
+    /// workspace-ticket delivery) to dial target peers. `None` only
+    /// for unit tests that don't wire up a full iroh runtime.
     #[cfg(feature = "iroh")]
     endpoint: Option<iroh::Endpoint>,
 }
@@ -825,8 +838,10 @@ impl Registry {
         Some(s.kind == SessionKind::Local)
     }
 
-    /// Borrow the iroh `Endpoint` (if wired). Used by the
-    /// `DeliverUpgrade` dispatch to dial target peers.
+    /// Borrow the iroh `Endpoint` (if wired). Used by the direct-stream
+    /// dispatch paths (`DeliverUpgrade` / `DeliverDowngrade` /
+    /// `DeliverRotate`) and `deliver_workspace_ticket_to` to dial
+    /// target peers.
     #[cfg(feature = "iroh")]
     pub(crate) const fn endpoint(&self) -> Option<&iroh::Endpoint> {
         self.endpoint.as_ref()
@@ -1836,14 +1851,14 @@ impl Registry {
             }
         }
 
-        // Auto-grant on join (Auth Slice C / L2): grant the capability
-        // tier the ticket claims (or RW if no claim is present — the
-        // `SendRequest` backstop path for pre-tiered-ticket joiners).
-        // Emit only for a `Local` session — we are its host, and only
-        // on a fresh admission — re-announces must not spam the cap
-        // log with duplicate grants. See the original comment block in
-        // the pre-tiered version for the full rationale re:
-        // HOST-PRIVATE (D3) delivery.
+        // Auto-grant on join: grant the capability tier the ticket
+        // claims (or RW if no claim is present — a test-only shape;
+        // every production admission carries a claim, per this fn's
+        // doc). Emit only for a `Local` session — we are its host, and
+        // only on a fresh admission — re-announces must not spam the
+        // cap log with duplicate grants. The grant stays host-private:
+        // `Capability` messages ride neither live fanout nor replay
+        // (see `log_since`).
         if session_kind == SessionKind::Local && newly_admitted {
             let granted_cap = cap_claim
                 .as_ref()
@@ -1991,7 +2006,7 @@ impl Registry {
     /// log adds zero joiner-visible gossip traffic. ⚠️ FOR P2P: caps
     /// MUST sync to peers — drop this filter and deliver capability
     /// events as part of the (causal) log sync. See
-    /// `docs/brainstorms/2026-06-04-auth-slice-c-l2-delivery-rethink-brainstorm.md`.
+    /// `docs/brainstorms/2026-06-03-auth-slice-c-l2-capabilities-seed.md`.
     ///
     /// Returns `Err(UnknownSession)` if `session` doesn't exist on
     /// this daemon. Returns an empty Vec if the joiner is already
@@ -2127,13 +2142,14 @@ impl Registry {
     /// (when the bridge is wired up and this is a `Local` session)
     /// fans out over gossip.
     ///
-    /// Remote-mirror sessions return [`SessionError::NotHost`] —
-    /// the joiner-side path goes through
-    /// [`crate::gossip_bridge::GossipBridge::send_remote`] which
-    /// publishes a [`GossipBody::SendRequest`] and awaits a
-    /// host-published [`GossipBody::SendAck`]. The outer registry
-    /// caller (the IPC dispatch) is responsible for choosing the
-    /// right path based on the session kind.
+    /// Remote-mirror sessions can't append locally — the host is the
+    /// sequencer. With iroh on, `send` forwards the body itself via
+    /// the bridge's `send_remote`, which publishes a
+    /// [`GossipBody::SendRequest`] and awaits the host-published
+    /// [`GossipBody::SendAck`]; the IPC dispatch calls `send`
+    /// unconditionally. Without iroh there is no transport to forward
+    /// through, so a `Remote` mirror returns
+    /// [`SessionError::NotHost`].
     ///
     /// [`GossipBody::SendRequest`]: artel_protocol::gossip::GossipBody::SendRequest
     /// [`GossipBody::SendAck`]: artel_protocol::gossip::GossipBody::SendAck
@@ -2313,7 +2329,7 @@ impl Registry {
         // ⚠️ FOR P2P: caps MUST propagate to peers — remove this
         // host-private gate and deliver capability events as part of the
         // (causal) log sync. See
-        // docs/brainstorms/2026-06-04-auth-slice-c-l2-delivery-rethink-brainstorm.md
+        // docs/brainstorms/2026-06-03-auth-slice-c-l2-capabilities-seed.md
         #[cfg(feature = "iroh")]
         if message.kind != MessageKind::Capability
             && let Some(bridge) = &self.bridge
@@ -2625,13 +2641,14 @@ impl Registry {
     }
 
     /// Lock a `Remote` mirror session and verify `sender_peer` is its
-    /// host — the shared validation prologue for both host→peer
-    /// direct-stream deliveries ([`Self::emit_upgrade`],
+    /// host — the shared validation prologue for every host→peer
+    /// direct-stream delivery ([`Self::emit_upgrade`],
+    /// [`Self::emit_downgrade`], [`Self::emit_rotate`],
     /// [`Self::emit_workspace_ticket`]). `what` names the payload in
-    /// error messages (`"upgrades"`, `"workspace tickets"`).
+    /// error messages (`"upgrades"`, `"workspace tickets"`, …).
     ///
-    /// Returns the locked session so both callers operate on the same
-    /// guard. Keeping this in one place means the two payload kinds of
+    /// Returns the locked session so all callers operate on the same
+    /// guard. Keeping this in one place means the payload kinds of
     /// the `artel/upgrade/2` channel can't drift in security posture —
     /// a future hardening of the host-authenticity check lands once.
     #[cfg(feature = "iroh")]
@@ -2991,8 +3008,10 @@ async fn run_delivery_with_retry<C, CFut, D, DFut>(
 /// daemon (synthetic, unsigned, off-log messages built from unicast
 /// capability material); a member must never author them. Returning
 /// the `'static` form lets the rejection name the action without
-/// allocating. This is the single source of truth for "reserved
-/// action" — the log-filter sites match the same two constants.
+/// allocating. Used by the `send` chokepoint and the `subscribe`
+/// replay filter. `log_since` filters its own, wider action set
+/// inline (these two plus `DOWNGRADE_ACTION` / `ROTATE_ACTION`)
+/// rather than through this helper.
 fn reserved_system_action(action: &str) -> Option<&'static str> {
     match action {
         TICKET_ACTION => Some(TICKET_ACTION),
@@ -3006,8 +3025,9 @@ fn reserved_system_action(action: &str) -> Option<&'static str> {
 /// (`PeerInfo::new(host, "host")` — consumers read `message.peer.id`
 /// as the host's daemon id), unsigned. It is not a log entry, exists
 /// only on the IPC surface, and must never ride the gossip topic.
-/// Shared by both delivery kinds (`UPGRADE_ACTION`, `TICKET_ACTION`)
-/// so their on-the-wire shape can't drift.
+/// Shared by every delivery kind (`UPGRADE_ACTION`, `TICKET_ACTION`,
+/// `DOWNGRADE_ACTION`, `ROTATE_ACTION`) so their on-the-wire shape
+/// can't drift.
 fn synthetic_system_message(host: PeerId, action: &str, payload: Vec<u8>) -> SessionMessage {
     SessionMessage::new(
         Seq::ZERO,
@@ -3029,10 +3049,10 @@ fn synthetic_ticket_message(host: PeerId, envelope_bytes: Vec<u8>) -> SessionMes
     synthetic_system_message(host, TICKET_ACTION, envelope_bytes)
 }
 
-/// Parse an artel join ticket. Phase 2b: returns the session id; the
-/// host peer id is decoded but not yet used (Phase 2c will route on
-/// it). Any decode failure surfaces as [`SessionError::InvalidTicket`]
-/// so the daemon doesn't leak parser internals over the wire.
+/// Parse an artel join ticket. [`Registry::join`] routes on the
+/// decoded host peer id (local session vs remote mirror). Any decode
+/// failure surfaces as [`SessionError::InvalidTicket`] so the daemon
+/// doesn't leak parser internals over the wire.
 fn parse_ticket(ticket: &JoinTicket) -> Result<SessionTicket, SessionError> {
     ticket::decode(ticket.as_str()).map_err(|err| {
         // Log the underlying TicketError at debug; the wire-facing
@@ -3168,7 +3188,7 @@ async fn apply_inbound_mirror_message(
     // host-sequenced stream — a message causally depending on its
     // authorizing Grant makes the ordering race impossible by
     // construction. See
-    // docs/brainstorms/2026-06-04-auth-slice-c-l2-delivery-rethink-brainstorm.md
+    // docs/brainstorms/2026-06-03-auth-slice-c-l2-capabilities-seed.md
     // ───────────────────────────────────────────────────────────────
 
     // Persist BEFORE mutating in-memory state so a crash mid-callback
@@ -5019,7 +5039,7 @@ mod tests {
         // does not gate on caps), and (b) the mirror's cap-set stays
         // host-only (mirrors don't project — the forged-self-grant
         // defense lives at the host's `send`, pinned by
-        // `grant_from_non_holder_is_a_no_op_on_caps`).
+        // `grant_from_non_host_is_a_no_op_on_caps`).
         let (host_key, session, author_key, mirror, store) = remote_mirror_fixture();
         store.create(&mirror.lock().await.record()).await.unwrap();
         let author = PeerInfo::new(
@@ -6911,8 +6931,8 @@ mod tests {
     #[cfg(feature = "iroh")]
     #[tokio::test]
     async fn ensure_member_with_none_claim_grants_rw_backwards_compat() {
-        // The `None` path (SendRequest backstop) still grants RW for
-        // pre-tiered-ticket joiners.
+        // The `None`-claim path (test-only; every production admission
+        // carries a claim) still auto-grants RW.
         let (r, host, _) = registry_with_signing_seed(0x54);
         let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
         let bob = peer(2, "bob");

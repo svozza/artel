@@ -597,7 +597,7 @@ impl Workspace {
     ///    subsequent restarts resume the existing record verbatim
     ///    (members, log, head preserved). The daemon stamps its own
     ///    authenticated `PeerId` server-side; the IPC caller cannot
-    ///    influence it (auth L1, `PROTOCOL_VERSION` 5).
+    ///    influence it (auth L1, since protocol version 5).
     /// 4. Walk `root`, publish every non-skipped file into the doc.
     /// 5. Share the doc as a `DocTicket` and publish it to the daemon
     ///    via `PublishWorkspaceTicket`; the daemon persists the
@@ -1023,7 +1023,9 @@ impl Workspace {
     ///    the persisted `workspace.ticket` envelope into the replay —
     ///    a joiner that attaches after the unicast delivery still
     ///    picks it up.
-    /// 3. Drains events until the ticket arrives (15 s ceiling).
+    /// 3. Drains events until the ticket arrives, bounded by
+    ///    [`WorkspaceConfig::join_ticket_timeout`] (default `None` =
+    ///    wait forever).
     /// 4. Imports the ticket into the joiner's local doc, runs
     ///    `bulk_export` to seed `root` with whatever's already in
     ///    the doc, and returns. Call [`Self::run`] to start the
@@ -1060,9 +1062,10 @@ impl Workspace {
     ///   `root` / `state_dir`; checked before any on-disk or IPC state.
     /// - [`WorkspaceError::Io`] / [`WorkspaceError::Iroh`] if the state
     ///   directory or iroh node can't be created.
-    /// - [`WorkspaceError::Iroh`] if the daemon's event stream closes or
-    ///   times out (15 s) before the `workspace.ticket` envelope
-    ///   arrives, or if [`Client::take_events`] was already consumed.
+    /// - [`WorkspaceError::Iroh`] if the daemon's event stream closes
+    ///   (or [`WorkspaceConfig::join_ticket_timeout`] elapses, when
+    ///   set) before the `workspace.ticket` envelope arrives, or if
+    ///   [`Client::take_events`] was already consumed.
     /// - [`WorkspaceError::Doc`] for iroh-docs failures importing the
     ///   ticket or bulk-exporting the doc into `root`.
     ///
@@ -3311,9 +3314,11 @@ fn persist_u64(path: &Path, value: u64, label: &str) -> Result<(), WorkspaceErro
 /// Identity decoupling (Slice 2): `doc-id` holds the **genesis**
 /// namespace (write-once, drives `SessionId`); `current-namespace`
 /// holds the namespace actually opened/synced (absent ⇒ equals
-/// genesis). Until rotation exists they are always equal; the split is
-/// what lets a later rotation change the current namespace without
-/// disturbing the session id.
+/// genesis). The two diverge once a rotation lands
+/// ([`Workspace::rotate_namespace`] rewrites `current-namespace`;
+/// joiners follow via [`Workspace::reimport_namespace`]); the split is
+/// what lets rotation change the current namespace without disturbing
+/// the session id.
 async fn open_or_create_doc(
     node: &WorkspaceNode,
     doc_id_path: &Path,
@@ -3906,6 +3911,8 @@ fn handle_capability_message(
 ///   imports the `NamespaceSecret` to gain Write capability.
 /// - `MessageKind::System` with `DOWNGRADE_ACTION`: on the joiner side,
 ///   halts the watcher and emits [`WorkspaceEvent::Demoted`].
+/// - `MessageKind::System` with `ROTATE_ACTION`: on the joiner side,
+///   signals the rotation task to re-import the rotated namespace.
 async fn handle_cap_event(
     ev: Event,
     session: SessionId,
@@ -4075,14 +4082,18 @@ fn spawn_gap_resubscribe(client: &Arc<Client>, session: SessionId, since: Option
 ///   client's [`Client::socket_path`] with bounded
 ///   [`cap_reconnect_backoff`], swapping in the fresh client + stream.
 ///
-/// Either way recovery is gap-free for everything this loop acts on:
-/// `Capability`, `NODE_ID_ACTION`, and `UPGRADE_ACTION` are all
-/// log-borne and replayed, and both [`PeerMap::apply_capability`] and
-/// [`PeerMap::register`] are idempotent. `PeerJoined`/`PeerLeft`/
-/// `SessionClosed` are live-only and not replayed, but the only one this
-/// loop acts on (`PeerJoined`, host-side) merely re-fires an upgrade
-/// that the replayed `Capability::Grant` already re-fires — so no
-/// separate membership reconciliation RPC is needed here.
+/// Recovery is gap-free for the log-borne events this loop acts on:
+/// `Capability` and `NODE_ID_ACTION` are replayed, and both
+/// [`PeerMap::apply_capability`] and [`PeerMap::register`] are
+/// idempotent. `UPGRADE_ACTION` / `DOWNGRADE_ACTION` / `ROTATE_ACTION`
+/// (also handled here) are live-only synthetics, never store-appended
+/// (the daemon's reserved-action invariant) — a delivery this loop
+/// missed is recovered by host-side re-delivery (admission /
+/// re-announce), not by replay. `PeerJoined`/`PeerLeft`/
+/// `SessionClosed` are live-only and not replayed, but the only one
+/// this loop acts on (`PeerJoined`, host-side) merely re-fires an
+/// upgrade that the replayed `Capability::Grant` already re-fires — so
+/// no separate membership reconciliation RPC is needed here.
 ///
 /// After [`CAP_RECONNECT_MAX_ATTEMPTS`] failed reconnects the task
 /// surfaces a [`WorkspaceError`] as a [`WorkspaceEvent::Error`] and

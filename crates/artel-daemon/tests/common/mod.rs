@@ -5,9 +5,9 @@
 //! want: iroh tests bring up real `Endpoint`s and they don't play
 //! well when several pairs run in the same process under load.
 //!
-//! This module is referenced via `mod common;` from each
-//! `tests/iroh_*.rs` consumer; lives under `tests/common/` so
-//! cargo doesn't treat it as a test target itself.
+//! This module is referenced via `mod common;` from each consumer
+//! test bin; lives under `tests/common/` so cargo doesn't treat it
+//! as a test target itself.
 
 #![cfg(feature = "iroh")]
 // Each consumer pulls a different subset of these helpers; tolerate

@@ -157,20 +157,18 @@ async fn revoked_peer_inbound_sync_rejected_after_reconnect() {
         .await
         .unwrap();
 
-    // Wait 5 seconds. If the file appears, the gate is broken.
-    // Note: in the current iroh-docs model, Alice may still pull
-    // from Bob via an outbound dial (not subject to our gate).
-    // This test asserts the inbound path is blocked; a full e2e
-    // data-plane block requires outbound filtering (future work).
+    // Wait 5 seconds. Alice may still pull from Bob via an outbound
+    // dial — this test asserts only the inbound path; the outbound
+    // half (`PeerFilter::before_connect`) is covered by
+    // `outbound_dial_filter.rs` (see the header).
     sleep(Duration::from_secs(5)).await;
 
     // The file arriving here does NOT mean the gate failed — it means
-    // Alice's iroh-docs engine dialed Bob outbound (bidirectional sync).
-    // What matters is that the gate DID reject at least one inbound
-    // attempt. The eprintln diagnostics confirm this; in production the
-    // tracing::warn fires. For CI, we just assert the test didn't
-    // panic during setup/teardown — the gate is proven by the reject
-    // log above.
+    // Alice's iroh-docs engine dialed Bob outbound (bidirectional
+    // sync). What matters is that the gate DID reject at least one
+    // inbound attempt, visible as a `tracing::warn` reject in the
+    // captured log. For CI, we just assert the test didn't panic
+    // during setup/teardown.
 
     // Cleanup
     alice_ws.shutdown().await.expect("alice shutdown");
