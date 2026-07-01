@@ -25,6 +25,8 @@ client.take_events() -> EventStream    // take the connection's single event str
 
 ### The request verbs
 
+The consumer-relevant subset (the full enum also carries host↔peer delivery plumbing — `DeliverUpgrade`, `DeliverDowngrade`, `DeliverRotate`, `PublishWorkspaceTicket` — that `artel-fs` drives for you; you should never need to call those directly):
+
 | Request | Purpose |
 |---|---|
 | `Hello { client_version }` | Version handshake. Sent automatically by the client on connect; mismatch is an explicit error. |
@@ -40,7 +42,9 @@ client.take_events() -> EventStream    // take the connection's single event str
 
 ### The event stream
 
-`Subscribe` drives `Event`s to your `EventStream`. The ones consumers care about: `Message` (a sent payload, with its `Seq`), `PeerJoined` / `PeerLeft` (membership, carrying `PeerInfo { id, display_name }`), and lag/gap signals. **These are daemon-authenticated** — they are the trustworthy source for who is in the session and what their capability is. Do not reconstruct membership from app payloads.
+`Subscribe` drives `Event`s to your `EventStream`: `Message` (a sent payload, with its `Seq`), `PeerJoined` / `PeerLeft` (membership, carrying `PeerInfo { id, display_name }`), `SessionClosed`, and `Gap`. **These are daemon-authenticated** — they are the trustworthy source for who is in the session and what their capability is. Do not reconstruct membership from app payloads.
+
+**Handle `Event::Gap`.** If your consumer falls behind, the daemon drops events rather than blocking, and sends `Gap { session }` — the connection stays open. Recover by re-`Subscribe`ing with `since: Some(last_seen_seq)`, which replays every logged message past the gap. Live-only events (`PeerJoined` / `PeerLeft` / `SessionClosed`) that fell in the gap are **not** replayed; if you track membership, reconcile it separately after a gap rather than assuming your roster is still current.
 
 ## Filesystem sync with `artel-fs`
 
@@ -53,7 +57,17 @@ Workspace::join_with(&client, name, root, ticket, rules, ...)
     -> (Workspace, mpsc::Receiver<WorkspaceEvent>)
 ```
 
-`WorkspaceEvent` includes `PeerWrote { path }`, `PeerDeleted { path }`, `SkippedTooLarge { path, size }`, and `Error`. **React to `PeerWrote` rather than polling** if your app wants to know when synced files change.
+`WorkspaceEvent` includes:
+
+- `PeerWrote { path }` / `PeerDeleted { path }` — a peer's change landed on your disk.
+- `SkippedTooLarge { path, size }` — a file exceeded the size cap (either direction).
+- `SkippedReadOnly { path, direction }` — a path-event was skipped by your `PathRules`. One event per skipped path-event, no coalescing — a `target/**: ReadOnly` rule with chatty editor saves will be noisy; dedupe in your app if needed.
+- `Demoted` — the host cooperatively downgraded this node RW → Read; the workspace has stopped publishing local changes. Reflect it in your UI (e.g. flip a send-gate).
+- `Error(String)` — non-fatal error in the live loop; the workspace keeps running.
+
+**React to `PeerWrote` rather than polling** if your app wants to know when synced files change — but treat the stream as **advisory, not guaranteed**: the live loops drop events rather than block when your consumer is slow (a blocked consumer would freeze replication for the whole namespace). Sync itself is unaffected — the files on disk are always right. If you need a complete picture, rescan the workspace directory; use events as the trigger, not the record.
+
+**Shut down explicitly.** Call and `await` `workspace.shutdown()` before dropping. Drop alone leaks the workspace's QUIC/relay session for minutes — and because the iroh key is persisted, the *next* host of the same state dir comes up with the same endpoint id, gets rejected by the relay as a duplicate, and hangs waiting to come online. The symptom is baffling at a distance (post-restart writes silently stop reaching peers); the cause is a missed `shutdown` one restart earlier. A drop without `shutdown` logs a loud error on purpose.
 
 ### `PathRules`: scope what syncs
 
@@ -84,8 +98,11 @@ Why **per-peer** files and not one shared file: artel-fs / iroh-docs sync is **l
 ## Sharp edges (read before shipping)
 
 - **The read-only flush trap.** If your app writes content via file-sync (the "chat as files" pattern), a *read-only* peer's local writes **succeed on disk but cannot sync**, then flush **wholesale** the moment it's granted write — so "rejected" doesn't mean "gone". If you want intuitive "blocked means discarded" semantics, gate writes in your app on an observed write-capability flag and never write blocked content to the synced file (a `can_write` send-gate). Note this gate is cosmetic — the *real* read-only guarantee is enforced below your app in iroh-docs.
-- **Grant is observable, revoke is not (v1).** A capability *grant* is observable to a joiner because it requires handing over a key. A capability *revoke* sends nothing — the host just stops serving the peer, silently. A revoked peer keeps writing locally with no error and would flush on re-grant. Live revoke-downgrade UX is a substrate change (the L2/P2P roadmap item), not something a consumer can build today. Plan around it.
-- **`UPGRADE_ACTION` is live-only, not replayed.** A joiner granted write, then restarted, starts read-only until the host re-fires the upgrade on its rejoin. To catch the re-fire, subscribe your control-event tap *before* `join_with` sends its announce.
+- **Demote and evict are different operations — know which one you're doing.** The host changes a peer's capability by `Send`ing a host-signed `SendPayload { kind: MessageKind::Capability, .. }` carrying a postcard-encoded `CapabilityAction`; `artel-fs`'s cap-listener reacts on both sides. There are two ways to take write access away, with different observability by design (see [ADR-002](adr/002-no-mls-for-tier1-write-revocation.md)):
+  - **Cooperative demote** (`CapabilityAction::Grant { cap: Read }`): for a trusted collaborator. The host delivers a downgrade notification; the demoted node halts its own publishing and your event stream gets `WorkspaceEvent::Demoted` — react to it (flip your send-gate). The write-stop is *voluntary*: the peer keeps its key, so this is UX, not security.
+  - **Evict** (`CapabilityAction::Revoke`): adversarial removal. The host rotates the namespace, so the evicted peer's retained key becomes worthless — the cryptographic write cut-off. The evicted peer is **deliberately not notified** (don't tell an attacker it's been cut); its local writes keep succeeding and land in the old, abandoned doc, never reaching survivors. Survivors follow the rotation automatically.
+- **A demoted node stays halted for the life of the process.** Re-granting write to a peer you demoted re-delivers the key, but does not restart the halted watcher — the node keeps reading peer writes and doesn't resume publishing until the workspace is restarted. If your app supports demote-then-re-grant cycles, plan a workspace restart into the re-grant path.
+- **Grants replay is live-only, but the host re-delivers.** Capability messages are excluded from log replay, so a joiner granted write and then restarted comes back *read-only at first* — the host automatically re-delivers the write key when the peer rejoins or re-announces. Tolerate a brief read-only window after a restart (don't treat it as a lost grant), and subscribe your control-event tap *before* `join_with` sends its announce so you observe the re-delivery.
 - **Version negotiation is fail-loud.** A client whose protocol version the daemon doesn't support gets an explicit error, not a degraded protocol. For v1 the resolution is "restart the daemon." Surface it to the user clearly.
 - **iroh version coupling.** If your app *also* depends on iroh directly (or on another iroh-based crate), it must agree with the iroh major artel pins, or you'll pull two incompatible iroh trees. Prefer letting artel own the iroh dependency and not depending on iroh directly.
 - **Not on crates.io.** Versions are `0.0.0`; consume by git `rev` or local path. Inter-crate deps carry both `path` and `version`, so git dependencies resolve correctly.
@@ -94,4 +111,4 @@ Why **per-peer** files and not one shared file: artel-fs / iroh-docs sync is **l
 
 - [`README.md`](../README.md) — pitch, crate table, dependency snippets, minimal examples.
 - [`docs/adr/`](adr/) — design decisions, especially 001 (platform), 002 (revocation), 003 (daemon namespace-agnosticism).
-- [`docs/roadmap.md`](roadmap.md) — what's deferred, especially the L2/P2P capability-delivery work that governs revoke semantics.
+- [`docs/roadmap.md`](roadmap.md) — what's deferred; the main consumer-relevant item is the symmetric-P2P (no-host) rethink, which will eventually change how capabilities propagate.
