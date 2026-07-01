@@ -152,13 +152,16 @@ async fn alice_delete_propagates_to_bob() {
 // tombstone while disk state diverged.
 //
 // Two acts, one per forget site:
-// - Act 1 (applier-side): bob's hash for the path came from his
-//   applier applying alice's write; alice deletes; bob re-creates
-//   the identical bytes and alice must see the file again.
-// - Act 2 (watcher-side): alice's hash for the path came from her
-//   applier applying bob's act-1 write; alice deletes locally
-//   (watcher `on_removed`); alice re-creates the identical bytes
-//   and bob must see the file again.
+// - Act 1 (applier-side `mark_remote_delete`): bob's hash for the
+//   path came from his applier applying alice's write; alice
+//   deletes; bob re-creates the identical bytes and alice must see
+//   the file again.
+// - Act 2 (watcher-side `forget` in `on_removed`): bob's hash came
+//   from his own watcher publishing the act-1 write; bob deletes
+//   locally and re-creates the identical bytes; alice must see the
+//   file again. (Bob deletes — not alice — so the delete is from
+//   steady state; see the in-test comment on Linux debouncer
+//   Create+Remove annihilation.)
 // =============================================================
 
 #[tokio::test(flavor = "multi_thread")]
@@ -243,16 +246,34 @@ async fn recreating_identical_bytes_after_delete_propagates() {
     tokio::fs::write(&bob_path, BYTES).await.unwrap();
     common::wait_for_file(&alice_path, BYTES).await;
 
-    // --- Act 2: watcher-side forget (alice's hash came from her
-    // applier applying bob's act-1 write). Alice deletes locally —
-    // her watcher's `on_removed` fires — then re-creates the
-    // identical bytes; bob must see the file come back.
-    eprintln!("--- act 2: local delete, host re-creates identical bytes ---");
-    tokio::fs::remove_file(&alice_path).await.unwrap();
-    common::wait_for_missing(&bob_path).await;
+    // --- Act 2: watcher-side forget (bob's hash for this path came
+    // from his own `record_local_publish` when his watcher published
+    // the act-1 write). Bob deletes locally — his watcher's
+    // `on_removed` fires and must forget the hash — then re-creates
+    // the identical bytes; alice must see the file come back.
+    //
+    // The deleting node is bob, NOT alice, on purpose. Act 1 ended
+    // with alice's applier re-creating alice's copy, and on Linux a
+    // Remove arriving while that Create is still queued in the same
+    // debounce window is annihilated by design — the debouncer's
+    // model is "created then removed within one window = never
+    // existed" (notify-debouncer-full 0.6, test case
+    // `add_remove_event_after_create_event.hjson`: Remove after
+    // queued Create ⇒ expected: {}); no event fires, no tombstone is
+    // ever published, and the test deadlocks (this PR's first ubuntu
+    // CI run captured exactly that — macOS was immune because
+    // FSEvents' post-unlink Modify events reach the on_modified
+    // NotFound→tombstone fallback regardless). Bob's side has no
+    // such queued Create: act 1's wait_for_file(alice_path) proves
+    // his watcher already flushed and published it — the file cannot
+    // reach alice otherwise — so his delete is from steady state by
+    // construction, no settling sleep needed.
+    eprintln!("--- act 2: local delete on joiner, re-creates identical bytes ---");
+    tokio::fs::remove_file(&bob_path).await.unwrap();
+    common::wait_for_missing(&alice_path).await;
 
-    tokio::fs::write(&alice_path, BYTES).await.unwrap();
-    common::wait_for_file(&bob_path, BYTES).await;
+    tokio::fs::write(&bob_path, BYTES).await.unwrap();
+    common::wait_for_file(&alice_path, BYTES).await;
 
     alice_ws.shutdown().await.expect("shutdown");
     bob_ws.shutdown().await.expect("shutdown");
@@ -588,7 +609,9 @@ async fn evict_auto_rotation_body(dns_pkarr: Arc<DnsPkarrServer>, pair: Pair) {
 async fn evict_auto_rotates_and_cuts_off_writes() {
     let pair = spawn_pair().await;
     let dns_pkarr = Arc::clone(&pair.dns_pkarr);
-    evict_auto_rotation_body(dns_pkarr, pair).await;
+    // Box: the body's future sits at clippy::large_futures' 16 KiB
+    // threshold on newer toolchains (CI's 1.96 flags it; 1.95 doesn't).
+    Box::pin(evict_auto_rotation_body(dns_pkarr, pair)).await;
 }
 
 // Real-n0 variant of the auto-rotation write cut-off (Tier C). Binds
