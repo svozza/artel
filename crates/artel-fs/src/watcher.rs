@@ -120,13 +120,9 @@ pub(crate) async fn run(workspace: Arc<Workspace>, ready: oneshot::Sender<()>) {
     let _ = ready.send(());
 
     let filter = WorkspaceFilter::new(&workspace.root);
-    // Same shared echo-guard handles the applier uses; we re-borrow
-    // them via `.shared(...)` so we hold an `Arc` clone of the maps
-    // rather than the workspace's own `EchoGuard` value.
-    let guard = EchoGuard::shared(
-        workspace.echo_guard.pending_handle(),
-        workspace.echo_guard.last_published_handle(),
-    );
+    // A clone shares the workspace guard's state (Arc-backed), so we
+    // observe everything the applier's clone marks.
+    let guard = workspace.echo_guard.clone();
 
     // Doc-scoped token: cancelled at workspace shutdown AND on
     // namespace rotation (which respawns this task against the new
@@ -146,7 +142,7 @@ pub(crate) async fn run(workspace: Arc<Workspace>, ready: oneshot::Sender<()>) {
                         on_modified(&workspace, &filter, &guard, path).await;
                     }
                     Some(LocalChange::Removed(path)) => {
-                        on_removed(&workspace, path).await;
+                        on_removed(&workspace, &guard, path).await;
                     }
                     None => {
                         debug!(target: "artel_fs::watcher", "notify channel closed, exiting watcher loop");
@@ -238,7 +234,7 @@ async fn on_modified(
             // `Remove`, and `on_removed` would handle it before we
             // got here.
             debug!(target: "artel_fs::watcher", path = %path.display(), "read NotFound -> tombstone");
-            on_removed(workspace, path).await;
+            on_removed(workspace, guard, path).await;
             return;
         }
         // Other read errors (permission, transient I/O) — drop
@@ -325,8 +321,24 @@ async fn rescan_dir(
     debug!(target: "artel_fs::watcher", dir = %dir.display(), files, "rescan_dir complete");
 }
 
-async fn on_removed(workspace: &Arc<Workspace>, path: PathBuf) {
+async fn on_removed(workspace: &Arc<Workspace>, guard: &EchoGuard, path: PathBuf) {
     debug!(target: "artel_fs::watcher", path = %path.display(), "on_removed entered");
+    // Echo check: is this unlink the filesystem shadow of a tombstone
+    // our applier just applied? Publishing it would re-tombstone the
+    // key under OUR author with a newer timestamp, which syncs back
+    // to the deleting peer and ping-pongs (see echo_guard module
+    // docs, defence 3).
+    if guard.should_skip_removal(&path).await {
+        debug!(target: "artel_fs::watcher", path = %path.display(), "echo-guard: skip removal (peer-driven delete)");
+        return;
+    }
+    // A genuine local delete. The file is gone, so its last-published
+    // hash must go with it — a later re-creation with identical bytes
+    // would otherwise be swallowed as an echo (see EchoGuard::forget).
+    // Before the write-halt / ReadOnly gates on purpose: those
+    // suppress the *tombstone publish*, but the local state fact
+    // "this path no longer exists" holds regardless.
+    guard.forget(&path).await;
     // Cooperative demotion: a downgraded node stops propagating its
     // own deletes too (voluntary write-stop).
     if workspace.is_write_halted() {

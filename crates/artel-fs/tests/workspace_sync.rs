@@ -138,6 +138,133 @@ async fn alice_delete_propagates_to_bob() {
 }
 
 // =============================================================
+// Delete-then-recreate with identical bytes must propagate.
+//
+// Regression trap for the echo guard's `last_published` map
+// surviving a delete (found via
+// `returning_rw_member_offline_across_rotation_regains_write_real_n0`
+// in the 2026-07-01 nightly): the applier records the blake3 of
+// every peer-driven write so the watcher can skip the resulting
+// filesystem echo, but nothing cleared that hash when the path was
+// later tombstoned. A file re-created with the *same bytes* after
+// a delete then hashed equal to the stale entry and the watcher
+// swallowed the publish forever — the doc's latest entry stayed a
+// tombstone while disk state diverged.
+//
+// Two acts, one per forget site:
+// - Act 1 (applier-side): bob's hash for the path came from his
+//   applier applying alice's write; alice deletes; bob re-creates
+//   the identical bytes and alice must see the file again.
+// - Act 2 (watcher-side): alice's hash for the path came from her
+//   applier applying bob's act-1 write; alice deletes locally
+//   (watcher `on_removed`); alice re-creates the identical bytes
+//   and bob must see the file again.
+// =============================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recreating_identical_bytes_after_delete_propagates() {
+    const BYTES: &[u8] = b"rises from the ashes";
+    common::init_tracing();
+
+    let Pair {
+        daemon_a,
+        daemon_b,
+        dns_pkarr,
+    } = spawn_pair().await;
+
+    // Alice hosts with the seed file already present so bob's
+    // bulk_export applies it (populating his last_published map).
+    let alice = Client::connect(&daemon_a.socket).await.unwrap();
+    let alice_dir = tempfile::tempdir().unwrap();
+    tokio::fs::write(alice_dir.path().join("phoenix.txt"), BYTES)
+        .await
+        .unwrap();
+
+    let (alice_ws, _) = Workspace::host_with(
+        &alice,
+        "alice",
+        alice_dir.path().to_path_buf(),
+        AttachPolicy::AllowExisting,
+        WorkspaceConfig::default()
+            .with_endpoint_setup(testing_setup(&dns_pkarr))
+            .with_daemon_socket(daemon_a.socket.clone()),
+    )
+    .await
+    .expect("Workspace::host");
+    let session = alice_ws.session_id();
+    let ticket = alice_ws
+        .join_ticket()
+        .expect("host has join_ticket")
+        .clone();
+    let alice_ws = Arc::new(alice_ws);
+    let alice_handle = Arc::clone(&alice_ws).run().await;
+
+    let bob = Client::connect(&daemon_b.socket).await.unwrap();
+    let bob_peer = bob.daemon_peer_id();
+    let resp = bob
+        .request(Request::JoinSession {
+            display_name: "bob".into(),
+            ticket,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(resp, Response::JoinSession { .. }), "{resp:?}");
+
+    let bob_dir = tempfile::tempdir().unwrap();
+    let (bob_ws, _) = Workspace::join_with(
+        &bob,
+        session,
+        bob_dir.path().to_path_buf(),
+        AttachPolicy::RequireEmpty,
+        WorkspaceConfig::default()
+            .with_endpoint_setup(testing_setup(&dns_pkarr))
+            .with_daemon_socket(daemon_b.socket.clone()),
+    )
+    .await
+    .expect("Workspace::join");
+    let bob_ws = Arc::new(bob_ws);
+    let bob_handle = Arc::clone(&bob_ws).run().await;
+
+    let alice_path = alice_ws.root.join("phoenix.txt");
+    let bob_path = bob_ws.root.join("phoenix.txt");
+    common::wait_for_file(&bob_path, BYTES).await;
+
+    // Bob needs write capability for both acts.
+    common::grant_rw_and_wait(&alice, session, bob_peer, bob_dir.path(), alice_dir.path()).await;
+
+    // --- Act 1: applier-side forget (bob's hash came from applying
+    // alice's seed write). Alice deletes; the tombstone removes
+    // bob's copy; bob re-creates the identical bytes; alice must
+    // see the file come back.
+    eprintln!("--- act 1: peer delete, joiner re-creates identical bytes ---");
+    tokio::fs::remove_file(&alice_path).await.unwrap();
+    common::wait_for_missing(&bob_path).await;
+
+    tokio::fs::write(&bob_path, BYTES).await.unwrap();
+    common::wait_for_file(&alice_path, BYTES).await;
+
+    // --- Act 2: watcher-side forget (alice's hash came from her
+    // applier applying bob's act-1 write). Alice deletes locally —
+    // her watcher's `on_removed` fires — then re-creates the
+    // identical bytes; bob must see the file come back.
+    eprintln!("--- act 2: local delete, host re-creates identical bytes ---");
+    tokio::fs::remove_file(&alice_path).await.unwrap();
+    common::wait_for_missing(&bob_path).await;
+
+    tokio::fs::write(&alice_path, BYTES).await.unwrap();
+    common::wait_for_file(&bob_path, BYTES).await;
+
+    alice_ws.shutdown().await.expect("shutdown");
+    bob_ws.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), alice_handle).await;
+    let _ = timeout(Duration::from_secs(5), bob_handle).await;
+    drop(alice);
+    drop(bob);
+    daemon_a.stop().await;
+    daemon_b.stop().await;
+}
+
+// =============================================================
 // An empty file in the workspace must not propagate as a doc
 // entry — iroh-docs reserves zero-length entries for tombstones,
 // so a naive `set_bytes(_, _, &[])` is rejected with

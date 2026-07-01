@@ -71,10 +71,9 @@ pub(crate) async fn run(workspace: Arc<Workspace>, ready: oneshot::Sender<()>) {
     // the receiver was dropped — fine to ignore.
     let _ = ready.send(());
 
-    let guard = EchoGuard::shared(
-        workspace.echo_guard.pending_handle(),
-        workspace.echo_guard.last_published_handle(),
-    );
+    // A clone shares the workspace guard's state (Arc-backed), so the
+    // watcher's clone observes everything we mark here.
+    let guard = workspace.echo_guard.clone();
     let filter = WorkspaceFilter::new(&workspace.root);
 
     // Doc-scoped token: cancelled at workspace shutdown AND on
@@ -190,6 +189,10 @@ async fn handle_entry(
 
     if entry.content_len() == 0 {
         debug!(target: "artel_fs::applier", path = %path.display(), "applying tombstone (remove_file)");
+        // Mark BEFORE the remove so the watcher can't observe the
+        // unlink first. Suppresses the removal echo and drops the
+        // stale last-published hash (see EchoGuard::mark_remote_delete).
+        guard.mark_remote_delete(&path).await;
         let _ = tokio::fs::remove_file(&path).await;
         emit_event(&workspace.events, WorkspaceEvent::PeerDeleted { path });
         return;
