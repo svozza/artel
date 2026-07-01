@@ -345,6 +345,50 @@ stayed green throughout. The chain that found it, and the verdict:
   tool of last resort that actually ends arguments — packet-level
   discard logs named the exact line.
 
+## Case study: debouncer Create+Remove annihilation (2026-07-01)
+
+`recreating_identical_bytes_after_delete_propagates` (new in the
+echo-guard PR, #6) deadlocked **deterministically on ubuntu CI on its
+first-ever Linux run** while passing 15/15 on the macOS dev machine.
+Not a flake — an OS-coverage gap. The chain and the verdict:
+
+- **Failing log first, mechanism second.** The captured CI log showed
+  the test's act-2 `remove_file` on alice's side produced *no watcher
+  event at all*: no `on_removed`, no `doc.del`, no tombstone. Bob's
+  copy never disappeared and `wait_for_missing` timed out.
+- **Mechanism (by design, upstream).** Act 1 ended with alice's
+  *applier* re-creating the file; act 2 deleted it ~300 ms later —
+  inside the watcher's debounce window. notify-debouncer-full's model
+  is "created then removed within one window = never existed": a
+  Remove arriving while a Create is still queued annihilates both.
+  Verified in the crate's own test suite
+  (`notify-debouncer-full-0.6.0/test_cases/`
+  `add_remove_event_after_create_event.hjson`: Remove after queued
+  Create ⇒ `expected: {}`). §4's "match against the producer's own
+  tests" applies to *behaviour* questions, not just API-usage ones.
+- **Why macOS never saw it:** FSEvents reports post-unlink
+  `Modify(Metadata)`/`Modify(Data)` events that reach `on_modified`'s
+  NotFound→tombstone fallback regardless of the debouncer queue.
+  Linux's clean `Remove` has no such second chance. A test that only
+  ever ran on one OS has only ever tested one delete path.
+- **Fix: an ordering guarantee, not a sleep.** The first instinct —
+  sleep past the debounce window — is exactly what this doc says not
+  to do. The shipped fix reworks act 2 so the *other* peer (bob)
+  deletes: act 1 already ends with `wait_for_file(alice_path)`, which
+  can only pass if bob's watcher flushed its debounce window and
+  published the file. Bob's delete is therefore from steady state by
+  construction. When a test needs "the watcher has settled", find the
+  event that *proves* it settled; every phase transition should ride
+  an observable effect, not wall-clock.
+- **Known substrate edge left behind (recorded, not fixed):** a
+  genuine local delete landing within the debounce window of a
+  peer-driven create of the same path is silently swallowed on Linux
+  — no tombstone, disk↔doc diverge until a workspace restart's
+  `reconcile_doc_against_disk`. Real fix belongs at the watcher layer
+  (e.g. don't annihilate a Remove whose path was previously synced,
+  or a periodic reconcile). If a "deleted file reappears / peers
+  never see my delete" report comes in on Linux, start here.
+
 ## Examples from this codebase
 
 (Paths updated after the 2026-05-29 test-consolidation plan merged
