@@ -112,19 +112,19 @@ The **[consumer guide](docs/consumer-guide.md)** is the main document for app au
 
 ```mermaid
 flowchart TB
-    subgraph app["your app  (you depend on these)"]
+    subgraph app["your app — you depend on these"]
         client["artel-client"]
         fs["artel-fs"]
     end
     subgraph daemon["artel-daemon"]
         log["session log"]
-        node["iroh node(s)"]
+        iroh["iroh nodes"]
     end
     peers(["NAT-traversed P2P to remote peers"])
 
     client -- "Unix socket" --> daemon
-    node --> peers
-    fs -- "iroh-docs ticket<br/>(handed out over the session)" --> peers
+    iroh --> peers
+    fs -- "iroh-docs ticket, handed out over the session" --> peers
 ```
 
 - The **daemon** is a long-running local process that owns the iroh node, the peer connections, and the persisted message log. Sessions outlive your app process; reconnect and replay from any sequence number.
