@@ -614,12 +614,11 @@ async fn evict_auto_rotates_and_cuts_off_writes() {
     Box::pin(evict_auto_rotation_body(dns_pkarr, pair)).await;
 }
 
-// Real-n0 variant of the auto-rotation write cut-off (Tier C). Binds
-// against n0's public relay (`Production`) rather than the localhost
-// DnsPkarrServer — see the matching note in `workspace_restart.rs` for
-// why Tier C uses the public relay until the iroh 1.0 upgrade. Filtered
-// out of the default profile by the `_n0` suffix; runs under
-// `make test-n0` / the `n0` nextest profile.
+// Real-network variant of the auto-rotation write cut-off (Tier C):
+// n0 DNS/pkarr for discovery, the bin-shared localhost relay for the
+// QUIC transport (`ProductionCustomRelay` — same pattern as
+// `workspace_restart.rs`). Filtered out of the default profile by the
+// `_n0` suffix; runs under `make test-n0` / the `n0` nextest profile.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::large_futures, clippy::too_many_lines)]
 async fn evict_auto_rotates_and_cuts_off_writes_n0() {
@@ -631,14 +630,24 @@ async fn evict_auto_rotates_and_cuts_off_writes_n0() {
     // them would delete the dir out from under the daemon).
     let alice_daemon_root = TempDir::new().unwrap();
     let bob_daemon_root = TempDir::new().unwrap();
+    let relay_url = || async {
+        common::shared_relay_url()
+            .await
+            .parse::<iroh::RelayUrl>()
+            .unwrap()
+    };
     let alice_daemon = common::spawn_daemon_at(
         &common::DaemonPaths::at(alice_daemon_root.path()),
-        artel_daemon::EndpointSetup::Production,
+        artel_daemon::EndpointSetup::ProductionCustomRelay {
+            relay_url: relay_url().await,
+        },
     )
     .await;
     let bob_daemon = common::spawn_daemon_at(
         &common::DaemonPaths::at(bob_daemon_root.path()),
-        artel_daemon::EndpointSetup::Production,
+        artel_daemon::EndpointSetup::ProductionCustomRelay {
+            relay_url: relay_url().await,
+        },
     )
     .await;
 
@@ -650,7 +659,9 @@ async fn evict_auto_rotates_and_cuts_off_writes_n0() {
         alice_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
         WorkspaceConfig::default()
-            .with_endpoint_setup(artel_fs::EndpointSetup::Production)
+            .with_endpoint_setup(artel_fs::EndpointSetup::ProductionCustomRelay {
+                relay_url: relay_url().await,
+            })
             .with_daemon_socket(alice_daemon.socket.clone()),
     )
     .await
@@ -690,7 +701,9 @@ async fn evict_auto_rotates_and_cuts_off_writes_n0() {
         bob_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
         WorkspaceConfig::default()
-            .with_endpoint_setup(artel_fs::EndpointSetup::Production)
+            .with_endpoint_setup(artel_fs::EndpointSetup::ProductionCustomRelay {
+                relay_url: relay_url().await,
+            })
             .with_daemon_socket(bob_daemon.socket.clone()),
     )
     .await
