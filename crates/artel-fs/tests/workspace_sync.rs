@@ -830,50 +830,23 @@ async fn survivor_follows_rotation_evicted_is_cut() {
         join_rw(&alice, session, &daemon_c, &dns_pkarr, "evicted").await;
     let evicted_peer = evicted_cli.daemon_peer_id();
 
-    // Grant RW to each peer and wait for it using a per-peer probe
-    // filename (the shared-name `grant_rw_and_wait` helper races when
-    // two RW joiners write the same probe path).
-    async fn grant_rw_wait_named(
-        host: &Client,
-        session: SessionId,
-        peer: PeerId,
-        joiner_dir: &Path,
-        host_dir: &Path,
-        probe_name: &str,
-    ) {
-        common::grant_rw(host, session, peer).await;
-        let joiner_probe = joiner_dir.join(probe_name);
-        let host_probe = host_dir.join(probe_name);
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            let _ = tokio::fs::write(&joiner_probe, b"rw").await;
-            sleep(POLL_INTERVAL).await;
-            if tokio::fs::read(&host_probe).await.is_ok_and(|b| b == b"rw") {
-                let _ = tokio::fs::remove_file(&joiner_probe).await;
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "grant RW for {peer} never propagated"
-            );
-        }
-    }
-    grant_rw_wait_named(
+    // Grant RW to each peer and wait for it. `grant_rw_and_wait`'s
+    // probe filename embeds the peer id, so consecutive grants don't
+    // race on a shared probe path.
+    common::grant_rw_and_wait(
         &alice,
         session,
         survivor_peer,
         survivor_dir.path(),
         alice_dir.path(),
-        ".probe_survivor",
     )
     .await;
-    grant_rw_wait_named(
+    common::grant_rw_and_wait(
         &alice,
         session,
         evicted_peer,
         evicted_dir.path(),
         alice_dir.path(),
-        ".probe_evicted",
     )
     .await;
 

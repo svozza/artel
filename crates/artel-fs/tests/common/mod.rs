@@ -550,10 +550,19 @@ pub async fn demote(client: &Client, session: SessionId, target_peer: PeerId) {
 }
 
 /// Grant RW and wait for the upgrade to propagate by polling a probe
-/// write. Writes `".artel_rw_probe"` from the joiner's workspace dir
-/// and waits for it to appear in the host's dir, proving the full
+/// write. Writes a probe file from the joiner's workspace dir and
+/// waits for it to appear in the host's dir, proving the full
 /// round-trip (grant → upgrade delivery → `import_namespace` → signed
 /// entry → sync → host applies).
+///
+/// The probe filename embeds `target_peer` so that consecutive grants
+/// in a multi-joiner workspace never touch the same key: with a shared
+/// name, peer A's probe (and its cleanup tombstone) syncs into peer
+/// B's dir before B's own grant, entangling B's probe writes with
+/// A's echo-guard and CRDT state. The delete-then-recreate-identical-
+/// bytes property that entanglement used to (accidentally) exercise is
+/// pinned by `recreating_identical_bytes_after_delete_propagates` in
+/// `workspace_sync.rs`.
 pub async fn grant_rw_and_wait(
     client: &Client,
     session: SessionId,
@@ -563,8 +572,9 @@ pub async fn grant_rw_and_wait(
 ) {
     grant_rw(client, session, target_peer).await;
     let probe = b"rw-probe";
-    let joiner_probe = joiner_dir.join(".artel_rw_probe");
-    let host_probe = host_dir.join(".artel_rw_probe");
+    let probe_name = format!(".artel_rw_probe_{}", &target_peer.to_hex()[..10]);
+    let joiner_probe = joiner_dir.join(&probe_name);
+    let host_probe = host_dir.join(&probe_name);
     // Poll: write the probe repeatedly until the host sees it,
     // proving the joiner has Write capability.
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
