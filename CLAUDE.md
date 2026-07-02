@@ -22,6 +22,8 @@ For one-off targeted runs, prefer `cargo nextest run --package <crate> --test <b
 - `make coverage-html` — same data, HTML report at `target/llvm-cov/html/index.html`.
 - `make ci-local` — fmt + clippy + doc + tests + n0 (coverage is opt-in).
 
+**Before pushing to a PR branch, always run `make fmt`, `make clippy`, AND `make doc` locally** (plus `make test` if code changed). A CI rerun costs ~10 minutes; `make doc` in particular catches rustdoc `-D warnings` failures (e.g. private-intra-doc-links) that fmt/clippy/tests all miss.
+
 ## Plans / brainstorms
 
 - Brainstorms: `docs/brainstorms/<date>-<topic>.md`
