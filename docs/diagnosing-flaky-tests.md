@@ -444,7 +444,82 @@ from a mechanism question instead. The chain and the verdict:
   finding, not noise — record it before returning to the target (this
   loop caught `recreating_identical_bytes_after_delete_propagates`
   failing on a macOS double-tombstone vs re-create race, preserved at
-  `~/sibling-recreate-flake-2026-07-02.log`, still open).
+  `~/sibling-recreate-flake-2026-07-02.log` — diagnosed in the next
+  case study).
+
+## Case study: straggler duplicate tombstone vs local re-create (2026-07-03)
+
+`recreating_identical_bytes_after_delete_propagates` (workspace_sync,
+Tier B, two daemons) — the bycatch from the previous case study's
+run-until-fail loop — failed once on macOS with a fully-traced log
+(the test calls `init_tracing()`). Unlike most flakes, the diagnosis
+started from reading a captured trace, not from looping. The chain
+and the verdict:
+
+- **The trace answered the ordering question directly.** Alice's
+  single act-1 `remove_file` fanned out via FSEvents into a
+  post-unlink `Modify(Metadata)`/`Modify(Data)` pair; each entered
+  `on_modified → read NotFound → on_removed → doc.del`, publishing
+  **two tombstones** four milliseconds apart (`doc.del ok ...
+  removed=1` at 26.367 and 26.369 — `on_removed` has no "already
+  tombstoned, no intervening write" dedup, and each `del` stamps a
+  fresh timestamp). Bob's applier ran `applying tombstone
+  (remove_file)` twice (26.370, 26.379). The test's
+  `wait_for_missing(bob_path)` polls disk every 100 ms — it returned
+  between the two applications, the test wrote bob's identical-bytes
+  re-create, and the **straggler tombstone's `remove_file` deleted
+  the fresh write**. `mark_remote_delete` re-armed `peer_deleted`, so
+  bob's debounced events for his own write (Remove + post-unlink
+  Modify pair at 26.755, all reading NotFound — the file was gone
+  again) were suppressed as peer-delete echoes: three consecutive
+  `echo-guard: skip removal (peer-driven delete)` lines, then zero
+  phoenix.txt activity on bob's side until the 15 s deadline. The
+  9 ms tombstone gap vs the 100 ms poll cadence is the flake's low
+  rate — the poll must land inside the gap.
+- **Mechanism (substrate, applier layer).** The applier's tombstone
+  branch unconditionally `remove_file`d. A duplicate tombstone for a
+  path already marked `peer_deleted` carries no new information —
+  both `mark_remote_write` and `record_local_publish` clear the
+  marker, so "still marked" proves no peer or published local write
+  landed since the first application. Anything on disk at that
+  moment is an **unpublished local creation** that raced in; deleting
+  it swallows the write with nothing to heal it (the watcher's events
+  for it read NotFound post-remove and are eaten by defence 3).
+  Mirror image of the recorded Linux debounce-annihilation edge
+  (2026-07-01 case study): there a local delete inside a peer-create
+  window is lost; here a peer delete-echo swallows a local create.
+- **Deterministic repro before the fix** (the 2026-07-02 case-study
+  pattern: derive the ordering, then drive it directly).
+  `straggler_duplicate_tombstone_spares_racing_local_recreate`
+  (workspace_sync) drives the receiving side on one node: apply
+  tombstone #1 via a `test_apply_peer_tombstone` hook (the same
+  `apply_tombstone` the applier's `content_len() == 0` branch runs),
+  write the file locally, apply the duplicate before the debounce
+  window can flush. Red exactly as predicted: the straggler deleted
+  the re-created file.
+- **Fix: `mark_remote_delete` reports duplicates; the applier skips
+  `remove_file` on one.** The marker insert now returns whether the
+  path was newly marked; `false` means duplicate-with-no-intervening-
+  re-creation, and the applier returns without touching disk. The
+  constraint was not reintroducing tombstone ping-pong — the reason
+  `should_skip_removal` deliberately doesn't consume the marker.
+  Skipping the *disk operation* leaves the marker armed, so echoes of
+  the original unlink are still suppressed; unit tests pin both the
+  duplicate report and the marker surviving it. Alice's double
+  publish was left as-is: publish-side dedup would add state to
+  `on_removed` to save one redundant-but-correct doc entry, and the
+  apply side must tolerate duplicate tombstones anyway (any peer can
+  legitimately re-tombstone a path).
+- **Portable lessons:** (1) when a suppression mechanism (echo guard,
+  dedup cache, debounce) re-arms from an event it *caused itself*,
+  look for the fixed point — here the straggler's remove re-armed the
+  very marker that then ate the evidence; (2) a captured trace turns
+  "which of three hypotheses" into "read the timestamps" — preserving
+  a failing log with tracing armed is worth more than 50 clean loop
+  iterations; (3) events that carry no new information (duplicate
+  tombstones) should be no-ops at the *effect* layer, not re-executed
+  — idempotency at apply time beats dedup at publish time because it
+  also covers duplicates you didn't author.
 
 ## Examples from this codebase
 

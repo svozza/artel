@@ -95,9 +95,22 @@ impl EchoGuard {
     /// `last_published` hash — the file is gone, and a stale hash
     /// would swallow a later re-creation with identical bytes as an
     /// echo (see the module docs, defences 2 and 3).
-    pub async fn mark_remote_delete(&self, path: &Path) {
+    ///
+    /// Returns `true` if the path was **newly** marked, `false` if it
+    /// was already marked peer-deleted. `false` means this tombstone
+    /// duplicates one we already applied, with no re-creation of the
+    /// path observed since (both [`Self::mark_remote_write`] and
+    /// [`Self::record_local_publish`] clear the marker) — so anything
+    /// on disk at that path now is an *unpublished local write* that
+    /// raced in, and the applier must NOT `remove_file` over it.
+    /// Duplicates are real: macOS `FSEvents` fans one unlink into
+    /// post-unlink `Modify` pairs that each take the watcher's
+    /// NotFound→tombstone fallback, publishing two tombstones (see
+    /// the straggler-tombstone case study in
+    /// `docs/diagnosing-flaky-tests.md`).
+    pub async fn mark_remote_delete(&self, path: &Path) -> bool {
         self.last_published.lock().await.remove(path);
-        self.peer_deleted.lock().await.insert(path.to_path_buf());
+        self.peer_deleted.lock().await.insert(path.to_path_buf())
     }
 
     /// Should the watcher skip a local *removal* event for `path`?
@@ -383,6 +396,50 @@ mod tests {
         assert!(
             guard.should_skip_removal(&p("/w/deleted.txt")).await,
             "a peer-delete marker is cleared only by re-creation, not by a namespace swap",
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_remote_delete_reports_duplicates() {
+        let guard = EchoGuard::new();
+        let path = p("/w/a.txt");
+
+        assert!(
+            guard.mark_remote_delete(&path).await,
+            "first tombstone for a path is newly marked",
+        );
+        assert!(
+            !guard.mark_remote_delete(&path).await,
+            "second tombstone with no intervening re-creation is a duplicate",
+        );
+
+        guard.mark_remote_write(&path, b"recreated").await;
+        assert!(
+            guard.mark_remote_delete(&path).await,
+            "a peer re-creation clears the marker; the next tombstone is fresh again",
+        );
+
+        guard.record_local_publish(&path, b"local").await;
+        assert!(
+            guard.mark_remote_delete(&path).await,
+            "a local publish clears the marker; the next tombstone is fresh again",
+        );
+    }
+
+    /// The duplicate-report path must still suppress removal echoes:
+    /// returning `false` means the applier skips its `remove_file`,
+    /// but the marker stays armed for the watcher (defence 3 is not
+    /// consumed — no ping-pong reintroduced).
+    #[tokio::test]
+    async fn duplicate_delete_keeps_removal_suppressed() {
+        let guard = EchoGuard::new();
+        let path = p("/w/a.txt");
+
+        guard.mark_remote_delete(&path).await;
+        guard.mark_remote_delete(&path).await;
+        assert!(
+            guard.should_skip_removal(&path).await,
+            "marker must survive a duplicate tombstone report",
         );
     }
 

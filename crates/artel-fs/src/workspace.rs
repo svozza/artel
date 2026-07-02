@@ -2245,6 +2245,20 @@ impl Workspace {
         Ok(())
     }
 
+    /// Drive the applier's tombstone application for `path` directly,
+    /// exactly as an incoming `InsertRemote` with `content_len() == 0`
+    /// would after passing the rule/filter gates. For tests that need
+    /// to deliver a *duplicate* tombstone at a controlled moment —
+    /// e.g. the straggler-tombstone race, where a second tombstone for
+    /// an already-deleted path arrives after a genuine local
+    /// re-creation of the file (macOS `FSEvents` fans one unlink into
+    /// two published tombstones; see the 2026-07-02 case study in
+    /// `docs/diagnosing-flaky-tests.md`).
+    #[cfg(feature = "test-utils")]
+    pub async fn test_apply_peer_tombstone(&self, path: std::path::PathBuf) {
+        crate::applier::apply_tombstone(&self.echo_guard, &self.events, path).await;
+    }
+
     /// This workspace node's `EndpointId` bytes, for tests asserting the
     /// same-seed author binding (`AuthorId == endpoint_id`). Returns
     /// `None` if the node has already been torn down.
