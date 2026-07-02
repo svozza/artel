@@ -1759,6 +1759,18 @@ impl Workspace {
             *tok = self.shutdown_token.child_token();
         }
 
+        // The last-published hashes describe what we published into the
+        // OLD namespace; against the rotated doc they are stale. A path
+        // published during the rotation lag (after the host's snapshot,
+        // so not carried forward) would otherwise have every identical-
+        // bytes re-write swallowed as an echo forever — the respawned
+        // watcher's events hash equal to the stale entry. Clearing is
+        // safe on both the host and survivor paths: it publishes
+        // nothing by itself, so it cannot resurrect a host-tombstoned
+        // path (a real filesystem event is still required, and
+        // `peer_deleted` markers survive the clear).
+        self.echo_guard.forget_all_published().await;
+
         // Respawn watcher + applier against the new namespace. They
         // select on the fresh doc token (via `doc_token()`) and clone
         // the swapped doc. We respawn only the doc tasks (not full
@@ -2304,6 +2316,52 @@ impl Workspace {
         .await
         .map_err(|e| e.to_string())?;
         Ok(new_namespace.to_bytes())
+    }
+
+    /// Rotate WITHOUT reimporting, returning the new epoch and the
+    /// Write `DocTicket` string a survivor would receive. Leaves the
+    /// live doc on the old namespace — for tests that need to publish
+    /// into the old doc *after* the rotation snapshot (the survivor
+    /// rotation-lag window) before driving the reimport themselves via
+    /// [`Self::test_reimport_from_survivor_ticket`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the stringified error if `rotate_namespace` fails (node
+    /// torn down, iroh-docs snapshot/create/share errors).
+    #[cfg(feature = "test-utils")]
+    pub async fn test_rotate_for_survivor_reimport(
+        &self,
+        prev_epoch: u64,
+    ) -> Result<(u64, String), String> {
+        self.rotate_namespace(prev_epoch)
+            .await
+            .map(|o| (o.new_epoch, o.write_ticket))
+            .map_err(|e| e.to_string())
+    }
+
+    /// Drive the **survivor-side** reimport directly: swap onto the
+    /// rotated namespace named by `doc_ticket` exactly as a delivered
+    /// [`RotationSignal::SurvivorRotate`] would — including the
+    /// deliberate absence of the host-only catch-up scan. Pairs with
+    /// [`Self::test_rotate_for_survivor_reimport`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the stringified error if `reimport_namespace` fails
+    /// (ticket parse, import/open/`start_sync` errors, node torn down).
+    #[cfg(feature = "test-utils")]
+    pub async fn test_reimport_from_survivor_ticket(
+        self: &Arc<Self>,
+        doc_ticket: String,
+        new_epoch_hint: u64,
+    ) -> Result<(), String> {
+        self.reimport_namespace(ReimportSource::SurvivorTicket {
+            doc_ticket,
+            new_epoch_hint,
+        })
+        .await
+        .map_err(|e| e.to_string())
     }
 
     /// The `NamespaceId` bytes of the workspace's **current** doc.

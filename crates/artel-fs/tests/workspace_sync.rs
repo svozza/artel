@@ -1277,6 +1277,91 @@ async fn reimport_catch_up_scan_recovers_write_in_rotation_window() {
 }
 
 // =============================================================
+// Survivor reimport vs stale echo-guard hash (rotation-lag regression):
+// a write published into the OLD namespace during the survivor's
+// rotation lag — after the host's rotation snapshot, before the
+// survivor's reimport — must still be publishable into the rotated
+// namespace by rewriting the file.
+//
+// The bug: the watcher's `record_local_publish` stores the blake3 of
+// the published bytes in the echo guard's `last_published` map, and
+// `reimport_namespace` never resets that map. A file whose publish
+// went into the abandoned namespace (so it is NOT in the rotation
+// snapshot's carry-forward set) keeps its hash entry across the doc
+// swap; every subsequent rewrite with the same bytes is swallowed by
+// `should_skip_local` as an echo, forever. No retry loop heals it —
+// which is what distinguishes this from the one-shot watcher dead
+// window PR #2 fixed (host-only catch-up scan).
+//
+// Deterministic reproduction of the survivor's ordering, one node
+// playing both roles: rotate (snapshot minted, live doc still old =
+// the survivor's lag window), publish probe.txt into the old doc,
+// reimport via the SURVIVOR path (no catch-up scan, by design), then
+// rewrite the identical bytes and require them to reach the rotated
+// namespace.
+// =============================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn survivor_reimport_clears_stale_echo_guard_hash() {
+    const BYTES: &[u8] = b"probe written during rotation lag";
+    common::init_tracing();
+    let (daemon, _client, ws, handle, _events, _dir, _dns_pkarr) =
+        spawn_host_workspace_for_empty_test().await;
+
+    // Rotate WITHOUT reimporting: the snapshot is taken and the ticket
+    // minted, but the live doc (and watcher) stay on the old
+    // namespace — exactly a survivor's position between the host's
+    // rotation and the ticket delivery.
+    let (new_epoch, ticket) = ws
+        .test_rotate_for_survivor_reimport(0)
+        .await
+        .expect("rotate");
+
+    // Publish probe.txt into the OLD namespace during the lag window.
+    // Waiting for the doc entry guarantees the watcher flushed its
+    // debounce and `record_local_publish` stored the hash — this
+    // isolates the echo-guard mechanism from the (host-side-fixed)
+    // teardown dead window.
+    let probe = ws.root.join("probe.txt");
+    tokio::fs::write(&probe, BYTES).await.unwrap();
+    assert!(
+        wait_for_doc_entry(&ws, &probe, WAIT_BUDGET).await,
+        "probe never published into the old namespace — test setup failed",
+    );
+
+    // Survivor-path reimport: swaps the doc, respawns watcher/applier,
+    // runs NO catch-up scan. probe.txt is not in the rotation snapshot
+    // (it was written after), so the rotated namespace starts without
+    // it.
+    ws.test_reimport_from_survivor_ticket(ticket, new_epoch)
+        .await
+        .expect("survivor reimport");
+
+    // Rewrite the identical bytes until they land in the rotated
+    // namespace. Each write fires a real watcher event (mirroring the
+    // 3-peer test's probe loop); with the stale `last_published` hash
+    // surviving the reimport, every one of them is swallowed as an
+    // echo and this never succeeds.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let _ = tokio::fs::write(&probe, BYTES).await;
+        sleep(POLL_INTERVAL).await;
+        if doc_has_entry_at(&ws, &probe).await {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "identical-bytes rewrite never reached the rotated namespace — \
+             stale last_published hash swallowed every post-reimport publish",
+        );
+    }
+
+    ws.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), handle).await;
+    daemon.stop().await;
+}
+
+// =============================================================
 // Epoch persistence (C2 regression): namespace_epoch must survive a
 // host restart. Without on-disk persistence the counter resets to 0,
 // and a second eviction re-mints epoch 1 — which every survivor that
