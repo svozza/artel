@@ -3,7 +3,8 @@
 //!
 //! ## Why
 //!
-//! The daemon installs a [`MemoryLookup`] (`addr_hint`) at startup
+//! The daemon installs a [`iroh::address_lookup::memory::MemoryLookup`]
+//! (`addr_hint`) at startup
 //! and registers it in iroh's address-lookup chain. When a peer's
 //! addr lands in `addr_hint`, iroh's resolver chain (consulted by
 //! every dial — including iroh-docs's internal `LiveActor` after a
@@ -18,14 +19,13 @@
 //! its internal `memory_lookup` seeding (`engine/live.rs:472`), and
 //! raced n0 pkarr/DNS to find bob. The race lost.
 //!
-//! See `docs/handoff-code-review-fixes.md` § "Findings discovered
-//! AFTER the original review" → finding #5c, and the brainstorm at
+//! See
 //! `docs/brainstorms/2026-05-29-host-restart-peer-addr-cache-brainstorm.md`.
 //!
 //! ## Shape
 //!
 //! - **Source of truth**: snapshot iroh's per-peer state at
-//!   graceful daemon shutdown via [`Endpoint::remote_info`].
+//!   graceful daemon shutdown via [`iroh::Endpoint::remote_info`].
 //! - **Storage**: single per-daemon file (`peer_addrs.postcard`)
 //!   alongside the daemon's `iroh.key`. Atomic write (tmp + fsync +
 //!   rename) so a crash mid-write never corrupts the live file.
@@ -62,8 +62,9 @@ const CACHE_MODE: u32 = 0o600;
 
 /// Maximum entries persisted per snapshot. Keeps the file size and
 /// `MemoryLookup` memory footprint bounded over a long-running daemon.
-/// 256 covers a several-hundred-peer mesh comfortably; entries beyond
-/// the cap are evicted MRU-style at write time.
+/// 256 covers a several-hundred-peer mesh comfortably; at write time
+/// the most-recently-seen entries are kept and the oldest evicted
+/// (LRU eviction).
 const MAX_ENTRIES: usize = 256;
 
 /// Versioned on-disk envelope. Externally-tagged so future variants

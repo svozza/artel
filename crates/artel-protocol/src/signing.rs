@@ -18,7 +18,7 @@
 //!                ||  timestamp_ms_be (8 bytes)
 //!                ||  peer.id (32 bytes)
 //!                ||  kind_tag (1 byte: chat=0, tool=1, system=2,
-//!                                       capability=3 reserved)
+//!                                       capability=3)
 //!                ||  action_len_be (4 bytes) || action_utf8
 //!                ||  payload_len_be (4 bytes) || payload_bytes
 //! ```
@@ -29,13 +29,10 @@
 //! `session_id` is included so future `Grant`-style events can't be
 //! cross-session-replayed (see brainstorm § Threat Model).
 //! `message_format` rides inside the signed bytes so a downgrade
-//! attack (force `version` back to `1`, the unsigned-era shape) flips
-//! the signature; `version=2` is the floor.
-//!
-//! Capability kind tag is reserved at byte `3` even though the enum
-//! doesn't define [`MessageKind::Capability`] yet — Slice C lands the
-//! variant, and pre-allocating the byte means existing v2 signatures
-//! stay valid post-C.
+//! attack (force `version` back to an unsigned-era shape) flips the
+//! signature; [`MESSAGE_FORMAT`] (currently 3) is the floor —
+//! `verify_message` rejects anything below it with
+//! [`VerifyError::VersionTooOld`].
 //!
 //! ## Why hand-rolled, not postcard
 //!
@@ -68,8 +65,8 @@ const fn kind_tag(kind: MessageKind) -> u8 {
         MessageKind::Chat => 0,
         MessageKind::Tool => 1,
         MessageKind::System => 2,
-        // Byte 3 was pre-reserved for this in Slice B so existing v3
-        // signatures stay valid once Slice C lands the variant.
+        // Byte 3 was pre-reserved before the variant existed, so
+        // signatures minted in the interim stayed valid when it landed.
         MessageKind::Capability => 3,
     }
 }
@@ -159,13 +156,14 @@ pub fn sign_body(
 /// # Errors
 ///
 /// - [`VerifyError::SentinelUnsigned`] if `signature` is the all-zero
-///   sentinel ([`SIGNATURE_UNSIGNED`]). A freshly-constructed v2
+///   sentinel ([`SIGNATURE_UNSIGNED`]). A freshly-constructed
 ///   message that never went through [`sign_body`] hits this.
 /// - [`VerifyError::VersionTooOld`] if `message.version` is below
 ///   [`MESSAGE_FORMAT`] — the signed-era floor. This is the active
-///   downgrade defense: the doc-comment's "the signature flips" only
-///   holds against *tampering* a v2 frame, but an author who signs a
-///   self-consistent sub-floor frame would otherwise verify fine.
+///   downgrade defense: the module doc's "the signature flips" only
+///   holds against *tampering* a current-format frame, but an author
+///   who signs a self-consistent sub-floor frame would otherwise
+///   verify fine.
 ///   Rejecting `version < MESSAGE_FORMAT` here makes the floor real
 ///   rather than aspirational.
 /// - [`VerifyError::BadKey`] if `peer.id` is not a valid ed25519
@@ -213,9 +211,8 @@ pub fn verify_message(
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum VerifyError {
     /// The signature was the all-zero sentinel — the body was never
-    /// signed. Once Slice B2 turns verification on, every receive
-    /// path must reject this catastrophically: it's the lit fuse for
-    /// "we forgot to wire signing in".
+    /// signed. Every receive path must reject this catastrophically:
+    /// it's the lit fuse for "we forgot to wire signing in".
     #[error("signature is the zero sentinel; message was never signed")]
     SentinelUnsigned,
     /// `message.version` is below the signed-era floor

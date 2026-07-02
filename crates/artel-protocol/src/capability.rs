@@ -1,19 +1,20 @@
-//! Capability vocabulary for the event-sourced authorization model
-//! (Auth Slice C / L2).
+//! Capability vocabulary for the event-sourced authorization model.
 //!
-//! See `docs/plans/2026-06-03-auth-slice-c-l2-capabilities-plan.md` and
-//! `docs/brainstorms/2026-06-03-auth-slice-c-l2-capabilities-brainstorm.md`.
+//! See `docs/brainstorms/2026-06-03-auth-slice-c-l2-capabilities-seed.md`.
 //!
 //! A capability change is not host-side mutable state: it is a signed
 //! [`crate::SessionMessage`] of [`crate::MessageKind::Capability`] whose
-//! payload is a postcard-encoded [`CapabilityAction`]. Every peer derives
-//! the current cap set by replaying the log in seq order; the cap set is a
-//! *projection*, grant/revoke are *commands*, replay is deterministic.
+//! payload is a postcard-encoded [`CapabilityAction`]. The cap set is a
+//! *projection* derived by replaying these messages in seq order;
+//! grant/revoke are *commands*, replay is deterministic. In v1 that
+//! projection is host-only: `Capability` messages never leave the host
+//! (they ride neither live fanout nor replay), and enforcement happens
+//! at the host's `send` chokepoint.
 //!
 //! Two tiers for v1: [`Capability::Read`] (subscribe + consume) and
-//! [`Capability::ReadWrite`] (today's behaviour — and the right to grant /
-//! revoke, per brainstorm Q2). A peer absent from the cap set is treated as
-//! `Read`-only for write checks — "absent ⇒ Read" is the floor, so a
+//! [`Capability::ReadWrite`] (author messages — and the right to grant /
+//! revoke). A peer absent from the cap set is treated as `Read`-only for
+//! write checks — "absent ⇒ Read" is the floor, so a
 //! [`CapabilityAction::Revoke`] is just removal from the set.
 
 use serde::{Deserialize, Serialize};

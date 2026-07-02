@@ -25,11 +25,17 @@
 //!    disk (not a hard-coded 0, which would make the re-delivered rotate
 //!    look stale to bob's monotonic-epoch guard).
 //!
-//! Both are real-n0 (`Production`) and suffixed `_n0`: the default
-//! nextest profile filters them out; `--profile n0` runs them. Daemon-
-//! restart + live-sync cannot run against the localhost relay until the
-//! iroh 1.0 upgrade (noq-proto handshake path-poisoning, see the INTERIM
-//! note in `workspace_restart.rs`).
+//! 4. `offline_read_to_write_promotion_delivers_secret_on_return_real_n0`
+//!    — a Read member promoted to RW while offline receives the secret
+//!    on its return (host-side detection: the returner holds no prior
+//!    secret to compare against).
+//!
+//! All four tests are real-network and suffixed `_n0`: the default
+//! nextest profile filters them out; `--profile n0` runs them. Tests
+//! 1, 2, and 4 ride the bin-shared localhost relay
+//! (`ProductionCustomRelay`); test 3 stays on n0's public relay — see
+//! [`fs_prod`] for why its simultaneous-restart topology can't use
+//! the localhost relay yet.
 
 mod common;
 
@@ -56,10 +62,36 @@ where
     phase_budgeted(name, PHASE_BUDGET, fut).await
 }
 
-const fn prod() -> artel_fs::EndpointSetup {
+/// Workspace-side localhost-relay setup: n0 DNS/pkarr for discovery,
+/// self-signed localhost relay for the QUIC transport (same pattern
+/// as `workspace_restart.rs`).
+async fn fs_custom_relay_setup() -> artel_fs::EndpointSetup {
+    let relay_url: iroh::RelayUrl = common::shared_relay_url().await.parse().unwrap();
+    artel_fs::EndpointSetup::ProductionCustomRelay { relay_url }
+}
+
+/// Daemon-side companion to [`fs_custom_relay_setup`].
+async fn daemon_custom_relay_setup() -> artel_daemon::EndpointSetup {
+    let relay_url: iroh::RelayUrl = common::shared_relay_url().await.parse().unwrap();
+    artel_daemon::EndpointSetup::ProductionCustomRelay { relay_url }
+}
+
+/// Public-n0-relay setups, used ONLY by
+/// `returning_rw_member_regains_write_after_host_workspace_restart_real_n0`.
+/// That test's simultaneous-restart topology (host workspace restarts,
+/// then bob's daemon+workspace restart and must re-discover the host's
+/// rebound endpoint) deterministically fails to re-establish gossip on
+/// the localhost shared relay — bob's dial to the host is closed with
+/// `ApplicationClosed { error_code: 62 }` and the host's post-restart
+/// workspace never sees a `NeighborUp` — while the same topology
+/// converges on n0's public relay. Diagnosed 2026-07-02 (flake-detective;
+/// upstream iroh-gossip/iroh-docs peer-rediscovery edge, not a substrate
+/// bug). Revisit after the next iroh upgrade.
+const fn fs_prod() -> artel_fs::EndpointSetup {
     artel_fs::EndpointSetup::Production
 }
 
+/// See [`fs_prod`].
 const fn daemon_prod() -> artel_daemon::EndpointSetup {
     artel_daemon::EndpointSetup::Production
 }
@@ -86,12 +118,12 @@ async fn joiner_daemon_restart_resyncs_both_ways_real_n0() {
 
     let alice_daemon = phase(
         "spawn alice daemon",
-        spawn_daemon_at(&alice_paths, daemon_prod()),
+        spawn_daemon_at(&alice_paths, daemon_custom_relay_setup().await),
     )
     .await;
     let bob_daemon = phase(
         "spawn bob daemon (initial)",
-        spawn_daemon_at(&bob_paths, daemon_prod()),
+        spawn_daemon_at(&bob_paths, daemon_custom_relay_setup().await),
     )
     .await;
 
@@ -100,7 +132,7 @@ async fn joiner_daemon_restart_resyncs_both_ways_real_n0() {
     let alice_cfg = WorkspaceConfig::default()
         .with_state_dir(alice_wstate.path().to_path_buf())
         .with_daemon_socket(alice_daemon.socket.clone())
-        .with_endpoint_setup(prod());
+        .with_endpoint_setup(fs_custom_relay_setup().await);
     let (alice_ws, alice_ws_events) = phase(
         "alice Workspace::host_with",
         Workspace::host_with(
@@ -136,7 +168,7 @@ async fn joiner_daemon_restart_resyncs_both_ways_real_n0() {
     let bob_cfg = WorkspaceConfig::default()
         .with_state_dir(bob_wstate.path().to_path_buf())
         .with_daemon_socket(bob_daemon.socket.clone())
-        .with_endpoint_setup(prod());
+        .with_endpoint_setup(fs_custom_relay_setup().await);
     let (bob_ws, bob_ws_events) = phase(
         "bob Workspace::join_with (initial)",
         Workspace::join_with(
@@ -194,7 +226,7 @@ async fn joiner_daemon_restart_resyncs_both_ways_real_n0() {
 
     let bob_daemon = phase(
         "spawn bob daemon (post-restart)",
-        spawn_daemon_at(&bob_paths, daemon_prod()),
+        spawn_daemon_at(&bob_paths, daemon_custom_relay_setup().await),
     )
     .await;
     let bob = Client::connect(&bob_daemon.socket).await.unwrap();
@@ -215,7 +247,7 @@ async fn joiner_daemon_restart_resyncs_both_ways_real_n0() {
     let bob_cfg = WorkspaceConfig::default()
         .with_state_dir(bob_wstate.path().to_path_buf())
         .with_daemon_socket(bob_daemon.socket.clone())
-        .with_endpoint_setup(prod());
+        .with_endpoint_setup(fs_custom_relay_setup().await);
     let (bob_ws, bob_ws_events) = phase(
         "bob Workspace::join_with (post-restart)",
         Workspace::join_with(
@@ -294,17 +326,17 @@ async fn returning_rw_member_offline_across_rotation_regains_write_real_n0() {
 
     let alice_daemon = phase(
         "spawn alice daemon",
-        spawn_daemon_at(&alice_paths, daemon_prod()),
+        spawn_daemon_at(&alice_paths, daemon_custom_relay_setup().await),
     )
     .await;
     let bob_daemon = phase(
         "spawn bob daemon (initial)",
-        spawn_daemon_at(&bob_paths, daemon_prod()),
+        spawn_daemon_at(&bob_paths, daemon_custom_relay_setup().await),
     )
     .await;
     let carol_daemon = phase(
         "spawn carol daemon",
-        spawn_daemon_at(&carol_paths, daemon_prod()),
+        spawn_daemon_at(&carol_paths, daemon_custom_relay_setup().await),
     )
     .await;
 
@@ -313,7 +345,7 @@ async fn returning_rw_member_offline_across_rotation_regains_write_real_n0() {
     let alice_cfg = WorkspaceConfig::default()
         .with_state_dir(alice_wstate.path().to_path_buf())
         .with_daemon_socket(alice_daemon.socket.clone())
-        .with_endpoint_setup(prod());
+        .with_endpoint_setup(fs_custom_relay_setup().await);
     let (alice_ws, alice_ws_events) = phase(
         "alice Workspace::host_with",
         Workspace::host_with(
@@ -348,7 +380,7 @@ async fn returning_rw_member_offline_across_rotation_regains_write_real_n0() {
     let bob_cfg = WorkspaceConfig::default()
         .with_state_dir(bob_wstate.path().to_path_buf())
         .with_daemon_socket(bob_daemon.socket.clone())
-        .with_endpoint_setup(prod());
+        .with_endpoint_setup(fs_custom_relay_setup().await);
     let (bob_ws, bob_ws_events) = phase(
         "bob Workspace::join_with (initial)",
         Workspace::join_with(
@@ -392,7 +424,7 @@ async fn returning_rw_member_offline_across_rotation_regains_write_real_n0() {
     let carol_cfg = WorkspaceConfig::default()
         .with_state_dir(carol_wstate.path().to_path_buf())
         .with_daemon_socket(carol_daemon.socket.clone())
-        .with_endpoint_setup(prod());
+        .with_endpoint_setup(fs_custom_relay_setup().await);
     let (carol_ws, carol_ws_events) = phase(
         "carol Workspace::join_with",
         Workspace::join_with(
@@ -454,7 +486,7 @@ async fn returning_rw_member_offline_across_rotation_regains_write_real_n0() {
     // Bob's daemon restarts and reattaches.
     let bob_daemon = phase(
         "spawn bob daemon (post-restart)",
-        spawn_daemon_at(&bob_paths, daemon_prod()),
+        spawn_daemon_at(&bob_paths, daemon_custom_relay_setup().await),
     )
     .await;
     let bob = Client::connect(&bob_daemon.socket).await.unwrap();
@@ -471,7 +503,7 @@ async fn returning_rw_member_offline_across_rotation_regains_write_real_n0() {
     let bob_cfg = WorkspaceConfig::default()
         .with_state_dir(bob_wstate.path().to_path_buf())
         .with_daemon_socket(bob_daemon.socket.clone())
-        .with_endpoint_setup(prod());
+        .with_endpoint_setup(fs_custom_relay_setup().await);
     let (bob_ws, bob_ws_events) = phase(
         "bob Workspace::join_with (post-restart, rotated namespace)",
         Workspace::join_with(
@@ -601,7 +633,7 @@ async fn returning_rw_member_regains_write_after_host_workspace_restart_real_n0(
     let alice_cfg = WorkspaceConfig::default()
         .with_state_dir(alice_wstate.path().to_path_buf())
         .with_daemon_socket(alice_daemon.socket.clone())
-        .with_endpoint_setup(prod());
+        .with_endpoint_setup(fs_prod());
     let (alice_ws, alice_ws_events) = phase(
         "alice Workspace::host_with",
         Workspace::host_with(
@@ -636,7 +668,7 @@ async fn returning_rw_member_regains_write_after_host_workspace_restart_real_n0(
     let bob_cfg = WorkspaceConfig::default()
         .with_state_dir(bob_wstate.path().to_path_buf())
         .with_daemon_socket(bob_daemon.socket.clone())
-        .with_endpoint_setup(prod());
+        .with_endpoint_setup(fs_prod());
     let (bob_ws, bob_ws_events) = phase(
         "bob Workspace::join_with (initial)",
         Workspace::join_with(
@@ -680,7 +712,7 @@ async fn returning_rw_member_regains_write_after_host_workspace_restart_real_n0(
     let carol_cfg = WorkspaceConfig::default()
         .with_state_dir(carol_wstate.path().to_path_buf())
         .with_daemon_socket(carol_daemon.socket.clone())
-        .with_endpoint_setup(prod());
+        .with_endpoint_setup(fs_prod());
     let (carol_ws, carol_ws_events) = phase(
         "carol Workspace::join_with",
         Workspace::join_with(
@@ -754,7 +786,7 @@ async fn returning_rw_member_regains_write_after_host_workspace_restart_real_n0(
     let alice_cfg = WorkspaceConfig::default()
         .with_state_dir(alice_wstate.path().to_path_buf())
         .with_daemon_socket(alice_daemon.socket.clone())
-        .with_endpoint_setup(prod());
+        .with_endpoint_setup(fs_prod());
     let (alice_ws, alice_ws_events) = phase(
         "alice Workspace::host_with (restart, rotated namespace)",
         Workspace::host_with(
@@ -796,7 +828,7 @@ async fn returning_rw_member_regains_write_after_host_workspace_restart_real_n0(
     let bob_cfg = WorkspaceConfig::default()
         .with_state_dir(bob_wstate.path().to_path_buf())
         .with_daemon_socket(bob_daemon.socket.clone())
-        .with_endpoint_setup(prod());
+        .with_endpoint_setup(fs_prod());
     let (bob_ws, bob_ws_events) = phase(
         "bob Workspace::join_with (post-restart, rotated namespace)",
         Workspace::join_with(
@@ -884,12 +916,12 @@ async fn offline_read_to_write_promotion_delivers_secret_on_return_real_n0() {
 
     let alice_daemon = phase(
         "spawn alice daemon",
-        spawn_daemon_at(&alice_paths, daemon_prod()),
+        spawn_daemon_at(&alice_paths, daemon_custom_relay_setup().await),
     )
     .await;
     let bob_daemon = phase(
         "spawn bob daemon (initial)",
-        spawn_daemon_at(&bob_paths, daemon_prod()),
+        spawn_daemon_at(&bob_paths, daemon_custom_relay_setup().await),
     )
     .await;
 
@@ -898,7 +930,7 @@ async fn offline_read_to_write_promotion_delivers_secret_on_return_real_n0() {
     let alice_cfg = WorkspaceConfig::default()
         .with_state_dir(alice_wstate.path().to_path_buf())
         .with_daemon_socket(alice_daemon.socket.clone())
-        .with_endpoint_setup(prod());
+        .with_endpoint_setup(fs_custom_relay_setup().await);
     let (alice_ws, alice_ws_events) = phase(
         "alice Workspace::host_with",
         Workspace::host_with(
@@ -933,7 +965,7 @@ async fn offline_read_to_write_promotion_delivers_secret_on_return_real_n0() {
     let bob_cfg = WorkspaceConfig::default()
         .with_state_dir(bob_wstate.path().to_path_buf())
         .with_daemon_socket(bob_daemon.socket.clone())
-        .with_endpoint_setup(prod());
+        .with_endpoint_setup(fs_custom_relay_setup().await);
     let (bob_ws, bob_ws_events) = phase(
         "bob Workspace::join_with (read-only)",
         Workspace::join_with(
@@ -981,7 +1013,7 @@ async fn offline_read_to_write_promotion_delivers_secret_on_return_real_n0() {
     // Bob's daemon restarts and reattaches.
     let bob_daemon = phase(
         "spawn bob daemon (post-restart)",
-        spawn_daemon_at(&bob_paths, daemon_prod()),
+        spawn_daemon_at(&bob_paths, daemon_custom_relay_setup().await),
     )
     .await;
     let bob = Client::connect(&bob_daemon.socket).await.unwrap();
@@ -998,7 +1030,7 @@ async fn offline_read_to_write_promotion_delivers_secret_on_return_real_n0() {
     let bob_cfg = WorkspaceConfig::default()
         .with_state_dir(bob_wstate.path().to_path_buf())
         .with_daemon_socket(bob_daemon.socket.clone())
-        .with_endpoint_setup(prod());
+        .with_endpoint_setup(fs_custom_relay_setup().await);
     let (bob_ws, bob_ws_events) = phase(
         "bob Workspace::join_with (post-restart, now RW)",
         Workspace::join_with(

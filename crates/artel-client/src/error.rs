@@ -39,8 +39,9 @@ pub enum ClientError {
     #[error("unexpected response variant: {0:?}")]
     UnexpectedResponse(Response),
 
-    /// Sent on `Client::shutdown` or when the `Client` is dropped while
-    /// callers still hold pending request futures.
+    /// Reserved: never constructed today. Pending callers observe
+    /// [`Self::ConnectionClosed`] when the client goes away; this
+    /// variant is kept for a future explicit-shutdown API.
     #[error("client is shutting down")]
     Shutdown,
 

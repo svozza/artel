@@ -143,12 +143,12 @@ pub enum MessageKind {
     Tool,
     /// Session-control or metadata events from the application layer.
     System,
-    /// Capability grant/revoke event (Auth Slice C / L2). Unlike the
+    /// Capability grant/revoke event. Unlike the
     /// other kinds, the daemon *does* project these into a per-session
     /// capability set — but it still never dispatches on
     /// [`SessionMessage::action`]; the authoritative verb is the
     /// `crate::capability::CapabilityAction` postcard-encoded into the
-    /// payload. See `docs/plans/2026-06-03-auth-slice-c-l2-capabilities-plan.md`.
+    /// payload. See `docs/brainstorms/2026-06-03-auth-slice-c-l2-capabilities-seed.md`.
     Capability,
 }
 
@@ -210,12 +210,10 @@ pub struct SessionMessage {
 impl SessionMessage {
     /// Construct a `SessionMessage` with the current [`MESSAGE_FORMAT`].
     ///
-    /// Callers that don't yet have a signing key (test fixtures and
-    /// the pre-Slice-B2 `Registry::send` code path) pass
-    /// [`SIGNATURE_UNSIGNED`]; verification rejects the sentinel as
-    /// soon as Slice B2 turns it on, which is the lit fuse that
-    /// catches "we forgot to wire signing in" loudly rather than
-    /// silently.
+    /// Callers that don't have a signing key (test fixtures) pass
+    /// [`SIGNATURE_UNSIGNED`]; verification rejects the sentinel,
+    /// which is the lit fuse that catches "we forgot to wire signing
+    /// in" loudly rather than silently.
     #[must_use]
     #[allow(clippy::too_many_arguments)] // mirrors the wire field set
     pub fn new(

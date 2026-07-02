@@ -3,13 +3,15 @@
 //! The host daemon delivers session-key material to a peer over a
 //! dedicated QUIC stream (ALPN [`UPGRADE_ALPN`]) rather than
 //! broadcasting it over gossip — the one sanctioned exception to the
-//! gossip-only inter-daemon rule. Two payload kinds ride the channel:
+//! gossip-only inter-daemon rule. Four payload kinds ride the channel:
 //! the `NamespaceSecret` for a promoted RW joiner
-//! ([`DeliveryFrame::Secret`]) and the read-capability workspace
-//! ticket envelope delivered at admission
-//! ([`DeliveryFrame::WorkspaceTicket`]). This module defines the
-//! on-the-wire frame and constants shared between sender and
-//! receiver.
+//! ([`DeliveryFrame::Secret`]), the read-capability workspace ticket
+//! envelope delivered at admission
+//! ([`DeliveryFrame::WorkspaceTicket`]), the cooperative RW → Read
+//! demotion notice ([`DeliveryFrame::Downgrade`]), and the rotated
+//! namespace ticket for a surviving RW peer
+//! ([`DeliveryFrame::Rotate`]). This module defines the on-the-wire
+//! frame and constants shared between sender and receiver.
 
 use serde::{Deserialize, Serialize};
 

@@ -6,9 +6,13 @@
 //! - `artel-daemon` knows nothing about `iroh-docs` or `iroh-blobs`.
 //! - `artel-fs::Workspace` spawns its **own** iroh `Endpoint` +
 //!   `Gossip` + `Docs` + `Blobs`, distinct from the daemon's.
-//! - The host shares the resulting `DocTicket` over the artel session
-//!   as a `MessageKind::System` with `action = "workspace.ticket"`.
-//!   Joiners pick it up off the events stream.
+//! - The host wraps the resulting `DocTicket` in a versioned
+//!   `WorkspaceTicketEnvelope` (postcard) and publishes it via
+//!   `Request::PublishWorkspaceTicket`; the daemon persists the
+//!   envelope and unicasts it to each member over the direct stream.
+//!   Joiners observe it as a synthetic `workspace.ticket` System
+//!   message on the events stream (bare `DocTicket` payloads are
+//!   hard-rejected).
 //!
 //! Public surface today:
 //! - [`Workspace::host`] / [`Workspace::join`] — host or attach to a

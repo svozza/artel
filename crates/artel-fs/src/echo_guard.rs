@@ -12,8 +12,8 @@
 //!    file, it inserts the path into a shared `HashSet`. The watcher
 //!    consults the set and skips publishing while the path is in it.
 //!    A short [`tokio`] timer removes the path once the inotify event
-//!    has had time to fire. (`PENDING_RELEASE_GRACE` lives at the
-//!    applier level, not here — this module just stores the set.)
+//!    has had time to fire ([`PENDING_RELEASE_GRACE`], defined here;
+//!    the applier passes it to [`EchoGuard::release_after`]).
 //!
 //! 2. **Last-published hash.** Even after the pending entry has been
 //!    cleared, watch events can race. We hash whatever bytes the
@@ -160,9 +160,9 @@ impl EchoGuard {
     /// with the *same bytes* hashes equal to the stale entry and
     /// [`Self::should_skip_local`] swallows the publish forever,
     /// leaving the doc's latest entry a tombstone while disk state
-    /// diverges. (Found via the rw-redelivery n0 tests, whose shared
-    /// probe file is deleted and re-created with identical bytes per
-    /// grant.)
+    /// diverges. (Found via the rw-redelivery n0 tests, whose
+    /// per-peer probe files are deleted and re-created with identical
+    /// bytes per grant.)
     ///
     /// The pending set is deliberately left alone: entries there
     /// expire on their own timer ([`release_after`]), and evicting

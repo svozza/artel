@@ -20,9 +20,10 @@
 //! - `steady` — host the workspace, publish whatever's already in
 //!   `--root`, emit `READY`, then idle.
 //! - `mid_scan` — same, but the parent SIGKILLs us between
-//!   `WORKSPACE_UP` and `READY` (i.e. mid scan-and-publish). Child
-//!   behaves identically; the parent's choice of when to kill
-//!   differentiates.
+//!   `WORKSPACE_UP` and `READY` (post-scan — `host_with` finishes
+//!   the initial publish before `WORKSPACE_UP` — but before peer
+//!   sync completes). Child behaves identically; the parent's
+//!   choice of when to kill differentiates.
 //! - `mid_write` — after `READY`, write a new file every 50 ms,
 //!   emitting `WROTE <name>` per file. Parent SIGKILLs after the
 //!   first WROTE arrives.

@@ -619,9 +619,10 @@ async fn capture_ticket_n0(events: &mut EventStream, session: SessionId) -> DocT
     DocTicket::from_str(&envelope.doc_ticket).expect("DocTicket parse")
 }
 
-// Real-n0 sibling for finding #5c (host-restart peer-addr cache).
-// The deterministic counterpart is the `peer_addr_cache_pkarr`
-// test fn in `crates/artel-daemon/tests/identity.rs`. Runs under
+// Real-n0 sibling of the host-restart peer-addr cache coverage.
+// The deterministic counterpart is
+// `addr_hint_survives_daemon_restart_via_on_disk_cache` in
+// `crates/artel-daemon/tests/identity.rs`. Runs under
 // the `n0` nextest profile (filter `test(/_n0$/)`); the default
 // profile filters it out via `not test(/_n0$/)`.
 //

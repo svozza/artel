@@ -5,7 +5,9 @@
 //! [`ProtocolHandler`] that accepts such connections, validates the
 //! frame, dispatches by payload kind — `Secret` → the session's
 //! upgrade event, `WorkspaceTicket` → persist + synthetic
-//! `TICKET_ACTION` System message — and returns a 1-byte ACK.
+//! `TICKET_ACTION` System message, `Downgrade` → synthetic
+//! `DOWNGRADE_ACTION` message, `Rotate` → synthetic `ROTATE_ACTION`
+//! message — and returns a 1-byte ACK.
 
 // Crate-private module: pair `unreachable_pub` with the
 // crate-visibility lint so they stop fighting (see memory).

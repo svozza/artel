@@ -17,8 +17,9 @@ pub type Framed<IO> = TokioFramed<IO, WireMessageCodec>;
 
 /// Wrap any `AsyncRead + AsyncWrite` in the artel framing.
 ///
-/// Use this with `tokio::io::duplex` for in-process tests, or with a real
-/// Unix socket / named-pipe connection in production.
+/// Use this with `tokio::io::duplex` for in-process tests, or with a
+/// real Unix socket in production (the transport module is
+/// `compile_error!` on non-Unix platforms).
 #[must_use]
 pub fn new<IO: AsyncRead + AsyncWrite>(io: IO) -> Framed<IO> {
     Framed::new(io, WireMessageCodec::new())

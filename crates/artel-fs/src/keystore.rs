@@ -7,9 +7,11 @@
 //! identity and any peer that learned about the workspace via a
 //! prior ticket has to re-learn it.
 //!
-//! Author identity is a separate concern: `iroh-docs`'s
-//! `Docs::persistent` already manages a per-store default author
-//! file under `<state_dir>/docs/default-author`.
+//! The iroh-docs **author** identity is derived from this same
+//! seed (`AuthorId` == endpoint id — see `node.rs`'s author
+//! binding), so this file covers both. iroh-docs' own
+//! `default-author` file still exists on disk but is deliberately
+//! unused.
 //!
 //! [`load_or_create_secret`] is the entry point. It reads `path`
 //! if it exists, otherwise generates a fresh key from `OsRng` and

@@ -1,9 +1,9 @@
 //! Shared fixtures for `artel-fs` integration tests.
 //!
 //! Two flavours of harness:
-//! - [`spawn_local_daemon`] / [`DaemonHarness`]-style — single
-//!   iroh-disabled daemon, used by tests that only exercise client
-//!   IPC paths (e.g. `host_publishes_ticket.rs`).
+//! - [`LocalDaemon::spawn`] — a single iroh-enabled daemon, used by
+//!   tests that only exercise client IPC paths or drive a single
+//!   `Workspace` without a peer (e.g. `workspace_lifecycle.rs`).
 //! - [`spawn_pair`] — two iroh-enabled daemons sharing one
 //!   localhost [`DnsPkarrServer`]. Mirrors `artel-daemon`'s test
 //!   fixture so the artel session traffic between the two daemons
@@ -247,7 +247,7 @@ pub fn testing_setup(dns_pkarr: &Arc<DnsPkarrServer>) -> FsEndpointSetup {
 /// Bring an iroh-enabled daemon up against the supplied
 /// [`EndpointSetup`]. Used by [`spawn_pair`] for the shared
 /// `Testing` setup; tests that need a single daemon (e.g. the
-/// single-daemon attachment cases in `workspace_attachment.rs`)
+/// single-daemon attachment cases in `workspace_lifecycle.rs`)
 /// can call this directly with their own per-test fixture.
 pub async fn spawn_daemon_with_setup(
     state: DaemonState,
@@ -275,10 +275,9 @@ pub async fn spawn_daemon_with_setup(
     }
 }
 
-/// Single-daemon, iroh-disabled harness. The daemon is configured
-/// with `iroh_key_path: None` so no `Endpoint` is bound — the
-/// workspace under test brings its own iroh node up internally and
-/// is the only iroh side that participates.
+/// Single-daemon harness (iroh-enabled, hermetic `Testing` setup —
+/// see [`LocalDaemon::spawn`]). The workspace under test still
+/// brings its own iroh node up internally.
 ///
 /// Used by tests that exercise client IPC paths or drive a single
 /// `Workspace` without a peer. For tests that need a daemon-side

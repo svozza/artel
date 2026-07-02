@@ -9,8 +9,8 @@
 //! `default_read_write_unchanged_behaviour`, `mixed_rules_first_match_wins`,
 //! `read_only_*` family, `ticket_envelope_*`, and `tombstone_filter_check`
 //! files) per `docs/plans/2026-05-29-faster-cargo-test-plan.md` slice 2b.
-//! Each original file's docstring is retained verbatim in section banners
-//! below so `git blame` from a failing test still finds the rationale.
+//! The original files' docstrings live on (occasionally updated) in the
+//! section banners below.
 
 mod common;
 

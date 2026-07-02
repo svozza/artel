@@ -792,7 +792,7 @@ Listed for completeness, no detailed plan yet:
      own cap-set projection and observe `Revoke` directly (the principled
      end-state; notification falls out for free, but it's the v2-scale
      symmetric-peer change — see
-     `docs/brainstorms/2026-06-04-auth-slice-c-l2-delivery-rethink-brainstorm.md`).
+     `docs/brainstorms/2026-06-03-auth-slice-c-l2-capabilities-seed.md`).
   2. **Read cut-off** — stop them pulling new state. Today: works
      (`PeerFilter` rejects their connection).
   3. **~~Write cut-off~~ — stop them *producing* valid state. DONE

@@ -20,8 +20,8 @@
 //! ## Concurrency
 //!
 //! Two parallel `connect_or_spawn` calls against the same cold dir
-//! both try to spawn the daemon. Only one wins
-//! [`crate::pidfile`]-equivalent contention — the other observes
+//! both try to spawn the daemon. Only one wins the pidfile
+//! contention (artel-daemon's `pidfile` module) — the other observes
 //! `AlreadyRunning` and exits. Both clients then connect to the
 //! survivor.
 //!
@@ -63,8 +63,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub struct SpawnOptions {
     /// IPC socket path the daemon will bind.
     pub socket_path: PathBuf,
-    /// PID file path. Used to distinguish "no daemon" from "daemon is
-    /// still booting"; never read or written by the client.
+    /// PID file path. Read (never written) by the client to
+    /// distinguish "no daemon" from "daemon is still booting" —
+    /// see `pidfile_names_live_process`.
     pub pid_path: PathBuf,
     /// Path to the `artel-daemon` binary. Required: the client refuses
     /// to guess.
@@ -188,7 +189,8 @@ pub(crate) async fn connect_or_spawn(opts: SpawnOptions) -> Result<Client, Clien
 /// - [`io::ErrorKind::NotFound`] — socket file absent.
 /// - [`io::ErrorKind::ConnectionRefused`] — socket exists, no
 ///   listener (daemon crashed without cleanup).
-/// - `ENOTSOCK` (raw errno 38) — a file exists at the socket path but
+/// - `ENOTSOCK` (via `nix::errno::Errno`, so per-platform: 38 on
+///   macOS, 88 on Linux) — a file exists at the socket path but
 ///   isn't a socket. Surfaces on the [`io::ErrorKind::Uncategorized`]
 ///   bucket on stable Rust. Daemon-side cleanup will replace it.
 fn is_no_daemon_error(err: &ClientError) -> bool {

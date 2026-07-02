@@ -5,9 +5,10 @@
 //! `attach_policy_join`, `attach_policy_state_dir_only`,
 //! `host_publishes_ticket`, `run_readiness`, `workspace_attachment`,
 //! `workspace_shutdown_contract`) per
-//! `docs/plans/2026-05-29-faster-cargo-test-plan.md` slice 2a. Each
-//! original file's docstring is retained in section banners below so
-//! `git blame` from a failing test still finds the rationale.
+//! `docs/plans/2026-05-29-faster-cargo-test-plan.md` slice 2a. The
+//! original files' docstrings live on (occasionally updated) in the
+//! section banners below. Also covers the same-seed author binding
+//! (`spawn_does_not_set_same_seed_author_as_store_default`).
 
 mod common;
 
@@ -391,9 +392,9 @@ async fn require_empty_accepts_dir_with_only_artel_fs_state() {
 // `workspace.ticket` system message on the artel session.
 //
 // Doesn't run the watcher / applier — verifies only that:
-// 1. `Workspace::host` returns successfully against an existing artel
-//    session.
-// 2. A second client subscribed to the same session observes a
+// 1. `Workspace::host` returns successfully (it owns the
+//    `HostSession` round-trip itself).
+// 2. The same client, subscribing after `host` returns, observes a
 //    `MessageKind::System` event with action [`TICKET_ACTION`] and a
 //    non-empty payload.
 // 3. The payload deserialises as a real [`DocTicket`].
@@ -426,9 +427,11 @@ async fn host_lands_ticket_on_session() {
     .expect("Workspace::host");
     let session = workspace.session_id();
 
-    // Subscribe *after* `host` returns. The daemon replays the
-    // session log on subscribe, so the `workspace.ticket` system
-    // message published during `host` is still observed here.
+    // Subscribe *after* `host` returns. The envelope never enters
+    // the log (revoked-lurker fix); the daemon injects a synthetic
+    // TICKET_ACTION message from the persisted envelope into every
+    // subscribe replay, so the ticket published during `host` is
+    // still observed here.
     let _ = alice
         .request(Request::Subscribe {
             session,
@@ -782,7 +785,7 @@ async fn list_known_workspaces_helper_returns_typed_view() {
 // `used_underscore_binding`: this test rebuilds a fresh `DaemonState`
 // from `RunningDaemon._state` to give the second daemon the same
 // on-disk paths. Renaming the field would ripple through every
-// fixture caller; matches `host_resume_session_id.rs`.
+// fixture caller; matches the resume tests in `workspace_restart.rs`.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines, clippy::used_underscore_binding)]
 async fn attachment_persists_across_daemon_restart() {
@@ -1048,8 +1051,7 @@ async fn attachment_removed_on_joiner_leave_session() {
 }
 
 // =============================================================
-// `Workspace::shutdown` contract pinned by the Tier-2 review trio
-// (originals #2 + #3 + #4 in `docs/handoff-code-review-fixes.md`).
+// `Workspace::shutdown` contract.
 //
 // Three properties:
 //

@@ -1,6 +1,6 @@
-//! Identifier types: [`SessionId`], [`PeerId`], [`Seq`].
+//! Identifier types: [`SessionId`], [`PeerId`], [`Seq`], [`TicketId`].
 //!
-//! All three are newtypes so that the wire format is explicit and so that
+//! All four are newtypes so that the wire format is explicit and so that
 //! mixing them in API signatures is a compile error.
 
 use std::fmt;

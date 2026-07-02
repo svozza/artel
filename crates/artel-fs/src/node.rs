@@ -41,9 +41,9 @@ use crate::peer_map::PeerMap;
 /// [`WorkspaceError::RelayUnreachable`]. Tight enough to fail fast
 /// when the relay is unreachable (offline laptop, captive portal,
 /// n0 outage), loose enough to cover normal startup. Mirrored in
-/// `artel_daemon::server::HOME_RELAY_BUDGET` — keep the two in
-/// sync until the `EndpointSetup` duplication (handoff finding
-/// #11) is resolved.
+/// `artel_daemon::server::HOME_RELAY_BUDGET` — the two crates each
+/// carry their own `EndpointSetup` enum and relay budget; keep them
+/// in sync until that duplication is consolidated.
 const HOME_RELAY_BUDGET: Duration = Duration::from_secs(30);
 
 /// Per-`Workspace` iroh runtime. Held for the workspace's lifetime;
@@ -69,7 +69,7 @@ pub(crate) struct WorkspaceNode {
     /// whose capability the session tracks (the `peer_map` resolves
     /// `entry.author` → daemon `PeerId` for free), without an
     /// announcement. Replaces iroh-docs' random `author_default()`.
-    /// See ADR-002 / CONTEXT.md "Author binding". The key reuse is safe:
+    /// See CONTEXT.md "Author binding". The key reuse is safe:
     /// a TLS `CertificateVerify` payload can never collide with an
     /// iroh-docs `entry.to_vec()` (distinct fixed prefixes).
     pub author: iroh_docs::AuthorId,

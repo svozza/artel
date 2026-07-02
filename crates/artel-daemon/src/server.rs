@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(feature = "iroh")]
 use std::time::Duration;
 
 use artel_protocol::transport::{self, Framed, server::Listener};
@@ -31,9 +32,10 @@ use crate::shutdown::{Shutdown, ShutdownToken};
 /// How long the daemon waits for the home-relay handshake
 /// (`endpoint.online()`) before surfacing
 /// [`StartError::RelayUnreachable`]. Mirrors
-/// `artel_fs::node::HOME_RELAY_BUDGET` — keep them in sync until
-/// the [`EndpointSetup`] duplication (handoff finding #11) is
-/// resolved and the constant can move alongside the shared enum.
+/// `artel_fs::node::HOME_RELAY_BUDGET` — the two crates each carry
+/// their own `EndpointSetup` enum and relay budget; keep them in sync
+/// until that duplication is consolidated and the constant can move
+/// alongside a shared enum.
 #[cfg(feature = "iroh")]
 const HOME_RELAY_BUDGET: Duration = Duration::from_secs(30);
 
@@ -94,11 +96,9 @@ pub struct DaemonConfig {
     /// localhost pkarr+DNS pair instead of paying n0's external
     /// rate limits.
     ///
-    /// Without the `iroh` feature this field is unconditionally
-    /// present so callers can construct [`DaemonConfig`] with the
-    /// same struct literal regardless of feature flags; the
-    /// `Production` default works in either case (the value is
-    /// just ignored in the no-iroh build).
+    /// Without the `iroh` feature the field still exists but its type
+    /// is `()`, so callers that set it (e.g. `main.rs`) need a cfg
+    /// split; it carries no information in that build.
     #[cfg(feature = "iroh")]
     pub endpoint_setup: EndpointSetup,
     /// Placeholder so the struct shape doesn't drift between
@@ -149,17 +149,18 @@ pub enum StartError {
 
 /// iroh-side state held for the daemon's lifetime: the `Endpoint`
 /// (network identity), a `Gossip` instance attached to it, and a
-/// `Router` accepting `iroh_gossip::ALPN`.
+/// `Router` accepting `iroh_gossip::ALPN` and
+/// `UpgradeProtocol::alpn()`.
 ///
-/// Held as a unit because the three are constructed together at
-/// startup and torn down together at shutdown via
+/// Endpoint and gossip are built together in `resolve_iroh_runtime`;
+/// the router is attached later in `Daemon::start` (see the field's
+/// doc). All three tear down together at shutdown via
 /// [`iroh::protocol::Router::shutdown`], which closes the underlying
 /// `Endpoint` for us. Keeping them together also means the
 /// daemon doesn't have to thread three separate options through
 /// every codepath that wants to know "is iroh on?".
 #[cfg(feature = "iroh")]
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // endpoint + gossip are read by Phase 2c-2 onwards.
 pub struct IrohRuntime {
     /// QUIC endpoint owning the daemon's ed25519 identity.
     pub endpoint: iroh::Endpoint,
@@ -366,9 +367,8 @@ impl Daemon {
     /// [`DaemonConfig::iroh_key_path`] was supplied.
     ///
     /// Exposed so embedders and integration tests can talk to the
-    /// daemon's `Endpoint` and `Gossip` directly. Phase 2c-2 will
-    /// keep this surface but route most session traffic through
-    /// `Registry`.
+    /// daemon's `Endpoint` and `Gossip` directly; session traffic
+    /// itself routes through `Registry`.
     #[cfg(feature = "iroh")]
     #[must_use]
     pub const fn iroh(&self) -> &IrohRuntime {
@@ -466,7 +466,8 @@ impl Daemon {
         // Before tearing down: snapshot the per-peer addrs iroh has
         // learned this incarnation so the next daemon startup can
         // seed `addr_hint` and skip the pkarr/DNS race that
-        // otherwise breaks post-restart sync (handoff finding #5c).
+        // otherwise breaks post-restart sync (iroh-docs keeps only
+        // id-only addrs on disk).
         // The snapshot must run BEFORE `router.shutdown()` because
         // that closes the endpoint and `remote_info` returns `None`
         // afterwards.
@@ -1320,7 +1321,7 @@ async fn resolve_iroh_runtime(
     // learned. Without this, a host restart loses every peer addr
     // iroh was holding in memory — iroh-docs's persistent doc store
     // keeps id-only `EndpointAddr`s and the post-restart dial races
-    // pkarr/DNS to find peers (handoff finding #5c). Loading is
+    // pkarr/DNS to find peers. Loading is
     // best-effort: a missing or corrupt cache yields an empty seed,
     // identical to pre-fix behaviour.
     let tracked_peer_ids = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::<
@@ -1451,9 +1452,6 @@ fn iroh_endpoint_to_wire(addr: &iroh::EndpointAddr) -> artel_protocol::WireEndpo
     }
 }
 
-/// Spawn a task that forwards events from `sub.events` as
-/// [`WireMessage::Event`] frames into `sink`. Backfills `sub.replay`
-/// first.
 /// Per-connection owner of subscription forwarder tasks, keyed by
 /// session.
 ///
@@ -1498,6 +1496,9 @@ impl Drop for ForwarderSet {
     }
 }
 
+/// Spawn a task that forwards events from `sub.events` as
+/// [`WireMessage::Event`] frames into `sink`. Backfills `sub.replay`
+/// first.
 fn spawn_subscription_forwarder(
     session: SessionId,
     sub: Subscription,

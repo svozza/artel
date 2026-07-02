@@ -1,10 +1,11 @@
 //! Decide whether a path should be included in a workspace sync.
 //!
-//! Three layers, in order:
+//! Four layers, in order:
 //!
 //! 1. Hardcoded skips (`.git`, `target`, `node_modules`, `.DS_Store`,
-//!    `*.swp`, `*.tmp`). Highest priority — these never sync regardless
-//!    of `.gitignore` config.
+//!    `.artel-fs` — the workspace's own state dir — plus `*.swp`,
+//!    `*.tmp`). Highest priority — these never sync regardless of
+//!    `.gitignore` config.
 //! 2. Symlink check. We deliberately do not follow links.
 //! 3. `.gitignore` patterns at the workspace root, parsed via the
 //!    `ignore` crate. Honoured for everything *except* the
@@ -18,9 +19,11 @@ use std::path::{Path, PathBuf};
 
 use ignore::gitignore::Gitignore;
 
-/// Files larger than this are skipped. Keeps the doc small enough that
-/// the memory-store path stays tractable; revisit when the doc grows
-/// big enough that streaming becomes a real concern.
+/// Files larger than this are skipped.
+///
+/// Whole-file reads and publishes (no streaming, no chunked diffing)
+/// keep the pipeline simple, and a cap keeps each of those operations
+/// cheap; revisit when large-file sync becomes a real need.
 pub const MAX_FILE_SIZE: u64 = 1 << 20;
 
 /// Pre-parsed view of the workspace root + its `.gitignore` (if any).

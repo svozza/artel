@@ -2,9 +2,9 @@
 //!
 //! These are *protocol* errors: they are serialized, sent across the IPC
 //! boundary, and reconstructed on the other side. Transport errors (broken
-//! socket, framing, malformed bytes) live in `artel-client` / `artel-daemon`
-//! respectively, since they cannot be sent over the very transport that
-//! failed.
+//! socket, framing, malformed bytes) live in this crate's `transport`
+//! module (`TransportError`, feature `tokio`), since they cannot be sent
+//! over the very transport that failed.
 
 use serde::{Deserialize, Serialize};
 
@@ -34,13 +34,19 @@ pub enum ProtocolError {
 
     /// The daemon refuses the request because it has not finished starting
     /// up. Clients should retry after a short delay.
+    ///
+    /// Reserved: no daemon path constructs it today (startup completes
+    /// before the socket accepts connections). Kept for its pinned
+    /// postcard index and for a future async-startup daemon.
     #[error("daemon is not ready yet")]
     NotReady,
 
-    /// `Send` was issued for a session whose host lives on another
-    /// daemon. Phase 2c-2b ships host→joiner one-way fanout only;
-    /// joiner-issued sends arrive in 2c-2c.
-    #[error("send is only supported on the host side in this build")]
+    /// The operation requires hosting the session but the daemon holds
+    /// only a remote mirror: issue/revoke/list tickets, member removal,
+    /// workspace-ticket publish — and `Send` on a mirror when the
+    /// daemon is built without its iroh transport (with iroh on,
+    /// joiner sends are forwarded to the host instead).
+    #[error("operation requires hosting the session (this daemon holds a remote mirror)")]
     NotHost,
 
     /// `HostSession { session: Some(id) }` was issued for an `id`

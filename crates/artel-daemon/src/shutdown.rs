@@ -70,9 +70,9 @@ impl Shutdown {
     }
 
     /// Spawn a task that waits for SIGINT or SIGTERM and triggers
-    /// shutdown when either fires. The returned [`Arc<Shutdown>`] is the
-    /// same handle the caller passes in; it is cloned into the spawned
-    /// task so the signal listener outlives nothing in particular.
+    /// shutdown when either fires. The spawned task holds only a
+    /// `Weak` reference to `self` — see the comment in the body for
+    /// why an `Arc` would leak the task and the `Shutdown` itself.
     ///
     /// Returns an `io::Error` if either signal stream fails to install
     /// (extremely unlikely on Unix; would mean the process has no signal

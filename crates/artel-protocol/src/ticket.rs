@@ -5,10 +5,13 @@
 //! `artel:<base32-nopad-lowercase>` where the base32 body is a
 //! `postcard`-encoded [`SessionTicket`].
 //!
-//! The bytes carry a wire version, the [`SessionId`], the host
-//! daemon's [`PeerId`], and a [`WireEndpointAddr`] describing how to
-//! reach the host on the iroh network. The doc-ticket extension
-//! lands in Phase 3 (workspace docs).
+//! The bytes carry a wire version, the [`TicketId`], the
+//! [`SessionId`], the host daemon's [`PeerId`], a
+//! [`WireEndpointAddr`] describing how to reach the host on the iroh
+//! network, and the tiered-capability fields (`granted_cap`,
+//! `expiry_ms`, `cap_sig`). Workspace doc tickets do not ride here —
+//! they are delivered separately as a `DeliveryFrame::WorkspaceTicket`
+//! over the direct stream.
 //!
 //! The gossip topic id is **not** in the ticket — joiners derive it
 //! deterministically from the session id, so the ticket only carries
