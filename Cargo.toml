@@ -5,6 +5,7 @@ members = [
     "crates/artel-client",
     "crates/artel-protocol",
     "crates/artel-fs",
+    "crates/artel-iroh-setup",
 ]
 
 [workspace.package]
@@ -18,6 +19,7 @@ rust-version = "1.95"
 artel-protocol = { path = "crates/artel-protocol", version = "0.0.0" }
 artel-client = { path = "crates/artel-client", version = "0.0.0" }
 artel-fs = { path = "crates/artel-fs", version = "0.0.0" }
+artel-iroh-setup = { path = "crates/artel-iroh-setup", version = "0.0.0" }
 
 # Third-party deps
 async-trait = "0.1"

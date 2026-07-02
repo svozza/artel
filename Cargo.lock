@@ -163,6 +163,7 @@ version = "0.0.0"
 dependencies = [
  "artel-client",
  "artel-daemon",
+ "artel-iroh-setup",
  "artel-protocol",
  "async-trait",
  "bytes",
@@ -192,6 +193,7 @@ dependencies = [
  "artel-client",
  "artel-daemon",
  "artel-fs",
+ "artel-iroh-setup",
  "artel-protocol",
  "blake3",
  "bytes",
@@ -219,6 +221,18 @@ dependencies = [
  "tracing-subscriber",
  "unicode-normalization",
  "walkdir",
+]
+
+[[package]]
+name = "artel-iroh-setup"
+version = "0.0.0"
+dependencies = [
+ "iroh",
+ "pretty_assertions",
+ "rand 0.9.4",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

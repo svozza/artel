@@ -28,7 +28,6 @@ mod applier;
 pub mod attachment;
 mod docs_gate;
 pub mod echo_guard;
-mod endpoint_setup;
 pub mod error;
 pub mod filter;
 pub mod keys;
@@ -45,10 +44,14 @@ pub mod workspace;
 pub use attachment::{
     KIND_V1, KnownWorkspace, WorkspaceAttachmentV1, WorkspaceRole, list_known_workspaces,
 };
-pub use echo_guard::EchoGuard;
-pub use endpoint_setup::EndpointSetup;
+// Endpoint-discovery setup is shared with `artel-daemon` via
+// `artel-iroh-setup` (the two are peer crates; neither may depend on
+// the other). Re-exported so consumers keep the
+// `artel_fs::EndpointSetup` path.
+pub use artel_iroh_setup::EndpointSetup;
 #[cfg(feature = "test-utils")]
-pub use endpoint_setup::TEST_DNS_ORIGIN;
+pub use artel_iroh_setup::TEST_DNS_ORIGIN;
+pub use echo_guard::EchoGuard;
 pub use error::{PolicyViolation, WorkspaceError};
 pub use filter::{FilterDecision, MAX_FILE_SIZE, SkipReason, WorkspaceFilter};
 pub use keys::{KEY_PREFIX, key_to_path, path_to_key};

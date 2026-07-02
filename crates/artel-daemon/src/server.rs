@@ -23,21 +23,11 @@ use tokio::sync::{Mutex as AsyncMutex, broadcast};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
-#[cfg(feature = "iroh")]
-use crate::endpoint_setup::EndpointSetup;
 use crate::pidfile::{PidError, PidFile};
 use crate::session::{Registry, SessionError, Subscription};
 use crate::shutdown::{Shutdown, ShutdownToken};
-
-/// How long the daemon waits for the home-relay handshake
-/// (`endpoint.online()`) before surfacing
-/// [`StartError::RelayUnreachable`]. Mirrors
-/// `artel_fs::node::HOME_RELAY_BUDGET` — the two crates each carry
-/// their own `EndpointSetup` enum and relay budget; keep them in sync
-/// until that duplication is consolidated and the constant can move
-/// alongside a shared enum.
 #[cfg(feature = "iroh")]
-const HOME_RELAY_BUDGET: Duration = Duration::from_secs(30);
+use artel_iroh_setup::EndpointSetup;
 
 /// Whole-operation deadline for one direct-stream
 /// [`deliver_frame`] delivery (dial → `open_bi` → write → ACK).
@@ -1286,7 +1276,7 @@ async fn resolve_iroh_runtime(
     let path = key_path
         .ok_or_else(|| StartError::Iroh("iroh feature is on but no iroh_key_path given".into()))?;
     let secret =
-        crate::iroh_key::load_or_create(path).map_err(|e| StartError::Iroh(e.to_string()))?;
+        artel_iroh_setup::load_or_create(path).map_err(|e| StartError::Iroh(e.to_string()))?;
     // `iroh::SecretKey` is a 32-byte wrapper that is `Clone`; we keep
     // a copy on `IrohRuntime` so the registry / gossip bridge can
     // sign session messages (Auth Slice B) without the
@@ -1345,21 +1335,15 @@ async fn resolve_iroh_runtime(
         }
     }
 
-    // Mirror `WorkspaceNode::spawn`: block on home-relay readiness
-    // when the configured setup uses one, so the daemon doesn't
-    // accept IPC and start broadcasting on gossip before its first
-    // dial out can complete. The timeout exists for the same
-    // reason it does on the workspace side — failing fast on an
-    // unreachable relay (offline laptop, captive portal, n0
-    // outage, or the `TestingUnreachableRelay` fixture) instead of
+    // Block on home-relay readiness when the configured setup uses
+    // one, so the daemon doesn't accept IPC and start broadcasting on
+    // gossip before its first dial out can complete. Bounded so an
+    // unreachable relay (offline laptop, captive portal, n0 outage,
+    // or the `TestingUnreachableRelay` fixture) fails fast instead of
     // hanging `Daemon::start` forever.
-    if setup.awaits_relay()
-        && tokio::time::timeout(HOME_RELAY_BUDGET, endpoint.online())
-            .await
-            .is_err()
-    {
-        return Err(StartError::RelayUnreachable(HOME_RELAY_BUDGET));
-    }
+    artel_iroh_setup::await_relay_ready(setup, &endpoint)
+        .await
+        .map_err(StartError::RelayUnreachable)?;
 
     // Gossip needs a clone of the endpoint to register itself for the
     // ALPN; the Router is built later in Daemon::start (after the
@@ -1655,7 +1639,7 @@ mod tests {
         assert_eq!(on_runtime, on_endpoint);
         // And both equal what was written to disk; load_or_create is
         // identity for an existing key file.
-        let on_disk = crate::iroh_key::load_or_create(&key_path).unwrap();
+        let on_disk = artel_iroh_setup::load_or_create(&key_path).unwrap();
         assert_eq!(on_runtime, on_disk.to_bytes());
 
         // Tear down to avoid leaking the iroh router's accept loop.

@@ -30,7 +30,6 @@ mod common;
 use std::time::{Duration, Instant};
 
 use artel_client::Client;
-use artel_daemon::EndpointSetup;
 use artel_protocol::gossip::{self, GossipBody};
 use artel_protocol::rpc::SendPayload;
 use artel_protocol::signing::{self, SigningKey};
@@ -42,15 +41,6 @@ use futures_util::StreamExt;
 use iroh_gossip::api::Event as GossipEvent;
 use pretty_assertions::assert_eq;
 use tokio::time::timeout;
-
-/// Tier C endpoint setup: localhost shared relay + n0 DNS/pkarr,
-/// skipping TLS cert verification for the self-signed localhost
-/// relay. The two-daemon `_n0` tests below dial each other across
-/// this real-QUIC localhost relay rather than n0's public infra.
-async fn custom_relay_setup() -> EndpointSetup {
-    let relay_url: iroh::RelayUrl = common::shared_relay_url().await.parse().unwrap();
-    EndpointSetup::ProductionCustomRelay { relay_url }
-}
 
 use common::topic_for;
 
@@ -746,8 +736,8 @@ async fn legit_host_frames_accepted() {
 /// (`ProductionCustomRelay`), mirroring `common::spawn_pair`'s shape
 /// but over real n0 DNS/pkarr discovery.
 async fn spawn_pair_n0() -> (common::RunningDaemon, common::RunningDaemon) {
-    let a = common::spawn_daemon(common::fresh_state(), custom_relay_setup().await).await;
-    let b = common::spawn_daemon(common::fresh_state(), custom_relay_setup().await).await;
+    let a = common::spawn_daemon(common::fresh_state(), common::custom_relay_setup().await).await;
+    let b = common::spawn_daemon(common::fresh_state(), common::custom_relay_setup().await).await;
     (a, b)
 }
 
@@ -781,8 +771,9 @@ async fn capability_survives_host_restart_n0() {
     let host_paths = common::RestartState::under(host_root.path());
 
     // 1. Spawn host + joiner (both Production/n0).
-    let daemon_a = common::spawn_daemon_at(&host_paths, custom_relay_setup().await).await;
-    let daemon_b = common::spawn_daemon(common::fresh_state(), custom_relay_setup().await).await;
+    let daemon_a = common::spawn_daemon_at(&host_paths, common::custom_relay_setup().await).await;
+    let daemon_b =
+        common::spawn_daemon(common::fresh_state(), common::custom_relay_setup().await).await;
 
     // Alice hosts, bob joins → auto-granted RW.
     let (session_id, alice_client, bob_client, _bob_events) =
@@ -810,7 +801,7 @@ async fn capability_survives_host_restart_n0() {
     daemon_a.stop().await;
 
     // 3. Respawn host at the SAME paths (cold start from disk).
-    let daemon_a = common::spawn_daemon_at(&host_paths, custom_relay_setup().await).await;
+    let daemon_a = common::spawn_daemon_at(&host_paths, common::custom_relay_setup().await).await;
 
     // 4. Alice resumes the session (host(Some(id))).
     let alice_client = Client::connect(&daemon_a.socket).await.unwrap();
@@ -829,7 +820,8 @@ async fn capability_survives_host_restart_n0() {
     // 5. Bob re-joins via a fresh ticket (his mirror was torn down).
     drop(bob_client);
     daemon_b.stop().await;
-    let daemon_b = common::spawn_daemon(common::fresh_state(), custom_relay_setup().await).await;
+    let daemon_b =
+        common::spawn_daemon(common::fresh_state(), common::custom_relay_setup().await).await;
     let bob_client = Client::connect(&daemon_b.socket).await.unwrap();
     let join_resp = bob_client
         .request(Request::JoinSession {

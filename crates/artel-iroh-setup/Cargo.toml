@@ -1,0 +1,30 @@
+[package]
+name = "artel-iroh-setup"
+description = "Shared iroh endpoint-discovery setup for artel-daemon and artel-fs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+# Exposes the `Testing` / `TestingUnreachableRelay` /
+# `ProductionCustomRelay` / `TestingWithRelay` fixtures +
+# `TEST_DNS_ORIGIN`, gated by iroh's own `test-utils` feature so
+# `iroh::test_utils::DnsPkarrServer` is in scope. Off by default;
+# both consumer crates forward their `test-utils` feature here.
+test-utils = ["iroh/test-utils"]
+
+[dependencies]
+iroh.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

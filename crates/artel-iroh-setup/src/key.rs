@@ -1,10 +1,11 @@
 //! Persisted iroh secret key.
 //!
-//! The daemon's `EndpointId` is derived from a 32-byte ed25519 secret
-//! key. That id is the daemon's network identity: it appears in
-//! tickets and is what peers dial. For the identity to be stable
-//! across daemon restarts, the secret has to live on disk between
-//! invocations.
+//! An artel node's `EndpointId` — the daemon's network identity, or
+//! a workspace's — is derived from a 32-byte ed25519 secret key. The
+//! id appears in tickets and is what peers dial, so for it to be
+//! stable across restarts the secret has to live on disk between
+//! invocations. (On the workspace side the same seed also derives
+//! the iroh-docs author, binding `AuthorId` == endpoint id.)
 //!
 //! [`load_or_create`] is the entry point. It reads `path` if it
 //! exists, generates a fresh key via `OsRng` otherwise, and writes
@@ -12,12 +13,10 @@
 //!
 //! ## Threat model
 //!
-//! Anyone with read access to the key file can impersonate this
-//! daemon's network identity. The file is owner-readable only, lives
-//! under `~/.artel` (already chmod 0700), and is never logged or
+//! Anyone with read access to the key file can impersonate the
+//! node's network identity. The file is owner-readable only, lives
+//! in an owner-only (0700) directory, and is never logged or
 //! transmitted. Same risk profile as `~/.ssh/id_ed25519`.
-
-#![allow(clippy::redundant_pub_crate)]
 
 use std::fs;
 use std::io::{self, Write};
@@ -29,12 +28,12 @@ use rand::TryRngCore;
 use rand::rngs::OsRng;
 
 /// Mode applied to the on-disk key file. Owner read+write only —
-/// anyone else who can read it can impersonate this daemon.
+/// anyone else who can read it can impersonate this node.
 const KEY_MODE: u32 = 0o600;
 
 /// Errors `load_or_create` may surface.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum KeyError {
+pub enum KeyError {
     /// Filesystem or syscall error while reading or writing the key
     /// file.
     #[error("iroh key {path}: {source}")]
@@ -65,7 +64,7 @@ pub(crate) enum KeyError {
 ///
 /// The parent directory of `path` is created at mode `0700` if
 /// missing — matches `transport::path` conventions.
-pub(crate) fn load_or_create(path: &Path) -> Result<SecretKey, KeyError> {
+pub fn load_or_create(path: &Path) -> Result<SecretKey, KeyError> {
     if let Some(parent) = path.parent() {
         ensure_dir(parent).map_err(|source| KeyError::Io {
             path: parent.to_path_buf(),
@@ -124,7 +123,7 @@ fn write_atomic(path: &Path, bytes: &[u8; 32]) -> io::Result<()> {
     // power loss. `sync_all()` flushed the tmp file's bytes, but the
     // directory entry the rename creates is separate metadata: without
     // this a crash right after the call returns can lose the freshly
-    // written key, and the daemon regenerates a DIFFERENT EndpointId on
+    // written key, and the node regenerates a DIFFERENT EndpointId on
     // next boot — breaking every ticket and cached addr that named the
     // old identity.
     if let Some(parent) = path.parent() {
@@ -168,8 +167,8 @@ fn fsync_dir(dir: &Path) -> io::Result<()> {
 #[cfg(test)]
 static FSYNC_DIR_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Same shape as `transport::server::ensure_dir` — chmod 0700 on
-/// create, leave existing dirs alone.
+/// Same shape as artel-protocol's `transport::server::ensure_dir` —
+/// chmod 0700 on create, leave existing dirs alone.
 fn ensure_dir(dir: &Path) -> io::Result<()> {
     match fs::metadata(dir) {
         Ok(meta) if meta.is_dir() => Ok(()),

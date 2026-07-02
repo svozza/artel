@@ -671,7 +671,7 @@ impl GossipBridge {
             action,
             payload,
         } = payload;
-        let timestamp_ms = now_ms();
+        let timestamp_ms = crate::session::now_ms();
         let signature = artel_protocol::signing::sign_body(
             self.signing_key.as_signing_key(),
             session,
@@ -958,7 +958,7 @@ impl GossipBridge {
         };
         let body = GossipBody::JoinAnnouncement {
             peer,
-            timestamp_ms: now_ms(),
+            timestamp_ms: crate::session::now_ms(),
             ticket_id,
             granted_cap,
             expiry_ms,
@@ -1426,17 +1426,6 @@ async fn run_host_replay(bridge: &Arc<GossipBridge>, session: SessionId, since: 
         // joiner already has some of these entries.
         bridge.publish_message(session, msg).await;
     }
-}
-
-/// Wall-clock millis since the Unix epoch. Stamped joiner-side onto
-/// bodies this daemon authors (`send_remote`,
-/// `publish_join_announcement`); the host preserves the joiner's
-/// stamp verbatim when sequencing.
-fn now_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// Translate session-layer errors into wire errors for the `SendAck`

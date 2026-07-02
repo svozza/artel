@@ -20,7 +20,6 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointId};
@@ -31,20 +30,9 @@ use iroh_gossip::net::Gossip;
 
 use crate::WorkspaceError;
 use crate::docs_gate::DocsGate;
-use crate::endpoint_setup::EndpointSetup;
-use crate::keystore::load_or_create_secret;
 use crate::peer_filter::PeerFilter;
 use crate::peer_map::PeerMap;
-
-/// How long the substrate waits for the home-relay handshake
-/// (`endpoint.online()`) before surfacing
-/// [`WorkspaceError::RelayUnreachable`]. Tight enough to fail fast
-/// when the relay is unreachable (offline laptop, captive portal,
-/// n0 outage), loose enough to cover normal startup. Mirrored in
-/// `artel_daemon::server::HOME_RELAY_BUDGET` — the two crates each
-/// carry their own `EndpointSetup` enum and relay budget; keep them
-/// in sync until that duplication is consolidated.
-const HOME_RELAY_BUDGET: Duration = Duration::from_secs(30);
+use artel_iroh_setup::EndpointSetup;
 
 /// Per-`Workspace` iroh runtime. Held for the workspace's lifetime;
 /// drop teardown is best-effort via [`Self::shutdown`].
@@ -111,7 +99,7 @@ impl WorkspaceNode {
         setup: &EndpointSetup,
         peer_map: Arc<PeerMap>,
     ) -> Result<Self, WorkspaceError> {
-        let secret = load_or_create_secret(&state_dir.join("iroh.key"))
+        let secret = artel_iroh_setup::load_or_create(&state_dir.join("iroh.key"))
             .map_err(|e| WorkspaceError::Iroh(format!("workspace key: {e}")))?;
         // Capture the raw key bytes before `secret` moves into the
         // endpoint builder — they seed the doc author below so
@@ -222,20 +210,14 @@ impl WorkspaceNode {
         // and `online()` would never resolve. Direct UDP is already
         // bound by the time `bind().await` returned, and the
         // localhost pkarr+DNS pair publishes our addr synchronously.
-        //
-        // The timeout exists to fail fast when the relay is
-        // unreachable (offline laptop, captive portal, n0 outage,
-        // or the `TestingUnreachableRelay` fixture). Without it
-        // `Workspace::host_with` / `join_with` would hang forever
-        // here. Surfacing a typed error lets the caller distinguish
-        // "no relay" from a generic Iroh failure.
-        if setup.awaits_relay()
-            && tokio::time::timeout(HOME_RELAY_BUDGET, endpoint.online())
-                .await
-                .is_err()
-        {
-            return Err(WorkspaceError::RelayUnreachable(HOME_RELAY_BUDGET));
-        }
+        // Bounded so an unreachable relay (offline laptop, captive
+        // portal, n0 outage, or the `TestingUnreachableRelay`
+        // fixture) fails fast as a typed error the caller can
+        // distinguish from a generic Iroh failure, rather than
+        // hanging `Workspace::host_with` / `join_with` forever.
+        artel_iroh_setup::await_relay_ready(setup, &endpoint)
+            .await
+            .map_err(WorkspaceError::RelayUnreachable)?;
 
         Ok(Self {
             docs,

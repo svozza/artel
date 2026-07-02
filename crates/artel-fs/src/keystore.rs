@@ -1,104 +1,19 @@
-//! Persisted ed25519 secret keys for an `artel-fs` workspace.
+//! Small atomic-write / private-dir helpers for `artel-fs` state
+//! files.
 //!
-//! A workspace has exactly one secret to keep stable across
-//! restarts: its **iroh endpoint identity** (the 32-byte ed25519
-//! seed that becomes the workspace's `EndpointId` / `NodeId`).
-//! Without persistence, every restart rotates the network
-//! identity and any peer that learned about the workspace via a
-//! prior ticket has to re-learn it.
-//!
-//! The iroh-docs **author** identity is derived from this same
-//! seed (`AuthorId` == endpoint id — see `node.rs`'s author
-//! binding), so this file covers both. iroh-docs' own
-//! `default-author` file still exists on disk but is deliberately
-//! unused.
-//!
-//! [`load_or_create_secret`] is the entry point. It reads `path`
-//! if it exists, otherwise generates a fresh key from `OsRng` and
-//! writes it out atomically with mode `0600`.
+//! The workspace's persisted **iroh secret key** (`iroh.key`) loads
+//! through the shared [`artel_iroh_setup::load_or_create`] — see
+//! `node.rs`. What remains here are the plain file helpers the
+//! workspace uses for its other state-dir slots (`doc-id`,
+//! `current-namespace`, `namespace_epoch`, …): atomic tmp+rename
+//! writes and 0700 directory creation.
 
 #![allow(clippy::redundant_pub_crate)]
 
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-
-use iroh::SecretKey;
-use rand::TryRngCore;
-use rand::rngs::OsRng;
-
-/// Mode applied to the on-disk secret file. Owner read/write only.
-const KEY_MODE: u32 = 0o600;
-
-/// Errors [`load_or_create_secret`] may surface.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum KeyError {
-    /// Filesystem or syscall error while reading or writing the
-    /// key file.
-    #[error("workspace key {path}: {source}")]
-    Io {
-        /// Path that failed.
-        path: PathBuf,
-        /// Underlying I/O error.
-        #[source]
-        source: io::Error,
-    },
-
-    /// Key file exists but is not exactly 32 bytes.
-    #[error("workspace key {path} is corrupt: expected 32 bytes, got {got}")]
-    Corrupt {
-        /// Path that was read.
-        path: PathBuf,
-        /// Number of bytes actually present.
-        got: usize,
-    },
-
-    /// Could not draw entropy from the OS RNG.
-    #[error("workspace key generation failed: {0}")]
-    Rng(#[source] rand::rand_core::OsError),
-}
-
-/// Load the secret key at `path`, or generate and persist a fresh
-/// one if the file does not yet exist.
-///
-/// The parent directory is created at mode `0700` if missing —
-/// matches the daemon's `iroh_key.rs` and `transport::path`
-/// conventions.
-pub(crate) fn load_or_create_secret(path: &Path) -> Result<SecretKey, KeyError> {
-    if let Some(parent) = path.parent() {
-        ensure_dir(parent).map_err(|source| KeyError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-    match fs::read(path) {
-        Ok(bytes) => parse_key(path, &bytes),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => generate_and_persist(path),
-        Err(source) => Err(KeyError::Io {
-            path: path.to_path_buf(),
-            source,
-        }),
-    }
-}
-
-fn parse_key(path: &Path, bytes: &[u8]) -> Result<SecretKey, KeyError> {
-    let arr: &[u8; 32] = bytes.try_into().map_err(|_| KeyError::Corrupt {
-        path: path.to_path_buf(),
-        got: bytes.len(),
-    })?;
-    Ok(SecretKey::from_bytes(arr))
-}
-
-fn generate_and_persist(path: &Path) -> Result<SecretKey, KeyError> {
-    let mut bytes = [0u8; 32];
-    OsRng.try_fill_bytes(&mut bytes).map_err(KeyError::Rng)?;
-    write_atomic(path, &bytes, Some(KEY_MODE)).map_err(|source| KeyError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    Ok(SecretKey::from_bytes(&bytes))
-}
+use std::path::Path;
 
 /// Write `bytes` to `path` atomically: tmp-create + `write_all` +
 /// fsync + (optional chmod) + rename. A partially-written tmp file
@@ -119,8 +34,8 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8], mode: Option<u32>) -> io::
     Ok(())
 }
 
-/// Same shape as `transport::server::ensure_dir` — chmod 0700 on
-/// create, leave existing dirs alone.
+/// Same shape as artel-protocol's `transport::server::ensure_dir` —
+/// chmod 0700 on create, leave existing dirs alone.
 pub(crate) fn ensure_dir(dir: &Path) -> io::Result<()> {
     match fs::metadata(dir) {
         Ok(meta) if meta.is_dir() => Ok(()),
@@ -141,102 +56,54 @@ pub(crate) fn ensure_dir(dir: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::MetadataExt;
-
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
     use super::*;
 
     #[test]
-    fn missing_file_generates_persists_and_returns_a_key() {
+    fn write_atomic_round_trips_and_removes_tmp() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("iroh.key");
-        assert!(!path.exists());
-
-        let key = load_or_create_secret(&path).unwrap();
-        assert!(path.exists(), "key file should be written");
-        assert_eq!(fs::read(&path).unwrap().len(), 32);
-
-        let on_disk = fs::read(&path).unwrap();
-        assert_eq!(on_disk, key.to_bytes());
+        let path = dir.path().join("slot");
+        write_atomic(&path, b"payload", None).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"payload");
+        assert!(!path.with_extension("tmp").exists());
     }
 
     #[test]
-    fn second_call_reads_existing_key_unchanged() {
+    fn write_atomic_applies_requested_mode() {
+        use std::os::unix::fs::MetadataExt;
         let dir = tempdir().unwrap();
-        let path = dir.path().join("iroh.key");
-
-        let first = load_or_create_secret(&path).unwrap();
-        let second = load_or_create_secret(&path).unwrap();
-        assert_eq!(
-            first.to_bytes(),
-            second.to_bytes(),
-            "second load must reuse the persisted key",
-        );
+        let path = dir.path().join("secretish");
+        write_atomic(&path, b"x", Some(0o600)).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
     }
 
     #[test]
-    fn key_file_is_chmod_0600() {
+    fn write_atomic_overwrites_existing() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("iroh.key");
-        let _ = load_or_create_secret(&path).unwrap();
-
-        let mode = fs::metadata(&path).unwrap().mode() & 0o777;
-        assert_eq!(mode, KEY_MODE, "key file mode should be {KEY_MODE:o}");
+        let path = dir.path().join("slot");
+        write_atomic(&path, b"old", None).unwrap();
+        write_atomic(&path, b"new", None).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
     }
 
     #[test]
-    fn parent_dir_is_created_at_0700() {
+    fn ensure_dir_creates_at_0700_and_tolerates_existing() {
+        use std::os::unix::fs::MetadataExt;
         let dir = tempdir().unwrap();
         let nested = dir.path().join("a").join("b");
-        let path = nested.join("iroh.key");
-        let _ = load_or_create_secret(&path).unwrap();
-
-        let mode = fs::metadata(&nested).unwrap().mode() & 0o777;
-        assert_eq!(mode, 0o700);
+        ensure_dir(&nested).unwrap();
+        assert_eq!(fs::metadata(&nested).unwrap().mode() & 0o777, 0o700);
+        // Second call is a no-op, not an error.
+        ensure_dir(&nested).unwrap();
     }
 
     #[test]
-    fn corrupt_file_too_short_errors() {
+    fn ensure_dir_rejects_non_directory() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("iroh.key");
-        fs::write(&path, b"short").unwrap();
-
-        let err = load_or_create_secret(&path).unwrap_err();
-        match err {
-            KeyError::Corrupt { got, .. } => assert_eq!(got, 5),
-            other => panic!("expected Corrupt, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn corrupt_file_too_long_errors() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("iroh.key");
-        fs::write(&path, vec![0u8; 64]).unwrap();
-
-        let err = load_or_create_secret(&path).unwrap_err();
-        assert!(matches!(err, KeyError::Corrupt { got: 64, .. }), "{err:?}");
-    }
-
-    #[test]
-    fn empty_file_errors_as_corrupt() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("iroh.key");
-        fs::write(&path, b"").unwrap();
-
-        let err = load_or_create_secret(&path).unwrap_err();
-        assert!(matches!(err, KeyError::Corrupt { got: 0, .. }), "{err:?}");
-    }
-
-    #[test]
-    fn endpoint_id_stable_across_loads() {
-        // Same key bytes -> same EndpointId / public key.
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("iroh.key");
-        let a = load_or_create_secret(&path).unwrap();
-        let b = load_or_create_secret(&path).unwrap();
-        assert_eq!(a.public(), b.public());
+        let file = dir.path().join("file");
+        fs::write(&file, b"x").unwrap();
+        assert!(ensure_dir(&file).is_err());
     }
 }

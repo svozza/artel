@@ -1,13 +1,20 @@
-//! Substrate's endpoint-discovery hook.
+//! Shared iroh endpoint-discovery setup.
 //!
-//! [`EndpointSetup`] picks how the per-`Workspace` iroh `Endpoint`
-//! finds peers. One production variant plus four `test-utils`-gated
-//! fixtures:
+//! [`EndpointSetup`] picks how an artel iroh `Endpoint` (the daemon's
+//! network identity, or a per-`Workspace` node) finds peers.
+//! `artel-daemon` and `artel-fs` are peer crates — neither may depend
+//! on the other (the daemon stays namespace-agnostic per ADR-003;
+//! artel-fs talks to the daemon only over IPC) — so the setup they
+//! share lives here, below both. Each re-exports the type, so
+//! consumers keep writing `artel_daemon::EndpointSetup` /
+//! `artel_fs::EndpointSetup`.
+//!
+//! One production variant plus four `test-utils`-gated fixtures:
 //!
 //! - [`EndpointSetup::Production`] — the [`presets::N0`] preset,
 //!   which adds n0's pkarr publish + DNS resolve + relay default.
 //!   Real deployments use this.
-//! - [`EndpointSetup::Testing`] — [`presets::Minimal`] + the
+//! - `EndpointSetup::Testing` — [`presets::Minimal`] + the
 //!   caller's [`DnsPkarrServer`]. A localhost pkarr-publish HTTP
 //!   server + a localhost DNS server with shared state, run for the
 //!   test's lifetime. Deterministic (no propagation race against
@@ -15,30 +22,44 @@
 //!   as production except the physical infrastructure. iroh-docs
 //!   uses the same fixture in its own tests; this is the
 //!   upstream-recommended pattern.
-//! - [`EndpointSetup::TestingUnreachableRelay`] — the inverse
+//! - `EndpointSetup::TestingUnreachableRelay` — the inverse
 //!   fixture: Minimal + a deliberately-unrouteable relay URL
 //!   ([RFC 5737] TEST-NET-1 `192.0.2.1`). `awaits_relay()` returns
 //!   `true`, so callers enter [`iroh::Endpoint::online`] and the
-//!   relay handshake never completes — exercising the timeout
-//!   wrapper that surfaces
-//!   [`crate::WorkspaceError::RelayUnreachable`] instead of hanging
-//!   forever.
-//! - [`EndpointSetup::ProductionCustomRelay`] — the N0 preset with
+//!   relay handshake never completes — exercising the
+//!   [`await_relay_ready`] timeout that each consumer surfaces as its
+//!   own typed relay-unreachable error instead of hanging forever.
+//! - `EndpointSetup::ProductionCustomRelay` — the N0 preset with
 //!   the relay overridden to a caller-supplied URL (self-signed TLS
 //!   accepted). Points real-network tests at a localhost
 //!   `iroh-relay` instead of n0's public relay.
-//! - [`EndpointSetup::TestingWithRelay`] — Minimal + a custom relay
+//! - `EndpointSetup::TestingWithRelay` — Minimal + a custom relay
 //!   only (no pkarr/DNS), for cross-process tests that can share a
 //!   localhost relay but not an in-process `DnsPkarrServer`.
 //!
 //! [`presets::Minimal`] has no relay, so a `Testing` endpoint must
 //! NOT call [`iroh::Endpoint::online`] (which awaits relay
-//! readiness — Minimal would hang forever). [`Self::awaits_relay`]
-//! is the gate.
+//! readiness — Minimal would hang forever).
+//! [`EndpointSetup::awaits_relay`] is the gate, applied by
+//! [`await_relay_ready`].
 //!
+//! [`presets::N0`]: iroh::endpoint::presets::N0
+//! [`presets::Minimal`]: iroh::endpoint::presets::Minimal
+//! [`DnsPkarrServer`]: https://docs.rs/iroh/latest/iroh/test_utils/struct.DnsPkarrServer.html
 //! [RFC 5737]: https://datatracker.ietf.org/doc/html/rfc5737
 
-#![allow(clippy::redundant_pub_crate)]
+pub mod key;
+
+use std::time::Duration;
+
+pub use key::{KeyError, load_or_create};
+
+/// How long [`await_relay_ready`] waits for the home-relay handshake.
+///
+/// Bounds the `endpoint.online()` wait: tight enough to fail fast
+/// when the relay is unreachable (offline laptop, captive portal, n0
+/// outage), loose enough to cover normal startup.
+pub const HOME_RELAY_BUDGET: Duration = Duration::from_secs(30);
 
 /// DNS origin domain for the `Testing` fixture's [`iroh::test_utils::DnsPkarrServer`].
 ///
@@ -53,7 +74,7 @@
 #[cfg(feature = "test-utils")]
 pub const TEST_DNS_ORIGIN: &str = "dns.iroh.test";
 
-/// How the per-`Workspace` iroh endpoint discovers peers.
+/// How an artel iroh endpoint discovers peers.
 ///
 /// See module docs for variant semantics.
 #[derive(Clone, Default)]
@@ -81,9 +102,9 @@ pub enum EndpointSetup {
     /// plus a custom [`iroh::RelayMode`] pointed at an RFC 5737
     /// TEST-NET-1 address. `Self::awaits_relay` returns `true` so
     /// the caller hits [`iroh::Endpoint::online`]; the relay
-    /// handshake never completes. Sole consumer is the integration
-    /// test that pins the timeout-and-typed-error contract for
-    /// [`crate::WorkspaceError::RelayUnreachable`].
+    /// handshake never completes. Sole consumers are the integration
+    /// tests that pin each crate's timeout-and-typed-error contract
+    /// (`RelayUnreachable`).
     #[cfg(feature = "test-utils")]
     TestingUnreachableRelay,
     /// Production with a custom relay URL: uses N0's DNS/pkarr infra
@@ -128,7 +149,8 @@ impl std::fmt::Debug for EndpointSetup {
 
 impl EndpointSetup {
     /// Apply this setup's discovery layer to an endpoint builder.
-    pub(crate) fn apply(&self, builder: iroh::endpoint::Builder) -> iroh::endpoint::Builder {
+    #[must_use]
+    pub fn apply(&self, builder: iroh::endpoint::Builder) -> iroh::endpoint::Builder {
         use iroh::endpoint::presets::Preset;
         match self {
             Self::Production => iroh::endpoint::presets::N0.apply(builder),
@@ -200,7 +222,8 @@ impl EndpointSetup {
     /// otherwise the future never completes.
     /// `TestingUnreachableRelay` returns `true` deliberately — the
     /// fixture's whole job is to drive the timeout wrapper.
-    pub(crate) const fn awaits_relay(&self) -> bool {
+    #[must_use]
+    pub const fn awaits_relay(&self) -> bool {
         match self {
             Self::Production => true,
             #[cfg(feature = "test-utils")]
@@ -212,5 +235,89 @@ impl EndpointSetup {
             #[cfg(feature = "test-utils")]
             Self::TestingWithRelay { .. } => true,
         }
+    }
+}
+
+/// Block until the home-relay handshake (`endpoint.online()`)
+/// completes, bounded by [`HOME_RELAY_BUDGET`] — or return
+/// immediately when `setup` has no relay to wait for
+/// ([`EndpointSetup::awaits_relay`]).
+///
+/// The bound exists to fail fast when the relay is unreachable
+/// (offline laptop, captive portal, n0 outage, or the
+/// `TestingUnreachableRelay` fixture) instead of hanging startup
+/// forever.
+///
+/// # Errors
+///
+/// `Err(HOME_RELAY_BUDGET)` when the handshake didn't complete within
+/// the budget. Each consumer maps this to its own typed error
+/// (`artel_daemon`'s `StartError::RelayUnreachable`, `artel_fs`'s
+/// `WorkspaceError::RelayUnreachable`) — the error types deliberately
+/// stay per-crate.
+pub async fn await_relay_ready(
+    setup: &EndpointSetup,
+    endpoint: &iroh::Endpoint,
+) -> Result<(), Duration> {
+    if setup.awaits_relay()
+        && tokio::time::timeout(HOME_RELAY_BUDGET, endpoint.online())
+            .await
+            .is_err()
+    {
+        return Err(HOME_RELAY_BUDGET);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn production_awaits_relay() {
+        assert!(EndpointSetup::Production.awaits_relay());
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn awaits_relay_truth_table() {
+        // `Testing` is the one variant with no relay at all —
+        // awaiting `online()` on it would hang forever, so it must
+        // be the only `false`. Every relay-configured variant is
+        // `true`, including `TestingUnreachableRelay`, whose whole
+        // job is to drive the `await_relay_ready` timeout.
+        let url: iroh::RelayUrl = "https://192.0.2.1/".parse().unwrap();
+        assert!(EndpointSetup::TestingUnreachableRelay.awaits_relay());
+        assert!(
+            EndpointSetup::ProductionCustomRelay {
+                relay_url: url.clone(),
+            }
+            .awaits_relay()
+        );
+        assert!(EndpointSetup::TestingWithRelay { relay_url: url }.awaits_relay());
+        // `Testing` needs a live DnsPkarrServer to construct; its
+        // `false` arm is pinned by every Tier-B integration test
+        // that would hang in `await_relay_ready` otherwise.
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn debug_impl_names_variants_without_dumping_fixtures() {
+        let url: iroh::RelayUrl = "https://192.0.2.1/".parse().unwrap();
+        assert_eq!(
+            format!("{:?}", EndpointSetup::Production),
+            "EndpointSetup::Production"
+        );
+        assert_eq!(
+            format!("{:?}", EndpointSetup::TestingUnreachableRelay),
+            "EndpointSetup::TestingUnreachableRelay"
+        );
+        assert!(
+            format!(
+                "{:?}",
+                EndpointSetup::ProductionCustomRelay { relay_url: url }
+            )
+            .starts_with("EndpointSetup::ProductionCustomRelay")
+        );
     }
 }

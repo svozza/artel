@@ -29,9 +29,8 @@ use tempfile::TempDir;
 use tokio::time::timeout;
 
 use common::{
-    DaemonPaths, LocalDaemon, Pair, daemon_testing_setup, fresh_state, init_tracing,
-    spawn_daemon_at, spawn_daemon_with_setup, spawn_pair, testing_setup, wait_for_file,
-    wait_for_missing,
+    DaemonPaths, LocalDaemon, Pair, fresh_state, init_tracing, spawn_daemon_at,
+    spawn_daemon_with_setup, spawn_pair, testing_setup, wait_for_file, wait_for_missing,
 };
 
 const TICKET_BUDGET: Duration = Duration::from_secs(15);
@@ -418,8 +417,8 @@ async fn alice_post_restart_writes_reach_bob() {
             .await
             .expect("DnsPkarrServer::run"),
     );
-    let alice_daemon = spawn_daemon_at(&alice_paths, daemon_testing_setup(&dns_pkarr)).await;
-    let bob_daemon = spawn_daemon_with_setup(fresh_state(), daemon_testing_setup(&dns_pkarr)).await;
+    let alice_daemon = spawn_daemon_at(&alice_paths, testing_setup(&dns_pkarr)).await;
+    let bob_daemon = spawn_daemon_with_setup(fresh_state(), testing_setup(&dns_pkarr)).await;
 
     // Phase 1: alice hosts, bob joins, exchange one file each way to
     // confirm baseline propagation before any restarts.
@@ -519,7 +518,7 @@ async fn alice_post_restart_writes_reach_bob() {
 
     // Phase 3: alice respawns. Same daemon-state dir, same workspace
     // state dir, same root.
-    let alice_daemon = spawn_daemon_at(&alice_paths, daemon_testing_setup(&dns_pkarr)).await;
+    let alice_daemon = spawn_daemon_at(&alice_paths, testing_setup(&dns_pkarr)).await;
     let alice = Client::connect(&alice_daemon.socket).await.unwrap();
     let alice_cfg = WorkspaceConfig::default()
         .with_state_dir(alice_wstate.path().to_path_buf())
@@ -638,18 +637,6 @@ async fn capture_ticket_n0(events: &mut EventStream, session: SessionId) -> DocT
 // with the iroh 1.0 upgrade, so Tier C no longer depends on n0's
 // public relay.
 
-/// Daemon-side localhost-relay setup for the Tier C test below.
-async fn daemon_custom_relay_setup() -> artel_daemon::EndpointSetup {
-    let relay_url: iroh::RelayUrl = common::shared_relay_url().await.parse().unwrap();
-    artel_daemon::EndpointSetup::ProductionCustomRelay { relay_url }
-}
-
-/// Workspace-side companion to [`daemon_custom_relay_setup`].
-async fn fs_custom_relay_setup() -> artel_fs::EndpointSetup {
-    let relay_url: iroh::RelayUrl = common::shared_relay_url().await.parse().unwrap();
-    artel_fs::EndpointSetup::ProductionCustomRelay { relay_url }
-}
-
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::large_futures, clippy::too_many_lines)]
 async fn alice_post_restart_writes_reach_bob_real_n0() {
@@ -664,14 +651,14 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
 
     let alice_daemon = phase(
         "spawn alice daemon (initial)",
-        spawn_daemon_at(&alice_paths, daemon_custom_relay_setup().await),
+        spawn_daemon_at(&alice_paths, common::custom_relay_setup().await),
     )
     .await;
     let bob_daemon_state = fresh_state();
     let bob_paths = DaemonPaths::at(bob_daemon_state.root.path());
     let bob_daemon = phase(
         "spawn bob daemon",
-        spawn_daemon_at(&bob_paths, daemon_custom_relay_setup().await),
+        spawn_daemon_at(&bob_paths, common::custom_relay_setup().await),
     )
     .await;
 
@@ -680,7 +667,7 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
     let alice_cfg = WorkspaceConfig::default()
         .with_state_dir(alice_wstate.path().to_path_buf())
         .with_daemon_socket(alice_daemon.socket.clone())
-        .with_endpoint_setup(fs_custom_relay_setup().await);
+        .with_endpoint_setup(common::custom_relay_setup().await);
     let (alice_ws, alice_ws_events) = phase(
         "alice Workspace::host_with (phase 1)",
         Workspace::host_with(
@@ -737,7 +724,7 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
     let bob_cfg = WorkspaceConfig::default()
         .with_state_dir(bob_wstate.path().to_path_buf())
         .with_daemon_socket(bob_daemon.socket.clone())
-        .with_endpoint_setup(fs_custom_relay_setup().await);
+        .with_endpoint_setup(common::custom_relay_setup().await);
     let (bob_ws, bob_ws_events) = phase(
         "bob Workspace::join_with (doc import + bulk_export)",
         Workspace::join_with(
@@ -796,14 +783,14 @@ async fn alice_post_restart_writes_reach_bob_real_n0() {
     // workspace-state dirs.
     let alice_daemon = phase(
         "spawn alice daemon (post-restart)",
-        spawn_daemon_at(&alice_paths, daemon_custom_relay_setup().await),
+        spawn_daemon_at(&alice_paths, common::custom_relay_setup().await),
     )
     .await;
     let alice = Client::connect(&alice_daemon.socket).await.unwrap();
     let alice_cfg = WorkspaceConfig::default()
         .with_state_dir(alice_wstate.path().to_path_buf())
         .with_daemon_socket(alice_daemon.socket.clone())
-        .with_endpoint_setup(fs_custom_relay_setup().await);
+        .with_endpoint_setup(common::custom_relay_setup().await);
     let (alice_ws, alice_ws_events) = phase(
         "alice Workspace::host_with (phase 2 — post-restart)",
         Workspace::host_with(
@@ -987,10 +974,8 @@ async fn re_hosting_recovers_session_id_and_resumes_message_flow() {
     // ---------------------------------------------------------------
     // Phase 1: Alice on daemon A1, Bob on daemon B. Live sync works.
     // ---------------------------------------------------------------
-    let daemon_b =
-        spawn_daemon_with_setup(bob_daemon_state, daemon_testing_setup(&dns_pkarr)).await;
-    let daemon_a1 =
-        spawn_daemon_with_setup(alice_daemon_state, daemon_testing_setup(&dns_pkarr)).await;
+    let daemon_b = spawn_daemon_with_setup(bob_daemon_state, testing_setup(&dns_pkarr)).await;
+    let daemon_a1 = spawn_daemon_with_setup(alice_daemon_state, testing_setup(&dns_pkarr)).await;
 
     let alice_a1 = Client::connect(&daemon_a1.socket).await.unwrap();
     let alice_cfg = WorkspaceConfig::default()
@@ -1078,8 +1063,7 @@ async fn re_hosting_recovers_session_id_and_resumes_message_flow() {
     // ---------------------------------------------------------------
     // Phase 2: fresh daemon A2 against Alice's same state dir.
     // ---------------------------------------------------------------
-    let daemon_a2 =
-        spawn_daemon_with_setup(alice_daemon_state_2, daemon_testing_setup(&dns_pkarr)).await;
+    let daemon_a2 = spawn_daemon_with_setup(alice_daemon_state_2, testing_setup(&dns_pkarr)).await;
 
     let alice_a2 = Client::connect(&daemon_a2.socket).await.unwrap();
     let alice_cfg_2 = WorkspaceConfig::default()
