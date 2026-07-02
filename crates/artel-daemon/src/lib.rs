@@ -7,8 +7,6 @@
 #[cfg(feature = "iroh")]
 pub(crate) mod gossip_bridge;
 #[cfg(feature = "iroh")]
-pub(crate) mod iroh_key;
-#[cfg(feature = "iroh")]
 pub(crate) mod peer_addr_cache;
 pub mod pidfile;
 pub mod server;

@@ -228,6 +228,10 @@ name = "artel-iroh-setup"
 version = "0.0.0"
 dependencies = [
  "iroh",
+ "pretty_assertions",
+ "rand 0.9.4",
+ "tempfile",
+ "thiserror 2.0.18",
  "tokio",
 ]
 

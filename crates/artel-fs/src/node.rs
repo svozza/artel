@@ -30,7 +30,6 @@ use iroh_gossip::net::Gossip;
 
 use crate::WorkspaceError;
 use crate::docs_gate::DocsGate;
-use crate::keystore::load_or_create_secret;
 use crate::peer_filter::PeerFilter;
 use crate::peer_map::PeerMap;
 use artel_iroh_setup::EndpointSetup;
@@ -100,7 +99,7 @@ impl WorkspaceNode {
         setup: &EndpointSetup,
         peer_map: Arc<PeerMap>,
     ) -> Result<Self, WorkspaceError> {
-        let secret = load_or_create_secret(&state_dir.join("iroh.key"))
+        let secret = artel_iroh_setup::load_or_create(&state_dir.join("iroh.key"))
             .map_err(|e| WorkspaceError::Iroh(format!("workspace key: {e}")))?;
         // Capture the raw key bytes before `secret` moves into the
         // endpoint builder — they seed the doc author below so

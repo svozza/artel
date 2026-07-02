@@ -48,7 +48,11 @@
 //! [`DnsPkarrServer`]: https://docs.rs/iroh/latest/iroh/test_utils/struct.DnsPkarrServer.html
 //! [RFC 5737]: https://datatracker.ietf.org/doc/html/rfc5737
 
+pub mod key;
+
 use std::time::Duration;
+
+pub use key::{KeyError, load_or_create};
 
 /// How long [`await_relay_ready`] waits for the home-relay handshake.
 ///

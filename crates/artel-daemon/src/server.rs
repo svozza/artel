@@ -1276,7 +1276,7 @@ async fn resolve_iroh_runtime(
     let path = key_path
         .ok_or_else(|| StartError::Iroh("iroh feature is on but no iroh_key_path given".into()))?;
     let secret =
-        crate::iroh_key::load_or_create(path).map_err(|e| StartError::Iroh(e.to_string()))?;
+        artel_iroh_setup::load_or_create(path).map_err(|e| StartError::Iroh(e.to_string()))?;
     // `iroh::SecretKey` is a 32-byte wrapper that is `Clone`; we keep
     // a copy on `IrohRuntime` so the registry / gossip bridge can
     // sign session messages (Auth Slice B) without the
@@ -1639,7 +1639,7 @@ mod tests {
         assert_eq!(on_runtime, on_endpoint);
         // And both equal what was written to disk; load_or_create is
         // identity for an existing key file.
-        let on_disk = crate::iroh_key::load_or_create(&key_path).unwrap();
+        let on_disk = artel_iroh_setup::load_or_create(&key_path).unwrap();
         assert_eq!(on_runtime, on_disk.to_bytes());
 
         // Tear down to avoid leaking the iroh router's accept loop.

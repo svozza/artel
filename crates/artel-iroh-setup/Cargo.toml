@@ -18,7 +18,13 @@ test-utils = ["iroh/test-utils"]
 
 [dependencies]
 iroh.workspace = true
+rand.workspace = true
+thiserror.workspace = true
 tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true
