@@ -10,7 +10,13 @@
 # filters them out via `not test(/_n0$/)`. See
 # docs/diagnosing-flaky-tests.md for the run-until-fail recipe.
 
-.PHONY: test test-n0 test-fallback fmt clippy doc coverage coverage-html ci-local
+.PHONY: test test-n0 test-fallback fmt clippy doc coverage coverage-html ci-local hooks
+
+# One-time setup: point git at the versioned hooks dir so the
+# pre-push gate (fmt + clippy + doc) runs before every push.
+hooks:
+	git config core.hooksPath .githooks
+	@echo "core.hooksPath -> .githooks (pre-push runs fmt + clippy + doc)"
 
 # Default test target: Tier A + B (no real n0). Fast.
 test:

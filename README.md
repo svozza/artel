@@ -146,6 +146,8 @@ Alpha, and moving. Working today: sessions and messaging over real n0 infrastruc
 
 ## Development
 
+One-time setup after cloning: `make hooks` — points git at the versioned `.githooks/` directory, so a pre-push hook runs `make fmt`, `make clippy`, and `make doc` before every push (the static half of CI, locally, in about a minute).
+
 Tests run through [`cargo-nextest`](https://nexte.st) (`cargo install cargo-nextest --locked`):
 
 - `make test` — unit + cross-peer tests against localhost infrastructure. Fast, deterministic, runs on every PR.

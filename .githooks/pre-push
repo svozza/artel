@@ -1,0 +1,20 @@
+#!/bin/sh
+# Pre-push gate: run the cheap static CI stages locally so a push
+# never burns a ~10-minute CI rerun on a failure fmt/clippy/rustdoc
+# would have caught in seconds-to-a-minute here.
+#
+# Deliberately NOT `make test`: the suite takes minutes and pushing
+# WIP to a non-PR branch shouldn't cost that. Tests remain your job
+# before marking a PR ready (see CLAUDE.md).
+#
+# Activated via `make hooks` (sets core.hooksPath to .githooks).
+# Bypass for emergencies: git push --no-verify
+set -e
+
+echo "pre-push: make fmt"
+make fmt
+echo "pre-push: make clippy"
+make clippy
+echo "pre-push: make doc"
+make doc
+echo "pre-push: all static checks passed"
