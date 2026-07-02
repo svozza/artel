@@ -73,8 +73,11 @@ use artel_protocol::{DOWNGRADE_ACTION, ROTATE_ACTION};
 use artel_protocol::{TICKET_ACTION, UPGRADE_ACTION};
 
 /// Wall-clock millis since the Unix epoch. The `Local` arm of
-/// [`Authoring`] stamps this onto every body it signs.
-fn now_ms() -> u64 {
+/// [`Authoring`] stamps this onto every body it signs; the gossip
+/// bridge stamps it joiner-side onto bodies this daemon authors
+/// (`send_remote`, `publish_join_announcement`) — the host preserves
+/// the joiner's stamp verbatim when sequencing.
+pub(crate) fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
