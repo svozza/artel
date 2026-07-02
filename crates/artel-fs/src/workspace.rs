@@ -2342,7 +2342,7 @@ impl Workspace {
 
     /// Drive the **survivor-side** reimport directly: swap onto the
     /// rotated namespace named by `doc_ticket` exactly as a delivered
-    /// [`RotationSignal::SurvivorRotate`] would — including the
+    /// `RotationSignal::SurvivorRotate` (private) would — including the
     /// deliberate absence of the host-only catch-up scan. Pairs with
     /// [`Self::test_rotate_for_survivor_reimport`].
     ///
