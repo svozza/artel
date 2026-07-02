@@ -389,6 +389,63 @@ Not a flake — an OS-coverage gap. The chain and the verdict:
   or a periodic reconcile). If a "deleted file reappears / peers
   never see my delete" report comes in on Linux, start here.
 
+## Case study: stale echo-guard hash across rotation reimport (2026-07-02)
+
+`survivor_follows_rotation_evicted_is_cut` (workspace_sync, Tier B,
+three daemons) failed once in a full `make test` run — "survivor's
+post-rotation write never reached host" after 30s of retries — then
+passed 25/25 full-suite and 10/10 whole-binary loops with tracing
+armed. The load-based reproduction never re-fired; the diagnosis came
+from a mechanism question instead. The chain and the verdict:
+
+- **The retry loop was the tell.** The test doesn't write once — it
+  rewrites `survivor_after.txt` with the *same bytes* every 100 ms for
+  30 s. A one-shot loss (the PR #2 watcher dead window) can't explain
+  that: the next rewrite fires a real event and heals it. Whatever ate
+  the write had to eat **every identical rewrite**, which points at a
+  content-hash dedup, not a missed event. The only such dedup is the
+  echo guard's `last_published` map.
+- **Mechanism (substrate, echo-guard layer).** The watcher's
+  `record_local_publish` stores the blake3 of every published file;
+  `reimport_namespace` swapped the live doc without clearing the map.
+  A file published into the OLD namespace during the survivor's
+  rotation lag — after the host's snapshot, so not in the carry-forward
+  set — kept its hash across the swap, and `should_skip_local`
+  swallowed every identical-bytes rewrite as a peer-write echo,
+  forever. Disk and rotated doc silently diverge; no retry heals it.
+- **Deterministic repro before any fix** (per §7: confirm substrate
+  suspicions by driving the internal operation directly).
+  `survivor_reimport_clears_stale_echo_guard_hash` splits rotation
+  from reimport with two test hooks (`test_rotate_for_survivor_reimport`
+  / `test_reimport_from_survivor_ticket`), publishes a probe into the
+  old namespace in between (waiting for the doc entry, so the hash is
+  provably recorded — isolating this from the dead-window mechanism),
+  reimports via the survivor path, then rewrites identical bytes.
+  Red exactly as predicted: `set_bytes ok` pre-swap, then 25
+  consecutive `echo-guard: skip local (peer-driven write)` lines
+  post-swap. That trace is the confirmation the load repro never
+  delivered.
+- **Fix: `EchoGuard::forget_all_published()` in `reimport_namespace`,
+  both host and survivor paths.** The hashes describe the old
+  namespace; they are stale against the rotated doc no matter which
+  side is reimporting. The interesting constraint was the
+  tombstone-resurrection hazard that keeps the PR #2 catch-up scan
+  host-only — clearing hashes is safe where scanning is not, because
+  a clear publishes nothing by itself: a republish still needs a real
+  filesystem event, and `peer_deleted` markers survive the clear (unit
+  tests pin both properties).
+- **Portable lessons:** (1) when a *retry loop* times out, ask what
+  mechanism defeats every retry — that question alone can narrow the
+  suspect list to one layer before any trace is captured; (2) a
+  low-rate load flake you can't re-fire is not a dead end if you can
+  derive the ordering it implies and build it deterministically —
+  hypothesis first, then a red test as the captured evidence; (3) an
+  unrelated test failing during a run-until-fail loop is a bycatch
+  finding, not noise — record it before returning to the target (this
+  loop caught `recreating_identical_bytes_after_delete_propagates`
+  failing on a macOS double-tombstone vs re-create race, preserved at
+  `~/sibling-recreate-flake-2026-07-02.log`, still open).
+
 ## Examples from this codebase
 
 (Paths updated after the 2026-05-29 test-consolidation plan merged

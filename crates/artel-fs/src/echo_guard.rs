@@ -173,6 +173,26 @@ impl EchoGuard {
     pub async fn forget(&self, path: &Path) {
         self.last_published.lock().await.remove(path);
     }
+
+    /// Drop **every** `last_published` hash. Call when the live doc is
+    /// swapped out from under the guard (namespace rotation's
+    /// `reimport_namespace`): the hashes record what we last published
+    /// into the *old* namespace, and a path that was published there
+    /// but is absent from the rotated namespace (e.g. a write landing
+    /// in the survivor's rotation lag, after the host's snapshot) must
+    /// be republishable — with a stale hash surviving the swap, every
+    /// re-write of the same bytes is swallowed as an echo forever.
+    ///
+    /// Clearing publishes nothing by itself — a publish still needs a
+    /// real filesystem event — so this cannot resurrect a
+    /// host-tombstoned path the way a survivor-side catch-up scan
+    /// could. `pending` and `peer_deleted` are left intact: an
+    /// applier write in its grace window still echoes after the swap,
+    /// and a peer-deleted marker is only cleared by re-creation
+    /// regardless of which namespace laid the tombstone down.
+    pub async fn forget_all_published(&self) {
+        self.last_published.lock().await.clear();
+    }
 }
 
 impl Default for EchoGuard {
@@ -329,6 +349,40 @@ mod tests {
         assert!(
             !guard.should_skip_removal(&path).await,
             "a peer re-creation clears the marker; the next removal is meaningful again",
+        );
+    }
+
+    #[tokio::test]
+    async fn forget_all_clears_every_last_published_hash() {
+        let guard = EchoGuard::new();
+        guard.record_local_publish(&p("/w/a.txt"), b"alpha").await;
+        guard.record_local_publish(&p("/w/b.txt"), b"beta").await;
+
+        guard.forget_all_published().await;
+        assert!(
+            !guard.should_skip_local(&p("/w/a.txt"), b"alpha").await,
+            "after a namespace swap, re-writing identical bytes must publish",
+        );
+        assert!(
+            !guard.should_skip_local(&p("/w/b.txt"), b"beta").await,
+            "the clear must cover every path, not just one",
+        );
+    }
+
+    #[tokio::test]
+    async fn forget_all_leaves_pending_and_peer_deleted_intact() {
+        let guard = EchoGuard::new();
+        guard.mark_remote_write(&p("/w/pending.txt"), b"v1").await;
+        guard.mark_remote_delete(&p("/w/deleted.txt")).await;
+
+        guard.forget_all_published().await;
+        assert!(
+            guard.should_skip_local(&p("/w/pending.txt"), b"v2").await,
+            "an applier write inside its grace window still echoes after the swap",
+        );
+        assert!(
+            guard.should_skip_removal(&p("/w/deleted.txt")).await,
+            "a peer-delete marker is cleared only by re-creation, not by a namespace swap",
         );
     }
 
