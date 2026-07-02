@@ -375,18 +375,6 @@ async fn valid_read_ticket_joiner_late_attach_gets_files() {
 /// every phase crosses real relay infrastructure.
 const N0_PHASE_BUDGET: Duration = Duration::from_mins(1);
 
-/// Daemon-side localhost-relay setup for the Tier C test below.
-async fn daemon_custom_relay_setup() -> artel_daemon::EndpointSetup {
-    let relay_url: iroh::RelayUrl = common::shared_relay_url().await.parse().unwrap();
-    artel_daemon::EndpointSetup::ProductionCustomRelay { relay_url }
-}
-
-/// Workspace-side companion to [`daemon_custom_relay_setup`].
-async fn fs_custom_relay_setup() -> artel_fs::EndpointSetup {
-    let relay_url: iroh::RelayUrl = common::shared_relay_url().await.parse().unwrap();
-    artel_fs::EndpointSetup::ProductionCustomRelay { relay_url }
-}
-
 /// Label + bound one phase of the n0 test so a hang fails fast with
 /// the phase name (per docs/diagnosing-flaky-tests.md).
 async fn n0_phase<F, T>(name: &'static str, fut: F) -> T
@@ -405,12 +393,12 @@ async fn unicast_workspace_ticket_delivery_real_n0() {
     let bob_state = common::fresh_state();
     let alice_daemon = n0_phase(
         "spawn alice daemon (production n0)",
-        common::spawn_daemon_with_setup(alice_state, daemon_custom_relay_setup().await),
+        common::spawn_daemon_with_setup(alice_state, common::custom_relay_setup().await),
     )
     .await;
     let bob_daemon = n0_phase(
         "spawn bob daemon (production n0)",
-        common::spawn_daemon_with_setup(bob_state, daemon_custom_relay_setup().await),
+        common::spawn_daemon_with_setup(bob_state, common::custom_relay_setup().await),
     )
     .await;
 
@@ -427,7 +415,7 @@ async fn unicast_workspace_ticket_delivery_real_n0() {
             alice_dir.path().to_path_buf(),
             AttachPolicy::AllowExisting,
             WorkspaceConfig::default()
-                .with_endpoint_setup(fs_custom_relay_setup().await)
+                .with_endpoint_setup(common::custom_relay_setup().await)
                 .with_daemon_socket(alice_daemon.socket.clone()),
         ),
     )
@@ -466,7 +454,7 @@ async fn unicast_workspace_ticket_delivery_real_n0() {
             bob_dir.path().to_path_buf(),
             AttachPolicy::RequireEmpty,
             WorkspaceConfig::default()
-                .with_endpoint_setup(fs_custom_relay_setup().await)
+                .with_endpoint_setup(common::custom_relay_setup().await)
                 .with_join_ticket_timeout(Some(Duration::from_secs(45))),
         ),
     )

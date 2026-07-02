@@ -30,7 +30,7 @@ use tempfile::TempDir;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
 
-use common::{Pair, daemon_testing_setup, spawn_pair, testing_setup};
+use common::{Pair, spawn_pair, testing_setup};
 
 const WAIT_BUDGET: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -331,8 +331,7 @@ async fn spawn_host_workspace_for_empty_test() -> (
             .expect("dns_pkarr"),
     );
     let daemon =
-        common::spawn_daemon_with_setup(common::fresh_state(), daemon_testing_setup(&dns_pkarr))
-            .await;
+        common::spawn_daemon_with_setup(common::fresh_state(), testing_setup(&dns_pkarr)).await;
     let client = Client::connect(&daemon.socket).await.unwrap();
     let dir = tempfile::tempdir().unwrap();
     let cfg = WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr));
@@ -630,24 +629,14 @@ async fn evict_auto_rotates_and_cuts_off_writes_n0() {
     // them would delete the dir out from under the daemon).
     let alice_daemon_root = TempDir::new().unwrap();
     let bob_daemon_root = TempDir::new().unwrap();
-    let relay_url = || async {
-        common::shared_relay_url()
-            .await
-            .parse::<iroh::RelayUrl>()
-            .unwrap()
-    };
     let alice_daemon = common::spawn_daemon_at(
         &common::DaemonPaths::at(alice_daemon_root.path()),
-        artel_daemon::EndpointSetup::ProductionCustomRelay {
-            relay_url: relay_url().await,
-        },
+        common::custom_relay_setup().await,
     )
     .await;
     let bob_daemon = common::spawn_daemon_at(
         &common::DaemonPaths::at(bob_daemon_root.path()),
-        artel_daemon::EndpointSetup::ProductionCustomRelay {
-            relay_url: relay_url().await,
-        },
+        common::custom_relay_setup().await,
     )
     .await;
 
@@ -659,9 +648,7 @@ async fn evict_auto_rotates_and_cuts_off_writes_n0() {
         alice_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
         WorkspaceConfig::default()
-            .with_endpoint_setup(artel_fs::EndpointSetup::ProductionCustomRelay {
-                relay_url: relay_url().await,
-            })
+            .with_endpoint_setup(common::custom_relay_setup().await)
             .with_daemon_socket(alice_daemon.socket.clone()),
     )
     .await
@@ -701,9 +688,7 @@ async fn evict_auto_rotates_and_cuts_off_writes_n0() {
         bob_dir.path().to_path_buf(),
         AttachPolicy::RequireEmpty,
         WorkspaceConfig::default()
-            .with_endpoint_setup(artel_fs::EndpointSetup::ProductionCustomRelay {
-                relay_url: relay_url().await,
-            })
+            .with_endpoint_setup(common::custom_relay_setup().await)
             .with_daemon_socket(bob_daemon.socket.clone()),
     )
     .await
@@ -778,11 +763,9 @@ async fn survivor_follows_rotation_evicted_is_cut() {
     // Three daemons sharing one DnsPkarrServer.
     let pair = spawn_pair().await;
     let dns_pkarr = Arc::clone(&pair.dns_pkarr);
-    let daemon_c = common::spawn_daemon_with_setup(
-        common::fresh_state(),
-        common::daemon_testing_setup(&dns_pkarr),
-    )
-    .await;
+    let daemon_c =
+        common::spawn_daemon_with_setup(common::fresh_state(), common::testing_setup(&dns_pkarr))
+            .await;
     common::wait_for_endpoint(&dns_pkarr, &daemon_c.iroh_addr.as_ref().expect("addr").id).await;
     let Pair {
         daemon_a, daemon_b, ..
@@ -965,11 +948,9 @@ async fn late_joiner_lands_on_rotated_namespace_and_can_be_promoted() {
     // peer we evict to force a rotation, carol joins afterwards.
     let pair = spawn_pair().await;
     let dns_pkarr = Arc::clone(&pair.dns_pkarr);
-    let daemon_c = common::spawn_daemon_with_setup(
-        common::fresh_state(),
-        common::daemon_testing_setup(&dns_pkarr),
-    )
-    .await;
+    let daemon_c =
+        common::spawn_daemon_with_setup(common::fresh_state(), common::testing_setup(&dns_pkarr))
+            .await;
     common::wait_for_endpoint(&dns_pkarr, &daemon_c.iroh_addr.as_ref().expect("addr").id).await;
     let Pair {
         daemon_a, daemon_b, ..
@@ -1316,11 +1297,8 @@ async fn namespace_epoch_survives_host_restart() {
     let state = tempfile::tempdir().unwrap();
 
     let epoch_after_rotation = {
-        let daemon = common::spawn_daemon_with_setup(
-            common::fresh_state(),
-            daemon_testing_setup(&dns_pkarr),
-        )
-        .await;
+        let daemon =
+            common::spawn_daemon_with_setup(common::fresh_state(), testing_setup(&dns_pkarr)).await;
         let client = Client::connect(&daemon.socket).await.unwrap();
         let cfg = WorkspaceConfig::default()
             .with_state_dir(state.path().to_path_buf())
@@ -1356,8 +1334,7 @@ async fn namespace_epoch_survives_host_restart() {
     // Phase 2: re-host the same state dir under a fresh daemon. The
     // epoch must be recovered from disk, not reset to 0.
     let daemon =
-        common::spawn_daemon_with_setup(common::fresh_state(), daemon_testing_setup(&dns_pkarr))
-            .await;
+        common::spawn_daemon_with_setup(common::fresh_state(), testing_setup(&dns_pkarr)).await;
     let client = Client::connect(&daemon.socket).await.unwrap();
     let cfg = WorkspaceConfig::default()
         .with_state_dir(state.path().to_path_buf())
@@ -1408,11 +1385,9 @@ async fn replayed_revoke_does_not_re_rotate_on_workspace_restart() {
     // session log (with the Revoke) persists. Alice's workspace state
     // dir is persistent so the re-host resumes the same session.
     let alice_daemon =
-        common::spawn_daemon_with_setup(common::fresh_state(), daemon_testing_setup(&dns_pkarr))
-            .await;
+        common::spawn_daemon_with_setup(common::fresh_state(), testing_setup(&dns_pkarr)).await;
     let bob_daemon =
-        common::spawn_daemon_with_setup(common::fresh_state(), daemon_testing_setup(&dns_pkarr))
-            .await;
+        common::spawn_daemon_with_setup(common::fresh_state(), testing_setup(&dns_pkarr)).await;
 
     let alice_dir = tempfile::tempdir().unwrap();
     let alice_state = tempfile::tempdir().unwrap();
@@ -1565,8 +1540,7 @@ async fn burst_of_evictions_all_rotate_no_signal_dropped() {
             .expect("dns_pkarr"),
     );
     let daemon =
-        common::spawn_daemon_with_setup(common::fresh_state(), daemon_testing_setup(&dns_pkarr))
-            .await;
+        common::spawn_daemon_with_setup(common::fresh_state(), testing_setup(&dns_pkarr)).await;
     let client = Client::connect(&daemon.socket).await.unwrap();
     let dir = tempfile::tempdir().unwrap();
     // Wire the daemon socket so the cap-listener observes the host's own

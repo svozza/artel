@@ -80,6 +80,15 @@ pub async fn shared_relay_url() -> &'static str {
         .1
 }
 
+/// Tier C endpoint setup: localhost shared relay + n0 DNS/pkarr,
+/// skipping TLS cert verification for the self-signed localhost
+/// relay. Real-QUIC tests dial each other across this localhost
+/// relay rather than n0's public infra.
+pub async fn custom_relay_setup() -> artel_daemon::EndpointSetup {
+    let relay_url: iroh::RelayUrl = shared_relay_url().await.parse().unwrap();
+    artel_daemon::EndpointSetup::ProductionCustomRelay { relay_url }
+}
+
 pub struct State {
     pub root: TempDir,
     pub socket: PathBuf,

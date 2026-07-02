@@ -28,8 +28,8 @@ use std::time::{Duration, Instant};
 
 use artel_client::Client;
 use artel_daemon::shutdown::Shutdown;
-use artel_daemon::{Daemon, DaemonConfig, EndpointSetup as DaemonEndpointSetup};
-use artel_fs::{EndpointSetup as FsEndpointSetup, WorkspaceEvent};
+use artel_daemon::{Daemon, DaemonConfig};
+use artel_fs::{EndpointSetup, WorkspaceEvent};
 use artel_protocol::capability::{Capability, CapabilityAction};
 use artel_protocol::{MessageKind, PeerId, Request, Response, SendPayload, SessionId};
 use futures_util::StreamExt;
@@ -226,22 +226,20 @@ impl RunningDaemon {
 /// `dns_pkarr` field stays the same across every endpoint that
 /// uses this fixture, so all of them resolve via the same
 /// localhost server.
-pub fn daemon_testing_setup(dns_pkarr: &Arc<DnsPkarrServer>) -> DaemonEndpointSetup {
-    DaemonEndpointSetup::Testing {
+pub fn testing_setup(dns_pkarr: &Arc<DnsPkarrServer>) -> EndpointSetup {
+    EndpointSetup::Testing {
         dns_pkarr: Arc::clone(dns_pkarr),
     }
 }
 
-/// Workspace-side companion to [`daemon_testing_setup`]. The
-/// daemon and workspace each define their own `EndpointSetup`
-/// enum (peer crates, neither depending on the other) so
-/// cross-crate setup values can't be shared by type. Both wrap
-/// the same `Arc<DnsPkarrServer>`. `WorkspaceConfig` callers
-/// pass this in; `DaemonConfig` callers pass [`daemon_testing_setup`].
-pub fn testing_setup(dns_pkarr: &Arc<DnsPkarrServer>) -> FsEndpointSetup {
-    FsEndpointSetup::Testing {
-        dns_pkarr: Arc::clone(dns_pkarr),
-    }
+/// Localhost-relay setup for Tier C tests: n0 DNS/pkarr for
+/// discovery, the bin-shared localhost relay
+/// ([`shared_relay_url`]) for the QUIC transport. One value serves
+/// daemons and workspaces alike now that both crates share the
+/// same `EndpointSetup` type.
+pub async fn custom_relay_setup() -> EndpointSetup {
+    let relay_url: iroh::RelayUrl = shared_relay_url().await.parse().unwrap();
+    EndpointSetup::ProductionCustomRelay { relay_url }
 }
 
 /// Bring an iroh-enabled daemon up against the supplied
@@ -249,10 +247,7 @@ pub fn testing_setup(dns_pkarr: &Arc<DnsPkarrServer>) -> FsEndpointSetup {
 /// `Testing` setup; tests that need a single daemon (e.g. the
 /// single-daemon attachment cases in `workspace_lifecycle.rs`)
 /// can call this directly with their own per-test fixture.
-pub async fn spawn_daemon_with_setup(
-    state: DaemonState,
-    setup: DaemonEndpointSetup,
-) -> RunningDaemon {
+pub async fn spawn_daemon_with_setup(state: DaemonState, setup: EndpointSetup) -> RunningDaemon {
     let daemon = Daemon::start(DaemonConfig {
         socket_path: state.socket.clone(),
         pid_path: state.pid.clone(),
@@ -291,7 +286,7 @@ pub struct LocalDaemon {
 
 impl LocalDaemon {
     /// Spawn an iroh-enabled daemon under a fresh tempdir. Uses
-    /// [`DaemonEndpointSetup::Testing`] against the bin-shared
+    /// [`EndpointSetup::Testing`] against the bin-shared
     /// [`DnsPkarrServer`] so daemon startup is fast and hermetic
     /// (no n0 traffic, no relay handshake). Pre-A2 this function
     /// stood up an iroh-disabled daemon via `iroh_key_path: None`;
@@ -306,7 +301,7 @@ impl LocalDaemon {
             pid_path: tempdir.path().join("daemon.pid"),
             sessions_dir: tempdir.path().join("sessions"),
             iroh_key_path: Some(tempdir.path().join("iroh.key")),
-            endpoint_setup: daemon_testing_setup(&dns_pkarr),
+            endpoint_setup: testing_setup(&dns_pkarr),
         })
         .await
         .expect("daemon start");
@@ -384,7 +379,7 @@ impl DaemonHandle {
 /// default) for real-n0 tests. The directory containing `paths` is
 /// the caller's responsibility — it must outlive the daemon and any
 /// planned restarts.
-pub async fn spawn_daemon_at(paths: &DaemonPaths, setup: DaemonEndpointSetup) -> DaemonHandle {
+pub async fn spawn_daemon_at(paths: &DaemonPaths, setup: EndpointSetup) -> DaemonHandle {
     let daemon = Daemon::start(DaemonConfig {
         socket_path: paths.socket.clone(),
         pid_path: paths.pid.clone(),
@@ -442,11 +437,11 @@ pub async fn spawn_pair() -> Pair {
     // future and trip `clippy::large_futures` at every caller.
     let fut_a = Box::pin(spawn_daemon_with_setup(
         fresh_state(),
-        daemon_testing_setup(&dns_pkarr),
+        testing_setup(&dns_pkarr),
     ));
     let fut_b = Box::pin(spawn_daemon_with_setup(
         fresh_state(),
-        daemon_testing_setup(&dns_pkarr),
+        testing_setup(&dns_pkarr),
     ));
     let (daemon_a, daemon_b) = tokio::join!(fut_a, fut_b);
 

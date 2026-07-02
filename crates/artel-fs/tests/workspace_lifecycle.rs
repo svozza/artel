@@ -31,7 +31,7 @@ use iroh_docs::store::Query;
 use tempfile::TempDir;
 use tokio::time::{sleep, timeout};
 
-use common::{LocalDaemon, daemon_testing_setup, shared_dns_pkarr, testing_setup};
+use common::{LocalDaemon, shared_dns_pkarr, testing_setup};
 
 /// [`WorkspaceConfig::default`] with the `Testing` endpoint setup so
 /// tests don't hit n0's production relay (which times out on
@@ -315,8 +315,7 @@ async fn join_init_from_existing_is_rejected() {
             .unwrap(),
     );
     let daemon =
-        common::spawn_daemon_with_setup(common::fresh_state(), daemon_testing_setup(&dns_pkarr))
-            .await;
+        common::spawn_daemon_with_setup(common::fresh_state(), testing_setup(&dns_pkarr)).await;
     let client = Client::connect(&daemon.socket).await.unwrap();
 
     // We need *some* session id to pass to `join`, but the policy
@@ -811,7 +810,7 @@ async fn attachment_persists_across_daemon_restart() {
 
     // Phase 1: host once, capture session id and attachment.
     let daemon_a1 =
-        common::spawn_daemon_with_setup(alice_daemon_state, daemon_testing_setup(&dns_pkarr)).await;
+        common::spawn_daemon_with_setup(alice_daemon_state, testing_setup(&dns_pkarr)).await;
 
     let alice_a1 = Client::connect(&daemon_a1.socket).await.unwrap();
     let cfg_1 = WorkspaceConfig::default()
@@ -856,8 +855,7 @@ async fn attachment_persists_across_daemon_restart() {
     // session id means the attachment from phase 1 is still indexed
     // under the same `(session, kind)` key on disk.
     let daemon_a2 =
-        common::spawn_daemon_with_setup(alice_daemon_state_2, daemon_testing_setup(&dns_pkarr))
-            .await;
+        common::spawn_daemon_with_setup(alice_daemon_state_2, testing_setup(&dns_pkarr)).await;
 
     let alice_a2 = Client::connect(&daemon_a2.socket).await.unwrap();
 
