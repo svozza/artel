@@ -14,10 +14,11 @@ publish = false
 # own `test-utils` feature so `iroh::test_utils::DnsPkarrServer` is
 # in scope. Off by default; integration tests turn it on (the
 # `dev-dependency` on `iroh` below already pulls it in for tests).
-test-utils = ["iroh/test-utils"]
+test-utils = ["iroh/test-utils", "artel-iroh-setup/test-utils"]
 
 [dependencies]
 artel-client.workspace = true
+artel-iroh-setup.workspace = true
 artel-protocol.workspace = true
 blake3 = "1"
 bytes.workspace = true

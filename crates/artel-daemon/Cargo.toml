@@ -15,14 +15,15 @@ default = ["iroh"]
 # substrate. Off-mode keeps the daemon a local-only IPC bus with a
 # synthetic peer id, useful for tests and embeds that don't want the
 # network stack.
-iroh = ["dep:iroh", "dep:iroh-gossip", "dep:rand", "dep:bytes"]
-# Exposes `EndpointSetup::Testing { dns_pkarr }`, gated by iroh's
-# own `test-utils` feature so `iroh::test_utils::DnsPkarrServer` is
-# in scope. Implies `iroh` (the type only exists with a real
-# endpoint).
-test-utils = ["iroh", "iroh?/test-utils"]
+iroh = ["dep:iroh", "dep:iroh-gossip", "dep:rand", "dep:bytes", "dep:artel-iroh-setup"]
+# Exposes `EndpointSetup::Testing { dns_pkarr }` and friends, gated
+# by iroh's own `test-utils` feature so
+# `iroh::test_utils::DnsPkarrServer` is in scope. Implies `iroh`
+# (the type only exists with a real endpoint).
+test-utils = ["iroh", "iroh?/test-utils", "artel-iroh-setup?/test-utils"]
 
 [dependencies]
+artel-iroh-setup = { workspace = true, optional = true }
 artel-protocol = { workspace = true, features = ["signing", "tokio"] }
 async-trait = { workspace = true }
 bytes = { workspace = true, optional = true }

@@ -5,8 +5,6 @@
 //! in-process without going through `fork`/`exec`.
 
 #[cfg(feature = "iroh")]
-pub(crate) mod endpoint_setup;
-#[cfg(feature = "iroh")]
 pub(crate) mod gossip_bridge;
 #[cfg(feature = "iroh")]
 pub(crate) mod iroh_key;
@@ -20,10 +18,14 @@ pub(crate) mod store;
 #[cfg(feature = "iroh")]
 pub(crate) mod upgrade_protocol;
 
+// Endpoint-discovery setup is shared with `artel-fs` via
+// `artel-iroh-setup` (the two are peer crates; neither may depend on
+// the other). Re-exported so consumers keep the
+// `artel_daemon::EndpointSetup` path.
 #[cfg(feature = "iroh")]
-pub use endpoint_setup::EndpointSetup;
+pub use artel_iroh_setup::EndpointSetup;
 #[cfg(all(feature = "iroh", feature = "test-utils"))]
-pub use endpoint_setup::TEST_DNS_ORIGIN;
+pub use artel_iroh_setup::TEST_DNS_ORIGIN;
 #[cfg(feature = "iroh")]
 pub use server::IrohRuntime;
 pub use server::{Daemon, DaemonConfig, StartError};

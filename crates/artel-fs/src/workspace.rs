@@ -44,7 +44,6 @@ use tracing::{debug, warn};
 use walkdir::WalkDir;
 
 use crate::echo_guard::{EchoGuard, PENDING_RELEASE_GRACE};
-use crate::endpoint_setup::EndpointSetup;
 use crate::error::{PolicyViolation, WorkspaceError};
 use crate::filter::{FilterDecision, SkipReason, WorkspaceFilter};
 use crate::keys;
@@ -52,6 +51,7 @@ use crate::node::WorkspaceNode;
 use crate::peer_map::PeerMap;
 use crate::rules::{CompiledPathRules, Mode, PathRules};
 use crate::ticket::{self, WorkspaceTicketEnvelope};
+use artel_iroh_setup::EndpointSetup;
 
 /// Maximum number of offending entries surfaced in a
 /// [`PolicyViolation::DirNotEmpty`] error before truncation. Five is
