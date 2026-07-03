@@ -2245,6 +2245,20 @@ impl Workspace {
         Ok(())
     }
 
+    /// Drive the applier's tombstone application for `path` directly,
+    /// exactly as an incoming `InsertRemote` with `content_len() == 0`
+    /// would after passing the rule/filter gates. For tests that need
+    /// to deliver a *duplicate* tombstone at a controlled moment —
+    /// e.g. the straggler-tombstone race, where a second tombstone for
+    /// an already-deleted path arrives after a genuine local
+    /// re-creation of the file (macOS `FSEvents` fans one unlink into
+    /// two published tombstones; see the 2026-07-02 case study in
+    /// `docs/diagnosing-flaky-tests.md`).
+    #[cfg(feature = "test-utils")]
+    pub async fn test_apply_peer_tombstone(&self, path: std::path::PathBuf) {
+        crate::applier::apply_tombstone(&self.echo_guard, &self.events, path).await;
+    }
+
     /// This workspace node's `EndpointId` bytes, for tests asserting the
     /// same-seed author binding (`AuthorId == endpoint_id`). Returns
     /// `None` if the node has already been torn down.
@@ -3043,7 +3057,12 @@ async fn bulk_export(
             // guard is handed to the watcher/applier right after this
             // bulk pass, and an unlink of a pre-existing file here can
             // surface as a watcher event after the watch attaches.
-            echo_guard.mark_remote_delete(&path).await;
+            // The Fresh/Duplicate mark is safe to discard here: the
+            // guard is empty at bulk-export time and the query is
+            // single_latest_per_key, so no key yields two tombstones
+            // in one pass — every mark is Fresh, and nothing local
+            // can have raced onto the path before the watcher exists.
+            let _ = echo_guard.mark_remote_delete(&path).await;
             let _ = tokio::fs::remove_file(&path).await;
             let _ = events.send(WorkspaceEvent::PeerDeleted { path }).await;
             continue;

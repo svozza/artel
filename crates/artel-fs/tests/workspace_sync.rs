@@ -286,6 +286,82 @@ async fn recreating_identical_bytes_after_delete_propagates() {
 }
 
 // =============================================================
+// Straggler duplicate tombstone must not delete a racing local
+// re-create.
+//
+// Deterministic repro of the once-observed macOS flake of
+// `recreating_identical_bytes_after_delete_propagates` (trace
+// captured 2026-07-02; see the case study in
+// docs/diagnosing-flaky-tests.md): one unlink on the deleting peer
+// fans out via FSEvents into TWO published tombstones (the
+// post-unlink Modify(Metadata)/Modify(Data) pair each take the
+// watcher's NotFound→tombstone fallback, and `on_removed` has no
+// "already tombstoned" dedup). On the receiving peer, a genuine
+// local re-create landing between the two tombstone applications is
+// deleted by the straggler's `remove_file`, `mark_remote_delete`
+// re-arms `peer_deleted`, and the watcher's debounced events for the
+// write then read NotFound and are swallowed as peer-delete echoes.
+// A consumer that writes once (no retry loop) never recovers — disk
+// and doc silently diverge.
+//
+// The ordering is driven directly, one node playing the receiving
+// side (the 2026-07-02 stale-echo-guard case-study pattern):
+// tombstone #1's doc + disk effects, then the local write, then the
+// straggler's disk effect via `test_apply_peer_tombstone` — the same
+// `apply_tombstone` the applier's `content_len() == 0` branch runs,
+// delivered before the watcher's 300 ms debounce can publish the
+// write (the test body is sub-millisecond between the two).
+// =============================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn straggler_duplicate_tombstone_spares_racing_local_recreate() {
+    const BYTES: &[u8] = b"rises from the ashes";
+    common::init_tracing();
+    let (daemon, _client, ws, handle, _events, _dir, _dns_pkarr) =
+        spawn_host_workspace_for_empty_test().await;
+
+    // Seed: publish phoenix.txt so the doc has a real entry and the
+    // watcher has settled (the wait proves the debounce flushed).
+    let path = ws.root.join("phoenix.txt");
+    tokio::fs::write(&path, BYTES).await.unwrap();
+    assert!(
+        wait_for_doc_entry(&ws, &path, WAIT_BUDGET).await,
+        "seed write never published — test setup failed",
+    );
+
+    // Tombstone #1. Doc side: a real deletion entry (doc_has_entry_at
+    // excludes tombstones, so it now reports false). Disk/guard side:
+    // exactly what the applier does for an incoming tombstone —
+    // mark_remote_delete + remove_file.
+    let key = path_to_key(ws.root.as_path(), &path).expect("path_to_key");
+    ws.doc().del(ws.author(), key).await.expect("doc.del");
+    ws.test_apply_peer_tombstone(path.clone()).await;
+    assert!(!path.exists(), "tombstone #1 must remove the file");
+
+    // The racing local re-create, then the straggler tombstone #2
+    // before the watcher's debounce window can flush. Pre-fix, #2's
+    // remove_file deletes the fresh write and re-arms peer_deleted;
+    // the watcher's events for the write then read NotFound and are
+    // swallowed, so the single write below never publishes.
+    tokio::fs::write(&path, BYTES).await.unwrap();
+    ws.test_apply_peer_tombstone(path.clone()).await;
+
+    assert!(
+        tokio::fs::read(&path).await.is_ok_and(|b| b == BYTES),
+        "straggler duplicate tombstone deleted the racing local re-create",
+    );
+    assert!(
+        wait_for_doc_entry(&ws, &path, WAIT_BUDGET).await,
+        "re-created file never published — straggler tombstone swallowed \
+         the local write",
+    );
+
+    ws.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), handle).await;
+    daemon.stop().await;
+}
+
+// =============================================================
 // An empty file in the workspace must not propagate as a doc
 // entry — iroh-docs reserves zero-length entries for tombstones,
 // so a naive `set_bytes(_, _, &[])` is rejected with
