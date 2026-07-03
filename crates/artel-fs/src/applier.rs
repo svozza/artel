@@ -21,7 +21,7 @@ use iroh_docs::store::Query;
 use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
-use crate::echo_guard::PENDING_RELEASE_GRACE;
+use crate::echo_guard::{PENDING_RELEASE_GRACE, RemoteDeleteMark};
 use crate::filter::{FilterDecision, SkipReason, WorkspaceFilter};
 use crate::rules::Mode;
 use crate::workspace::{Direction, Workspace, WorkspaceEvent, emit_event};
@@ -248,26 +248,24 @@ pub(crate) async fn apply_tombstone(
     // Mark BEFORE the remove so the watcher can't observe the
     // unlink first. Suppresses the removal echo and drops the
     // stale last-published hash (see EchoGuard::mark_remote_delete).
-    if !guard.mark_remote_delete(&path).await {
-        // Duplicate of a tombstone we already applied, with no
-        // re-creation observed since (a re-creation clears the
-        // marker). Our remove_file already ran; if the path exists
-        // NOW, it's a genuine local write that raced in between the
-        // duplicates — deleting it would swallow an unpublished
-        // creation with nothing to heal it (the watcher's events for
-        // that write read NotFound post-remove and are suppressed as
-        // peer-delete echoes). Skip the remove; the marker stays
-        // armed, so echoes of the original unlink are still eaten.
-        // Duplicates are real: one unlink on the deleting peer fans
-        // out into two published tombstones on macOS (FSEvents
-        // post-unlink Modify pair through the watcher's
-        // NotFound→tombstone fallback).
-        debug!(
-            target: "artel_fs::applier",
-            path = %path.display(),
-            "duplicate tombstone for already-deleted path; skipping remove_file"
-        );
-        return;
+    match guard.mark_remote_delete(&path).await {
+        RemoteDeleteMark::Duplicate => {
+            // Our remove_file already ran for the original tombstone;
+            // if the path exists NOW, it's a genuine local write that
+            // raced in between the duplicates — deleting it would
+            // swallow an unpublished creation with nothing to heal it
+            // (the watcher's events for that write read NotFound
+            // post-remove and are suppressed as peer-delete echoes).
+            // Skip the remove; the marker stays armed, so echoes of
+            // the original unlink are still eaten.
+            debug!(
+                target: "artel_fs::applier",
+                path = %path.display(),
+                "duplicate tombstone for already-deleted path; skipping remove_file"
+            );
+            return;
+        }
+        RemoteDeleteMark::Fresh => {}
     }
     let _ = tokio::fs::remove_file(&path).await;
     emit_event(events, WorkspaceEvent::PeerDeleted { path });

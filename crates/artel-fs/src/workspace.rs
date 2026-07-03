@@ -3057,7 +3057,12 @@ async fn bulk_export(
             // guard is handed to the watcher/applier right after this
             // bulk pass, and an unlink of a pre-existing file here can
             // surface as a watcher event after the watch attaches.
-            echo_guard.mark_remote_delete(&path).await;
+            // The Fresh/Duplicate mark is safe to discard here: the
+            // guard is empty at bulk-export time and the query is
+            // single_latest_per_key, so no key yields two tombstones
+            // in one pass — every mark is Fresh, and nothing local
+            // can have raced onto the path before the watcher exists.
+            let _ = echo_guard.mark_remote_delete(&path).await;
             let _ = tokio::fs::remove_file(&path).await;
             let _ = events.send(WorkspaceEvent::PeerDeleted { path }).await;
             continue;
