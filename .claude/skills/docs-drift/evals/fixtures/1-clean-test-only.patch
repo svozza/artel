@@ -1,0 +1,30 @@
+diff --git a/crates/artel-fs/src/filter.rs b/crates/artel-fs/src/filter.rs
+index 26ea83a..7316c17 100644
+--- a/crates/artel-fs/src/filter.rs
++++ b/crates/artel-fs/src/filter.rs
+@@ -222,6 +222,25 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn does_not_over_skip_uppercase_swp() {
++        let dir = make_root();
++        let filter = WorkspaceFilter::new(dir.path());
++        let p = write_file(dir.path(), "Foo.SWP", b"user file, not vim");
++        assert_eq!(filter.check(&p), FilterDecision::Include);
++    }
++
++    #[test]
++    fn deep_nested_hardcoded_component_still_skips() {
++        let dir = make_root();
++        let filter = WorkspaceFilter::new(dir.path());
++        let p = write_file(dir.path(), "a/b/target/c/out.bin", b"x");
++        assert_eq!(
++            filter.check(&p),
++            FilterDecision::Skip(SkipReason::Hardcoded)
++        );
++    }
++
+     #[test]
+     fn skips_swp_and_tmp_and_ds_store() {
+         let dir = make_root();

@@ -1,0 +1,13 @@
+diff --git a/crates/artel-fs/src/filter.rs b/crates/artel-fs/src/filter.rs
+index 26ea83a..6665f1a 100644
+--- a/crates/artel-fs/src/filter.rs
++++ b/crates/artel-fs/src/filter.rs
+@@ -24,7 +24,7 @@ use ignore::gitignore::Gitignore;
+ /// Whole-file reads and publishes (no streaming, no chunked diffing)
+ /// keep the pipeline simple, and a cap keeps each of those operations
+ /// cheap; revisit when large-file sync becomes a real need.
+-pub const MAX_FILE_SIZE: u64 = 1 << 20;
++pub const MAX_FILE_SIZE: u64 = 4 << 20;
+ 
+ /// Pre-parsed view of the workspace root + its `.gitignore` (if any).
+ ///

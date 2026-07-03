@@ -6,7 +6,8 @@
       "eval_name": "new-event-variant-stale-guide",
       "prompt": "Check whether the docs are still accurate for what's in flight on this branch before I open a PR.",
       "expected_output": "Detects that WorkspaceEvent gained a ScanCompleted variant on this branch while docs/consumer-guide.md's WorkspaceEvent enumeration does not mention it. Reports the divergence with file:line evidence on both sides and a proposed fix, without editing anything.",
-      "files": ["/tmp/artel-eval/drift-variant"],
+      "fixture": "drift-variant",
+      "patch": "fixtures/0-new-event-variant.patch",
       "assertions": [
         "Detects that the branch adds a ScanCompleted variant to WorkspaceEvent and flags docs/consumer-guide.md's WorkspaceEvent enumeration as missing it",
         "Cites file:line evidence on both sides (the doc claim and the code location) for the divergence",
@@ -20,7 +21,8 @@
       "eval_name": "clean-test-only-branch",
       "prompt": "Are the docs still in sync with the changes on this branch?",
       "expected_output": "Recognizes the branch only adds unit tests and reports a clean verdict with a 'checked and current' account, without inventing spurious findings or editing docs.",
-      "files": ["/tmp/artel-eval/clean-tests"],
+      "fixture": "clean-tests",
+      "patch": "fixtures/1-clean-test-only.patch",
       "assertions": [
         "Reaches a clean verdict (no divergences) for the test-only branch",
         "Explicitly reasons that the change is test-only / non-public-API rather than just asserting cleanliness",
@@ -34,7 +36,8 @@
       "eval_name": "uncommitted-constant-change-stale-rustdoc",
       "prompt": "Did anything go stale docs-wise with my current changes? I haven't committed yet.",
       "expected_output": "Catches the uncommitted MAX_FILE_SIZE change (1 MiB -> 4 MiB) and reports the stale '1 MiB' claims in filter.rs module rustdoc and docs/roadmap.md.",
-      "files": ["/tmp/artel-eval/rustdoc-stale"],
+      "fixture": "rustdoc-stale",
+      "patch": "fixtures/2-uncommitted-rustdoc.patch",
       "assertions": [
         "Includes the uncommitted working-tree change (MAX_FILE_SIZE 1 MiB -> 4 MiB) in the audit",
         "Flags the stale module-level rustdoc in crates/artel-fs/src/filter.rs that still says '1 MiB'",
