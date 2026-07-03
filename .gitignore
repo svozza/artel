@@ -4,6 +4,9 @@
 .idea
 .vscode
 .claude/settings.local.json
+# Skill eval scratch (fixtures, run transcripts, benchmarks) — the
+# skill itself (.claude/skills/*/) is committed.
+.claude/skills/*-workspace/
 
 # Handoff docs are local working artifacts (session-to-session
 # context transfer), never committed — per project convention.
