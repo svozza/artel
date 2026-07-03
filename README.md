@@ -88,26 +88,28 @@ Message payloads are opaque bytes — artel gives you ordering, delivery, persis
 Add `artel-fs` to mirror a directory to everyone in the session:
 
 ```rust
-use artel_fs::{Workspace, WorkspaceConfig, PathRules, AttachPolicy};
+use artel_fs::{Workspace, WorkspaceConfig, PathRules, PathRule, Mode, AttachPolicy};
 
 // Host a workspace rooted at `root`, syncing files to joiners.
+// AttachPolicy is always explicit (no Default) so wrong-dir risk is
+// visible at the call site; RequireEmpty is the safe choice.
 let (workspace, mut events) = Workspace::host_with(
     &client,
     "alice",
     root,                       // PathBuf
-    AttachPolicy::default(),
-    WorkspaceConfig {
-        // e.g. pin the root read-only with only `.chat/**` writable.
-        rules: Some(PathRules { /* root ReadOnly, .chat/** ReadWrite */ ..Default::default() }),
-        ..Default::default()
-    },
+    AttachPolicy::RequireEmpty,
+    WorkspaceConfig::default().with_rules(PathRules {
+        // Pin the root read-only with only `.chat/**` writable.
+        default: Mode::ReadOnly,
+        rules: vec![PathRule { glob: ".chat/**".into(), mode: Mode::ReadWrite }],
+    }),
 ).await?;
 
 // React to WorkspaceEvent::{PeerWrote, PeerDeleted, SkippedTooLarge, Error, ...}.
 while let Some(ev) = events.recv().await { /* react */ }
 ```
 
-A joiner calls `Workspace::join_with(&client, name, root, ticket, rules, ...)`.
+A joiner first joins the session (`Request::JoinSession { display_name, ticket }`), then calls `Workspace::join_with(&client, session, root, AttachPolicy::RequireEmpty, WorkspaceConfig::default())` — the workspace ticket arrives over the session automatically, and the host's path rules always win.
 
 **Tip — you may not need a message protocol at all.** A common pattern is to let file sync carry your app's data: for a chat, each peer appends to its own file in the workspace (`.chat/<peer-id>.jsonl`) and tails everyone else's. The history is persisted and replayable for free. One writer per file is the rule to remember — sync is last-writer-wins per file. The [consumer guide](docs/consumer-guide.md) covers this pattern and its sharp edges.
 
