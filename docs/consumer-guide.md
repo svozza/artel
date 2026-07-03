@@ -25,7 +25,7 @@ client.take_events() -> EventStream    // take the connection's single event str
 
 ### The request verbs
 
-The consumer-relevant subset (the full enum also carries host↔peer delivery plumbing — `DeliverUpgrade`, `DeliverDowngrade`, `DeliverRotate`, `PublishWorkspaceTicket` — that `artel-fs` drives for you; you should never need to call those directly):
+The consumer-relevant subset (the full enum also carries host↔peer delivery plumbing — `DeliverUpgrade`, `DeliverDowngrade`, `DeliverRotate`, `PublishWorkspaceTicket`, `RemoveSessionMember` — that `artel-fs` drives for you; you should never need to call those directly):
 
 | Request | Purpose |
 |---|---|
@@ -42,7 +42,7 @@ The consumer-relevant subset (the full enum also carries host↔peer delivery pl
 
 ### The event stream
 
-`Subscribe` drives `Event`s to your `EventStream`: `Message` (a sent payload, with its `Seq`), `PeerJoined` / `PeerLeft` (membership, carrying `PeerInfo { id, display_name }`), `SessionClosed`, and `Gap`. **These are daemon-authenticated** — they are the trustworthy source for who is in the session and what their capability is. Do not reconstruct membership from app payloads.
+`Subscribe` drives `Event`s to your `EventStream`: `Message` (a sent payload, with its `Seq`), `PeerJoined` / `PeerLeft` (membership; `PeerJoined` carries `PeerInfo { id, display_name }`, `PeerLeft` only the bare `PeerId` — capture display names at join time if you need them later), `SessionClosed`, and `Gap`. **These are daemon-authenticated** — they are the trustworthy source for who is in the session and what their capability is. Do not reconstruct membership from app payloads.
 
 **Handle `Event::Gap`.** If your consumer falls behind, the daemon drops events rather than blocking, and sends `Gap { session }` — the connection stays open. Recover by re-`Subscribe`ing with `since: Some(last_seen_seq)`, which replays every logged message past the gap. Live-only events (`PeerJoined` / `PeerLeft` / `SessionClosed`) that fell in the gap are **not** replayed; if you track membership, reconcile it separately after a gap rather than assuming your roster is still current.
 
