@@ -53,9 +53,11 @@ The consumer-relevant subset (the full enum also carries host↔peer delivery pl
 ```rust
 Workspace::host_with(&client, name, root, AttachPolicy, WorkspaceConfig)
     -> (Workspace, mpsc::Receiver<WorkspaceEvent>)
-Workspace::join_with(&client, name, root, ticket, rules, ...)
+Workspace::join_with(&client, session, root, AttachPolicy, WorkspaceConfig)
     -> (Workspace, mpsc::Receiver<WorkspaceEvent>)
 ```
+
+The joiner first joins the session itself (`Request::JoinSession { display_name, ticket }`) and passes the resulting `SessionId` to `join_with` — there is no ticket or rules parameter on the workspace call: the *workspace* ticket arrives over the session automatically, and the host's rules always win (a joiner-side `WorkspaceConfig::rules` is ignored).
 
 `WorkspaceEvent` includes:
 
@@ -73,13 +75,13 @@ Workspace::join_with(&client, name, root, ticket, rules, ...)
 
 ### `PathRules`: scope what syncs
 
-`PathRules` decide, per relative path, whether it's `ReadOnly`, `ReadWrite`, or excluded. A common pattern: pin the workspace **root read-only** and make only one subtree writable, so you can point artel at a real project directory and sync just your app's scratch area without sharing or risking the rest:
+`PathRules` decide, per relative path, whether it's `ReadOnly` or `ReadWrite` (excluding a path from sync entirely is the built-in filter's job, not the rules'). A common pattern: pin the workspace **root read-only** and make only one subtree writable, so you can point artel at a real project directory and sync just your app's scratch area without sharing or risking the rest:
 
 ```rust
 PathRules { /* root ReadOnly, ".app/**" ReadWrite */ }
 ```
 
-`PathRules::read_write()` is the permissive default. Built-in filtering also skips `.git`, `target`, `node_modules`, symlinks, and files over the size cap.
+`PathRules::read_write()` is the permissive default. Built-in filtering also skips `.git`, `target`, `node_modules`, the `.artel-fs` state dir, `.DS_Store` and editor temp files (`*.swp`, `*.tmp`), symlinks, files over the size cap (1 MiB), and anything matched by the workspace root's `.gitignore`.
 
 ## Patterns that work
 
