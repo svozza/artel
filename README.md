@@ -20,8 +20,9 @@ artel is not on crates.io yet; depend on it by git:
 
 ```toml
 [dependencies]
-artel-client = { git = "https://github.com/svozza/artel.git", rev = "<commit-sha>" }
-artel-fs     = { git = "https://github.com/svozza/artel.git", rev = "<commit-sha>" }  # only if you want file sync
+artel-client   = { git = "https://github.com/svozza/artel.git", rev = "<commit-sha>" }
+artel-protocol = { git = "https://github.com/svozza/artel.git", rev = "<commit-sha>" }  # Request/Response/Event types
+artel-fs       = { git = "https://github.com/svozza/artel.git", rev = "<commit-sha>" }  # only if you want file sync
 ```
 
 <details>
@@ -29,12 +30,14 @@ artel-fs     = { git = "https://github.com/svozza/artel.git", rev = "<commit-sha
 
 ```toml
 [dependencies]
-artel-client = "0.0.0"
-artel-fs     = "0.0.0"
+artel-client   = "0.0.0"
+artel-protocol = "0.0.0"
+artel-fs       = "0.0.0"
 
 [patch.crates-io]
-artel-client = { path = "../artel/crates/artel-client" }
-artel-fs     = { path = "../artel/crates/artel-fs" }
+artel-client   = { path = "../artel/crates/artel-client" }
+artel-protocol = { path = "../artel/crates/artel-protocol" }
+artel-fs       = { path = "../artel/crates/artel-fs" }
 ```
 
 </details>
@@ -46,7 +49,11 @@ use artel_client::{Client, SpawnOptions};
 use artel_protocol::{Request, Response};
 
 // Connect to the daemon, auto-spawning it if not already running.
-let client = Client::connect_or_spawn(SpawnOptions::default()).await?;
+// You supply the socket path, pidfile path, and daemon binary explicitly —
+// the client never guesses a $PATH-resolved binary.
+let client = Client::connect_or_spawn(
+    SpawnOptions::new(socket_path, pid_path, daemon_binary),
+).await?;
 
 // Host a session; get back a session id and a shareable ticket.
 let resp = client.request(Request::HostSession {
@@ -135,7 +142,7 @@ flowchart TB
 |---|---|
 | `artel-client` | The crate your app depends on. Wraps the Unix-socket IPC in an idiomatic async API. |
 | `artel-fs` | Optional filesystem-sync workspace built on top of a session. |
-| `artel-protocol` | Wire protocol types shared by daemon and client. iroh-free, transport-free. |
+| `artel-protocol` | Wire protocol types shared by daemon and client, plus the Unix-socket IPC transport (behind the `tokio` feature). iroh-free. |
 | `artel-daemon` | The long-running local process. You normally never depend on it directly — the client auto-spawns it. |
 
 Other workspace types (CRDT docs, KV stores, etc.) can be built as sibling crates of `artel-fs` following the same convention.

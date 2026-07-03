@@ -10,7 +10,9 @@ Apps build on this rather than speaking the wire protocol directly.
 use artel_client::{Client, SpawnOptions};
 use artel_protocol::Request;
 
-let client = Client::connect_or_spawn(SpawnOptions::default()).await?;
+let client = Client::connect_or_spawn(
+    SpawnOptions::new(socket_path, pid_path, daemon_binary),
+).await?;
 let resp = client.request(Request::HostSession {
     display_name: "alice".into(),
     session: None,
