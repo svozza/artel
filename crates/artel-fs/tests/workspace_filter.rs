@@ -32,7 +32,8 @@ use pretty_assertions::assert_eq;
 use tokio::time::{sleep, timeout};
 
 use common::{
-    Pair, doc_has_key, init_tracing, spawn_pair, testing_setup, wait_for_file, wait_for_missing,
+    Pair, doc_has_key, init_tracing, spawn_pair, testing_setup, wait_for_event, wait_for_file,
+    wait_for_missing,
 };
 
 // =============================================================
@@ -434,22 +435,25 @@ async fn applier_drops_incoming_read_only_insert() {
         "applier regression: secret/foo.txt landed on bob despite ReadOnly rule",
     );
 
-    // Bob's event stream has at least one SkippedReadOnly{Incoming}
-    // for the secret.
-    let mut saw_skip = false;
-    while let Ok(ev) = bob_events.try_recv() {
-        if let WorkspaceEvent::SkippedReadOnly { path, direction } = ev
-            && direction == Direction::Incoming
-            && path.ends_with("secret/foo.txt")
-        {
-            saw_skip = true;
-            break;
-        }
-    }
-    assert!(
-        saw_skip,
-        "expected SkippedReadOnly{{Incoming}} on bob for secret/foo.txt",
-    );
+    // Bob's event stream surfaces SkippedReadOnly{Incoming} for the
+    // secret. `wait_for_event` awaits the channel rather than
+    // draining what happened to have arrived, so this doesn't lean
+    // on the marker wait having ordered the event's delivery.
+    wait_for_event(
+        &mut bob_events,
+        common::FILE_BUDGET,
+        "SkippedReadOnly{Incoming} for secret/foo.txt",
+        |ev| {
+            matches!(
+                ev,
+                WorkspaceEvent::SkippedReadOnly {
+                    path,
+                    direction: Direction::Incoming,
+                } if path.ends_with("secret/foo.txt")
+            )
+        },
+    )
+    .await;
 
     // Now drive a tombstone for the same key. The applier's rule
     // check sits BEFORE the tombstone branch, so the delete must
@@ -460,29 +464,26 @@ async fn applier_drops_incoming_read_only_insert() {
         .await
         .expect("doc.del");
 
-    // Sleep just enough for the tombstone InsertRemote to traverse
-    // — there's no positive-disk-state to poll on, so a short
-    // settle window is the cheapest cross-platform approach.
-    sleep(Duration::from_millis(500)).await;
-
     // No file existed to begin with on Bob, so the assertion is
     // about the event stream: a second SkippedReadOnly{Incoming}
     // for the same path means the tombstone branch was gated.
-    let mut saw_tomb_skip = false;
-    while let Ok(ev) = bob_events.try_recv() {
-        if let WorkspaceEvent::SkippedReadOnly { path, direction } = ev
-            && direction == Direction::Incoming
-            && path.ends_with("secret/foo.txt")
-        {
-            saw_tomb_skip = true;
-            break;
-        }
-    }
-    assert!(
-        saw_tomb_skip,
-        "expected SkippedReadOnly{{Incoming}} for tombstone on secret/foo.txt — \
-         applier rule check is sitting AFTER the tombstone branch",
-    );
+    // (The first wait consumed the write's skip event, so a match
+    // here can only be the tombstone's.)
+    wait_for_event(
+        &mut bob_events,
+        common::FILE_BUDGET,
+        "SkippedReadOnly{Incoming} for tombstone on secret/foo.txt",
+        |ev| {
+            matches!(
+                ev,
+                WorkspaceEvent::SkippedReadOnly {
+                    path,
+                    direction: Direction::Incoming,
+                } if path.ends_with("secret/foo.txt")
+            )
+        },
+    )
+    .await;
 
     alice_ws.shutdown().await.expect("shutdown");
     bob_ws.shutdown().await.expect("shutdown");
@@ -600,21 +601,24 @@ async fn watcher_blocks_outgoing_read_only_write() {
     );
 
     // The watcher emitted `SkippedReadOnly { Outgoing }` for the
-    // secret. Drain Alice's events and assert at least one matched.
-    let mut saw_skip = false;
-    while let Ok(ev) = alice_events.try_recv() {
-        if let WorkspaceEvent::SkippedReadOnly { path, direction } = ev
-            && direction == Direction::Outgoing
-            && path.ends_with("secret/key.txt")
-        {
-            saw_skip = true;
-            break;
-        }
-    }
-    assert!(
-        saw_skip,
-        "expected SkippedReadOnly{{Outgoing}} event for secret/key.txt",
-    );
+    // secret. Await it rather than draining what's already queued —
+    // the watcher emits after its debounce, which is not ordered
+    // against the marker's cross-peer round-trip.
+    wait_for_event(
+        &mut alice_events,
+        common::FILE_BUDGET,
+        "SkippedReadOnly{Outgoing} for secret/key.txt",
+        |ev| {
+            matches!(
+                ev,
+                WorkspaceEvent::SkippedReadOnly {
+                    path,
+                    direction: Direction::Outgoing,
+                } if path.ends_with("secret/key.txt")
+            )
+        },
+    )
+    .await;
 
     alice_ws.shutdown().await.expect("shutdown");
     bob_ws.shutdown().await.expect("shutdown");
