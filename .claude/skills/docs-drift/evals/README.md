@@ -25,7 +25,8 @@ against assertions.
 
 ```bash
 .claude/skills/docs-drift/evals/run-evals.sh            # default model
-.claude/skills/docs-drift/evals/run-evals.sh --model claude-haiku-4-5-20251001
+# --model takes whatever your claude auth accepts — Bedrock IDs here:
+.claude/skills/docs-drift/evals/run-evals.sh --model us.anthropic.claude-haiku-4-5-20251001-v1:0
 ```
 
 Each run costs a handful of agent invocations (3 audits + 3 gradings), takes
@@ -56,3 +57,11 @@ detection. The step-by-step procedure in SKILL.md is kept deliberately for
 smaller models, where the scaffolding is expected to matter more. See
 `docs/brainstorms/2026-07-03-docs-gate-skill-brainstorm.md` for the design
 rationale.
+
+Haiku 4.5 run (2026-07-03, same suite): 14/15. Detection fully held —
+every planted drift found, clean branch stayed clean, uncommitted change
+included — but report discipline degraded at the margins: eval 2's report
+cited `docs/roadmap.md` without a line number and skipped the "checked
+and current" section. Consistent with the keep-the-scaffolding call:
+procedure survives on a smaller model, evidence rigor is the first thing
+to slip.
