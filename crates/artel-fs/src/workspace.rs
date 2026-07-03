@@ -315,18 +315,20 @@ impl WorkspaceConfig {
     }
 }
 
-/// Which side of the sync a [`WorkspaceEvent::SkippedReadOnly`] fired
-/// on.
+/// Which side a directional [`WorkspaceEvent`] fired on.
 ///
-/// `Outgoing` covers a local change the watcher / scan refused to
-/// publish. `Incoming` covers a peer-driven event the applier /
-/// bulk-export refused to apply.
+/// For [`WorkspaceEvent::SkippedReadOnly`]: `Outgoing` covers a local
+/// change the watcher / scan refused to publish; `Incoming` covers a
+/// peer-driven event the applier / bulk-export refused to apply.
+///
+/// For [`WorkspaceEvent::RevokedPeerBlocked`]: `Incoming` is an inbound
+/// connection from the revoked peer rejected post-handshake; `Outgoing`
+/// is an outbound dial to the revoked peer refused before connecting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
-    /// A peer's change was refused at the applier or bulk-export
-    /// boundary.
+    /// A peer-originated action was refused on the receiving boundary.
     Incoming,
-    /// A local change was refused at the watcher or scan boundary.
+    /// A locally-originated action was refused on the sending boundary.
     Outgoing,
 }
 
@@ -376,6 +378,31 @@ pub enum WorkspaceEvent {
     /// write-stop); the node keeps reading peer writes. Surfaced so a
     /// consumer (e.g. a TUI send-gate) can reflect the demotion.
     Demoted,
+    /// The host revoked `peer`'s capability and this workspace's
+    /// cap-listener has applied it: from this moment the transport
+    /// gates (`PeerFilter` / `DocsGate`) block that peer. Fires on
+    /// every application, including session-log replay after a
+    /// reconnect or workspace restart — consumers should treat it as
+    /// idempotent state ("peer is out"), not an edge.
+    PeerRevoked {
+        /// The revoked peer's daemon-level id.
+        peer: PeerId,
+    },
+    /// A connection involving a revoked peer was blocked at the
+    /// transport layer. `Incoming`: the peer dialed us and the
+    /// post-handshake filter rejected it. `Outgoing`: our own iroh
+    /// node tried to dial the revoked peer (e.g. iroh-docs sync
+    /// addressing a stale member) and the dial was refused.
+    ///
+    /// Advisory: the block itself is already enforced when this
+    /// event fires. Surfaced so an orchestrator or UI can observe
+    /// that a revoked peer is still attempting to sync.
+    RevokedPeerBlocked {
+        /// The revoked peer's daemon-level id.
+        peer: PeerId,
+        /// Which side of the connection was blocked.
+        direction: Direction,
+    },
     /// Non-fatal error in the live loop. Logged for the consumer;
     /// the workspace keeps running.
     Error(String),
@@ -741,7 +768,17 @@ impl Workspace {
     ) -> Result<(Self, mpsc::Receiver<WorkspaceEvent>), WorkspaceError> {
         let daemon_peer_id = client.daemon_peer_id();
         let peer_map = Arc::new(PeerMap::new(daemon_peer_id));
-        let node = WorkspaceNode::spawn(&state_dir, endpoint_setup, Arc::clone(&peer_map)).await?;
+        // Create the event channel before the node spawns: the node's
+        // transport-layer filters (PeerFilter / DocsGate) emit
+        // `RevokedPeerBlocked` events on it.
+        let (tx, rx) = mpsc::channel(EVENT_BUFFER);
+        let node = WorkspaceNode::spawn(
+            &state_dir,
+            endpoint_setup,
+            Arc::clone(&peer_map),
+            tx.clone(),
+        )
+        .await?;
         rb.node = Some(node);
         // Borrow the node back for the rest of the constructor — it
         // moves into `Self` at the end via `rb.disarm()`.
@@ -832,7 +869,6 @@ impl Workspace {
         )
         .await?;
 
-        let (tx, rx) = mpsc::channel(EVENT_BUFFER);
         let echo_guard = EchoGuard::new();
 
         // Returning host: prune entries that no longer exist on
@@ -1177,7 +1213,17 @@ impl Workspace {
             peer_map.register(node_info.id, host_daemon_peer_id);
         }
 
-        let node = WorkspaceNode::spawn(&state_dir, endpoint_setup, Arc::clone(&peer_map)).await?;
+        // Create the event channel before the node spawns: the node's
+        // transport-layer filters (PeerFilter / DocsGate) emit
+        // `RevokedPeerBlocked` events on it.
+        let (tx, rx) = mpsc::channel(EVENT_BUFFER);
+        let node = WorkspaceNode::spawn(
+            &state_dir,
+            endpoint_setup,
+            Arc::clone(&peer_map),
+            tx.clone(),
+        )
+        .await?;
         rb.node = Some(node);
         let node = rb.node.as_ref().expect("just stored");
         // Joiners don't persist a per-workspace `doc-id` — they
@@ -1219,7 +1265,6 @@ impl Workspace {
         // because the doc state hasn't replicated yet.
         wait_for_initial_sync(live).await?;
 
-        let (tx, rx) = mpsc::channel(EVENT_BUFFER);
         let echo_guard = EchoGuard::new();
 
         bulk_export(&root, &doc, &node.blobs, &compiled_rules, &echo_guard, &tx).await?;
@@ -3872,6 +3917,7 @@ fn handle_capability_message(
     message: &SessionMessage,
     peer_map: &Arc<PeerMap>,
     host_ctx: Option<&HostUpgradeCtx>,
+    events_tx: &mpsc::Sender<WorkspaceEvent>,
 ) {
     use artel_protocol::capability::{Capability, CapabilityAction};
 
@@ -3891,6 +3937,16 @@ fn handle_capability_message(
     };
 
     peer_map.apply_capability(message.peer.id, &message.payload);
+
+    // Surface the applied revoke to the events stream. Gate on host
+    // authorship — `apply_capability` ignored anything else, so a
+    // non-host `Revoke` must not signal "peer is out" when the
+    // transport gates won't actually block it.
+    if message.peer.id == peer_map.host_peer_id()
+        && let Ok(CapabilityAction::Revoke { peer }) = CapabilityAction::decode(&message.payload)
+    {
+        emit_event(events_tx, WorkspaceEvent::PeerRevoked { peer });
+    }
 
     // Host: on RW grant, deliver the NamespaceSecret to the promoted
     // peer. Check has_rw AFTER apply so a grant whose peer was later
@@ -4006,7 +4062,7 @@ async fn handle_cap_event(
             let seq = message.seq;
             match message.kind {
                 MessageKind::Capability => {
-                    handle_capability_message(&message, peer_map, host_ctx);
+                    handle_capability_message(&message, peer_map, host_ctx, events_tx);
                 }
                 MessageKind::System if message.action == NODE_ID_ACTION => {
                     handle_node_id_message(&message, peer_map, host_ctx);
@@ -4457,6 +4513,76 @@ mod tests {
             cap: Capability::ReadWrite,
         }
         .encode()
+    }
+
+    /// Build a `MessageKind::Capability` session message authored by
+    /// `author` carrying `payload`.
+    fn capability_message(author: PeerId, payload: Vec<u8>) -> SessionMessage {
+        SessionMessage::new(
+            Seq::new(1),
+            1,
+            artel_protocol::PeerInfo::new(author, "test"),
+            MessageKind::Capability,
+            "capability",
+            payload,
+            artel_protocol::message::SIGNATURE_UNSIGNED,
+            artel_protocol::message::SIGNATURE_UNSIGNED,
+        )
+    }
+
+    // ---- PeerRevoked event emission ----
+
+    #[test]
+    fn host_revoke_emits_peer_revoked_event() {
+        use artel_protocol::capability::CapabilityAction;
+        let host = PeerId::from_bytes([0xa0; 32]);
+        let peer = PeerId::from_bytes([0xb0; 32]);
+        let peer_map = Arc::new(PeerMap::new(host));
+        let (events_tx, mut events_rx) = mpsc::channel(EVENT_BUFFER);
+
+        peer_map.apply_capability(host, &grant_rw_payload(peer));
+        let revoke = capability_message(host, CapabilityAction::Revoke { peer }.encode());
+        handle_capability_message(&revoke, &peer_map, None, &events_tx);
+
+        match events_rx.try_recv() {
+            Ok(WorkspaceEvent::PeerRevoked { peer: got }) => assert_eq!(got, peer),
+            other => panic!("expected PeerRevoked, got {other:?}"),
+        }
+        // And the projection actually blocks: the peer is revoked.
+        assert!(!peer_map.has_rw(peer));
+    }
+
+    #[test]
+    fn non_host_revoke_emits_nothing() {
+        use artel_protocol::capability::CapabilityAction;
+        let host = PeerId::from_bytes([0xa0; 32]);
+        let peer = PeerId::from_bytes([0xb0; 32]);
+        let impostor = PeerId::from_bytes([0x99; 32]);
+        let peer_map = Arc::new(PeerMap::new(host));
+        let (events_tx, mut events_rx) = mpsc::channel(EVENT_BUFFER);
+
+        peer_map.apply_capability(host, &grant_rw_payload(peer));
+        let revoke = capability_message(impostor, CapabilityAction::Revoke { peer }.encode());
+        handle_capability_message(&revoke, &peer_map, None, &events_tx);
+
+        // The impostor's revoke was ignored by the projection, so no
+        // "peer is out" signal may fire — the gates won't block them.
+        assert!(events_rx.try_recv().is_err());
+        assert!(peer_map.has_rw(peer));
+    }
+
+    #[test]
+    fn host_grant_emits_no_peer_revoked_event() {
+        let host = PeerId::from_bytes([0xa0; 32]);
+        let peer = PeerId::from_bytes([0xb0; 32]);
+        let peer_map = Arc::new(PeerMap::new(host));
+        let (events_tx, mut events_rx) = mpsc::channel(EVENT_BUFFER);
+
+        let grant = capability_message(host, grant_rw_payload(peer));
+        handle_capability_message(&grant, &peer_map, None, &events_tx);
+
+        assert!(events_rx.try_recv().is_err());
+        assert!(peer_map.has_rw(peer));
     }
 
     // ---- NODE_ID re-delivery de-storm (finding #4) ----

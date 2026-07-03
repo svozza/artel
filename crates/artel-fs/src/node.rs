@@ -98,6 +98,7 @@ impl WorkspaceNode {
         state_dir: &Path,
         setup: &EndpointSetup,
         peer_map: Arc<PeerMap>,
+        events: tokio::sync::mpsc::Sender<crate::WorkspaceEvent>,
     ) -> Result<Self, WorkspaceError> {
         let secret = artel_iroh_setup::load_or_create(&state_dir.join("iroh.key"))
             .map_err(|e| WorkspaceError::Iroh(format!("workspace key: {e}")))?;
@@ -115,7 +116,7 @@ impl WorkspaceNode {
             .apply(
                 Endpoint::builder(iroh::endpoint::presets::Empty)
                     .secret_key(secret)
-                    .hooks(PeerFilter::new(Arc::clone(&peer_map))),
+                    .hooks(PeerFilter::new(Arc::clone(&peer_map), events.clone())),
             )
             .bind()
             .await
@@ -200,7 +201,7 @@ impl WorkspaceNode {
             .accept(iroh_blobs::ALPN, blobs.clone())
             .accept(
                 iroh_docs::ALPN,
-                DocsGate::new(docs.clone(), Arc::clone(&peer_map)),
+                DocsGate::new(docs.clone(), Arc::clone(&peer_map), events),
             )
             .spawn();
 

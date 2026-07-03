@@ -120,6 +120,37 @@ pub async fn wait_for_missing(path: &Path) {
     }
 }
 
+/// Drain `rx` until `pred` matches an event, panicking after `budget`.
+/// Non-matching events are logged and dropped (the stream interleaves
+/// advisory `PeerWrote`/`Error` events with the ones under test).
+///
+/// The deterministic replacement for "sleep N seconds and hope the
+/// side-effect landed": resolves the moment the workspace surfaces
+/// the event, fails loudly with the event name on timeout.
+pub async fn wait_for_event<F>(
+    rx: &mut tokio::sync::mpsc::Receiver<WorkspaceEvent>,
+    budget: Duration,
+    what: &str,
+    mut pred: F,
+) -> WorkspaceEvent
+where
+    F: FnMut(&WorkspaceEvent) -> bool,
+{
+    timeout(budget, async {
+        loop {
+            let ev = rx.recv().await.unwrap_or_else(|| {
+                panic!("event stream closed while waiting for {what}");
+            });
+            if pred(&ev) {
+                return ev;
+            }
+            eprintln!("wait_for_event({what}): skipping {ev:?}");
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("never saw {what} within {budget:?}"))
+}
+
 /// Spawn a task that drains a [`WorkspaceEvent`] receiver to the
 /// floor for the rest of the test.
 ///
