@@ -18,13 +18,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use artel_client::Client;
-use artel_fs::{AttachPolicy, Workspace, WorkspaceConfig};
+use artel_fs::{AttachPolicy, Direction, Workspace, WorkspaceConfig, WorkspaceEvent};
 use artel_protocol::capability::CapabilityAction;
 use artel_protocol::{MessageKind, Request, Response, SendPayload};
 use tempfile::TempDir;
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 
-use common::{Pair, spawn_pair, testing_setup};
+use common::{Pair, spawn_pair, testing_setup, wait_for_event};
 
 /// After revocation + host restart, the host's outbound dial filter
 /// prevents iroh-docs from syncing with the revoked joiner.
@@ -41,7 +41,7 @@ async fn host_outbound_dial_blocked_after_revocation() {
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
     let alice_dir = TempDir::new().unwrap();
 
-    let (alice_ws, _) = Workspace::host_with(
+    let (alice_ws, mut alice_events) = Workspace::host_with(
         &alice,
         "alice",
         alice_dir.path().to_path_buf(),
@@ -124,8 +124,17 @@ async fn host_outbound_dial_blocked_after_revocation() {
         .unwrap();
     assert!(matches!(resp, Response::Sent { .. }), "{resp:?}");
 
-    // Wait for the revoke to propagate to Alice's cap-listener.
-    sleep(Duration::from_secs(2)).await;
+    // Wait until Alice's cap-listener has applied the revoke: the
+    // moment `PeerRevoked` fires, her PeerMap marks Bob revoked, and
+    // the restarted workspace below re-derives that same state from
+    // session-log replay.
+    wait_for_event(
+        &mut alice_events,
+        common::FILE_BUDGET,
+        "PeerRevoked(bob)",
+        |ev| matches!(ev, WorkspaceEvent::PeerRevoked { peer } if *peer == bob_peer_id),
+    )
+    .await;
 
     // --- Phase 3: restart Alice's workspace. ---
     // The restart forces Alice's iroh-docs engine to establish fresh
@@ -136,7 +145,7 @@ async fn host_outbound_dial_blocked_after_revocation() {
     let _ = timeout(Duration::from_secs(5), alice_handle).await;
 
     let alice2 = Client::connect(&daemon_a.socket).await.unwrap();
-    let (alice_ws2, _) = Workspace::host_with(
+    let (alice_ws2, mut alice_events2) = Workspace::host_with(
         &alice2,
         "alice",
         alice_dir.path().to_path_buf(),
@@ -156,9 +165,52 @@ async fn host_outbound_dial_blocked_after_revocation() {
         .await
         .unwrap();
 
-    // Give generous time for sync to propagate (if it could).
-    sleep(Duration::from_secs(8)).await;
+    // Force the outbound dial rather than waiting for the engine to
+    // decide to make one: after a restart, iroh-docs only dials peers
+    // recovered from its persisted useful-peers table, on its own
+    // schedule (observed flaky — some runs never dialed within the
+    // budget). `Doc::start_sync(peers)` drives the same code path a
+    // spontaneous dial would (`join_peers` → `sync_with_peer` →
+    // `Endpoint::connect`), which must pass
+    // `PeerFilter::before_connect` — the subject under test.
+    let bob_workspace_id = iroh::EndpointId::from_bytes(
+        &bob_ws
+            .test_endpoint_id_bytes()
+            .await
+            .expect("bob node live"),
+    )
+    .expect("valid endpoint id");
+    alice_ws2
+        .doc()
+        .start_sync(vec![iroh::EndpointAddr::new(bob_workspace_id)])
+        .await
+        .expect("start_sync toward bob");
 
+    // Deterministic wait: the dial attempt to Bob is refused by
+    // `PeerFilter::before_connect`, surfaced as a
+    // `RevokedPeerBlocked { Outgoing }` event. (Bob's own inbound
+    // attempts at Alice fire `Incoming` blocks too — the predicate
+    // pins the direction under test.)
+    wait_for_event(
+        &mut alice_events2,
+        common::FILE_BUDGET,
+        "RevokedPeerBlocked { bob, Outgoing }",
+        |ev| {
+            matches!(
+                ev,
+                WorkspaceEvent::RevokedPeerBlocked {
+                    peer,
+                    direction: Direction::Outgoing,
+                } if *peer == bob_peer_id
+            )
+        },
+    )
+    .await;
+
+    // With the dial provably blocked, assert the payload never landed.
+    // (No settling window needed: the blocked dial IS the only path
+    // this data could have taken to Alice — her inbound gate rejects
+    // Bob symmetrically.)
     let alice_blocked = alice_dir.path().join("after_revoke.txt");
     assert!(
         !alice_blocked.exists(),

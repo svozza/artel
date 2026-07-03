@@ -178,21 +178,25 @@ impl PeerMap {
         }
     }
 
-    /// Check whether an incoming workspace `EndpointId` belongs to a
-    /// peer that was explicitly revoked. Returns `false` (allow) for:
+    /// If the workspace `EndpointId` belongs to a peer that was
+    /// explicitly revoked, return that peer's daemon `PeerId` so the
+    /// caller can name it in the block signal it surfaces. Returns
+    /// `None` (allow) for:
     /// - Unknown `EndpointId`s (haven't seen the mapping yet)
     /// - Peers not yet granted (race: registered before grant arrives)
     /// - Read-only peers (legitimate tiered-ticket holders)
     ///
-    /// Only returns `true` for peers that once held a capability and
+    /// Only returns `Some` for peers that once held a capability and
     /// were then explicitly revoked by the host.
-    pub(crate) fn is_revoked_workspace_id(&self, workspace_id: EndpointId) -> bool {
+    pub(crate) fn revoked_daemon_peer(&self, workspace_id: EndpointId) -> Option<PeerId> {
         let id_map = self.id_map.read().unwrap();
-        let Some(&daemon_peer) = id_map.get(&workspace_id) else {
-            return false;
-        };
+        let &daemon_peer = id_map.get(&workspace_id)?;
         drop(id_map);
-        self.revoked.read().unwrap().contains(&daemon_peer)
+        self.revoked
+            .read()
+            .unwrap()
+            .contains(&daemon_peer)
+            .then_some(daemon_peer)
     }
 }
 
@@ -223,7 +227,7 @@ mod tests {
     #[test]
     fn unknown_endpoint_id_is_allowed() {
         let map = PeerMap::new(test_host());
-        assert!(!map.is_revoked_workspace_id(test_workspace_id()));
+        assert!(map.revoked_daemon_peer(test_workspace_id()).is_none());
     }
 
     #[test]
@@ -236,7 +240,7 @@ mod tests {
         map.apply_capability(host, &grant_payload(peer, Capability::ReadWrite));
         map.register(wid, peer);
 
-        assert!(!map.is_revoked_workspace_id(wid));
+        assert!(map.revoked_daemon_peer(wid).is_none());
     }
 
     #[test]
@@ -250,7 +254,7 @@ mod tests {
         map.register(wid, peer);
         map.apply_capability(host, &revoke_payload(peer));
 
-        assert!(map.is_revoked_workspace_id(wid));
+        assert_eq!(map.revoked_daemon_peer(wid), Some(peer));
     }
 
     #[test]
@@ -262,13 +266,13 @@ mod tests {
 
         map.register(wid, peer);
         // Before grant: peer absent from caps but never revoked → allowed
-        assert!(!map.is_revoked_workspace_id(wid));
+        assert!(map.revoked_daemon_peer(wid).is_none());
 
         map.apply_capability(host, &grant_payload(peer, Capability::ReadWrite));
-        assert!(!map.is_revoked_workspace_id(wid));
+        assert!(map.revoked_daemon_peer(wid).is_none());
 
         map.apply_capability(host, &revoke_payload(peer));
-        assert!(map.is_revoked_workspace_id(wid));
+        assert_eq!(map.revoked_daemon_peer(wid), Some(peer));
     }
 
     #[test]
@@ -283,11 +287,11 @@ mod tests {
         map.register(wid, peer);
         map.apply_capability(host, &grant_payload(peer, Capability::ReadWrite));
         map.apply_capability(host, &revoke_payload(peer));
-        assert!(map.is_revoked_workspace_id(wid));
+        assert_eq!(map.revoked_daemon_peer(wid), Some(peer));
 
         // Impostor grant is ignored — peer stays revoked.
         map.apply_capability(impostor, &grant_payload(peer, Capability::ReadWrite));
-        assert!(map.is_revoked_workspace_id(wid));
+        assert_eq!(map.revoked_daemon_peer(wid), Some(peer));
     }
 
     #[test]
@@ -303,7 +307,7 @@ mod tests {
         map.apply_capability(impostor, &revoke_payload(peer));
 
         // Still allowed — the non-host revoke was ignored
-        assert!(!map.is_revoked_workspace_id(wid));
+        assert!(map.revoked_daemon_peer(wid).is_none());
     }
 
     #[test]
@@ -316,7 +320,7 @@ mod tests {
         map.register(wid, peer);
         map.apply_capability(host, &grant_payload(peer, Capability::Read));
 
-        assert!(!map.is_revoked_workspace_id(wid));
+        assert!(map.revoked_daemon_peer(wid).is_none());
     }
 
     #[test]
@@ -329,10 +333,10 @@ mod tests {
         map.register(wid, peer);
         map.apply_capability(host, &grant_payload(peer, Capability::ReadWrite));
         map.apply_capability(host, &revoke_payload(peer));
-        assert!(map.is_revoked_workspace_id(wid));
+        assert_eq!(map.revoked_daemon_peer(wid), Some(peer));
 
         map.apply_capability(host, &grant_payload(peer, Capability::Read));
-        assert!(!map.is_revoked_workspace_id(wid));
+        assert!(map.revoked_daemon_peer(wid).is_none());
     }
 
     #[test]
@@ -342,7 +346,7 @@ mod tests {
         let host_wid = EndpointId::from_bytes(&[10; 32]).unwrap();
         map.register(host_wid, host);
 
-        assert!(!map.is_revoked_workspace_id(host_wid));
+        assert!(map.revoked_daemon_peer(host_wid).is_none());
     }
 
     #[test]

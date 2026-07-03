@@ -63,6 +63,8 @@ Workspace::join_with(&client, name, root, ticket, rules, ...)
 - `SkippedTooLarge { path, size }` — a file exceeded the size cap (either direction).
 - `SkippedReadOnly { path, direction }` — a path-event was skipped by your `PathRules`. One event per skipped path-event, no coalescing — a `target/**: ReadOnly` rule with chatty editor saves will be noisy; dedupe in your app if needed.
 - `Demoted` — the host cooperatively downgraded this node RW → Read; the workspace has stopped publishing local changes. Reflect it in your UI (e.g. flip a send-gate).
+- `PeerRevoked { peer }` — this workspace's cap-listener applied a host-authored revoke; from this moment the transport gates block that peer. Fires on every application, including session-log replay after a reconnect or restart — treat it as idempotent state ("peer is out"), not an edge.
+- `RevokedPeerBlocked { peer, direction }` — a connection involving a revoked peer was blocked at the transport layer (`Incoming`: the peer dialed us and was rejected; `Outgoing`: our own engine's dial to the stale member was refused). Advisory — the block is already enforced when it fires; useful for surfacing "a revoked peer is still knocking" in an orchestrator or UI.
 - `Error(String)` — non-fatal error in the live loop; the workspace keeps running.
 
 **React to `PeerWrote` rather than polling** if your app wants to know when synced files change — but treat the stream as **advisory, not guaranteed**: the live loops drop events rather than block when your consumer is slow (a blocked consumer would freeze replication for the whole namespace). Sync itself is unaffected — the files on disk are always right. If you need a complete picture, rescan the workspace directory; use events as the trigger, not the record.

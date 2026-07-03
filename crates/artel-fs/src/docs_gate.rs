@@ -17,29 +17,50 @@ use iroh::endpoint::{Connection, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh_docs::protocol::Docs;
 use n0_error::e;
+use tokio::sync::mpsc;
 
 use crate::peer_map::PeerMap;
+use crate::workspace::{Direction, WorkspaceEvent, emit_event};
 
 #[derive(Debug, Clone)]
 pub(crate) struct DocsGate {
     inner: Docs,
     peer_map: Arc<PeerMap>,
+    /// Surfaces a [`WorkspaceEvent::RevokedPeerBlocked`] per reject.
+    /// Non-blocking (`emit_event`): the accept path must never park
+    /// on a slow event consumer.
+    events: mpsc::Sender<WorkspaceEvent>,
 }
 
 impl DocsGate {
-    pub(crate) const fn new(inner: Docs, peer_map: Arc<PeerMap>) -> Self {
-        Self { inner, peer_map }
+    pub(crate) const fn new(
+        inner: Docs,
+        peer_map: Arc<PeerMap>,
+        events: mpsc::Sender<WorkspaceEvent>,
+    ) -> Self {
+        Self {
+            inner,
+            peer_map,
+            events,
+        }
     }
 }
 
 impl ProtocolHandler for DocsGate {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let remote_id = connection.remote_id();
-        if self.peer_map.is_revoked_workspace_id(remote_id) {
+        if let Some(peer) = self.peer_map.revoked_daemon_peer(remote_id) {
             tracing::warn!(
                 target: "artel_fs::docs_gate",
                 %remote_id,
                 "rejected connection from revoked peer",
+            );
+            emit_event(
+                &self.events,
+                WorkspaceEvent::RevokedPeerBlocked {
+                    peer,
+                    direction: Direction::Incoming,
+                },
             );
             connection.close(VarInt::from_u32(1), b"revoked");
             return Err(e!(AcceptError::NotAllowed));

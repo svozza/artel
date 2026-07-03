@@ -3,9 +3,13 @@
 //! Exercises the full revocation flow:
 //! 1. Host + joiner set up workspaces with `daemon_socket` wired.
 //! 2. Joiner writes a file → host sees it (baseline: sync works).
-//! 3. Host revokes joiner via a `Capability/Revoke` session message.
+//! 3. Host revokes joiner via a `Capability/Revoke` session message
+//!    and observes `WorkspaceEvent::PeerRevoked` (the cap-listener
+//!    applied it — the gates are armed).
 //! 4. Joiner restarts (forces a fresh connection attempt).
-//! 5. The gate rejects the joiner's inbound sync connection.
+//! 5. The host observes `WorkspaceEvent::RevokedPeerBlocked
+//!    { Incoming }`: the joiner's inbound sync connection was
+//!    rejected at the transport layer.
 //!
 //! This test validates the inbound rejection path. The outbound half
 //! (host's iroh-docs engine blocked from dialing revoked peers) is
@@ -17,17 +21,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use artel_client::Client;
-use artel_fs::{AttachPolicy, Workspace, WorkspaceConfig};
+use artel_fs::{AttachPolicy, Direction, Workspace, WorkspaceConfig, WorkspaceEvent};
 use artel_protocol::capability::CapabilityAction;
 use artel_protocol::{MessageKind, Request, Response, SendPayload};
 use tempfile::TempDir;
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 
-use common::{Pair, spawn_pair, testing_setup};
+use common::{Pair, spawn_pair, testing_setup, wait_for_event};
 
-/// Prove the full cap-listener + `PeerMap` + `DocsGate` pipeline works:
-/// after revocation and reconnection, the gate rejects the peer's
-/// inbound sync connection.
+/// Prove the full cap-listener + `PeerMap` + transport-gate pipeline
+/// works: after revocation and reconnection, the peer's inbound sync
+/// connection is rejected — observed as
+/// `WorkspaceEvent::RevokedPeerBlocked { Incoming }` on the host's
+/// event stream.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn revoked_peer_inbound_sync_rejected_after_reconnect() {
@@ -41,7 +47,7 @@ async fn revoked_peer_inbound_sync_rejected_after_reconnect() {
     let alice = Client::connect(&daemon_a.socket).await.unwrap();
     let alice_dir = TempDir::new().unwrap();
 
-    let (alice_ws, _) = Workspace::host_with(
+    let (alice_ws, mut alice_events) = Workspace::host_with(
         &alice,
         "alice",
         alice_dir.path().to_path_buf(),
@@ -123,17 +129,31 @@ async fn revoked_peer_inbound_sync_rejected_after_reconnect() {
         .unwrap();
     assert!(matches!(resp, Response::Sent { .. }), "{resp:?}");
 
-    // Wait for the revoke to propagate to Alice's cap-listener.
-    sleep(Duration::from_secs(2)).await;
+    // Wait until Alice's cap-listener has applied the revoke — the
+    // moment `PeerRevoked` fires, the transport gates block Bob. Only
+    // now is it safe to let Bob reconnect: earlier, his fresh
+    // connection would be accepted and held open by iroh-docs,
+    // and no rejection would ever fire.
+    wait_for_event(
+        &mut alice_events,
+        common::FILE_BUDGET,
+        "PeerRevoked(bob)",
+        |ev| matches!(ev, WorkspaceEvent::PeerRevoked { peer } if *peer == bob_peer_id),
+    )
+    .await;
 
     // --- Phase 2b: restart Bob's workspace to force a fresh connection.
-    // The gate only fires on new accept() calls. iroh-docs holds the
+    // The gate only fires on new connections. iroh-docs holds the
     // sync connection from phase 1 open, so we must force a reconnect.
     bob_ws.shutdown().await.expect("bob phase-1 shutdown");
     let _ = timeout(Duration::from_secs(5), bob_handle).await;
 
     // Re-join: Bob's docs node re-opens its replica and tries to dial
-    // Alice for sync — hitting Alice's DocsGate which now rejects.
+    // Alice for sync — hitting Alice's transport gates which now
+    // reject. Bob's own outbound dial to Alice is NOT filtered on his
+    // side (his PeerMap tracks peers revoked *by the host*, and he is
+    // the revoked one), so the attempt reaches Alice and her inbound
+    // rejection is what we observe below.
     let bob2 = Client::connect(&daemon_b.socket).await.unwrap();
     let (bob_ws2, _) = Workspace::join_with(
         &bob2,
@@ -149,26 +169,34 @@ async fn revoked_peer_inbound_sync_rejected_after_reconnect() {
     let bob_ws2 = Arc::new(bob_ws2);
     let bob_handle2 = Arc::clone(&bob_ws2).run().await;
 
-    // --- Phase 3: Bob writes — verify it does NOT arrive at Alice
-    // via the inbound path. Give enough time for the write to
-    // propagate through Bob's watcher → doc → sync attempt.
+    // Bob writes post-revoke, giving his docs engine a reason to keep
+    // dialing Alice in case the join-time sync attempt raced the
+    // event wiring.
     let blocked_path = bob_dir.path().join("after_revoke.txt");
     tokio::fs::write(&blocked_path, b"should be blocked")
         .await
         .unwrap();
 
-    // Wait 5 seconds. Alice may still pull from Bob via an outbound
-    // dial — this test asserts only the inbound path; the outbound
-    // half (`PeerFilter::before_connect`) is covered by
-    // `outbound_dial_filter.rs` (see the header).
-    sleep(Duration::from_secs(5)).await;
-
-    // The file arriving here does NOT mean the gate failed — it means
-    // Alice's iroh-docs engine dialed Bob outbound (bidirectional
-    // sync). What matters is that the gate DID reject at least one
-    // inbound attempt, visible as a `tracing::warn` reject in the
-    // captured log. For CI, we just assert the test didn't panic
-    // during setup/teardown.
+    // --- Phase 3: the assertion this test exists for. Alice's
+    // transport layer (PeerFilter::after_handshake, or the DocsGate
+    // defense-in-depth behind it) rejected an inbound connection from
+    // the revoked Bob. Deterministic: resolves the moment the
+    // rejection fires instead of sleeping a fixed window.
+    wait_for_event(
+        &mut alice_events,
+        common::FILE_BUDGET,
+        "RevokedPeerBlocked { bob, Incoming }",
+        |ev| {
+            matches!(
+                ev,
+                WorkspaceEvent::RevokedPeerBlocked {
+                    peer,
+                    direction: Direction::Incoming,
+                } if *peer == bob_peer_id
+            )
+        },
+    )
+    .await;
 
     // Cleanup
     alice_ws.shutdown().await.expect("alice shutdown");
