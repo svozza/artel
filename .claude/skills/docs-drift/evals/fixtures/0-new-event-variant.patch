@@ -1,0 +1,19 @@
+diff --git a/crates/artel-fs/src/workspace.rs b/crates/artel-fs/src/workspace.rs
+index 780e6c2..873b526 100644
+--- a/crates/artel-fs/src/workspace.rs
++++ b/crates/artel-fs/src/workspace.rs
+@@ -403,6 +403,14 @@ pub enum WorkspaceEvent {
+         /// Which side of the connection was blocked.
+         direction: Direction,
+     },
++    /// The initial bulk scan of the workspace root finished and the
++    /// watcher is now live. Emitted exactly once per workspace start;
++    /// consumers that defer UI readiness until the first full sweep
++    /// can key off this instead of heuristically waiting.
++    ScanCompleted {
++        /// Number of files the sweep published.
++        published: u64,
++    },
+     /// Non-fatal error in the live loop. Logged for the consumer;
+     /// the workspace keeps running.
+     Error(String),
