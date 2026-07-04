@@ -31,10 +31,15 @@ pub const UPGRADE_ACK: u8 = 0x01;
 /// Cap on one encoded [`DeliveryFrame`] (postcard bytes, excluding
 /// the 4-byte length prefix).
 ///
-/// Shared by the sender and the receiving protocol handler so the two
-/// can't drift: a frame one side will emit, the other will accept.
-/// Raised from the secret-only 1 KiB when `WorkspaceTicket` joined the
-/// channel — envelopes carry user-authored `PathRules` globs.
+/// Enforced by the receiving protocol handler before it allocates the
+/// payload. Senders stay under it by construction rather than by
+/// checking this constant: `Secret` and `Downgrade` are fixed-size,
+/// `Rotate` carries an encoded `DocTicket` (small in practice), and
+/// `WorkspaceTicket` is bounded at every producer site by
+/// [`WORKSPACE_TICKET_ENVELOPE_MAX`], whose headroom guarantees the
+/// framed bytes clear this cap. Raised from the secret-only 1 KiB when
+/// `WorkspaceTicket` joined the channel — envelopes carry
+/// user-authored `PathRules` globs.
 pub const MAX_DELIVERY_FRAME: usize = 64 * 1024;
 
 /// Cap on the raw `WorkspaceTicketEnvelope` bytes accepted anywhere

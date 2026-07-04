@@ -67,7 +67,7 @@ let (session, ticket) = match resp {
 
 // Subscribe to the session's event stream and send a message.
 client.request(Request::Subscribe { session, since: None }).await?;
-client.request(Request::Send { session, payload }).await?; // payload: app-chosen bytes
+client.request(Request::Send { session, payload }).await?; // payload: SendPayload { kind, action, payload: app-chosen bytes }
 let mut events = client.take_events().await.expect("event stream");
 while let Some(event) = events.recv().await { /* render */ }
 ```

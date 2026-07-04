@@ -12,8 +12,12 @@
 //! at the host's `send` chokepoint.
 //!
 //! Two tiers for v1: [`Capability::Read`] (subscribe + consume) and
-//! [`Capability::ReadWrite`] (author messages — and the right to grant /
-//! revoke). A peer absent from the cap set is treated as `Read`-only for
+//! [`Capability::ReadWrite`] (author messages). Grant/revoke *authority*
+//! is host-only in v1: any `ReadWrite` holder can author a `Capability`
+//! message, but the projection ignores it unless the host authored it
+//! (tightened from the original "any RW holder" rule to stop a malicious
+//! joiner revoking peers). A peer absent from the cap set is treated as
+//! `Read`-only for
 //! write checks — "absent ⇒ Read" is the floor, so a
 //! [`CapabilityAction::Revoke`] is just removal from the set.
 
@@ -50,15 +54,16 @@ pub enum Capability {
     /// May subscribe to the session and consume its log, but may not
     /// author non-capability messages.
     Read,
-    /// Full access: author messages **and** issue [`CapabilityAction`]
-    /// grants / revokes (brainstorm Q2 — grant authority rides on
-    /// `ReadWrite`, there is no separate `Admin` tier in v1).
+    /// Full access: author messages of any kind, including
+    /// [`CapabilityAction`] carriers. Grant/revoke *authority* is
+    /// host-only in v1 (a non-host `Capability` message is inert at
+    /// projection); there is no separate `Admin` tier.
     ReadWrite,
 }
 
 impl Capability {
-    /// Whether this tier permits authoring non-capability messages (and,
-    /// per Q2, issuing grants / revokes).
+    /// Whether this tier permits authoring messages. (Grant/revoke
+    /// authority is a separate, host-only rule — see the module doc.)
     ///
     /// The single source of the "can write" rule, so the enforcement
     /// sites in the daemon don't each re-encode it.
