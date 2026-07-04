@@ -1,9 +1,8 @@
 //! Request / response / event types for the daemon ↔ client RPC.
 //!
 //! See ADR-001 § "RPC surface". The IPC framing (length prefix, transport)
-//! is intentionally not specified here — both `artel-daemon` and
-//! `artel-client` agree on a separate framing convention. This module only
-//! defines the *payload* of each frame.
+//! is intentionally not specified here — it lives in `crate::transport`
+//! (feature `tokio`). This module only defines the *payload* of each frame.
 
 use serde::{Deserialize, Serialize};
 
