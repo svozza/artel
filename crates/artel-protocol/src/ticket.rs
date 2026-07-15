@@ -6,9 +6,9 @@
 //! `postcard`-encoded [`SessionTicket`].
 //!
 //! The bytes carry a wire version, the [`TicketId`], the
-//! [`SessionId`], the host daemon's [`PeerId`], a
-//! [`WireEndpointAddr`] describing how to reach the host on the iroh
-//! network, and the tiered-capability fields (`granted_cap`,
+//! [`SessionId`], a [`WireEndpointAddr`] describing how to reach the
+//! host on the iroh network (which itself carries the host daemon's
+//! [`PeerId`]), and the tiered-capability fields (`granted_cap`,
 //! `expiry_ms`, `cap_sig`). Workspace doc tickets do not ride here —
 //! they are delivered separately as a `DeliveryFrame::WorkspaceTicket`
 //! over the direct stream.
@@ -37,15 +37,20 @@ use crate::ids::{PeerId, SessionId, TicketId};
 use crate::message::SigBytes;
 
 /// Current ticket envelope version. Incremented when the structure
-/// of the `Wire` payload changes in a way old daemons can't
-/// understand.
+/// of the wire payload changes in a way old daemons can't understand.
 ///
 /// Bumped to `4` on 2026-06-05 when tiered tickets landed:
 /// [`SessionTicket::granted_cap`], [`SessionTicket::expiry_ms`], and
 /// [`SessionTicket::cap_sig`] joined the wire form. The host signs
 /// the cap claim under `"artel/ticket-cap-v1"` and verifies its own
 /// signature at admission — stateless bearer-token capability.
-pub const TICKET_VERSION: u8 = 4;
+///
+/// Bumped to `5` on 2026-07-15 (finding #4): the redundant top-level
+/// `host_peer_id` was removed from the wire body — the host `PeerId`
+/// now lives only inside `host_addr`. This drops 32 bytes and makes the
+/// two-copies-disagree state unrepresentable, but it reshapes the body,
+/// so v4 and v5 are wire-incompatible.
+pub const TICKET_VERSION: u8 = 5;
 
 /// Prefix shared by every well-formed ticket. Distinguishes artel
 /// tickets from raw base32 input and makes obsolete `artel-local:`
@@ -98,6 +103,13 @@ pub struct TicketEntry {
 }
 
 /// Decoded form of an artel join ticket.
+///
+/// The host daemon's [`PeerId`] is **not** a separate field: it lives
+/// once, in `host_addr.peer_id`, and is read via [`Self::host_peer_id`].
+/// A previous version carried it both at the top level and inside
+/// `host_addr`, which had to agree — [`encode`] didn't enforce that, so
+/// it could mint a ticket its own [`decode`] rejected. Storing it once
+/// makes the two-copies-disagree state unrepresentable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionTicket {
     /// Unique id naming this issued ticket. Enforced at admission
@@ -108,15 +120,12 @@ pub struct SessionTicket {
     /// The host session's id. Joiners use this to identify which
     /// session they're joining.
     pub session_id: SessionId,
-    /// The host daemon's [`PeerId`]. Identical to
-    /// `host_addr.peer_id`; kept as a top-level field so callers can
-    /// route by id without parsing the addr.
-    pub host_peer_id: PeerId,
-    /// How to reach the host daemon on the iroh network: zero or one
-    /// home-relay URL, plus zero or more direct socket addresses.
-    /// May be empty if the host has no published transport addresses
-    /// yet, in which case dialers fall back to whatever address-
-    /// lookup mechanism is configured.
+    /// How to reach the host daemon on the iroh network: the host's
+    /// [`PeerId`] plus zero or one home-relay URL and zero or more
+    /// direct socket addresses. The relay/direct parts may be empty if
+    /// the host has no published transport addresses yet, in which case
+    /// dialers fall back to whatever address-lookup mechanism is
+    /// configured. Read the host id via [`Self::host_peer_id`].
     pub host_addr: WireEndpointAddr,
     /// Capability tier this ticket grants the bearer on admission.
     pub granted_cap: Capability,
@@ -130,14 +139,25 @@ pub struct SessionTicket {
     pub cap_sig: SigBytes,
 }
 
+impl SessionTicket {
+    /// The host daemon's [`PeerId`] — the single stored copy, from
+    /// `host_addr.peer_id`. Callers route by id without parsing the
+    /// rest of the addr.
+    #[must_use]
+    pub const fn host_peer_id(&self) -> PeerId {
+        self.host_addr.peer_id
+    }
+}
+
 /// Wire-friendly mirror of `iroh::EndpointAddr`. Lives in
 /// `artel-protocol` so the wire format stays iroh-free; the daemon
 /// converts to/from the iroh type at the boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireEndpointAddr {
-    /// Same bytes as the parent ticket's `host_peer_id`. Carried here
-    /// too so the addr is self-contained — the daemon can hand the
-    /// whole struct to iroh without re-stitching.
+    /// The host daemon's [`PeerId`] — the ticket's single copy of it
+    /// ([`SessionTicket::host_peer_id`] reads it from here). Kept inside
+    /// the addr so the struct is self-contained: the daemon can hand the
+    /// whole thing to iroh without re-stitching.
     pub peer_id: PeerId,
     /// Home relay URL as a string (we don't pull `url::Url` into the
     /// protocol crate). Empty when the host has no relay configured.
@@ -197,16 +217,12 @@ pub enum TicketError {
 /// and no untrusted field is deserialized under a version this build
 /// doesn't understand.
 ///
-/// This is byte-compatible with the previous layout, where `version`
-/// was the first field of the combined struct: postcard encodes a `u8`
-/// as a bare leading byte with no struct framing, so
-/// `[TICKET_VERSION] ++ postcard(WireBody)` reproduces the old
-/// `postcard(Wire)` output exactly. No [`TICKET_VERSION`] bump needed.
+/// The host `PeerId` appears exactly once, inside `host_addr` — there is
+/// no separate top-level copy to disagree with it (finding #4).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WireBody {
     ticket_id: TicketId,
     session_id: SessionId,
-    host_peer_id: PeerId,
     host_addr: WireEndpointAddr,
     granted_cap: Capability,
     expiry_ms: u64,
@@ -230,7 +246,6 @@ pub fn encode(ticket: &SessionTicket) -> String {
     let body = WireBody {
         ticket_id: ticket.ticket_id,
         session_id: ticket.session_id,
-        host_peer_id: ticket.host_peer_id,
         host_addr: ticket.host_addr.clone(),
         granted_cap: ticket.granted_cap,
         expiry_ms: ticket.expiry_ms,
@@ -258,9 +273,12 @@ pub fn encode(ticket: &SessionTicket) -> String {
 /// start with [`TICKET_PREFIX`], [`TicketError::InvalidBase32`] if the
 /// body is not valid base32, [`TicketError::UnsupportedVersion`] if the
 /// leading version byte is not [`TICKET_VERSION`], and
-/// [`TicketError::Malformed`] if the frame is empty, the remaining bytes
-/// do not postcard-decode into the wire body, or its `host_addr.peer_id`
-/// disagrees with its `host_peer_id`.
+/// [`TicketError::Malformed`] if the frame is empty or the remaining
+/// bytes do not postcard-decode into the wire body.
+///
+/// There is no longer a host-id self-consistency check: the host
+/// `PeerId` is stored once (in `host_addr`), so there is no second copy
+/// to disagree with it (finding #4).
 pub fn decode(raw: &str) -> Result<SessionTicket, TicketError> {
     let trimmed: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
     let body = trimmed
@@ -279,18 +297,9 @@ pub fn decode(raw: &str) -> Result<SessionTicket, TicketError> {
     }
     let wire: WireBody =
         postcard::from_bytes(rest).map_err(|e| TicketError::Malformed(e.to_string()))?;
-    if wire.host_addr.peer_id != wire.host_peer_id {
-        // Self-consistency check: the addr's peer id has to match
-        // the ticket-level host id. A mismatch means tampering or
-        // cross-version drift; either way, refuse it.
-        return Err(TicketError::Malformed(
-            "host_addr.peer_id does not match host_peer_id".into(),
-        ));
-    }
     Ok(SessionTicket {
         ticket_id: wire.ticket_id,
         session_id: wire.session_id,
-        host_peer_id: wire.host_peer_id,
         host_addr: wire.host_addr,
         granted_cap: wire.granted_cap,
         expiry_ms: wire.expiry_ms,
@@ -323,7 +332,6 @@ mod tests {
         SessionTicket {
             ticket_id: TicketId::from_bytes([0x01; 16]),
             session_id: SessionId::from_bytes([0xab; 16]),
-            host_peer_id: peer,
             host_addr: WireEndpointAddr::id_only(peer),
             granted_cap: Capability::ReadWrite,
             expiry_ms: 0,
@@ -339,7 +347,6 @@ mod tests {
         SessionTicket {
             ticket_id: TicketId::from_bytes([0x02; 16]),
             session_id: SessionId::from_bytes([0xcd; 16]),
-            host_peer_id: peer,
             host_addr: WireEndpointAddr {
                 peer_id: peer,
                 relay_url: "https://relay.example.com".into(),
@@ -428,7 +435,6 @@ mod tests {
         let bogus = WireBody {
             ticket_id: TicketId::from_bytes([0; 16]),
             session_id: SessionId::from_bytes([0; 16]),
-            host_peer_id: peer,
             host_addr: WireEndpointAddr::id_only(peer),
             granted_cap: Capability::Read,
             expiry_ms: 0,
@@ -453,33 +459,36 @@ mod tests {
     }
 
     #[test]
-    fn host_peer_id_addr_mismatch_errors_as_malformed() {
-        let bad = WireBody {
-            ticket_id: TicketId::from_bytes([3; 16]),
-            session_id: SessionId::from_bytes([1; 16]),
-            host_peer_id: PeerId::from_bytes([0xaa; 32]),
-            host_addr: WireEndpointAddr::id_only(PeerId::from_bytes([0xbb; 32])),
+    fn host_peer_id_reads_from_host_addr() {
+        // Finding #4: the host id has exactly one home — `host_addr` —
+        // so `host_peer_id()` always agrees with it by construction.
+        // There is no separate field that could disagree, and thus no
+        // decode-time cross-check to fail.
+        let peer = PeerId::from_bytes([0x9c; 32]);
+        let ticket = SessionTicket {
+            ticket_id: TicketId::from_bytes([1; 16]),
+            session_id: SessionId::from_bytes([2; 16]),
+            host_addr: WireEndpointAddr::id_only(peer),
             granted_cap: Capability::Read,
             expiry_ms: 0,
             cap_sig: SIGNATURE_UNSIGNED,
         };
-        let raw = raw_frame(TICKET_VERSION, &bad);
-        match decode(&raw) {
-            Err(TicketError::Malformed(msg)) => assert!(
-                msg.contains("host_addr.peer_id"),
-                "msg should mention the field: {msg}",
-            ),
-            other => panic!("expected Malformed, got {other:?}"),
-        }
+        assert_eq!(ticket.host_peer_id(), peer);
+        assert_eq!(ticket.host_peer_id(), ticket.host_addr.peer_id);
+        // Round-trips and still agrees after decode.
+        let decoded = decode(&encode(&ticket)).unwrap();
+        assert_eq!(decoded.host_peer_id(), peer);
+        assert_eq!(decoded.host_peer_id(), decoded.host_addr.peer_id);
     }
 
     #[test]
     fn ticket_text_for_id_only_is_paste_friendly() {
         // id-only (no relay, no direct addrs) = 1 (ver) + 16 (ticket_id) +
-        // 16 (session_id) + 32 (peer id) + 32 (addr peer id) + 0 (empty
-        // relay) + 0 (empty addrs) + 1 (cap) + 8 (expiry) + 64 (cap_sig)
-        // ≈ ~170 bytes postcard. base32 encodes at 8:5, so ~272 chars +
-        // "artel:" prefix. Fits on two terminal lines; still paste-friendly.
+        // 16 (session_id) + 32 (addr peer id) + 0 (empty relay) + 0 (empty
+        // addrs) + 1 (cap) + 8 (expiry) + 64 (cap_sig) ≈ ~138 bytes
+        // postcard (32 fewer than v4, which carried the host id twice).
+        // base32 encodes at 8:5, so ~222 chars + "artel:" prefix. Fits on
+        // two terminal lines; still paste-friendly.
         let encoded = encode(&sample());
         assert!(
             encoded.len() <= 300,
@@ -497,22 +506,20 @@ mod tests {
     }
 
     #[test]
-    fn ticket_version_is_four() {
-        // Deliberately unchanged by the revocation slice: TicketId has
-        // been on the wire since v3, so enforcement needs no bump. Also
-        // unchanged by the version-dispatch refactor (finding #2): the
-        // version moved *out* of the postcard body to a leading byte,
-        // but the byte layout — and thus the version — is identical.
-        assert_eq!(TICKET_VERSION, 4);
+    fn ticket_version_is_five() {
+        // v4 landed tiered tickets; v5 (finding #4) removed the
+        // redundant top-level host_peer_id from the wire body. A bump
+        // guards a v4 daemon from mis-parsing a v5 body (host id no
+        // longer sits where v4 expects it).
+        assert_eq!(TICKET_VERSION, 5);
     }
 
     #[test]
     fn encoded_frame_is_version_byte_then_postcard_body() {
         // Pin the wire layout: the decoded frame must be exactly
-        // [TICKET_VERSION] followed by postcard(WireBody). This is what
-        // keeps the version-outside-the-body refactor byte-compatible
-        // with the old version-first-field-of-Wire encoding, and guards
-        // against anyone folding the version back into the body.
+        // [TICKET_VERSION] followed by postcard(WireBody), with the
+        // version living *outside* the postcard body. Guards against
+        // anyone folding the version back into the body (finding #2).
         let ticket = sample();
         let encoded = encode(&ticket);
         let frame = BASE32_NOPAD
@@ -529,7 +536,6 @@ mod tests {
         let body = WireBody {
             ticket_id: ticket.ticket_id,
             session_id: ticket.session_id,
-            host_peer_id: ticket.host_peer_id,
             host_addr: ticket.host_addr.clone(),
             granted_cap: ticket.granted_cap,
             expiry_ms: ticket.expiry_ms,
@@ -603,18 +609,22 @@ mod tests {
 
     #[test]
     fn previous_version_byte_is_now_unsupported() {
+        // A v4 frame (the version immediately before the finding-#4
+        // reshape) must be declined, not mis-parsed. We stamp version 4
+        // onto the current body shape purely to exercise the version
+        // gate; the body contents are irrelevant since dispatch happens
+        // first.
         let peer = PeerId::from_bytes([0x55; 32]);
         let prev = WireBody {
             ticket_id: TicketId::from_bytes([0x44; 16]),
             session_id: SessionId::from_bytes([0x66; 16]),
-            host_peer_id: peer,
             host_addr: WireEndpointAddr::id_only(peer),
             granted_cap: Capability::ReadWrite,
             expiry_ms: 0,
             cap_sig: SIGNATURE_UNSIGNED,
         };
-        let raw = raw_frame(3, &prev);
-        assert_eq!(decode(&raw), Err(TicketError::UnsupportedVersion(3)));
+        let raw = raw_frame(4, &prev);
+        assert_eq!(decode(&raw), Err(TicketError::UnsupportedVersion(4)));
     }
 
     proptest! {
@@ -632,7 +642,6 @@ mod tests {
             let original = SessionTicket {
                 ticket_id: TicketId::from_bytes(tid),
                 session_id: SessionId::from_bytes(sid),
-                host_peer_id,
                 host_addr: WireEndpointAddr::id_only(host_peer_id),
                 granted_cap,
                 expiry_ms: expiry,
