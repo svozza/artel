@@ -339,6 +339,80 @@ pub fn topic_for(session: artel_protocol::SessionId) -> iroh_gossip::proto::Topi
     iroh_gossip::proto::TopicId::from_bytes(bytes)
 }
 
+/// A bare iroh `Endpoint` + `Gossip` actor with no daemon behind it —
+/// a genuinely third-party gossip peer for tests that need to inject a
+/// hand-crafted frame and observe it actually cross the network.
+///
+/// **Why this exists, not `daemon_x.gossip` directly:** iroh-gossip's
+/// plumtree only pushes a `broadcast()` call to REMOTE eager/lazy
+/// peers — the local node that calls `broadcast()` never receives its
+/// own frame back as `Event::Received`, even if it holds its own
+/// separate subscription to the same topic (same `TopicId` inside the
+/// same per-process `Gossip` actor resolves to one shared
+/// `TopicState`). So injecting a forged/replayed frame via
+/// `daemon_b.gossip.subscribe(...)` and broadcasting from that same
+/// handle never reaches `daemon_b`'s OWN bridge forwarder — only a
+/// genuinely separate peer's `Event::Received` fires. Use this struct
+/// as the injection point instead of a `RunningDaemon`'s `gossip`
+/// field whenever the assertion is "peer X must / must not act on this
+/// frame" for one of the two daemons already in the test.
+pub struct RawGossipPeer {
+    pub gossip: iroh_gossip::net::Gossip,
+    endpoint: iroh::Endpoint,
+    router: iroh::protocol::Router,
+}
+
+impl RawGossipPeer {
+    /// Bind a fresh endpoint (random key) against [`EndpointSetup::Testing`]
+    /// and spawn a `Gossip` actor + `Router` (accepting
+    /// `iroh_gossip::ALPN` — without this, other peers' dials to join
+    /// this peer's mesh would have nothing to accept the connection).
+    /// Waits for the pkarr record to publish before returning so an
+    /// immediate `subscribe` with this peer as bootstrap doesn't race
+    /// the publish.
+    pub async fn spawn(dns_pkarr: &Arc<DnsPkarrServer>) -> Self {
+        let this = Self::spawn_with_setup(testing_setup(dns_pkarr)).await;
+        dns_pkarr
+            .on_endpoint(&this.id(), PKARR_READY_TIMEOUT)
+            .await
+            .expect("raw gossip peer: pkarr publish");
+        this
+    }
+
+    /// Same as [`Self::spawn`] but for the real-n0 (`ProductionCustomRelay`)
+    /// Tier C setup, where there's no in-process `DnsPkarrServer` to
+    /// wait on — n0's DNS/pkarr propagation is the readiness gate, and
+    /// callers already tolerate that latency elsewhere in Tier C.
+    pub async fn spawn_n0(setup: artel_daemon::EndpointSetup) -> Self {
+        Self::spawn_with_setup(setup).await
+    }
+
+    async fn spawn_with_setup(setup: artel_daemon::EndpointSetup) -> Self {
+        let endpoint = setup
+            .apply(iroh::Endpoint::builder(iroh::endpoint::presets::Empty))
+            .bind()
+            .await
+            .expect("raw gossip peer: bind endpoint");
+        let gossip = iroh_gossip::net::Gossip::builder().spawn(endpoint.clone());
+        let router = iroh::protocol::Router::builder(endpoint.clone())
+            .accept(iroh_gossip::ALPN, gossip.clone())
+            .spawn();
+        Self {
+            gossip,
+            endpoint,
+            router,
+        }
+    }
+
+    pub fn id(&self) -> iroh::EndpointId {
+        self.endpoint.id()
+    }
+
+    pub async fn shutdown(self) {
+        let _ = self.router.shutdown().await;
+    }
+}
+
 /// Drain `events` until a `PeerJoined` for `peer_id` arrives; panic
 /// after 20 s. Deadline-aware (tolerates spurious per-recv timeouts),
 /// the same loop shape as [`expect_message_with_payload`].

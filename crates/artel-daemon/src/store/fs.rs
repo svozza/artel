@@ -75,6 +75,16 @@ const WORKSPACE_TICKET_FILE: &str = "workspace-ticket.bin";
 /// a put the store accepts is one the loader and the wire accept too.
 /// A larger sidecar can only be corruption.
 const WORKSPACE_TICKET_MAX: u64 = artel_protocol::upgrade::WORKSPACE_TICKET_ENVELOPE_MAX as u64;
+/// Root-level subdirectory holding one small JSON file per session id,
+/// tracking the lowest `host_epoch` a fresh [`FsLogStore::create`] of
+/// that id may use (session-ID-reuse replay finding). Deliberately a
+/// **sibling** of the per-session directories, not inside one: `delete`
+/// only `remove_dir_all`s a session's own directory, so a floor here
+/// survives a full close-and-recreate of the same session id — the
+/// exact case the floor exists to protect against. Entries are never
+/// removed; the directory grows by one tiny file per session id ever
+/// hosted, which is the intended permanent record.
+const EPOCH_FLOORS_DIR: &str = "epoch_floors";
 /// Per-session subdirectory for opaque consumer attachments.
 const ATTACHMENTS_DIR: &str = "attachments";
 /// Suffix on attachment files; the prefix is the kind, hex-encoded.
@@ -130,15 +140,31 @@ impl FsLogStore {
     fn session_dir(&self, id: SessionId) -> PathBuf {
         self.root.join(id.to_string())
     }
+
+    /// Path to `id`'s epoch-floor sidecar under [`EPOCH_FLOORS_DIR`] —
+    /// a sibling of the session directory, not inside it, so it
+    /// survives that directory's removal. See [`EPOCH_FLOORS_DIR`].
+    fn epoch_floor_path(&self, id: SessionId) -> PathBuf {
+        self.root.join(EPOCH_FLOORS_DIR).join(format!("{id}.json"))
+    }
 }
 
 #[async_trait]
 impl SessionStore for FsLogStore {
     async fn create(&self, record: &SessionRecord) -> io::Result<()> {
         let dir = self.session_dir(record.id);
+        let epoch_floor_path = self.epoch_floor_path(record.id);
         let record = record.clone();
         tokio::task::spawn_blocking(move || -> io::Result<()> {
             ensure_dir(&dir, DIR_MODE)?;
+            // Raise the epoch floor to cover the epoch this create is
+            // about to persist, BEFORE writing meta.json — so a crash
+            // between the two leaves the floor at least as high as
+            // what's about to land on disk, never behind it (session-
+            // ID-reuse replay finding). `record.host_epoch` is 0 for a
+            // genuinely fresh session and the caller-resolved floor
+            // value for one that reuses a previously-deleted id.
+            read_and_raise_epoch_floor(&epoch_floor_path, record.host_epoch + 1)?;
             // Idempotent (trait contract): a second create for the same
             // id — a host(Some(id)) resume whose in-memory entry was
             // lost, or recovery of a dir left half-built by a crash
@@ -217,6 +243,7 @@ impl SessionStore for FsLogStore {
 
     async fn bump_host_epoch(&self, session: SessionId, epoch: u64) -> io::Result<()> {
         let meta_path = self.session_dir(session).join(META_FILE);
+        let epoch_floor_path = self.epoch_floor_path(session);
         tokio::task::spawn_blocking(move || -> io::Result<()> {
             // Read-modify-write the tiny meta.json. A missing meta means
             // the session is unknown to this store — a no-op per the
@@ -227,11 +254,22 @@ impl SessionStore for FsLogStore {
                 Err(err) => return Err(err),
             };
             meta.host_epoch = epoch;
+            // Raise the floor first (session-ID-reuse replay finding): a
+            // crash between the two writes must never leave the floor
+            // behind an epoch this call is about to durably commit.
+            read_and_raise_epoch_floor(&epoch_floor_path, epoch + 1)?;
             write_meta(&meta_path, &meta)?;
             Ok(())
         })
         .await
         .map_err(|e| join_to_io(&e))?
+    }
+
+    async fn epoch_floor(&self, session: SessionId) -> io::Result<u64> {
+        let epoch_floor_path = self.epoch_floor_path(session);
+        tokio::task::spawn_blocking(move || read_and_raise_epoch_floor(&epoch_floor_path, 0))
+            .await
+            .map_err(|e| join_to_io(&e))?
     }
 
     async fn put_tickets(&self, session: SessionId, tickets: &[TicketEntry]) -> io::Result<()> {
@@ -915,6 +953,67 @@ fn read_tickets(path: &Path) -> io::Result<Vec<TicketEntry>> {
         ));
     }
     Ok(doc.entries)
+}
+
+/// On-disk envelope for one session id's [`EPOCH_FLOORS_DIR`] sidecar.
+/// Same versioned-envelope idiom as [`Meta`] / [`TicketsFile`].
+#[derive(Debug, Serialize, Deserialize)]
+struct EpochFloorFile {
+    /// Schema version for forward-compat.
+    version: u32,
+    /// Lowest `host_epoch` a fresh `create` of this session id may use.
+    floor: u64,
+}
+
+impl EpochFloorFile {
+    const CURRENT_VERSION: u32 = 1;
+}
+
+/// Read-modify-write the epoch-floor sidecar for `session`: returns the
+/// floor to use *now* (the value before this call), then durably raises
+/// the stored floor to `raise_to` — or leaves it unchanged if the
+/// existing floor is already `>= raise_to` (monotonic, so a
+/// lower-numbered concurrent caller's write can't regress a
+/// higher-numbered one's).
+///
+/// Absent file ⇒ floor `0`, matching the trait's "never seen ⇒ 0"
+/// contract. Shared by [`FsLogStore::epoch_floor`] (reads only, via
+/// `raise_to = 0` — a no-op raise) and every site that persists a fresh
+/// `host_epoch` ([`FsLogStore::create`], [`FsLogStore::bump_host_epoch`]),
+/// so the floor can never be observed to be *behind* an epoch this store
+/// has already durably committed for `session`.
+fn read_and_raise_epoch_floor(path: &Path, raise_to: u64) -> io::Result<u64> {
+    let current = match read_json::<EpochFloorFile>(path, "epoch_floor") {
+        Ok(doc) => {
+            if doc.version != EpochFloorFile::CURRENT_VERSION {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "unsupported epoch_floor version {} (expected {})",
+                        doc.version,
+                        EpochFloorFile::CURRENT_VERSION
+                    ),
+                ));
+            }
+            doc.floor
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => 0,
+        Err(err) => return Err(err),
+    };
+    if raise_to > current {
+        if let Some(parent) = path.parent() {
+            ensure_dir(parent, DIR_MODE)?;
+        }
+        write_json_atomic(
+            path,
+            &EpochFloorFile {
+                version: EpochFloorFile::CURRENT_VERSION,
+                floor: raise_to,
+            },
+            "epoch_floor",
+        )?;
+    }
+    Ok(current)
 }
 
 fn write_meta(path: &Path, meta: &Meta) -> io::Result<()> {

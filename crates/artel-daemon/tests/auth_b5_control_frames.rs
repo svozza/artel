@@ -188,27 +188,38 @@ async fn assert_no_session_closed(
 async fn forged_session_closed_dropped_impl(
     daemon_a: &common::RunningDaemon,
     daemon_b: &common::RunningDaemon,
+    attacker_peer: &common::RawGossipPeer,
 ) {
     let (session_id, alice_client, _bob_client, mut bob_events) =
         wire_host_and_join(daemon_a, daemon_b).await;
 
     // A non-host topic member broadcasts a SessionClosed signed with a
-    // key that is NOT the host's. verify_ctrl must reject it.
+    // key that is NOT the host's. verify_ctrl must reject it. Injected
+    // from a genuinely third-party gossip peer, NOT `daemon_b.gossip`
+    // itself — iroh-gossip never delivers a node's own broadcast back
+    // to that same node's local subscribers, so a self-injection would
+    // never reach bob's bridge forwarder and this test would pass
+    // vacuously (see `RawGossipPeer`'s doc comment).
     let topic_id = topic_for(session_id);
-    let topic = daemon_b
+    let topic = attacker_peer
         .gossip
-        .subscribe(topic_id, vec![daemon_a.iroh_addr.id])
+        .subscribe(topic_id, vec![daemon_a.iroh_addr.id, daemon_b.iroh_addr.id])
         .await
-        .expect("B raw subscribes");
+        .expect("attacker raw subscribes");
     let (sender, mut receiver) = topic.split();
     timeout(Duration::from_secs(15), receiver.joined())
         .await
         .expect("raw subscribe never joined")
         .expect("joined() errored");
 
-    let attacker = SigningKey::from_bytes(&[0xee; 32]);
+    let attacker_key = SigningKey::from_bytes(&[0xee; 32]);
     let host_epoch = 0u64;
-    let host_sig = signing::sign_ctrl(&attacker, session_id, signing::CtrlFrame::Close, host_epoch);
+    let host_sig = signing::sign_ctrl(
+        &attacker_key,
+        session_id,
+        signing::CtrlFrame::Close,
+        host_epoch,
+    );
     sender
         .broadcast(Bytes::from(gossip::encode(&GossipBody::SessionClosed {
             host_epoch,
@@ -240,8 +251,10 @@ async fn forged_session_closed_dropped_impl(
 
 #[tokio::test]
 async fn forged_session_closed_dropped() {
-    let (daemon_a, daemon_b, _dns) = common::spawn_pair().await;
-    forged_session_closed_dropped_impl(&daemon_a, &daemon_b).await;
+    let (daemon_a, daemon_b, dns) = common::spawn_pair().await;
+    let attacker_peer = common::RawGossipPeer::spawn(&dns).await;
+    forged_session_closed_dropped_impl(&daemon_a, &daemon_b, &attacker_peer).await;
+    attacker_peer.shutdown().await;
     daemon_a.stop().await;
     daemon_b.stop().await;
 }
@@ -259,15 +272,19 @@ async fn forged_session_closed_dropped() {
 
 #[tokio::test]
 async fn beacon_signature_rewrapped_as_close_is_dropped() {
-    let (daemon_a, daemon_b, _dns, session_id, alice_client, bob_client, mut bob_events) =
+    let (daemon_a, daemon_b, dns, session_id, alice_client, bob_client, mut bob_events) =
         host_and_join().await;
 
+    // Injected from a genuinely third-party gossip peer — see
+    // `RawGossipPeer`'s doc comment for why `daemon_b.gossip` itself
+    // would never deliver back to bob's own bridge forwarder.
+    let attacker_peer = common::RawGossipPeer::spawn(&dns).await;
     let topic_id = topic_for(session_id);
-    let topic = daemon_b
+    let topic = attacker_peer
         .gossip
-        .subscribe(topic_id, vec![daemon_a.iroh_addr.id])
+        .subscribe(topic_id, vec![daemon_a.iroh_addr.id, daemon_b.iroh_addr.id])
         .await
-        .expect("raw subscribes");
+        .expect("attacker raw subscribes");
     let (sender, mut receiver) = topic.split();
     timeout(Duration::from_secs(15), receiver.joined())
         .await
@@ -314,6 +331,7 @@ async fn beacon_signature_rewrapped_as_close_is_dropped() {
     drop(sender);
     drop(alice_client);
     drop(bob_client);
+    attacker_peer.shutdown().await;
     daemon_a.stop().await;
     daemon_b.stop().await;
 }
@@ -487,20 +505,40 @@ async fn forged_send_ack_err_dropped() {
 
 #[tokio::test]
 async fn replayed_message_under_new_seq_dropped() {
-    let (daemon_a, daemon_b, _dns, session_id, alice_client, bob_client, mut bob_events) =
+    let (daemon_a, daemon_b, dns, session_id, alice_client, bob_client, mut bob_events) =
         host_and_join().await;
 
-    // Raw-subscribe to capture the host's genuine broadcast.
+    // Raw-subscribe on daemon B to capture the host's (daemon A's)
+    // genuine broadcast — this observer role is fine on `daemon_b.gossip`
+    // since the frame we're capturing here originates on a REMOTE peer
+    // (daemon A), not a self-broadcast.
     let topic_id = topic_for(session_id);
     let topic = daemon_b
         .gossip
         .subscribe(topic_id, vec![daemon_a.iroh_addr.id])
         .await
         .expect("raw subscribes");
-    let (sender, mut receiver) = topic.split();
+    let (_capture_sender, mut receiver) = topic.split();
     timeout(Duration::from_secs(15), receiver.joined())
         .await
         .expect("raw subscribe never joined")
+        .expect("joined() errored");
+
+    // The REPLAY, however, must be injected from a genuinely
+    // third-party peer: broadcasting the captured frame back out on
+    // `daemon_b.gossip`'s own sender would never reach daemon_b's own
+    // bridge forwarder (see `RawGossipPeer`'s doc comment) — bob is
+    // the joiner under test here.
+    let attacker_peer = common::RawGossipPeer::spawn(&dns).await;
+    let attacker_topic = attacker_peer
+        .gossip
+        .subscribe(topic_id, vec![daemon_a.iroh_addr.id, daemon_b.iroh_addr.id])
+        .await
+        .expect("attacker raw subscribes");
+    let (sender, mut attacker_receiver) = attacker_topic.split();
+    timeout(Duration::from_secs(15), attacker_receiver.joined())
+        .await
+        .expect("attacker raw subscribe never joined")
         .expect("joined() errored");
 
     // Host sends a real message; capture the genuine Message frame off
@@ -566,6 +604,7 @@ async fn replayed_message_under_new_seq_dropped() {
     drop(sender);
     drop(alice_client);
     drop(bob_client);
+    attacker_peer.shutdown().await;
     daemon_a.stop().await;
     daemon_b.stop().await;
 }
@@ -588,7 +627,7 @@ async fn replayed_message_under_new_seq_dropped() {
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn replayed_session_closed_across_epoch_bump_dropped() {
-    let (daemon_a, daemon_b, _dns, session_id, alice_client, bob_client, mut bob_events) =
+    let (daemon_a, daemon_b, dns, session_id, alice_client, bob_client, mut bob_events) =
         host_and_join().await;
 
     // Mint a genuine host close signature at epoch 1 up front — a real
@@ -600,16 +639,35 @@ async fn replayed_session_closed_across_epoch_bump_dropped() {
     let host_key = daemon_a.host_signing_key();
     let epoch1_close_sig = signing::sign_ctrl(&host_key, session_id, signing::CtrlFrame::Close, 1);
 
+    // Raw-subscribe on daemon B to capture the host's (daemon A's)
+    // genuine beacon broadcasts — fine on `daemon_b.gossip` since these
+    // frames originate on a REMOTE peer, not a self-broadcast.
     let topic_id = topic_for(session_id);
     let topic = daemon_b
         .gossip
         .subscribe(topic_id, vec![daemon_a.iroh_addr.id])
         .await
         .expect("raw subscribes");
-    let (sender, mut receiver) = topic.split();
+    let (_capture_sender, mut receiver) = topic.split();
     timeout(Duration::from_secs(15), receiver.joined())
         .await
         .expect("raw subscribe never joined")
+        .expect("joined() errored");
+
+    // The REPLAY must come from a genuinely third-party peer: bob is
+    // the joiner under test, and broadcasting from `daemon_b.gossip`'s
+    // own sender would never reach daemon_b's own bridge forwarder
+    // (see `RawGossipPeer`'s doc comment).
+    let attacker_peer = common::RawGossipPeer::spawn(&dns).await;
+    let attacker_topic = attacker_peer
+        .gossip
+        .subscribe(topic_id, vec![daemon_a.iroh_addr.id, daemon_b.iroh_addr.id])
+        .await
+        .expect("attacker raw subscribes");
+    let (sender, mut attacker_receiver) = attacker_topic.split();
+    timeout(Duration::from_secs(15), attacker_receiver.joined())
+        .await
+        .expect("attacker raw subscribe never joined")
         .expect("joined() errored");
 
     // Resume #1: epoch 0 → 1, beacon broadcast. Confirm the host emitted
@@ -676,6 +734,185 @@ async fn replayed_session_closed_across_epoch_bump_dropped() {
     drop(sender);
     drop(alice_client);
     drop(bob_client);
+    attacker_peer.shutdown().await;
+    daemon_a.stop().await;
+    daemon_b.stop().await;
+}
+
+// =============================================================
+// Session-ID-reuse replay finding: a host's ed25519 key is stable
+// across a full close-and-recreate of the same session id (e.g.
+// `artel-fs` re-derives the id from a workspace's doc namespace, so
+// "close workspace, later re-host the same workspace" reuses the id).
+// Before the fix, a fresh incarnation's host_epoch always restarted at
+// 0, and a fresh joiner's watermark always seeded at 0 too — so a
+// `SessionClosed` captured from ANY prior incarnation would satisfy
+// `epoch >= watermark` trivially and tear the new incarnation down.
+//
+// The fix has two parts: (a) a store-backed epoch floor that survives
+// `delete()`, so a fresh incarnation never reuses an epoch a prior one
+// already used; (b) the ticket now carries the minting incarnation's
+// epoch (bound into its cap-sig), so a FRESH joiner seeds its watermark
+// above the floor instead of always at 0. This test exercises (b) most
+// directly: bob joins only the SECOND incarnation (never having joined
+// the first), and a close signed at the first incarnation's epoch must
+// still be rejected.
+// =============================================================
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn session_id_reuse_replay_across_full_close_and_recreate_dropped() {
+    let (daemon_a, daemon_b, dns) = common::spawn_pair().await;
+    let alice_client = Client::connect(&daemon_a.socket).await.unwrap();
+
+    // Incarnation #1: host, then resume once so its epoch is 1 (not 0
+    // — pins that this isn't just "epoch 0 was never valid").
+    let host_resp = alice_client
+        .request(Request::HostSession {
+            display_name: "alice".into(),
+            session: None,
+        })
+        .await
+        .unwrap();
+    let session_id = match host_resp {
+        Response::HostSession { session, .. } => session,
+        other => panic!("expected HostSession, got {other:?}"),
+    };
+    resume_host(&alice_client, session_id).await;
+
+    // Mint a genuine close signature at incarnation #1's epoch (1) —
+    // exactly what a captured close from this incarnation would carry.
+    let host_key = daemon_a.host_signing_key();
+    let incarnation1_close_sig =
+        signing::sign_ctrl(&host_key, session_id, signing::CtrlFrame::Close, 1);
+
+    // Fully close incarnation #1: alice (the host) leaves, which
+    // cascades `store.delete(session_id)` — the exact teardown that
+    // must NOT reset the epoch floor.
+    alice_client
+        .request(Request::LeaveSession {
+            session: session_id,
+        })
+        .await
+        .unwrap();
+
+    // Incarnation #2: host the SAME session id again. Without the
+    // fix this would land at epoch 0; with the fix it starts at the
+    // store's floor (2 — one past incarnation #1's post-resume epoch).
+    let host_resp = alice_client
+        .request(Request::HostSession {
+            display_name: "alice".into(),
+            session: Some(session_id),
+        })
+        .await
+        .unwrap();
+    let (session_id_2, ticket) = match host_resp {
+        Response::HostSession {
+            session, ticket, ..
+        } => (session, ticket),
+        other => panic!("expected HostSession, got {other:?}"),
+    };
+    assert_eq!(session_id_2, session_id, "re-host must land on the same id");
+
+    // Bob joins ONLY incarnation #2 — a genuinely fresh joiner who
+    // never saw incarnation #1. His ticket carries incarnation #2's
+    // epoch, so his watermark seeds above the floor rather than at 0.
+    let bob_client = Client::connect(&daemon_b.socket).await.unwrap();
+    let join_resp = bob_client
+        .request(Request::JoinSession {
+            display_name: "bob".into(),
+            ticket,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(join_resp, Response::JoinSession { .. }));
+    let mut bob_events = bob_client.take_events().await.expect("bob events");
+    bob_client
+        .request(Request::Subscribe {
+            session: session_id,
+            since: None,
+        })
+        .await
+        .unwrap();
+
+    // Inject the captured incarnation-#1 close from a genuinely
+    // third-party gossip peer — simulating an eavesdropper who
+    // recorded it during incarnation #1 and replays it now, against
+    // incarnation #2. Must be a peer distinct from both daemons:
+    // iroh-gossip never delivers a node's own broadcast back to that
+    // same node's local subscribers, so injecting via `daemon_b.gossip`
+    // itself would never reach bob's bridge forwarder (see
+    // `RawGossipPeer`'s doc comment).
+    let attacker = common::RawGossipPeer::spawn(&dns).await;
+    let topic_id = topic_for(session_id);
+    let topic = attacker
+        .gossip
+        .subscribe(topic_id, vec![daemon_a.iroh_addr.id, daemon_b.iroh_addr.id])
+        .await
+        .expect("raw subscribes");
+    let (sender, mut receiver) = topic.split();
+    timeout(Duration::from_secs(15), receiver.joined())
+        .await
+        .expect("raw subscribe never joined")
+        .expect("joined() errored");
+
+    // Deterministic happens-before gate: a genuine send from
+    // incarnation #2 must reach bob before we inject the replay, so
+    // there is no ordering race on whether bob has finished
+    // materialising its mirror (with the epoch-#2-seeded watermark).
+    alice_client
+        .request(Request::Send {
+            session: session_id,
+            payload: SendPayload {
+                kind: MessageKind::Chat,
+                action: "chat.message".into(),
+                payload: b"incarnation 2 alive".to_vec(),
+            },
+        })
+        .await
+        .unwrap();
+    let _ =
+        common::expect_message_with_payload(&mut bob_events, b"incarnation 2 alive", "bob").await;
+
+    // Replay the captured incarnation-#1 close against incarnation #2.
+    // Pre-fix: bob's watermark would have seeded at 0, so `1 >= 0`
+    // trivially passes and the forged-looking-genuine close tears his
+    // mirror down. Post-fix: bob's watermark seeded from his ticket's
+    // host_epoch (>= the floor, which is itself > 1), so `1 >=
+    // watermark` fails and the frame is dropped.
+    sender
+        .broadcast(Bytes::from(gossip::encode(&GossipBody::SessionClosed {
+            host_epoch: 1,
+            host_sig: incarnation1_close_sig,
+        })))
+        .await
+        .expect("broadcast replayed close");
+
+    assert_no_session_closed(&mut bob_events, Duration::from_secs(2), "bob").await;
+
+    // And incarnation #2 is still live for bob.
+    alice_client
+        .request(Request::Send {
+            session: session_id,
+            payload: SendPayload {
+                kind: MessageKind::Chat,
+                action: "chat.message".into(),
+                payload: b"alive after cross-incarnation replay".to_vec(),
+            },
+        })
+        .await
+        .unwrap();
+    let _ = common::expect_message_with_payload(
+        &mut bob_events,
+        b"alive after cross-incarnation replay",
+        "bob",
+    )
+    .await;
+
+    drop(sender);
+    drop(alice_client);
+    drop(bob_client);
+    attacker.shutdown().await;
     daemon_a.stop().await;
     daemon_b.stop().await;
 }
@@ -834,7 +1071,9 @@ async fn legit_host_frames_accepted_n0() {
 #[tokio::test]
 async fn forged_session_closed_dropped_n0() {
     let (daemon_a, daemon_b) = spawn_pair_n0().await;
-    forged_session_closed_dropped_impl(&daemon_a, &daemon_b).await;
+    let attacker_peer = common::RawGossipPeer::spawn_n0(common::custom_relay_setup().await).await;
+    forged_session_closed_dropped_impl(&daemon_a, &daemon_b, &attacker_peer).await;
+    attacker_peer.shutdown().await;
     daemon_a.stop().await;
     daemon_b.stop().await;
 }

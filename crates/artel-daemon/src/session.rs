@@ -360,6 +360,13 @@ pub(crate) struct CapClaim {
     pub ticket_id: TicketId,
     pub granted_cap: Capability,
     pub expiry_ms: u64,
+    /// The host's incarnation epoch at ticket-mint time, bound into
+    /// [`Self::cap_sig`]'s signed scope (session-ID-reuse replay
+    /// finding). Cross-checked at admission the same way `expiry_ms`
+    /// and `granted_cap` are; a fresh joiner also uses this value
+    /// (once the signature verifies) to seed its
+    /// `host_epoch_watermark` instead of always starting at 0.
+    pub host_epoch: u64,
     pub cap_sig: SigBytes,
 }
 
@@ -900,17 +907,25 @@ impl Registry {
                 // local-host record IS the incarnation boundary: a
                 // `SessionClosed` signed at the old epoch is rejected
                 // against a joiner whose beacon-advanced watermark has
-                // moved past it. A fresh create (below) leaves epoch 0.
-                let (ticket, ticket_id) = self.mint_ticket(id, granted_cap, expiry_ms);
+                // moved past it. A fresh create (below) uses the
+                // store's epoch floor, never a hardcoded 0.
+                //
                 // Read by the bridge re-subscribe below, which only
                 // exists with iroh on.
                 #[cfg_attr(not(feature = "iroh"), allow(unused_variables))]
-                let host_epoch = {
+                let (host_epoch, ticket, ticket_id) = {
                     let mut s = arc.lock().await;
                     if s.host != host_peer.id || s.kind != SessionKind::Local {
                         return Err(SessionError::SessionConflict(id));
                     }
                     let host_epoch = s.host_epoch.saturating_add(1);
+                    // Mint AFTER resolving the new epoch, not before —
+                    // the ticket's cap_sig binds host_epoch (session-
+                    // ID-reuse replay finding), so a stale value here
+                    // would seed a fresh joiner's watermark behind
+                    // where this incarnation actually starts.
+                    let (ticket, ticket_id) =
+                        self.mint_ticket(id, granted_cap, expiry_ms, host_epoch);
                     // Every resume re-mints, so every resume appends a
                     // ledger entry (deliberate — the bearer string just
                     // handed back genuinely admits and must be
@@ -958,7 +973,8 @@ impl Registry {
                         .map_err(SessionError::Storage)?;
                     s.host_epoch = host_epoch;
                     s.tickets = tickets;
-                    host_epoch
+                    drop(s);
+                    (host_epoch, ticket, ticket_id)
                 };
 
                 // Re-open the gossip topic. The bridge tracks per-
@@ -988,8 +1004,21 @@ impl Registry {
         // Create path. Either no `requested_id` (mint random) or
         // `Some(id)` whose entry doesn't exist locally yet.
         let session_id = requested_id.unwrap_or_else(SessionId::new_random);
-        let (ticket, ticket_id) = self.mint_ticket(session_id, granted_cap, expiry_ms);
+        // The starting epoch is the store's floor for this id, not a
+        // hardcoded 0 (session-ID-reuse replay finding): if this id was
+        // ever hosted-and-fully-closed before, the floor is above 0 and
+        // a captured control frame from that prior incarnation can no
+        // longer satisfy a fresh joiner's watermark gate. For an id
+        // this store has never seen, the floor is 0 — identical to
+        // today's behavior.
+        let host_epoch = self
+            .store
+            .epoch_floor(session_id)
+            .await
+            .map_err(SessionError::Storage)?;
+        let (ticket, ticket_id) = self.mint_ticket(session_id, granted_cap, expiry_ms, host_epoch);
         let mut session = Session::new(session_id, &host_peer, SessionKind::Local);
+        session.host_epoch = host_epoch;
         // Seed the ledger before record(): create() persists the
         // initial entry together with the session, so there is no
         // window where the ticket exists but its ledger entry doesn't.
@@ -1062,7 +1091,7 @@ impl Registry {
         expiry_ms: u64,
     ) -> Result<(JoinTicket, TicketId), SessionError> {
         let mut s = self.lock_local_session(session).await?;
-        let (ticket, ticket_id) = self.mint_ticket(session, granted_cap, expiry_ms);
+        let (ticket, ticket_id) = self.mint_ticket(session, granted_cap, expiry_ms, s.host_epoch);
         // Store-before-memory: if the ledger write fails, the
         // mint fails and no unrevocable ticket leaves the daemon
         // (issued-only would reject it anyway — fail loudly here
@@ -1129,11 +1158,19 @@ impl Registry {
     /// [`TicketEntry`] for the returned id (issued-only admission
     /// rejects ledger-absent ids, so a mint whose entry is never
     /// recorded produces a ticket that can never admit).
+    ///
+    /// `host_epoch` is the session's *current* incarnation epoch,
+    /// stamped into the ticket and bound into `cap_sig`'s signed scope
+    /// (session-ID-reuse replay finding) — callers pass the value
+    /// they're about to use/have just used for this incarnation (the
+    /// store-backed floor on create, `Session::host_epoch` on resume),
+    /// never a stale or default one.
     fn mint_ticket(
         &self,
         session_id: SessionId,
         granted_cap: Capability,
         expiry_ms: u64,
+        host_epoch: u64,
     ) -> (JoinTicket, TicketId) {
         let tid = TicketId::new_random();
         #[cfg(feature = "iroh")]
@@ -1144,6 +1181,7 @@ impl Registry {
                 session_id,
                 granted_cap,
                 expiry_ms,
+                host_epoch,
             )
         });
         #[cfg(not(feature = "iroh"))]
@@ -1154,6 +1192,7 @@ impl Registry {
             host_addr: self.daemon_addr.clone(),
             granted_cap,
             expiry_ms,
+            host_epoch,
             cap_sig,
         }));
         (ticket, tid)
@@ -1218,6 +1257,7 @@ impl Registry {
                 parsed.ticket_id,
                 parsed.granted_cap,
                 parsed.expiry_ms,
+                parsed.host_epoch,
                 parsed.cap_sig,
             )
             .await?
@@ -1347,6 +1387,19 @@ impl Registry {
     /// `session_id`, persists it, and asks the bridge to subscribe
     /// to the host's gossip topic. Inbound gossip messages land in
     /// the mirror's `log` and `events_tx`.
+    ///
+    /// `host_epoch` and `cap_sig` come straight from the ticket
+    /// (session-ID-reuse replay finding): this method verifies
+    /// `cap_sig` against the host's own claimed pubkey (`host_peer_id`)
+    /// before trusting `host_epoch` to seed the fresh mirror's
+    /// `host_epoch_watermark` — an unverified epoch would let a forged
+    /// ticket poison the watermark below where this incarnation
+    /// actually starts, and the gossip subscribe below happens (and
+    /// starts processing inbound control frames) before the host's own
+    /// `ensure_member` admission check ever runs, so admission can't be
+    /// relied on to catch this. A verify failure is `InvalidTicket` —
+    /// the same opaque-to-the-bearer error every other ticket defect
+    /// collapses to.
     #[allow(clippy::too_many_arguments)]
     #[cfg_attr(not(feature = "iroh"), allow(clippy::unused_async))]
     async fn materialise_remote_session(
@@ -1358,6 +1411,7 @@ impl Registry {
         ticket_id: TicketId,
         granted_cap: Capability,
         expiry_ms: u64,
+        host_epoch: u64,
         cap_sig: SigBytes,
     ) -> Result<Arc<Mutex<Session>>, SessionError> {
         // Without the `iroh` feature, there's no way to actually
@@ -1372,6 +1426,7 @@ impl Registry {
                 ticket_id,
                 granted_cap,
                 expiry_ms,
+                host_epoch,
                 cap_sig,
             );
             tracing::debug!(
@@ -1383,6 +1438,35 @@ impl Registry {
 
         #[cfg(feature = "iroh")]
         {
+            // Verify the ticket's cap claim — including `host_epoch` —
+            // against the host's own claimed pubkey BEFORE trusting
+            // `host_epoch` for anything (session-ID-reuse replay
+            // finding). This is a bearer-side self-check: the ticket
+            // came straight from whoever handed it to us, so a
+            // mismatched or forged claim must not be allowed to seed
+            // the fresh mirror's watermark at a stale value. Skipped
+            // only when this daemon has no signing key configured at
+            // all (test-only path; production always has one) —
+            // mirrors the symmetric skip in `ensure_member`.
+            if self.signing_key.is_some()
+                && let Err(err) = signing::verify_ticket_cap(
+                    host_peer_id,
+                    ticket_id,
+                    session_id,
+                    granted_cap,
+                    expiry_ms,
+                    host_epoch,
+                    &cap_sig,
+                )
+            {
+                tracing::debug!(
+                    ?session_id,
+                    ?err,
+                    "materialise_remote_session: cap_sig verify failed"
+                );
+                return Err(SessionError::InvalidTicket);
+            }
+
             let bridge = self
                 .bridge
                 .as_ref()
@@ -1397,16 +1481,23 @@ impl Registry {
             // so two racing joins can't double-subscribe or split-brain
             // (the registry guard that replaces the FsLogStore O_EXCL
             // reject now that `create` is idempotent).
-            let (arc, fresh) = self.claim_remote_mirror(session_id, host_peer_id).await?;
+            let (arc, fresh) = self
+                .claim_remote_mirror(session_id, host_peer_id, host_epoch)
+                .await?;
             if !fresh {
                 // A prior/concurrent join owns the mirror and its
                 // subscription; reuse it.
                 return Ok(arc);
             }
 
-            // Seed the host-epoch watermark from the persisted mirror
-            // (0 for a fresh join). The bridge's EpochBeacon arm
-            // advances this AtomicU64 on each host-signed beacon and
+            // Seed the host-epoch watermark from the persisted mirror.
+            // `claim_remote_mirror` seeded that record's `host_epoch`
+            // from the ticket's *verified* claim above (session-ID-
+            // reuse replay finding) rather than always 0 — a fresh
+            // joiner of a session that's been through prior
+            // incarnations starts its watermark at the incarnation the
+            // ticket was actually minted for. The bridge's EpochBeacon
+            // arm advances this AtomicU64 on each host-signed beacon and
             // persists the advance via `advance_host_epoch_watermark`;
             // the SessionClosed arm reads it to gate replayed closes.
             let host_epoch_watermark = Arc::new(std::sync::atomic::AtomicU64::new(
@@ -1448,6 +1539,7 @@ impl Registry {
                     ticket_id,
                     granted_cap,
                     expiry_ms,
+                    host_epoch,
                     cap_sig,
                 )
                 .await
@@ -1480,6 +1572,13 @@ impl Registry {
     /// build a fresh `Remote` [`Session`], persist it, insert it, and
     /// return `(arc, true)` — the caller drives the gossip subscribe.
     ///
+    /// `host_epoch` seeds the *fresh* mirror's `host_epoch` field — the
+    /// caller's already-verified claim from the joining ticket (session-
+    /// ID-reuse replay finding), not always 0. Ignored on the
+    /// already-claimed path: an existing mirror's `host_epoch` is
+    /// beacon-advanced live state that a later, possibly-stale ticket
+    /// must never regress.
+    ///
     /// Doing the existence check and the insert under one lock hold is
     /// what prevents two concurrent `join`s from each materialising a
     /// separate mirror (split-brain: the IPC-visible arc differs from the
@@ -1491,6 +1590,7 @@ impl Registry {
         &self,
         session_id: SessionId,
         host_peer_id: &PeerId,
+        host_epoch: u64,
     ) -> Result<(Arc<Mutex<Session>>, bool), SessionError> {
         // Build the prospective mirror before taking the lock so the
         // (async) store write happens outside the lock-held window — but
@@ -1505,6 +1605,7 @@ impl Registry {
         // but we'll never see local Send from them — Sends arrive via
         // gossip and route through the forwarder.
         session_obj.host = *host_peer_id;
+        session_obj.host_epoch = host_epoch;
 
         // Fast path: already claimed. A read-lock check avoids a
         // redundant store write on the common resume/concurrent case.
@@ -1771,6 +1872,7 @@ impl Registry {
                     session,
                     claim.granted_cap,
                     claim.expiry_ms,
+                    claim.host_epoch,
                     &claim.cap_sig,
                 )
             {
@@ -3657,6 +3759,7 @@ mod tests {
             host_addr: WireEndpointAddr::id_only(host_peer_id),
             granted_cap: Capability::ReadWrite,
             expiry_ms: 0,
+            host_epoch: 0,
             cap_sig: SIGNATURE_UNSIGNED,
         }));
         let err = r.join(&ticket, peer(2, "bob")).await.unwrap_err();
@@ -5670,9 +5773,15 @@ mod tests {
         .await
         .unwrap();
 
-        let (arc1, fresh1) = r.claim_remote_mirror(session_id, &host.id).await.unwrap();
+        let (arc1, fresh1) = r
+            .claim_remote_mirror(session_id, &host.id, 0)
+            .await
+            .unwrap();
         assert!(fresh1, "first claim is fresh");
-        let (arc2, fresh2) = r.claim_remote_mirror(session_id, &host.id).await.unwrap();
+        let (arc2, fresh2) = r
+            .claim_remote_mirror(session_id, &host.id, 0)
+            .await
+            .unwrap();
         assert!(!fresh2, "second claim reuses the existing mirror");
         assert!(
             Arc::ptr_eq(&arc1, &arc2),
@@ -5706,7 +5815,10 @@ mod tests {
         .await
         .unwrap();
 
-        let (_arc, fresh) = r.claim_remote_mirror(session_id, &host.id).await.unwrap();
+        let (_arc, fresh) = r
+            .claim_remote_mirror(session_id, &host.id, 0)
+            .await
+            .unwrap();
         assert!(fresh);
         assert_eq!(r.list().await.len(), 1, "claimed");
         assert_eq!(store.load_all().await.unwrap().len(), 1, "persisted");
@@ -5719,7 +5831,10 @@ mod tests {
             "persisted record deleted — no durable orphan",
         );
         // A fresh re-claim succeeds and is fresh again (the slot is free).
-        let (_arc, fresh_again) = r.claim_remote_mirror(session_id, &host.id).await.unwrap();
+        let (_arc, fresh_again) = r
+            .claim_remote_mirror(session_id, &host.id, 0)
+            .await
+            .unwrap();
         assert!(fresh_again, "rollback frees the slot for a clean retry");
     }
 
@@ -6800,17 +6915,20 @@ mod tests {
     ) -> CapClaim {
         use artel_protocol::ids::TicketId;
         let ticket_id = TicketId::from_bytes([0xCC; 16]);
+        let host_epoch = 0;
         let cap_sig = signing::sign_ticket_cap(
             host_key.as_signing_key(),
             ticket_id,
             session,
             granted_cap,
             expiry_ms,
+            host_epoch,
         );
         CapClaim {
             ticket_id,
             granted_cap,
             expiry_ms,
+            host_epoch,
             cap_sig,
         }
     }
@@ -6824,6 +6942,7 @@ mod tests {
             ticket_id: decoded.ticket_id,
             granted_cap: decoded.granted_cap,
             expiry_ms: decoded.expiry_ms,
+            host_epoch: decoded.host_epoch,
             cap_sig: decoded.cap_sig,
         }
     }
@@ -7150,6 +7269,10 @@ mod tests {
                 return Err(std::io::Error::other("injected bump_host_epoch failure"));
             }
             self.inner.bump_host_epoch(session, epoch).await
+        }
+
+        async fn epoch_floor(&self, session: SessionId) -> std::io::Result<u64> {
+            self.inner.epoch_floor(session).await
         }
 
         async fn put_tickets(
@@ -7591,6 +7714,7 @@ mod tests {
             ticket_id: tid,
             granted_cap: Capability::ReadWrite,
             expiry_ms: far_future,
+            host_epoch: 0,
             cap_sig: SIGNATURE_UNSIGNED,
         };
         assert_eq!(
@@ -7605,6 +7729,7 @@ mod tests {
             ticket_id: tid,
             granted_cap: Capability::Read,
             expiry_ms: 0,
+            host_epoch: 0,
             cap_sig: SIGNATURE_UNSIGNED,
         };
         assert_eq!(
@@ -7619,6 +7744,7 @@ mod tests {
             ticket_id: tid,
             granted_cap: Capability::Read,
             expiry_ms: far_future,
+            host_epoch: 0,
             cap_sig: SIGNATURE_UNSIGNED,
         };
         r.ensure_member(id, peer(2, "bob"), Some(honest))

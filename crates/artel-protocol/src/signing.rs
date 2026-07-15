@@ -525,7 +525,20 @@ pub fn verify_ctrl(
 // ===========================================================================
 
 /// Domain prefix for ticket capability claims.
-pub const TICKET_CAP_DOMAIN_TAG: &[u8] = b"artel/ticket-cap-v1";
+///
+/// Bumped to `-v2` on 2026-07-15 (session-ID-reuse replay finding): the
+/// `-v1` layout signed only `(ticket_id, session_id, cap, expiry)`, with
+/// no binding to the host's incarnation epoch. A host's ed25519 key is
+/// stable across a `delete()` + recreate of the same session id (e.g.
+/// `artel-fs` re-derives the id from a workspace's doc namespace), so a
+/// captured `SessionClosed` from any prior incarnation could tear down a
+/// freshly re-hosted session: a brand-new joiner's watermark seeds at 0
+/// regardless of how many incarnations came before. Folding `host_epoch`
+/// into the ticket's signed scope lets a fresh joiner seed its watermark
+/// from the *ticket's* epoch instead of always starting at 0 — closing
+/// that gap without touching the live control-frame signatures
+/// ([`CTRL_DOMAIN_TAG`]), which already bind epoch per-frame.
+pub const TICKET_CAP_DOMAIN_TAG: &[u8] = b"artel/ticket-cap-v2";
 
 /// Pinned single-byte encoding for [`Capability`] inside the signed scope.
 ///
@@ -541,20 +554,27 @@ const fn cap_byte(cap: Capability) -> u8 {
 /// Build the canonical signed bytes for a ticket capability claim.
 ///
 /// Layout: `TICKET_CAP_DOMAIN_TAG || ticket_id(16) || session_id(16) ||
-/// cap_byte(1) || expiry_ms_be(8)`. All fields fixed-width.
+/// cap_byte(1) || expiry_ms_be(8) || host_epoch_be(8)`. All fields
+/// fixed-width. `host_epoch` is the host's incarnation epoch at mint time
+/// (session-ID-reuse replay finding) — binding it here lets a fresh
+/// joiner seed its `host_epoch_watermark` from the ticket instead of
+/// always starting at 0, so a captured close from a prior incarnation
+/// can't tear down a session re-hosted at the same id.
 #[must_use]
 pub fn ticket_cap_canonical_bytes(
     ticket_id: TicketId,
     session_id: SessionId,
     granted_cap: Capability,
     expiry_ms: u64,
+    host_epoch: u64,
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(TICKET_CAP_DOMAIN_TAG.len() + 16 + 16 + 1 + 8);
+    let mut out = Vec::with_capacity(TICKET_CAP_DOMAIN_TAG.len() + 16 + 16 + 1 + 8 + 8);
     out.extend_from_slice(TICKET_CAP_DOMAIN_TAG);
     out.extend_from_slice(ticket_id.as_bytes());
     out.extend_from_slice(session_id.as_bytes());
     out.push(cap_byte(granted_cap));
     out.extend_from_slice(&expiry_ms.to_be_bytes());
+    out.extend_from_slice(&host_epoch.to_be_bytes());
     out
 }
 
@@ -566,12 +586,14 @@ pub fn sign_ticket_cap(
     session_id: SessionId,
     granted_cap: Capability,
     expiry_ms: u64,
+    host_epoch: u64,
 ) -> SigBytes {
     key.sign(&ticket_cap_canonical_bytes(
         ticket_id,
         session_id,
         granted_cap,
         expiry_ms,
+        host_epoch,
     ))
     .to_bytes()
 }
@@ -583,13 +605,15 @@ pub fn sign_ticket_cap(
 /// - [`VerifyError::SentinelUnsigned`] if `cap_sig` is the all-zero sentinel.
 /// - [`VerifyError::BadKey`] if `host_pubkey` is not a valid ed25519 key.
 /// - [`VerifyError::BadSig`] if the signature does not verify (wrong host,
-///   tampered fields, or wrong cap). Uses strict verification.
+///   tampered fields, wrong cap, or wrong `host_epoch`). Uses strict
+///   verification.
 pub fn verify_ticket_cap(
     host_pubkey: &PeerId,
     ticket_id: TicketId,
     session_id: SessionId,
     granted_cap: Capability,
     expiry_ms: u64,
+    host_epoch: u64,
     cap_sig: &SigBytes,
 ) -> Result<(), VerifyError> {
     if cap_sig == &SIGNATURE_UNSIGNED {
@@ -600,7 +624,7 @@ pub fn verify_ticket_cap(
     let sig = Signature::from_bytes(cap_sig);
     verifying
         .verify_strict(
-            &ticket_cap_canonical_bytes(ticket_id, session_id, granted_cap, expiry_ms),
+            &ticket_cap_canonical_bytes(ticket_id, session_id, granted_cap, expiry_ms, host_epoch),
             &sig,
         )
         .map_err(|_| VerifyError::BadSig)
@@ -1385,7 +1409,9 @@ mod tests {
 
     #[test]
     fn ticket_cap_domain_tag_is_versioned() {
-        assert_eq!(TICKET_CAP_DOMAIN_TAG, b"artel/ticket-cap-v1");
+        // Bumped to -v2 (session-ID-reuse replay finding) when host_epoch
+        // joined the signed scope.
+        assert_eq!(TICKET_CAP_DOMAIN_TAG, b"artel/ticket-cap-v2");
     }
 
     #[test]
@@ -1398,7 +1424,7 @@ mod tests {
     fn ticket_cap_canonical_bytes_field_offsets() {
         let tid = TicketId::from_bytes([0x01; 16]);
         let sid = SessionId::from_bytes([0x01; 16]);
-        let base = ticket_cap_canonical_bytes(tid, sid, Capability::Read, 1000);
+        let base = ticket_cap_canonical_bytes(tid, sid, Capability::Read, 1000, 7);
 
         // ticket_id starts after the domain tag
         let with_other_ticket = ticket_cap_canonical_bytes(
@@ -1406,6 +1432,7 @@ mod tests {
             sid,
             Capability::Read,
             1000,
+            7,
         );
         let first = base
             .iter()
@@ -1420,6 +1447,7 @@ mod tests {
             SessionId::from_bytes([0x02; 16]),
             Capability::Read,
             1000,
+            7,
         );
         let first = base
             .iter()
@@ -1429,7 +1457,7 @@ mod tests {
         assert_eq!(first, TICKET_CAP_DOMAIN_TAG.len() + 16);
 
         // cap_byte is after session_id
-        let diff_cap = ticket_cap_canonical_bytes(tid, sid, Capability::ReadWrite, 1000);
+        let diff_cap = ticket_cap_canonical_bytes(tid, sid, Capability::ReadWrite, 1000, 7);
         let first = base
             .iter()
             .zip(diff_cap.iter())
@@ -1438,13 +1466,22 @@ mod tests {
         assert_eq!(first, TICKET_CAP_DOMAIN_TAG.len() + 16 + 16);
 
         // expiry_ms is after cap_byte (last byte differs for 1000 vs 1001)
-        let diff_expiry = ticket_cap_canonical_bytes(tid, sid, Capability::Read, 1001);
+        let diff_expiry = ticket_cap_canonical_bytes(tid, sid, Capability::Read, 1001, 7);
         let first = base
             .iter()
             .zip(diff_expiry.iter())
             .position(|(x, y)| x != y)
             .expect("expiry diff");
         assert_eq!(first, TICKET_CAP_DOMAIN_TAG.len() + 16 + 16 + 1 + 7);
+
+        // host_epoch is after expiry_ms
+        let diff_epoch = ticket_cap_canonical_bytes(tid, sid, Capability::Read, 1000, 8);
+        let first = base
+            .iter()
+            .zip(diff_epoch.iter())
+            .position(|(x, y)| x != y)
+            .expect("host_epoch diff");
+        assert_eq!(first, TICKET_CAP_DOMAIN_TAG.len() + 16 + 16 + 1 + 8 + 7);
     }
 
     #[test]
@@ -1454,8 +1491,12 @@ mod tests {
             SessionId::from_bytes([0; 16]),
             Capability::Read,
             0,
+            0,
         );
-        assert_eq!(bytes.len(), TICKET_CAP_DOMAIN_TAG.len() + 16 + 16 + 1 + 8);
+        assert_eq!(
+            bytes.len(),
+            TICKET_CAP_DOMAIN_TAG.len() + 16 + 16 + 1 + 8 + 8
+        );
     }
 
     #[test]
@@ -1464,8 +1505,8 @@ mod tests {
         let tid = TicketId::from_bytes([0x01; 16]);
         let sid = sample_session_id();
         for cap in [Capability::Read, Capability::ReadWrite] {
-            let sig = sign_ticket_cap(&key, tid, sid, cap, 5000);
-            verify_ticket_cap(&host_pubkey(&key), tid, sid, cap, 5000, &sig).unwrap();
+            let sig = sign_ticket_cap(&key, tid, sid, cap, 5000, 3);
+            verify_ticket_cap(&host_pubkey(&key), tid, sid, cap, 5000, 3, &sig).unwrap();
         }
     }
 
@@ -1474,10 +1515,18 @@ mod tests {
         let signer = key_a();
         let tid = TicketId::from_bytes([0x01; 16]);
         let sid = sample_session_id();
-        let sig = sign_ticket_cap(&signer, tid, sid, Capability::Read, 0);
+        let sig = sign_ticket_cap(&signer, tid, sid, Capability::Read, 0, 0);
         assert_eq!(
-            verify_ticket_cap(&host_pubkey(&key_b()), tid, sid, Capability::Read, 0, &sig)
-                .unwrap_err(),
+            verify_ticket_cap(
+                &host_pubkey(&key_b()),
+                tid,
+                sid,
+                Capability::Read,
+                0,
+                0,
+                &sig
+            )
+            .unwrap_err(),
             VerifyError::BadSig,
         );
     }
@@ -1487,7 +1536,7 @@ mod tests {
         let key = key_a();
         let tid = TicketId::from_bytes([0x01; 16]);
         let sid = sample_session_id();
-        let sig = sign_ticket_cap(&key, tid, sid, Capability::Read, 0);
+        let sig = sign_ticket_cap(&key, tid, sid, Capability::Read, 0, 0);
         let other_tid = TicketId::from_bytes([0x02; 16]);
         assert_eq!(
             verify_ticket_cap(
@@ -1495,6 +1544,7 @@ mod tests {
                 other_tid,
                 sid,
                 Capability::Read,
+                0,
                 0,
                 &sig
             )
@@ -1508,7 +1558,7 @@ mod tests {
         let key = key_a();
         let tid = TicketId::from_bytes([0x01; 16]);
         let sid = sample_session_id();
-        let sig = sign_ticket_cap(&key, tid, sid, Capability::ReadWrite, 0);
+        let sig = sign_ticket_cap(&key, tid, sid, Capability::ReadWrite, 0, 0);
         let other_sid = SessionId::from_bytes([0x02; 16]);
         assert_eq!(
             verify_ticket_cap(
@@ -1516,6 +1566,7 @@ mod tests {
                 tid,
                 other_sid,
                 Capability::ReadWrite,
+                0,
                 0,
                 &sig
             )
@@ -1529,10 +1580,18 @@ mod tests {
         let key = key_a();
         let tid = TicketId::from_bytes([0x01; 16]);
         let sid = sample_session_id();
-        let sig = sign_ticket_cap(&key, tid, sid, Capability::Read, 0);
+        let sig = sign_ticket_cap(&key, tid, sid, Capability::Read, 0, 0);
         assert_eq!(
-            verify_ticket_cap(&host_pubkey(&key), tid, sid, Capability::ReadWrite, 0, &sig)
-                .unwrap_err(),
+            verify_ticket_cap(
+                &host_pubkey(&key),
+                tid,
+                sid,
+                Capability::ReadWrite,
+                0,
+                0,
+                &sig
+            )
+            .unwrap_err(),
             VerifyError::BadSig,
         );
     }
@@ -1542,7 +1601,7 @@ mod tests {
         let key = key_a();
         let tid = TicketId::from_bytes([0x01; 16]);
         let sid = sample_session_id();
-        let sig = sign_ticket_cap(&key, tid, sid, Capability::ReadWrite, 1000);
+        let sig = sign_ticket_cap(&key, tid, sid, Capability::ReadWrite, 1000, 0);
         assert_eq!(
             verify_ticket_cap(
                 &host_pubkey(&key),
@@ -1550,6 +1609,32 @@ mod tests {
                 sid,
                 Capability::ReadWrite,
                 1001,
+                0,
+                &sig
+            )
+            .unwrap_err(),
+            VerifyError::BadSig,
+        );
+    }
+
+    #[test]
+    fn verify_ticket_cap_rejects_tampered_host_epoch() {
+        // Session-ID-reuse replay finding: a cap-sig minted at one host
+        // epoch must not verify at a different epoch — otherwise a
+        // captured ticket claim could be replayed to seed a joiner's
+        // watermark at a stale (lower) epoch after a host resume.
+        let key = key_a();
+        let tid = TicketId::from_bytes([0x01; 16]);
+        let sid = sample_session_id();
+        let sig = sign_ticket_cap(&key, tid, sid, Capability::ReadWrite, 0, 3);
+        assert_eq!(
+            verify_ticket_cap(
+                &host_pubkey(&key),
+                tid,
+                sid,
+                Capability::ReadWrite,
+                0,
+                4,
                 &sig
             )
             .unwrap_err(),
@@ -1568,6 +1653,7 @@ mod tests {
                 tid,
                 sid,
                 Capability::Read,
+                0,
                 0,
                 &SIGNATURE_UNSIGNED
             )
