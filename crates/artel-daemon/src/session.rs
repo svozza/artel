@@ -4186,12 +4186,18 @@ mod tests {
             "second resume bumps to epoch 2",
         );
 
-        // The bumped epoch produces a verify_ctrl-valid signature —
-        // the same bytes the resume EpochBeacon and a SessionClosed
-        // would carry. (The broadcast itself is driven end-to-end by
-        // the B5.3 e2e; no real bridge exists in a MemoryStore registry.)
-        let sig = artel_protocol::signing::sign_ctrl(secret.as_signing_key(), id, 2);
-        signing::verify_ctrl(&peer_id, id, 2, &sig).expect("ctrl sig at bumped epoch must verify");
+        // The bumped epoch produces a verify_ctrl-valid signature — the
+        // bytes the resume EpochBeacon carries. (The broadcast itself is
+        // driven end-to-end by the B5.3 e2e; no real bridge exists in a
+        // MemoryStore registry.)
+        let sig = artel_protocol::signing::sign_ctrl(
+            secret.as_signing_key(),
+            id,
+            signing::CtrlFrame::Beacon,
+            2,
+        );
+        signing::verify_ctrl(&peer_id, id, signing::CtrlFrame::Beacon, 2, &sig)
+            .expect("ctrl sig at bumped epoch must verify");
     }
 
     // ---- Joiner mirror acceptance pipeline (Auth Slice B.5.3) ----
@@ -4523,15 +4529,18 @@ mod tests {
 
         // A host-signed beacon at epoch 3 verifies, and the registry
         // method persists the advance.
-        let good = artel_protocol::signing::sign_ctrl(&host_key, session, 3);
-        signing::verify_ctrl(&host_id, session, 3, &good).expect("host-signed beacon verifies");
+        let good =
+            artel_protocol::signing::sign_ctrl(&host_key, session, signing::CtrlFrame::Beacon, 3);
+        signing::verify_ctrl(&host_id, session, signing::CtrlFrame::Beacon, 3, &good)
+            .expect("host-signed beacon verifies");
 
         // A wrong-key beacon does NOT verify — the bridge arm would
         // drop it before any watermark move.
         let impostor = artel_protocol::signing::SigningKey::from_bytes(&[0x99; 32]);
-        let bad = artel_protocol::signing::sign_ctrl(&impostor, session, 99);
+        let bad =
+            artel_protocol::signing::sign_ctrl(&impostor, session, signing::CtrlFrame::Beacon, 99);
         assert!(
-            signing::verify_ctrl(&host_id, session, 99, &bad).is_err(),
+            signing::verify_ctrl(&host_id, session, signing::CtrlFrame::Beacon, 99, &bad).is_err(),
             "wrong-key beacon must not verify",
         );
 

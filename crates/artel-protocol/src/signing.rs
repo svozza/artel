@@ -287,11 +287,45 @@ pub const ACK_DOMAIN_TAG: &[u8] = b"artel/ack-v1";
 /// Domain prefix for the host's control-frame signature.
 ///
 /// Shared by [`crate::gossip::GossipBody::SessionClosed`] **and**
-/// [`crate::gossip::GossipBody::EpochBeacon`]:
-/// `"artel/ctrl-v1" || session_id || host_epoch`. One verifier
-/// ([`verify_ctrl`]) serves both frames, so a `host_sig` produced for a
-/// beacon validates a close at the same epoch.
-pub const CTRL_DOMAIN_TAG: &[u8] = b"artel/ctrl-v1";
+/// [`crate::gossip::GossipBody::EpochBeacon`], but the signed bytes now
+/// carry a [`CtrlFrame`] discriminant so the two are **not**
+/// interchangeable:
+/// `"artel/ctrl-v2" || session_id || frame_byte || host_epoch`.
+///
+/// Bumped to `-v2` on 2026-07-15: the `-v1` layout signed only
+/// `(session_id, host_epoch)`, so a captured [`EpochBeacon`] and a
+/// forged [`SessionClosed`] at the same epoch had byte-identical signed
+/// scopes — any topic participant could re-wrap a genuine beacon as a
+/// close and tear down every joiner's mirror. Binding the frame kind
+/// closes that; the version bump invalidates every old signature by
+/// construction (see also [`crate::gossip::GOSSIP_WIRE_VERSION`], bumped
+/// in lockstep so a mixed-version mesh fails at the frame version byte
+/// rather than at signature verification).
+///
+/// [`EpochBeacon`]: crate::gossip::GossipBody::EpochBeacon
+/// [`SessionClosed`]: crate::gossip::GossipBody::SessionClosed
+pub const CTRL_DOMAIN_TAG: &[u8] = b"artel/ctrl-v2";
+
+/// Which control frame a ctrl-signature authenticates.
+///
+/// Folded into [`ctrl_canonical_bytes`] as a pinned discriminant byte so
+/// a signature minted for one frame cannot validate the other at the
+/// same epoch. Keep the byte values stable: changing one silently
+/// invalidates every existing signature of that frame kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CtrlFrame {
+    /// [`crate::gossip::GossipBody::SessionClosed`].
+    Close,
+    /// [`crate::gossip::GossipBody::EpochBeacon`].
+    Beacon,
+}
+
+const fn ctrl_frame_byte(frame: CtrlFrame) -> u8 {
+    match frame {
+        CtrlFrame::Close => 0,
+        CtrlFrame::Beacon => 1,
+    }
+}
 
 /// Canonical bytes for the host's per-message sequencing signature.
 ///
@@ -423,38 +457,50 @@ pub fn verify_ack(
 /// ([`crate::gossip::GossipBody::SessionClosed`] and
 /// [`crate::gossip::GossipBody::EpochBeacon`]).
 ///
-/// `CTRL_DOMAIN_TAG || session_id(16) || host_epoch.to_be_bytes()(8)`. The
-/// `host_epoch` is the freshness element defeating replay across a same-id
-/// host resume (the iroh endpoint secret is stable, so a host signature
-/// alone can't distinguish incarnations N and N+1).
+/// `CTRL_DOMAIN_TAG || session_id(16) || frame_byte(1) ||
+/// host_epoch.to_be_bytes()(8)`. The `frame_byte` binds the
+/// [`CtrlFrame`] kind so a beacon signature cannot be re-wrapped as a
+/// close at the same epoch. The `host_epoch` is the freshness element
+/// defeating replay across a same-id host resume (the iroh endpoint
+/// secret is stable, so a host signature alone can't distinguish
+/// incarnations N and N+1).
 #[must_use]
-pub fn ctrl_canonical_bytes(session_id: SessionId, host_epoch: u64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(CTRL_DOMAIN_TAG.len() + 16 + 8);
+pub fn ctrl_canonical_bytes(session_id: SessionId, frame: CtrlFrame, host_epoch: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(CTRL_DOMAIN_TAG.len() + 16 + 1 + 8);
     out.extend_from_slice(CTRL_DOMAIN_TAG);
     out.extend_from_slice(session_id.as_bytes());
+    out.push(ctrl_frame_byte(frame));
     out.extend_from_slice(&host_epoch.to_be_bytes());
     out
 }
 
-/// Sign a host control-frame (close / epoch beacon) at `host_epoch`.
+/// Sign a host control-frame ([`CtrlFrame::Close`] /
+/// [`CtrlFrame::Beacon`]) at `host_epoch`.
 #[must_use]
-pub fn sign_ctrl(key: &SigningKey, session_id: SessionId, host_epoch: u64) -> SigBytes {
-    key.sign(&ctrl_canonical_bytes(session_id, host_epoch))
+pub fn sign_ctrl(
+    key: &SigningKey,
+    session_id: SessionId,
+    frame: CtrlFrame,
+    host_epoch: u64,
+) -> SigBytes {
+    key.sign(&ctrl_canonical_bytes(session_id, frame, host_epoch))
         .to_bytes()
 }
 
 /// Verify a host control-frame signature against the host's public key.
 ///
-/// Shared by `SessionClosed` and `EpochBeacon` — a `host_sig` produced for
-/// either verifies the other at the same epoch.
+/// The `frame` must match the kind the signature was minted for: a
+/// `host_sig` produced for a [`CtrlFrame::Beacon`] no longer verifies as
+/// a [`CtrlFrame::Close`] at the same epoch (and vice-versa).
 ///
 /// # Errors
 ///
 /// Mirrors [`verify_seq`]: sentinel, bad key, or bad sig. A tampered
-/// `host_epoch` yields [`VerifyError::BadSig`].
+/// `host_epoch`, or the wrong [`CtrlFrame`], yields [`VerifyError::BadSig`].
 pub fn verify_ctrl(
     host_pubkey: &PeerId,
     session_id: SessionId,
+    frame: CtrlFrame,
     host_epoch: u64,
     host_sig: &SigBytes,
 ) -> Result<(), VerifyError> {
@@ -465,7 +511,7 @@ pub fn verify_ctrl(
         VerifyingKey::from_bytes(host_pubkey.as_bytes()).map_err(|_| VerifyError::BadKey)?;
     let sig = Signature::from_bytes(host_sig);
     verifying
-        .verify_strict(&ctrl_canonical_bytes(session_id, host_epoch), &sig)
+        .verify_strict(&ctrl_canonical_bytes(session_id, frame, host_epoch), &sig)
         .map_err(|_| VerifyError::BadSig)
 }
 
@@ -994,7 +1040,9 @@ mod tests {
     fn host_domain_tags_are_versioned() {
         assert_eq!(SEQ_DOMAIN_TAG, b"artel/seq-v1");
         assert_eq!(ACK_DOMAIN_TAG, b"artel/ack-v1");
-        assert_eq!(CTRL_DOMAIN_TAG, b"artel/ctrl-v1");
+        // ctrl bumped to -v2 with the frame-kind binding (finding #1);
+        // the dedicated assertion lives in `ctrl_domain_tag_is_v2`.
+        assert_eq!(CTRL_DOMAIN_TAG, b"artel/ctrl-v2");
     }
 
     // ---- seq canonical bytes / round-trip ----
@@ -1201,9 +1249,25 @@ mod tests {
     // ---- ctrl canonical bytes / round-trip ----
 
     #[test]
+    fn ctrl_domain_tag_is_v2() {
+        // v1 signed only (session_id, host_epoch); v2 folds in the frame
+        // discriminant so a beacon and a close at the same epoch no
+        // longer share signed bytes (finding #1).
+        assert_eq!(CTRL_DOMAIN_TAG, b"artel/ctrl-v2");
+    }
+
+    #[test]
+    fn ctrl_frame_byte_values_are_pinned() {
+        // These bytes are part of the signed scope; changing one
+        // silently invalidates every existing signature of that frame.
+        assert_eq!(ctrl_frame_byte(CtrlFrame::Close), 0);
+        assert_eq!(ctrl_frame_byte(CtrlFrame::Beacon), 1);
+    }
+
+    #[test]
     fn ctrl_canonical_bytes_field_offsets() {
-        let base = ctrl_canonical_bytes(SessionId::from_bytes([0x01; 16]), 7);
-        let diff_sid = ctrl_canonical_bytes(SessionId::from_bytes([0x02; 16]), 7);
+        let base = ctrl_canonical_bytes(SessionId::from_bytes([0x01; 16]), CtrlFrame::Close, 7);
+        let diff_sid = ctrl_canonical_bytes(SessionId::from_bytes([0x02; 16]), CtrlFrame::Close, 7);
         let first = base
             .iter()
             .zip(diff_sid.iter())
@@ -1211,32 +1275,45 @@ mod tests {
             .expect("session_id diff");
         assert_eq!(first, CTRL_DOMAIN_TAG.len());
 
-        let diff_epoch = ctrl_canonical_bytes(SessionId::from_bytes([0x01; 16]), 8);
+        // frame byte sits right after the session id (tag + 16).
+        let diff_frame =
+            ctrl_canonical_bytes(SessionId::from_bytes([0x01; 16]), CtrlFrame::Beacon, 7);
+        let first = base
+            .iter()
+            .zip(diff_frame.iter())
+            .position(|(x, y)| x != y)
+            .expect("frame diff");
+        assert_eq!(first, CTRL_DOMAIN_TAG.len() + 16);
+
+        let diff_epoch =
+            ctrl_canonical_bytes(SessionId::from_bytes([0x01; 16]), CtrlFrame::Close, 8);
         let first = base
             .iter()
             .zip(diff_epoch.iter())
             .position(|(x, y)| x != y)
             .expect("epoch diff");
-        // be-encoded u64 epoch differs in its last byte: tag + 16 + 7.
-        assert_eq!(first, CTRL_DOMAIN_TAG.len() + 16 + 7);
+        // be-encoded u64 epoch differs in its last byte: tag + 16 + 1 + 7.
+        assert_eq!(first, CTRL_DOMAIN_TAG.len() + 16 + 1 + 7);
     }
 
     #[test]
     fn sign_then_verify_ctrl_round_trip() {
         let key = key_a();
         let s = sample_session_id();
-        let host_sig = sign_ctrl(&key, s, 5);
-        verify_ctrl(&host_pubkey(&key), s, 5, &host_sig).unwrap();
+        for frame in [CtrlFrame::Close, CtrlFrame::Beacon] {
+            let host_sig = sign_ctrl(&key, s, frame, 5);
+            verify_ctrl(&host_pubkey(&key), s, frame, 5, &host_sig).unwrap();
+        }
     }
 
     #[test]
     fn verify_ctrl_rejects_epoch_change() {
         let key = key_a();
         let s = sample_session_id();
-        let host_sig = sign_ctrl(&key, s, 5);
-        verify_ctrl(&host_pubkey(&key), s, 5, &host_sig).unwrap();
+        let host_sig = sign_ctrl(&key, s, CtrlFrame::Close, 5);
+        verify_ctrl(&host_pubkey(&key), s, CtrlFrame::Close, 5, &host_sig).unwrap();
         assert_eq!(
-            verify_ctrl(&host_pubkey(&key), s, 6, &host_sig).unwrap_err(),
+            verify_ctrl(&host_pubkey(&key), s, CtrlFrame::Close, 6, &host_sig).unwrap_err(),
             VerifyError::BadSig,
         );
     }
@@ -1245,28 +1322,41 @@ mod tests {
     fn verify_ctrl_rejects_wrong_host_key() {
         let key = key_a();
         let s = sample_session_id();
-        let host_sig = sign_ctrl(&key, s, 5);
+        let host_sig = sign_ctrl(&key, s, CtrlFrame::Close, 5);
         assert_eq!(
-            verify_ctrl(&host_pubkey(&key_b()), s, 5, &host_sig).unwrap_err(),
+            verify_ctrl(&host_pubkey(&key_b()), s, CtrlFrame::Close, 5, &host_sig).unwrap_err(),
             VerifyError::BadSig,
         );
     }
 
     #[test]
-    fn verify_ctrl_shared_by_beacon_and_close() {
-        // The defining property of the shared CTRL canonical bytes: a
-        // host_sig produced for an EpochBeacon verifies a SessionClosed
-        // at the same epoch and vice-versa — they sign identical bytes.
+    fn verify_ctrl_rejects_frame_swap() {
+        // Finding #1: a genuine EpochBeacon signature must NOT verify as
+        // a SessionClosed at the same epoch, and vice-versa. This is the
+        // property the v1 layout lacked — any topic participant could
+        // re-wrap a captured beacon as a forged close.
         let key = key_a();
         let s = sample_session_id();
-        // "beacon" and "close" are just two call sites; the sig is over
-        // (session_id, host_epoch) regardless of frame.
-        let beacon_sig = sign_ctrl(&key, s, 9);
-        // Verify it as if it rode on a SessionClosed at epoch 9.
-        verify_ctrl(&host_pubkey(&key), s, 9, &beacon_sig).unwrap();
-        let close_sig = sign_ctrl(&key, s, 9);
-        verify_ctrl(&host_pubkey(&key), s, 9, &close_sig).unwrap();
-        assert_eq!(beacon_sig, close_sig, "deterministic over identical bytes");
+
+        let beacon_sig = sign_ctrl(&key, s, CtrlFrame::Beacon, 9);
+        assert_eq!(
+            verify_ctrl(&host_pubkey(&key), s, CtrlFrame::Close, 9, &beacon_sig).unwrap_err(),
+            VerifyError::BadSig,
+            "a beacon signature must not validate a close at the same epoch",
+        );
+
+        let close_sig = sign_ctrl(&key, s, CtrlFrame::Close, 9);
+        assert_eq!(
+            verify_ctrl(&host_pubkey(&key), s, CtrlFrame::Beacon, 9, &close_sig).unwrap_err(),
+            VerifyError::BadSig,
+            "a close signature must not validate a beacon at the same epoch",
+        );
+
+        // The two signatures over the same epoch are now distinct blobs.
+        assert_ne!(
+            beacon_sig, close_sig,
+            "close and beacon must sign different bytes at the same epoch",
+        );
     }
 
     #[test]
@@ -1274,7 +1364,14 @@ mod tests {
         let key = key_a();
         let s = sample_session_id();
         assert_eq!(
-            verify_ctrl(&host_pubkey(&key), s, 1, &SIGNATURE_UNSIGNED).unwrap_err(),
+            verify_ctrl(
+                &host_pubkey(&key),
+                s,
+                CtrlFrame::Close,
+                1,
+                &SIGNATURE_UNSIGNED
+            )
+            .unwrap_err(),
             VerifyError::SentinelUnsigned,
         );
     }

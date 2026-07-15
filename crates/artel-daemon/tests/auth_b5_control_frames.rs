@@ -208,7 +208,7 @@ async fn forged_session_closed_dropped_impl(
 
     let attacker = SigningKey::from_bytes(&[0xee; 32]);
     let host_epoch = 0u64;
-    let host_sig = signing::sign_ctrl(&attacker, session_id, host_epoch);
+    let host_sig = signing::sign_ctrl(&attacker, session_id, signing::CtrlFrame::Close, host_epoch);
     sender
         .broadcast(Bytes::from(gossip::encode(&GossipBody::SessionClosed {
             host_epoch,
@@ -242,6 +242,78 @@ async fn forged_session_closed_dropped_impl(
 async fn forged_session_closed_dropped() {
     let (daemon_a, daemon_b, _dns) = common::spawn_pair().await;
     forged_session_closed_dropped_impl(&daemon_a, &daemon_b).await;
+    daemon_a.stop().await;
+    daemon_b.stop().await;
+}
+
+// =============================================================
+// Finding #1: a captured *genuine* `EpochBeacon` re-wrapped as a
+// `SessionClosed` at the same epoch is dropped. Pre-fix the two frames
+// shared canonical bytes (`"artel/ctrl-v1" || session || host_epoch`),
+// so any topic participant could lift the host's real beacon signature,
+// stuff it into a SessionClosed, and force every joiner to tear down its
+// mirror. The `"artel/ctrl-v2"` frame-kind binding makes the beacon
+// signature invalid as a close, so it is dropped at verify_ctrl before
+// the watermark is even consulted.
+// =============================================================
+
+#[tokio::test]
+async fn beacon_signature_rewrapped_as_close_is_dropped() {
+    let (daemon_a, daemon_b, _dns, session_id, alice_client, bob_client, mut bob_events) =
+        host_and_join().await;
+
+    let topic_id = topic_for(session_id);
+    let topic = daemon_b
+        .gossip
+        .subscribe(topic_id, vec![daemon_a.iroh_addr.id])
+        .await
+        .expect("raw subscribes");
+    let (sender, mut receiver) = topic.split();
+    timeout(Duration::from_secs(15), receiver.joined())
+        .await
+        .expect("raw subscribe never joined")
+        .expect("joined() errored");
+
+    // Resume once so the host broadcasts a genuine epoch-1 beacon;
+    // capture its signature off the wire — this is the attacker's
+    // harvested material. Bob's watermark advances to 1, so an epoch-1
+    // frame is NOT stale: the ONLY thing standing between this signature
+    // and a mirror teardown is the v2 frame-kind binding.
+    resume_host(&alice_client, session_id).await;
+    let beacon_sig = capture_beacon_at(&mut receiver, 1).await;
+
+    // Re-wrap the captured beacon signature as a SessionClosed at the
+    // same epoch — the pre-fix forgery.
+    sender
+        .broadcast(Bytes::from(gossip::encode(&GossipBody::SessionClosed {
+            host_epoch: 1,
+            host_sig: beacon_sig,
+        })))
+        .await
+        .expect("broadcast rewrapped close");
+
+    // Bob must NOT see a SessionClosed: the beacon sig fails verify_ctrl
+    // as a Close frame.
+    assert_no_session_closed(&mut bob_events, Duration::from_secs(2), "bob").await;
+
+    // And bob is still live — a host send reaches him.
+    alice_client
+        .request(Request::Send {
+            session: session_id,
+            payload: SendPayload {
+                kind: MessageKind::Chat,
+                action: "chat.message".into(),
+                payload: b"alive after rewrap".to_vec(),
+            },
+        })
+        .await
+        .unwrap();
+    let _ =
+        common::expect_message_with_payload(&mut bob_events, b"alive after rewrap", "bob").await;
+
+    drop(sender);
+    drop(alice_client);
+    drop(bob_client);
     daemon_a.stop().await;
     daemon_b.stop().await;
 }
@@ -501,14 +573,15 @@ async fn replayed_message_under_new_seq_dropped() {
 // =============================================================
 // A `SessionClosed` replayed across a host epoch bump is dropped.
 // Drives the D3 mechanism end to end: the host resume EpochBeacon
-// advances the joiner's watermark past the captured close's epoch.
+// advances the joiner's watermark past the replayed close's epoch.
 //
-// The host close and the epoch beacon share canonical bytes
-// (`verify_ctrl`), so a genuine epoch-N ctrl signature captured off
-// the wire is a valid close signature at epoch N. We capture a real
-// epoch-1 beacon signature, let a later epoch-2 beacon advance bob's
-// watermark to 2, then replay a SessionClosed{epoch:1} carrying the
-// captured (genuine) signature. It passes verify_ctrl but fails
+// Since the `"artel/ctrl-v2"` fix (finding #1) a close and a beacon at
+// the same epoch sign *different* bytes, so we can no longer harvest a
+// close signature off a captured beacon — we mint a genuine
+// `CtrlFrame::Close` signature directly from the host's on-disk key.
+// We build a real epoch-1 close signature, let a later epoch-2 beacon
+// advance bob's watermark to 2, then replay a SessionClosed{epoch:1}
+// carrying that genuine signature. It passes verify_ctrl but fails
 // `host_epoch >= watermark` (1 < 2), so it is dropped.
 // =============================================================
 
@@ -517,6 +590,15 @@ async fn replayed_message_under_new_seq_dropped() {
 async fn replayed_session_closed_across_epoch_bump_dropped() {
     let (daemon_a, daemon_b, _dns, session_id, alice_client, bob_client, mut bob_events) =
         host_and_join().await;
+
+    // Mint a genuine host close signature at epoch 1 up front — a real
+    // `CtrlFrame::Close` sig under the host key, exactly what a genuine
+    // epoch-1 close would carry. (Pre-fix this test reused a captured
+    // beacon sig; the v2 frame binding makes that a forgery that would
+    // now be dropped at verify_ctrl, masking the watermark gate we mean
+    // to exercise.)
+    let host_key = daemon_a.host_signing_key();
+    let epoch1_close_sig = signing::sign_ctrl(&host_key, session_id, signing::CtrlFrame::Close, 1);
 
     let topic_id = topic_for(session_id);
     let topic = daemon_b
@@ -530,10 +612,10 @@ async fn replayed_session_closed_across_epoch_bump_dropped() {
         .expect("raw subscribe never joined")
         .expect("joined() errored");
 
-    // Resume #1: epoch 0 → 1, beacon broadcast. Capture the genuine
-    // epoch-1 ctrl signature.
+    // Resume #1: epoch 0 → 1, beacon broadcast. Confirm the host emitted
+    // the epoch-1 beacon (bob's watermark moves to 1).
     resume_host(&alice_client, session_id).await;
-    let epoch1_sig = capture_beacon_at(&mut receiver, 1).await;
+    let _epoch1_beacon_sig = capture_beacon_at(&mut receiver, 1).await;
 
     // Resume #2: epoch 1 → 2, beacon broadcast. This advances bob's
     // watermark to 2. Capture the epoch-2 beacon off our receiver to
@@ -561,14 +643,14 @@ async fn replayed_session_closed_across_epoch_bump_dropped() {
     let _ =
         common::expect_message_with_payload(&mut bob_events, b"after epoch2 beacon", "bob").await;
 
-    // Replay a SessionClosed at epoch 1 with the genuine captured
-    // signature. verify_ctrl passes (real host sig at epoch 1), but
-    // 1 < watermark(2) → dropped. Bob has provably processed the
+    // Replay a SessionClosed at epoch 1 with the genuine minted close
+    // signature. verify_ctrl passes (real host close sig at epoch 1),
+    // but 1 < watermark(2) → dropped. Bob has provably processed the
     // epoch-2 beacon already, so no ordering race remains.
     sender
         .broadcast(Bytes::from(gossip::encode(&GossipBody::SessionClosed {
             host_epoch: 1,
-            host_sig: epoch1_sig,
+            host_sig: epoch1_close_sig,
         })))
         .await
         .expect("broadcast replayed close");
