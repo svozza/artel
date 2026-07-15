@@ -57,7 +57,15 @@ use crate::rpc::SignedSendPayload;
 /// are wire-incompatible with the pre-B.5 mesh, so a mixed-version mesh
 /// fails cleanly at the version byte ([`GossipFrameError::UnsupportedVersion`])
 /// instead of mis-decoding postcard bytes into the wrong variant.
-pub const GOSSIP_WIRE_VERSION: u8 = 1;
+///
+/// Bumped to `2` on 2026-07-15 alongside the `"artel/ctrl-v2"` control
+/// signature (see [`crate::signing::CTRL_DOMAIN_TAG`]). The ctrl frames
+/// now sign a [`crate::signing::CtrlFrame`] discriminant, so a `-v2`
+/// daemon's `SessionClosed`/`EpochBeacon` signatures do not verify under
+/// a `-v1` peer's key layout and vice-versa. The wire byte moves in
+/// lockstep so the mismatch is caught at decode rather than surfacing as
+/// a spurious `host_sig verify failed`.
+pub const GOSSIP_WIRE_VERSION: u8 = 2;
 
 /// One frame on a session's gossip topic. Externally tagged so
 /// postcard can serialise it (see workspace memo on postcard +
@@ -164,9 +172,12 @@ pub enum GossipBody {
         /// the freshness element.
         host_epoch: u64,
         /// Host signature over `crate::signing::ctrl_canonical_bytes`
-        /// of (`session_id`, `host_epoch`) — `"artel/ctrl-v1"`. Shares
-        /// canonical bytes with [`GossipBody::EpochBeacon`], so one
-        /// verifier (`verify_ctrl`) serves both.
+        /// of (`session_id`, `CtrlFrame::Close`, `host_epoch`) —
+        /// `"artel/ctrl-v2"`. Shares the domain and verifier
+        /// (`verify_ctrl`) with [`GossipBody::EpochBeacon`], but the
+        /// `CtrlFrame` discriminant in the signed bytes means a beacon
+        /// signature does **not** validate a close at the same epoch
+        /// (finding #1).
         #[serde(with = "crate::message::signature_serde")]
         host_sig: SigBytes,
     },
@@ -186,8 +197,11 @@ pub enum GossipBody {
         /// The host's current incarnation counter.
         host_epoch: u64,
         /// Host signature over `crate::signing::ctrl_canonical_bytes`
-        /// of (`session_id`, `host_epoch`) — `"artel/ctrl-v1"`, the
-        /// **same** canonical bytes as [`GossipBody::SessionClosed`].
+        /// of (`session_id`, `CtrlFrame::Beacon`, `host_epoch`) —
+        /// `"artel/ctrl-v2"`. Same domain and verifier as
+        /// [`GossipBody::SessionClosed`], but the `CtrlFrame`
+        /// discriminant keeps the two signatures distinct at a shared
+        /// epoch (finding #1).
         #[serde(with = "crate::message::signature_serde")]
         host_sig: SigBytes,
     },

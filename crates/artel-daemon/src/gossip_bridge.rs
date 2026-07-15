@@ -877,12 +877,15 @@ impl GossipBridge {
             );
             return;
         };
-        // Host-sign over `"artel/ctrl-v1" || session || host_epoch`
-        // (Auth Slice B.5, D3) — the same canonical bytes as the
-        // EpochBeacon, so the joiner's `verify_ctrl` serves both.
+        // Host-sign over `"artel/ctrl-v2" || session || Close ||
+        // host_epoch` (Auth Slice B.5, D3; finding #1). The frame-kind
+        // byte means this close signature is NOT interchangeable with an
+        // EpochBeacon at the same epoch — a captured beacon can no longer
+        // be re-wrapped as a forged close.
         let host_sig = artel_protocol::signing::sign_ctrl(
             self.signing_key.as_signing_key(),
             session,
+            artel_protocol::signing::CtrlFrame::Close,
             host_epoch,
         );
         let bytes = Bytes::from(gossip::encode(&GossipBody::SessionClosed {
@@ -914,6 +917,7 @@ impl GossipBridge {
         let host_sig = artel_protocol::signing::sign_ctrl(
             self.signing_key.as_signing_key(),
             session,
+            artel_protocol::signing::CtrlFrame::Beacon,
             host_epoch,
         );
         let bytes = Bytes::from(gossip::encode(&GossipBody::EpochBeacon {
@@ -1130,9 +1134,13 @@ async fn handle_inbound_frame(
             // (no host key); a close captured from an earlier
             // incarnation and replayed after a resume fails (b) (its
             // epoch is below the watermark the resume beacon advanced).
-            if let Err(err) =
-                artel_protocol::signing::verify_ctrl(host_pubkey, session, host_epoch, &host_sig)
-            {
+            if let Err(err) = artel_protocol::signing::verify_ctrl(
+                host_pubkey,
+                session,
+                artel_protocol::signing::CtrlFrame::Close,
+                host_epoch,
+                &host_sig,
+            ) {
                 warn!(
                     ?session,
                     host_epoch,
@@ -1277,9 +1285,13 @@ async fn handle_inbound_frame(
                 host_sig,
             },
         ) => {
-            if let Err(err) =
-                artel_protocol::signing::verify_ctrl(host_pubkey, session, host_epoch, &host_sig)
-            {
+            if let Err(err) = artel_protocol::signing::verify_ctrl(
+                host_pubkey,
+                session,
+                artel_protocol::signing::CtrlFrame::Beacon,
+                host_epoch,
+                &host_sig,
+            ) {
                 warn!(
                     ?session,
                     host_epoch,

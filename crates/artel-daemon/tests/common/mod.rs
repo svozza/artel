@@ -163,6 +163,26 @@ impl RunningDaemon {
         PeerId::from_bytes(*self.iroh_addr.id.as_bytes())
     }
 
+    /// The daemon's persisted iroh secret, loaded off disk as an
+    /// ed25519 [`SigningKey`]. Lets a test mint a *genuine* host
+    /// signature (e.g. a real `SessionClosed` ctrl-sig) without routing
+    /// through the daemon. The on-disk `iroh.key` is the 32-byte ed25519
+    /// seed, identical for `iroh::SecretKey` and `SigningKey`. Panics if
+    /// the daemon wasn't spawned with a caller-owned state dir.
+    // `_state` is underscore-prefixed to signal "keep-alive, don't touch"
+    // to most call sites; this one legitimately reads the retained path.
+    #[allow(clippy::used_underscore_binding)]
+    pub fn host_signing_key(&self) -> artel_protocol::signing::SigningKey {
+        let key_path = &self
+            ._state
+            .as_ref()
+            .expect("daemon retains its state dir")
+            .iroh_key;
+        let bytes = std::fs::read(key_path).expect("read iroh.key");
+        let seed: [u8; 32] = bytes.as_slice().try_into().expect("iroh.key is 32 bytes");
+        artel_protocol::signing::SigningKey::from_bytes(&seed)
+    }
+
     /// Snapshot the bridge's `tracked_peer_ids` set. Returns a fresh
     /// `BTreeSet` so the caller can assert membership without holding
     /// the daemon's internal lock.
