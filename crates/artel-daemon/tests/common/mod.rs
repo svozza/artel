@@ -393,7 +393,12 @@ impl RawGossipPeer {
             .bind()
             .await
             .expect("raw gossip peer: bind endpoint");
-        let gossip = iroh_gossip::net::Gossip::builder().spawn(endpoint.clone());
+        // Match the daemon's raised cap — a peer left on iroh-gossip's
+        // 4096-byte default would reject the daemon's larger frames at
+        // its recv loop.
+        let gossip = iroh_gossip::net::Gossip::builder()
+            .max_message_size(artel_protocol::gossip::MAX_GOSSIP_MESSAGE_SIZE)
+            .spawn(endpoint.clone());
         let router = iroh::protocol::Router::builder(endpoint.clone())
             .accept(iroh_gossip::ALPN, gossip.clone())
             .spawn();

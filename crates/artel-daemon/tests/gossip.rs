@@ -280,6 +280,210 @@ async fn host_sends_message_joiner_observes_via_gossip() {
 }
 
 // =============================================================
+// Gossip frame-size mismatch (adversarial-review finding #2): with
+// iroh-gossip left on its 4096-byte default max_message_size, a host
+// send over ~4 KiB persisted + acked locally and then silently died
+// inside iroh-gossip's send loop — permanent host/mirror divergence
+// with no attacker. The daemon now raises the transport cap to
+// MAX_GOSSIP_MESSAGE_SIZE and rejects anything the wire still can't
+// carry at send time.
+// =============================================================
+
+/// A payload well over the old 4096-byte default must still reach the
+/// joiner. This is the regression test for the silent-loss bug: before
+/// the `.max_message_size()` raise it hung waiting for Bob's copy.
+#[tokio::test]
+async fn payload_over_iroh_gossip_default_reaches_joiner() {
+    let (daemon_a, daemon_b, _dns_pkarr) = common::spawn_pair().await;
+
+    let alice_client = Client::connect(&daemon_a.socket).await.unwrap();
+    let host_resp = alice_client
+        .request(Request::HostSession {
+            display_name: "alice".into(),
+            session: None,
+        })
+        .await
+        .unwrap();
+    let (session_id, ticket) = match host_resp {
+        Response::HostSession {
+            session, ticket, ..
+        } => (session, ticket),
+        other => panic!("expected HostSession, got {other:?}"),
+    };
+
+    let bob_client = Client::connect(&daemon_b.socket).await.unwrap();
+    bob_client
+        .request(Request::JoinSession {
+            display_name: "bob".into(),
+            ticket,
+        })
+        .await
+        .unwrap();
+    bob_client
+        .request(Request::Subscribe {
+            session: session_id,
+            since: None,
+        })
+        .await
+        .unwrap();
+    let mut bob_events = bob_client.take_events().await.expect("bob events");
+
+    // 64 KiB: 16× the old default cap, far under the new 1 MiB one.
+    let big = vec![0x5A; 64 * 1024];
+    alice_client
+        .request(Request::Send {
+            session: session_id,
+            payload: SendPayload {
+                kind: MessageKind::Chat,
+                action: "chat.message".into(),
+                payload: big.clone(),
+            },
+        })
+        .await
+        .unwrap();
+
+    let bob_msg = common::expect_message_with_payload(&mut bob_events, &big, "bob").await;
+    assert_eq!(bob_msg.payload, big);
+
+    drop(alice_client);
+    drop(bob_client);
+    daemon_a.stop().await;
+    daemon_b.stop().await;
+}
+
+/// A payload the (raised) gossip transport still can't carry is
+/// rejected loudly at send time with `payload_too_large` — never
+/// persisted, never acked as success.
+#[tokio::test]
+async fn oversized_send_rejected_with_payload_too_large() {
+    let (daemon_a, _daemon_b, _dns_pkarr) = common::spawn_pair().await;
+
+    let alice_client = Client::connect(&daemon_a.socket).await.unwrap();
+    let host_resp = alice_client
+        .request(Request::HostSession {
+            display_name: "alice".into(),
+            session: None,
+        })
+        .await
+        .unwrap();
+    let session_id = match host_resp {
+        Response::HostSession { session, .. } => session,
+        other => panic!("expected HostSession, got {other:?}"),
+    };
+
+    let err = alice_client
+        .request(Request::Send {
+            session: session_id,
+            payload: SendPayload {
+                kind: MessageKind::Chat,
+                action: "chat.message".into(),
+                payload: vec![0x5A; artel_protocol::gossip::MAX_SESSION_MESSAGE_FRAME + 1],
+            },
+        })
+        .await
+        .unwrap_err();
+    match err {
+        ClientError::Protocol(ProtocolError::PayloadTooLarge { size, max }) => {
+            assert_eq!(
+                max,
+                artel_protocol::gossip::MAX_SESSION_MESSAGE_FRAME as u64
+            );
+            assert!(size > max);
+        }
+        other => panic!("expected PayloadTooLarge error, got {other:?}"),
+    }
+
+    // The rejected message must not have been sequenced: the next
+    // (small) send takes seq 1.
+    let resp = alice_client
+        .request(Request::Send {
+            session: session_id,
+            payload: SendPayload {
+                kind: MessageKind::Chat,
+                action: "chat.message".into(),
+                payload: b"small".to_vec(),
+            },
+        })
+        .await
+        .unwrap();
+    match resp {
+        Response::Sent { seq, .. } => assert_eq!(seq.get(), 1),
+        other => panic!("expected Sent, got {other:?}"),
+    }
+
+    drop(alice_client);
+    daemon_a.stop().await;
+}
+
+/// A joiner's oversized send fails fast at the bridge's frame gate —
+/// a loud `payload_too_large` reply, not a silent broadcast drop that
+/// burns the full 15s `SEND_REMOTE_TIMEOUT` waiting for an ack that
+/// can never arrive.
+#[tokio::test]
+async fn joiner_oversized_send_fails_fast_not_timeout() {
+    let (daemon_a, daemon_b, _dns_pkarr) = common::spawn_pair().await;
+
+    let alice_client = Client::connect(&daemon_a.socket).await.unwrap();
+    let host_resp = alice_client
+        .request(Request::HostSession {
+            display_name: "alice".into(),
+            session: None,
+        })
+        .await
+        .unwrap();
+    let (session_id, ticket) = match host_resp {
+        Response::HostSession {
+            session, ticket, ..
+        } => (session, ticket),
+        other => panic!("expected HostSession, got {other:?}"),
+    };
+
+    let bob_client = Client::connect(&daemon_b.socket).await.unwrap();
+    bob_client
+        .request(Request::JoinSession {
+            display_name: "bob".into(),
+            ticket,
+        })
+        .await
+        .unwrap();
+
+    // Payload sized so the SendRequest frame (payload + peer + sig +
+    // uuid envelope) is decisively over MAX_GOSSIP_FRAME, tripping the
+    // bridge-local gate before any broadcast.
+    let started = Instant::now();
+    let err = bob_client
+        .request(Request::Send {
+            session: session_id,
+            payload: SendPayload {
+                kind: MessageKind::Chat,
+                action: "chat.message".into(),
+                payload: vec![0x5A; artel_protocol::gossip::MAX_GOSSIP_FRAME + 1],
+            },
+        })
+        .await
+        .unwrap_err();
+    match err {
+        ClientError::Protocol(ProtocolError::PayloadTooLarge { size, max }) => {
+            assert_eq!(max, artel_protocol::gossip::MAX_GOSSIP_FRAME as u64);
+            assert!(size > max);
+        }
+        other => panic!("expected PayloadTooLarge error, got {other:?}"),
+    }
+    // Fail-fast, not the 15s send timeout. Generous bound: the reply
+    // only has to beat the timeout by a mile, not be instant.
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "oversized joiner send took {:?} — did it burn the ack timeout?",
+        started.elapsed(),
+    );
+
+    drop(alice_client);
+    drop(bob_client);
+    daemon_a.stop().await;
+    daemon_b.stop().await;
+}
+
+// =============================================================
 // Phase 2c-2d: a joiner announces themselves on the gossip topic
 // once the mesh is up so the host's IPC subscribers see `PeerJoined`
 // proactively — without waiting for the joiner's first `SendRequest`

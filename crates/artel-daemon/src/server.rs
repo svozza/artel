@@ -1348,7 +1348,15 @@ async fn resolve_iroh_runtime(
     // Gossip needs a clone of the endpoint to register itself for the
     // ALPN; the Router is built later in Daemon::start (after the
     // Registry exists) so UpgradeProtocol can be registered on it.
-    let gossip = iroh_gossip::net::Gossip::builder().spawn(endpoint.clone());
+    //
+    // `max_message_size` MUST be raised above iroh-gossip's 4096-byte
+    // default: the send path caps messages at
+    // `MAX_SESSION_MESSAGE_FRAME`, and an under-sized transport would
+    // silently drop broadcasts inside iroh-gossip's send loop — the
+    // exact divergence bug the cap exists to prevent (finding #2).
+    let gossip = iroh_gossip::net::Gossip::builder()
+        .max_message_size(artel_protocol::gossip::MAX_GOSSIP_MESSAGE_SIZE)
+        .spawn(endpoint.clone());
 
     Ok((
         peer_id,

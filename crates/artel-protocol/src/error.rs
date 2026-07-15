@@ -91,6 +91,25 @@ pub enum ProtocolError {
     /// `postcard_variant_indices_are_pinned` test.
     #[error("ticket {0} was never issued for this session")]
     UnknownTicket(crate::ids::TicketId),
+
+    /// A `Send` was rejected because the message, once framed for the
+    /// inter-daemon gossip wire, would exceed
+    /// [`crate::gossip::MAX_GOSSIP_MESSAGE_SIZE`]. Rejected at send
+    /// time — before the message is sequenced or persisted — because a
+    /// message the gossip transport cannot carry would otherwise be
+    /// acked to the sender and then silently never reach remote
+    /// mirrors (adversarial-review finding #2). `size` is the encoded
+    /// frame length that was refused; `max` the ceiling it had to fit.
+    ///
+    /// Appended after [`Self::UnknownTicket`] — postcard wire index is
+    /// declaration order; see `postcard_variant_indices_are_pinned`.
+    #[error("message too large for gossip transport: {size} bytes (max {max})")]
+    PayloadTooLarge {
+        /// Encoded frame length of the rejected message.
+        size: u64,
+        /// The ceiling the frame had to fit under.
+        max: u64,
+    },
 }
 
 impl ProtocolError {
@@ -110,6 +129,7 @@ impl ProtocolError {
             Self::Capability(_) => "capability",
             Self::UnknownTicket(_) => "unknown_ticket",
             Self::Internal(_) => "internal",
+            Self::PayloadTooLarge { .. } => "payload_too_large",
         }
     }
 }
@@ -164,6 +184,10 @@ mod tests {
             "unknown_ticket"
         );
         assert_eq!(ProtocolError::Internal("x".into()).slug(), "internal");
+        assert_eq!(
+            ProtocolError::PayloadTooLarge { size: 2, max: 1 }.slug(),
+            "payload_too_large"
+        );
     }
 
     #[test]
@@ -180,6 +204,10 @@ mod tests {
             ProtocolError::Capability("had Read, needs ReadWrite".into()),
             ProtocolError::UnknownTicket(crate::ids::TicketId::from_bytes([2; 16])),
             ProtocolError::Internal("disk full".into()),
+            ProtocolError::PayloadTooLarge {
+                size: 2_000_000,
+                max: 1_048_064,
+            },
         ];
         for c in cases {
             let msg = c.to_string();
@@ -243,6 +271,8 @@ mod tests {
             any::<[u8; 16]>()
                 .prop_map(|b| ProtocolError::UnknownTicket(crate::ids::TicketId::from_bytes(b))),
             "[\\PC]{0,64}".prop_map(ProtocolError::Internal),
+            (any::<u64>(), any::<u64>())
+                .prop_map(|(size, max)| ProtocolError::PayloadTooLarge { size, max }),
         ]
     }
 
@@ -260,7 +290,7 @@ mod tests {
         // bump, not a re-pin).
         let s = sample_session();
         let tid = crate::ids::TicketId::from_bytes([2; 16]);
-        let cases: [(ProtocolError, u8); 11] = [
+        let cases: [(ProtocolError, u8); 12] = [
             (
                 ProtocolError::VersionMismatch(VersionMismatch {
                     client: ProtocolVersion::new(1),
@@ -282,6 +312,8 @@ mod tests {
             (ProtocolError::Internal("x".into()), 9),
             // Revocation slice: appended, never inserted.
             (ProtocolError::UnknownTicket(tid), 10),
+            // Gossip frame-size slice: appended, never inserted.
+            (ProtocolError::PayloadTooLarge { size: 2, max: 1 }, 11),
         ];
         for (err, index) in cases {
             let bytes = postcard::to_allocvec(&err).unwrap();
