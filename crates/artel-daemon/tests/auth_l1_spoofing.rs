@@ -221,6 +221,7 @@ async fn host_drops_join_announcement_with_spoofed_peer_id() {
         ticket_id: artel_protocol::TicketId::from_bytes([0xde; 16]),
         granted_cap: artel_protocol::Capability::ReadWrite,
         expiry_ms: 0,
+        host_epoch: 0,
         cap_sig: artel_protocol::SIGNATURE_UNSIGNED,
     };
     sender

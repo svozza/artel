@@ -50,17 +50,34 @@ impl SessionEntry {
 #[derive(Debug, Default)]
 pub(crate) struct MemoryStore {
     inner: Mutex<HashMap<SessionId, SessionEntry>>,
+    /// Epoch floors (session-ID-reuse replay finding), tracked in a map
+    /// separate from `inner` so `delete` — which only removes `inner`'s
+    /// entry — cannot reset a floor. Mirrors `FsLogStore`'s
+    /// `EPOCH_FLOORS_DIR` sibling-directory design.
+    epoch_floors: Mutex<HashMap<SessionId, u64>>,
 }
 
 impl MemoryStore {
     pub(crate) fn new() -> Self {
         Self::default()
     }
+
+    /// Raise `session`'s epoch floor to `raise_to` if it isn't already
+    /// at least that high. Monotonic, matching `FsLogStore`'s
+    /// `read_and_raise_epoch_floor`.
+    fn raise_epoch_floor(&self, session: SessionId, raise_to: u64) {
+        let mut guard = self.epoch_floors.lock().expect("poisoned");
+        let floor = guard.entry(session).or_insert(0);
+        if raise_to > *floor {
+            *floor = raise_to;
+        }
+    }
 }
 
 #[async_trait]
 impl SessionStore for MemoryStore {
     async fn create(&self, record: &SessionRecord) -> io::Result<()> {
+        self.raise_epoch_floor(record.id, record.host_epoch + 1);
         self.inner
             .lock()
             .expect("poisoned")
@@ -85,11 +102,22 @@ impl SessionStore for MemoryStore {
     }
 
     async fn bump_host_epoch(&self, session: SessionId, epoch: u64) -> io::Result<()> {
+        self.raise_epoch_floor(session, epoch + 1);
         let mut guard = self.inner.lock().expect("poisoned");
         if let Some(entry) = guard.get_mut(&session) {
             entry.record.host_epoch = epoch;
         }
         Ok(())
+    }
+
+    async fn epoch_floor(&self, session: SessionId) -> io::Result<u64> {
+        Ok(self
+            .epoch_floors
+            .lock()
+            .expect("poisoned")
+            .get(&session)
+            .copied()
+            .unwrap_or(0))
     }
 
     async fn put_tickets(&self, session: SessionId, tickets: &[TicketEntry]) -> io::Result<()> {

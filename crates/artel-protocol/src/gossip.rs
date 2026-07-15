@@ -149,6 +149,11 @@ pub enum GossipBody {
         granted_cap: Capability,
         /// Expiry from the ticket (0 = no expiry).
         expiry_ms: u64,
+        /// The host's incarnation epoch at the moment the joiner's
+        /// ticket was minted (session-ID-reuse replay finding). Part
+        /// of the cap claim's signed scope — see
+        /// [`crate::signing::verify_ticket_cap`].
+        host_epoch: u64,
         /// Host signature over the cap claim. The host verifies this
         /// against its own pubkey at admission.
         #[serde(with = "crate::message::signature_serde")]
@@ -406,6 +411,7 @@ mod tests {
             ticket_id: crate::ids::TicketId::from_bytes([0x01; 16]),
             granted_cap: crate::capability::Capability::Read,
             expiry_ms: 5000,
+            host_epoch: 3,
             cap_sig: [0x99; 64],
         };
         let bytes = encode(&body);
@@ -421,6 +427,7 @@ mod tests {
             ticket_id: crate::ids::TicketId::from_bytes([0x02; 16]),
             granted_cap: crate::capability::Capability::ReadWrite,
             expiry_ms: 0,
+            host_epoch: 0,
             cap_sig: [0xaa; 64],
         };
         let bytes = encode(&body);

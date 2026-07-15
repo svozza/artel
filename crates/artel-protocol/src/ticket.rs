@@ -50,7 +50,15 @@ use crate::message::SigBytes;
 /// now lives only inside `host_addr`. This drops 32 bytes and makes the
 /// two-copies-disagree state unrepresentable, but it reshapes the body,
 /// so v4 and v5 are wire-incompatible.
-pub const TICKET_VERSION: u8 = 5;
+///
+/// Bumped to `6` on 2026-07-15 (session-ID-reuse replay finding):
+/// [`SessionTicket::host_epoch`] joined the wire body so a fresh
+/// joiner can seed its `host_epoch_watermark` from the host's
+/// incarnation epoch at mint time, instead of always starting at 0.
+/// Folded into the cap-sig's signed scope
+/// ([`crate::signing::TICKET_CAP_DOMAIN_TAG`] `-v2`), so v5 and v6 are
+/// wire- and signature-incompatible.
+pub const TICKET_VERSION: u8 = 6;
 
 /// Prefix shared by every well-formed ticket. Distinguishes artel
 /// tickets from raw base32 input and makes obsolete `artel-local:`
@@ -133,9 +141,18 @@ pub struct SessionTicket {
     /// The host checks this at admission time; decode does NOT reject
     /// expired tickets (the host clock is authoritative).
     pub expiry_ms: u64,
+    /// The host's incarnation epoch at the moment this ticket was
+    /// minted (session-ID-reuse replay finding). A fresh joiner seeds
+    /// its `host_epoch_watermark` from this value instead of always
+    /// starting at 0, so a `SessionClosed` captured from a prior
+    /// incarnation of a session re-hosted at the same id can't tear
+    /// down the new one. Bound into [`Self::cap_sig`]'s signed scope —
+    /// a bearer cannot lower it undetected.
+    pub host_epoch: u64,
     /// Host signature over `(ticket_id, session_id, granted_cap,
-    /// expiry_ms)` under the `"artel/ticket-cap-v1"` domain. Verified
-    /// by the host at admission to prove this ticket was genuinely issued.
+    /// expiry_ms, host_epoch)` under the `"artel/ticket-cap-v2"`
+    /// domain. Verified by the host at admission to prove this ticket
+    /// was genuinely issued, and by the joiner to trust `host_epoch`.
     pub cap_sig: SigBytes,
 }
 
@@ -226,6 +243,7 @@ struct WireBody {
     host_addr: WireEndpointAddr,
     granted_cap: Capability,
     expiry_ms: u64,
+    host_epoch: u64,
     #[serde(with = "crate::message::signature_serde")]
     cap_sig: SigBytes,
 }
@@ -249,6 +267,7 @@ pub fn encode(ticket: &SessionTicket) -> String {
         host_addr: ticket.host_addr.clone(),
         granted_cap: ticket.granted_cap,
         expiry_ms: ticket.expiry_ms,
+        host_epoch: ticket.host_epoch,
         cap_sig: ticket.cap_sig,
     };
     let mut bytes = vec![TICKET_VERSION];
@@ -303,6 +322,7 @@ pub fn decode(raw: &str) -> Result<SessionTicket, TicketError> {
         host_addr: wire.host_addr,
         granted_cap: wire.granted_cap,
         expiry_ms: wire.expiry_ms,
+        host_epoch: wire.host_epoch,
         cap_sig: wire.cap_sig,
     })
 }
@@ -335,6 +355,7 @@ mod tests {
             host_addr: WireEndpointAddr::id_only(peer),
             granted_cap: Capability::ReadWrite,
             expiry_ms: 0,
+            host_epoch: 0,
             cap_sig: [0xaa; 64],
         }
     }
@@ -354,6 +375,7 @@ mod tests {
             },
             granted_cap: Capability::Read,
             expiry_ms: 1_700_000_000_000,
+            host_epoch: 4,
             cap_sig: [0xbb; 64],
         }
     }
@@ -438,6 +460,7 @@ mod tests {
             host_addr: WireEndpointAddr::id_only(peer),
             granted_cap: Capability::Read,
             expiry_ms: 0,
+            host_epoch: 0,
             cap_sig: SIGNATURE_UNSIGNED,
         };
         let raw = raw_frame(0xff, &bogus);
@@ -471,6 +494,7 @@ mod tests {
             host_addr: WireEndpointAddr::id_only(peer),
             granted_cap: Capability::Read,
             expiry_ms: 0,
+            host_epoch: 0,
             cap_sig: SIGNATURE_UNSIGNED,
         };
         assert_eq!(ticket.host_peer_id(), peer);
@@ -485,10 +509,10 @@ mod tests {
     fn ticket_text_for_id_only_is_paste_friendly() {
         // id-only (no relay, no direct addrs) = 1 (ver) + 16 (ticket_id) +
         // 16 (session_id) + 32 (addr peer id) + 0 (empty relay) + 0 (empty
-        // addrs) + 1 (cap) + 8 (expiry) + 64 (cap_sig) ≈ ~138 bytes
-        // postcard (32 fewer than v4, which carried the host id twice).
-        // base32 encodes at 8:5, so ~222 chars + "artel:" prefix. Fits on
-        // two terminal lines; still paste-friendly.
+        // addrs) + 1 (cap) + 8 (expiry) + 8 (host_epoch) + 64 (cap_sig) ≈
+        // ~146 bytes postcard. base32 encodes at 8:5, so ~234 chars +
+        // "artel:" prefix. Fits on two terminal lines; still
+        // paste-friendly.
         let encoded = encode(&sample());
         assert!(
             encoded.len() <= 300,
@@ -506,12 +530,12 @@ mod tests {
     }
 
     #[test]
-    fn ticket_version_is_five() {
+    fn ticket_version_is_six() {
         // v4 landed tiered tickets; v5 (finding #4) removed the
-        // redundant top-level host_peer_id from the wire body. A bump
-        // guards a v4 daemon from mis-parsing a v5 body (host id no
-        // longer sits where v4 expects it).
-        assert_eq!(TICKET_VERSION, 5);
+        // redundant top-level host_peer_id from the wire body. v6
+        // (session-ID-reuse replay finding) added host_epoch. A bump
+        // guards an older daemon from mis-parsing the reshaped body.
+        assert_eq!(TICKET_VERSION, 6);
     }
 
     #[test]
@@ -539,6 +563,7 @@ mod tests {
             host_addr: ticket.host_addr.clone(),
             granted_cap: ticket.granted_cap,
             expiry_ms: ticket.expiry_ms,
+            host_epoch: ticket.host_epoch,
             cap_sig: ticket.cap_sig,
         };
         assert_eq!(
@@ -609,8 +634,8 @@ mod tests {
 
     #[test]
     fn previous_version_byte_is_now_unsupported() {
-        // A v4 frame (the version immediately before the finding-#4
-        // reshape) must be declined, not mis-parsed. We stamp version 4
+        // A v5 frame (the version immediately before host_epoch joined
+        // the body) must be declined, not mis-parsed. We stamp version 5
         // onto the current body shape purely to exercise the version
         // gate; the body contents are irrelevant since dispatch happens
         // first.
@@ -621,10 +646,11 @@ mod tests {
             host_addr: WireEndpointAddr::id_only(peer),
             granted_cap: Capability::ReadWrite,
             expiry_ms: 0,
+            host_epoch: 0,
             cap_sig: SIGNATURE_UNSIGNED,
         };
-        let raw = raw_frame(4, &prev);
-        assert_eq!(decode(&raw), Err(TicketError::UnsupportedVersion(4)));
+        let raw = raw_frame(5, &prev);
+        assert_eq!(decode(&raw), Err(TicketError::UnsupportedVersion(5)));
     }
 
     proptest! {
@@ -635,6 +661,7 @@ mod tests {
             peer in any::<[u8; 32]>(),
             cap_is_rw in any::<bool>(),
             expiry in any::<u64>(),
+            epoch in any::<u64>(),
             sig in any::<[u8; 64]>(),
         ) {
             let host_peer_id = PeerId::from_bytes(peer);
@@ -645,6 +672,7 @@ mod tests {
                 host_addr: WireEndpointAddr::id_only(host_peer_id),
                 granted_cap,
                 expiry_ms: expiry,
+                host_epoch: epoch,
                 cap_sig: sig,
             };
             let encoded = encode(&original);

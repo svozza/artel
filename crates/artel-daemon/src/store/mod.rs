@@ -59,7 +59,36 @@ pub(crate) trait SessionStore: Send + Sync + std::fmt::Debug {
     /// rewriting the full record (Auth Slice B.5). Called from
     /// `Registry::host`'s resume branch after bumping the in-memory
     /// epoch. A no-op (returning `Ok(())`) for an unknown session.
+    ///
+    /// Implementations must also durably raise `session`'s
+    /// [`Self::epoch_floor`] to at least `epoch + 1` as part of this
+    /// call — see that method's doc for why.
     async fn bump_host_epoch(&self, session: SessionId, epoch: u64) -> io::Result<()>;
+
+    /// The lowest `host_epoch` a fresh [`Self::create`] of `session` may
+    /// safely use (session-ID-reuse replay finding).
+    ///
+    /// A host's signing key is stable across a full `delete()` +
+    /// `create()` of the same session id (e.g. `artel-fs` re-derives the
+    /// id from a workspace's doc namespace, so "close, later re-host the
+    /// same workspace" reuses the id). Without a floor, a fresh create
+    /// always starts at epoch 0, so a `SessionClosed` control frame
+    /// captured from *any* prior incarnation would satisfy a fresh
+    /// joiner's `host_epoch >= watermark` gate trivially and tear the new
+    /// session down.
+    ///
+    /// This floor is tracked **independently of the per-session
+    /// record/directory** so [`Self::delete`] does not reset it: every
+    /// `epoch` this store has ever durably persisted via [`Self::create`]
+    /// or [`Self::bump_host_epoch`] for `session` must stay below the
+    /// floor forever after, even across a delete. Returns `0` for a
+    /// session id this store has never seen.
+    ///
+    /// Callers read this once, before minting a fresh session's first
+    /// epoch and ticket — `create` and `bump_host_epoch` themselves keep
+    /// the floor in sync with every epoch they persist, so there is no
+    /// separate "advance the floor" call to remember.
+    async fn epoch_floor(&self, session: SessionId) -> io::Result<u64>;
 
     /// Persist the full issued-ticket ledger for `session`, replacing
     /// any previous contents (ticket-revocation slice). Full rewrite

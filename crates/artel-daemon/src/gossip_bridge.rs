@@ -475,6 +475,7 @@ impl GossipBridge {
         ticket_id: TicketId,
         granted_cap: Capability,
         expiry_ms: u64,
+        host_epoch: u64,
         cap_sig: SigBytes,
     ) -> Result<(), BridgeError> {
         let host_endpoint_id = iroh::EndpointId::from_bytes(host_peer.as_bytes())
@@ -530,8 +531,16 @@ impl GossipBridge {
         // verification). If this publish is lost, the host rejects
         // our sends with NotMember until a re-announcement gets
         // through.
-        self.publish_join_announcement(session, joiner, ticket_id, granted_cap, expiry_ms, cap_sig)
-            .await;
+        self.publish_join_announcement(
+            session,
+            joiner,
+            ticket_id,
+            granted_cap,
+            expiry_ms,
+            host_epoch,
+            cap_sig,
+        )
+        .await;
         // Ask the host to backfill any committed messages we
         // missed before the mesh was up. Since this is a fresh
         // mirror, we have nothing — `since: ZERO` requests the
@@ -934,6 +943,7 @@ impl GossipBridge {
     /// mesh is up. Best-effort — a failed broadcast falls back to
     /// the lazy-admission path (the host learns about us on our
     /// first `SendRequest`).
+    #[allow(clippy::too_many_arguments)]
     async fn publish_join_announcement(
         &self,
         session: SessionId,
@@ -941,6 +951,7 @@ impl GossipBridge {
         ticket_id: TicketId,
         granted_cap: Capability,
         expiry_ms: u64,
+        host_epoch: u64,
         cap_sig: SigBytes,
     ) {
         let sender = self.sessions.map_live(session, |s| s.sender.clone());
@@ -966,6 +977,7 @@ impl GossipBridge {
             ticket_id,
             granted_cap,
             expiry_ms,
+            host_epoch,
             cap_sig,
         };
         let bytes = Bytes::from(gossip::encode(&body));
@@ -1091,6 +1103,7 @@ async fn handle_inbound_frame(
                 ticket_id,
                 granted_cap,
                 expiry_ms,
+                host_epoch,
                 cap_sig,
             },
         ) => {
@@ -1102,6 +1115,7 @@ async fn handle_inbound_frame(
                 ticket_id,
                 granted_cap,
                 expiry_ms,
+                host_epoch,
                 cap_sig,
             };
             let registry_weak = bridge.registry.lock().await.clone();
