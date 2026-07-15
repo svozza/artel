@@ -184,11 +184,26 @@ pub enum TicketError {
     UnsupportedVersion(u8),
 }
 
-/// On-the-wire body. Versioned so we can extend without breaking old
-/// joiners.
+/// On-the-wire body, **without** the version byte.
+///
+/// The version lives *outside* this struct as a structural leading
+/// byte on the encoded frame (`[version: u8][postcard(WireBody)]`),
+/// mirroring the gossip-frame convention (see
+/// [`crate::gossip::encode`]). Keeping it out of the postcard body lets
+/// [`decode`] dispatch on the version *before* deserializing any
+/// version-specific field, so a future/unknown version is rejected as
+/// [`TicketError::UnsupportedVersion`] up front rather than surfacing as
+/// a [`TicketError::Malformed`] once its reshaped body fails to parse —
+/// and no untrusted field is deserialized under a version this build
+/// doesn't understand.
+///
+/// This is byte-compatible with the previous layout, where `version`
+/// was the first field of the combined struct: postcard encodes a `u8`
+/// as a bare leading byte with no struct framing, so
+/// `[TICKET_VERSION] ++ postcard(WireBody)` reproduces the old
+/// `postcard(Wire)` output exactly. No [`TICKET_VERSION`] bump needed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Wire {
-    version: u8,
+struct WireBody {
     ticket_id: TicketId,
     session_id: SessionId,
     host_peer_id: PeerId,
@@ -201,15 +216,18 @@ struct Wire {
 
 /// Encode `ticket` to its `artel:<base32>` text form.
 ///
+/// The encoded frame is `[TICKET_VERSION][postcard(body)]`; the version
+/// rides outside the postcard body so [`decode`] can dispatch on it
+/// before deserializing any version-specific field.
+///
 /// # Panics
 ///
-/// Panics if postcard fails to encode the `Wire` body. Its fields are
+/// Panics if postcard fails to encode the wire body. Its fields are
 /// all fixed-size types that always serialize, so this is unreachable
 /// in practice.
 #[must_use]
 pub fn encode(ticket: &SessionTicket) -> String {
-    let wire = Wire {
-        version: TICKET_VERSION,
+    let body = WireBody {
         ticket_id: ticket.ticket_id,
         session_id: ticket.session_id,
         host_peer_id: ticket.host_peer_id,
@@ -218,23 +236,31 @@ pub fn encode(ticket: &SessionTicket) -> String {
         expiry_ms: ticket.expiry_ms,
         cap_sig: ticket.cap_sig,
     };
-    let bytes = postcard::to_stdvec(&wire).expect("postcard encode of fixed-size types");
-    let body = BASE32_NOPAD.encode(&bytes).to_ascii_lowercase();
-    format!("{TICKET_PREFIX}{body}")
+    let mut bytes = vec![TICKET_VERSION];
+    bytes.extend_from_slice(
+        &postcard::to_stdvec(&body).expect("postcard encode of fixed-size types"),
+    );
+    let encoded = BASE32_NOPAD.encode(&bytes).to_ascii_lowercase();
+    format!("{TICKET_PREFIX}{encoded}")
 }
 
 /// Decode a ticket from its text form. Whitespace inside the input
 /// is ignored — paste-friendly.
 ///
+/// The version byte is read and checked *before* the rest of the frame
+/// is deserialized, so an unknown version is reported as
+/// [`TicketError::UnsupportedVersion`] without parsing any
+/// version-specific field.
+///
 /// # Errors
 ///
 /// Returns [`TicketError::MissingPrefix`] if the trimmed input does not
 /// start with [`TICKET_PREFIX`], [`TicketError::InvalidBase32`] if the
-/// body is not valid base32, [`TicketError::Malformed`] if the decoded
-/// bytes do not postcard-decode into a `Wire` body or if its
-/// `host_addr.peer_id` disagrees with its `host_peer_id`, and
-/// [`TicketError::UnsupportedVersion`] if the wire version is not
-/// [`TICKET_VERSION`].
+/// body is not valid base32, [`TicketError::UnsupportedVersion`] if the
+/// leading version byte is not [`TICKET_VERSION`], and
+/// [`TicketError::Malformed`] if the frame is empty, the remaining bytes
+/// do not postcard-decode into the wire body, or its `host_addr.peer_id`
+/// disagrees with its `host_peer_id`.
 pub fn decode(raw: &str) -> Result<SessionTicket, TicketError> {
     let trimmed: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
     let body = trimmed
@@ -243,11 +269,16 @@ pub fn decode(raw: &str) -> Result<SessionTicket, TicketError> {
     let bytes = BASE32_NOPAD
         .decode(body.to_ascii_uppercase().as_bytes())
         .map_err(|e| TicketError::InvalidBase32(e.to_string()))?;
-    let wire: Wire =
-        postcard::from_bytes(&bytes).map_err(|e| TicketError::Malformed(e.to_string()))?;
-    if wire.version != TICKET_VERSION {
-        return Err(TicketError::UnsupportedVersion(wire.version));
+    // Dispatch on the structural version byte before deserializing any
+    // version-specific field (finding #2).
+    let (&version, rest) = bytes
+        .split_first()
+        .ok_or_else(|| TicketError::Malformed("empty ticket frame".into()))?;
+    if version != TICKET_VERSION {
+        return Err(TicketError::UnsupportedVersion(version));
     }
+    let wire: WireBody =
+        postcard::from_bytes(rest).map_err(|e| TicketError::Malformed(e.to_string()))?;
     if wire.host_addr.peer_id != wire.host_peer_id {
         // Self-consistency check: the addr's peer id has to match
         // the ticket-level host id. A mismatch means tampering or
@@ -274,6 +305,18 @@ mod tests {
 
     use super::*;
     use crate::message::SIGNATURE_UNSIGNED;
+
+    /// Build a raw `artel:<base32>` frame from an explicit version byte
+    /// and a [`WireBody`], mirroring [`encode`]'s
+    /// `[version][postcard(body)]` layout. Lets version-dispatch tests
+    /// stamp an arbitrary leading version without going through
+    /// [`encode`] (which always writes [`TICKET_VERSION`]).
+    fn raw_frame(version: u8, body: &WireBody) -> String {
+        let mut bytes = vec![version];
+        bytes.extend_from_slice(&postcard::to_stdvec(body).unwrap());
+        let encoded = BASE32_NOPAD.encode(&bytes).to_ascii_lowercase();
+        format!("{TICKET_PREFIX}{encoded}")
+    }
 
     fn sample() -> SessionTicket {
         let peer = PeerId::from_bytes([0x42; 32]);
@@ -359,8 +402,9 @@ mod tests {
 
     #[test]
     fn prefix_only_errors_as_malformed() {
-        // base32 of zero bytes → empty string. postcard can't decode
-        // an empty buffer into a Wire, so we surface Malformed.
+        // base32 of zero bytes → empty string → a zero-length frame:
+        // there is no leading version byte to split off, so we surface
+        // Malformed rather than panic.
         let raw = TICKET_PREFIX;
         match decode(raw) {
             Err(TicketError::Malformed(_)) => {}
@@ -381,8 +425,7 @@ mod tests {
     #[test]
     fn unknown_version_byte_errors_clearly() {
         let peer = PeerId::from_bytes([0; 32]);
-        let bogus = Wire {
-            version: 0xff,
+        let bogus = WireBody {
             ticket_id: TicketId::from_bytes([0; 16]),
             session_id: SessionId::from_bytes([0; 16]),
             host_peer_id: peer,
@@ -391,16 +434,27 @@ mod tests {
             expiry_ms: 0,
             cap_sig: SIGNATURE_UNSIGNED,
         };
-        let bytes = postcard::to_stdvec(&bogus).unwrap();
-        let body = BASE32_NOPAD.encode(&bytes).to_ascii_lowercase();
-        let raw = format!("{TICKET_PREFIX}{body}");
+        let raw = raw_frame(0xff, &bogus);
         assert_eq!(decode(&raw), Err(TicketError::UnsupportedVersion(0xff)));
     }
 
     #[test]
+    fn unknown_version_rejected_before_body_is_parsed() {
+        // Finding #2: an unknown version whose body is *garbage* must
+        // still report UnsupportedVersion, proving the version byte is
+        // checked before any attempt to deserialize the body. Pre-fix
+        // (version inside the postcard body) this surfaced as Malformed,
+        // because the whole struct was deserialized first.
+        let mut bytes = vec![0xfe_u8]; // unknown version
+        bytes.extend_from_slice(&[0xff; 3]); // truncated / nonsense body
+        let encoded = BASE32_NOPAD.encode(&bytes).to_ascii_lowercase();
+        let raw = format!("{TICKET_PREFIX}{encoded}");
+        assert_eq!(decode(&raw), Err(TicketError::UnsupportedVersion(0xfe)));
+    }
+
+    #[test]
     fn host_peer_id_addr_mismatch_errors_as_malformed() {
-        let bad = Wire {
-            version: TICKET_VERSION,
+        let bad = WireBody {
             ticket_id: TicketId::from_bytes([3; 16]),
             session_id: SessionId::from_bytes([1; 16]),
             host_peer_id: PeerId::from_bytes([0xaa; 32]),
@@ -409,9 +463,7 @@ mod tests {
             expiry_ms: 0,
             cap_sig: SIGNATURE_UNSIGNED,
         };
-        let bytes = postcard::to_stdvec(&bad).unwrap();
-        let body = BASE32_NOPAD.encode(&bytes).to_ascii_lowercase();
-        let raw = format!("{TICKET_PREFIX}{body}");
+        let raw = raw_frame(TICKET_VERSION, &bad);
         match decode(&raw) {
             Err(TicketError::Malformed(msg)) => assert!(
                 msg.contains("host_addr.peer_id"),
@@ -447,8 +499,47 @@ mod tests {
     #[test]
     fn ticket_version_is_four() {
         // Deliberately unchanged by the revocation slice: TicketId has
-        // been on the wire since v3, so enforcement needs no bump.
+        // been on the wire since v3, so enforcement needs no bump. Also
+        // unchanged by the version-dispatch refactor (finding #2): the
+        // version moved *out* of the postcard body to a leading byte,
+        // but the byte layout — and thus the version — is identical.
         assert_eq!(TICKET_VERSION, 4);
+    }
+
+    #[test]
+    fn encoded_frame_is_version_byte_then_postcard_body() {
+        // Pin the wire layout: the decoded frame must be exactly
+        // [TICKET_VERSION] followed by postcard(WireBody). This is what
+        // keeps the version-outside-the-body refactor byte-compatible
+        // with the old version-first-field-of-Wire encoding, and guards
+        // against anyone folding the version back into the body.
+        let ticket = sample();
+        let encoded = encode(&ticket);
+        let frame = BASE32_NOPAD
+            .decode(
+                encoded
+                    .strip_prefix(TICKET_PREFIX)
+                    .unwrap()
+                    .to_ascii_uppercase()
+                    .as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(frame[0], TICKET_VERSION, "leading byte is the version");
+
+        let body = WireBody {
+            ticket_id: ticket.ticket_id,
+            session_id: ticket.session_id,
+            host_peer_id: ticket.host_peer_id,
+            host_addr: ticket.host_addr.clone(),
+            granted_cap: ticket.granted_cap,
+            expiry_ms: ticket.expiry_ms,
+            cap_sig: ticket.cap_sig,
+        };
+        assert_eq!(
+            &frame[1..],
+            postcard::to_stdvec(&body).unwrap().as_slice(),
+            "remaining bytes are the postcard body, version excluded",
+        );
     }
 
     #[test]
@@ -513,8 +604,7 @@ mod tests {
     #[test]
     fn previous_version_byte_is_now_unsupported() {
         let peer = PeerId::from_bytes([0x55; 32]);
-        let prev = Wire {
-            version: 3,
+        let prev = WireBody {
             ticket_id: TicketId::from_bytes([0x44; 16]),
             session_id: SessionId::from_bytes([0x66; 16]),
             host_peer_id: peer,
@@ -523,9 +613,7 @@ mod tests {
             expiry_ms: 0,
             cap_sig: SIGNATURE_UNSIGNED,
         };
-        let bytes = postcard::to_stdvec(&prev).unwrap();
-        let body = BASE32_NOPAD.encode(&bytes).to_ascii_lowercase();
-        let raw = format!("{TICKET_PREFIX}{body}");
+        let raw = raw_frame(3, &prev);
         assert_eq!(decode(&raw), Err(TicketError::UnsupportedVersion(3)));
     }
 
