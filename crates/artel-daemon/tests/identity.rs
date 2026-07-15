@@ -105,10 +105,10 @@ async fn host_ticket_carries_a_real_endpoint_addr_n0() {
         other => panic!("expected HostSession, got {other:?}"),
     };
     let decoded = ticket::decode(raw.as_str()).expect("ticket decodes");
-    assert_eq!(decoded.host_peer_id, daemon_id);
     assert_eq!(
-        decoded.host_addr.peer_id, daemon_id,
-        "host_addr.peer_id must match the daemon's live id",
+        decoded.host_peer_id(),
+        daemon_id,
+        "the ticket's host id (from host_addr) must be the daemon's live id",
     );
 
     drop(client);

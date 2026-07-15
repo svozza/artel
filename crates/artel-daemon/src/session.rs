@@ -1151,7 +1151,6 @@ impl Registry {
         let ticket = JoinTicket::from(ticket::encode(&SessionTicket {
             ticket_id: tid,
             session_id,
-            host_peer_id: self.daemon_peer_id,
             host_addr: self.daemon_addr.clone(),
             granted_cap,
             expiry_ms,
@@ -1198,10 +1197,11 @@ impl Registry {
             guard.get(&session_id).cloned()
         };
 
+        let host_peer_id = parsed.host_peer_id();
         let session = if let Some(existing) = session {
             existing
         } else {
-            if parsed.host_peer_id == self.daemon_peer_id {
+            if host_peer_id == self.daemon_peer_id {
                 // Same-daemon ticket but the session id isn't
                 // registered locally — that's a stale or forged
                 // ticket, not a "join a remote" request.
@@ -1212,7 +1212,7 @@ impl Registry {
             // messages start flowing in.
             self.materialise_remote_session(
                 session_id,
-                &parsed.host_peer_id,
+                &host_peer_id,
                 &parsed.host_addr,
                 &peer,
                 parsed.ticket_id,
@@ -3325,7 +3325,7 @@ mod tests {
         // The ticket round-trips and embeds this daemon's identity.
         let decoded = ticket::decode(ticket.as_str()).unwrap();
         assert_eq!(decoded.session_id, id);
-        assert_eq!(decoded.host_peer_id, daemon_peer);
+        assert_eq!(decoded.host_peer_id(), daemon_peer);
         // Without an iroh runtime the addr is id-only — the daemon
         // is local-only in this test path.
         assert_eq!(decoded.host_addr.peer_id, daemon_peer);
@@ -3433,7 +3433,7 @@ mod tests {
         // Ticket re-stamped with this daemon's current addr.
         let decoded = ticket::decode(ticket.as_str()).unwrap();
         assert_eq!(decoded.session_id, session_id);
-        assert_eq!(decoded.host_peer_id, daemon_peer);
+        assert_eq!(decoded.host_peer_id(), daemon_peer);
 
         // Resumed session keeps members, log, head verbatim. Replay
         // the log via Subscribe to confirm.
@@ -3654,7 +3654,6 @@ mod tests {
         let ticket = JoinTicket::from(ticket::encode(&SessionTicket {
             ticket_id: TicketId::new_random(),
             session_id: bogus,
-            host_peer_id,
             host_addr: WireEndpointAddr::id_only(host_peer_id),
             granted_cap: Capability::ReadWrite,
             expiry_ms: 0,
