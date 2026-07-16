@@ -65,7 +65,89 @@ use crate::rpc::SignedSendPayload;
 /// a `-v1` peer's key layout and vice-versa. The wire byte moves in
 /// lockstep so the mismatch is caught at decode rather than surfacing as
 /// a spurious `host_sig verify failed`.
-pub const GOSSIP_WIRE_VERSION: u8 = 2;
+///
+/// Bumped to `3` on 2026-07-16 with the gossip transport cap raise
+/// ([`MAX_GOSSIP_MESSAGE_SIZE`], finding #2). The frame *encoding* is
+/// unchanged, but a `-v2` daemon's transport still enforces
+/// iroh-gossip's 4096-byte default — in a mixed mesh, small frames
+/// would interop while anything larger died silently in the old peer's
+/// recv loop: exactly the silent-loss mode this bump's fix closes.
+/// Failing every frame at the version byte turns that into a loud,
+/// immediate mismatch instead.
+pub const GOSSIP_WIRE_VERSION: u8 = 3;
+
+/// Maximum size, in bytes, of a single message on a session's gossip
+/// topic — the value the daemon passes to iroh-gossip's
+/// `Gossip::builder().max_message_size(..)`.
+///
+/// iroh-gossip's default is 4096 bytes, while the daemon's store and
+/// IPC transport both accept payloads up to 16 MiB
+/// (`transport::MAX_FRAME_SIZE`). Left unreconciled, a host `send()`
+/// with a payload over ~4 KiB persisted locally and acked success to
+/// the IPC caller, then the broadcast died inside iroh-gossip's
+/// per-connection send loop where no daemon error path could see it —
+/// permanent, silent host/mirror divergence with no attacker required
+/// (adversarial-review finding #2).
+///
+/// 1 MiB is a deliberate middle ceiling: generous for chat/tool
+/// messages, far below the 16 MiB store bound (which remains the cap
+/// for *attachments*, which never ride gossip), and bounded because
+/// every broadcast is pushed in full to each eager peer and retained
+/// in plumtree's message cache — bytes cost scales with mesh fanout.
+pub const MAX_GOSSIP_MESSAGE_SIZE: usize = 1024 * 1024;
+
+/// Headroom out of [`MAX_GOSSIP_MESSAGE_SIZE`] for iroh-gossip's own envelope.
+///
+/// Covers the plumtree wrapping around our frame — topic id, blake3
+/// message id, delivery scope, length prefixes and enum discriminants
+/// — well under this in practice; the slack is cheap insurance
+/// against upstream envelope growth.
+pub const GOSSIP_ENVELOPE_OVERHEAD: usize = 512;
+
+/// Maximum encoded [`GossipBody`] frame handed to a gossip broadcast.
+///
+/// Anything larger (as produced by [`encode`]) is rejected at send
+/// time with [`crate::error::ProtocolError::PayloadTooLarge`] instead
+/// of being accepted and silently lost on the wire — see
+/// [`MAX_GOSSIP_MESSAGE_SIZE`].
+pub const MAX_GOSSIP_FRAME: usize = MAX_GOSSIP_MESSAGE_SIZE - GOSSIP_ENVELOPE_OVERHEAD;
+
+/// Headroom out of [`MAX_GOSSIP_FRAME`] for a [`SessionMessage`]'s largest carrier.
+///
+/// `SendAck` wraps the message in `req_id` (16-byte uuid) + `Ok`
+/// discriminant + 64-byte `host_sig` (~85 bytes; 128 leaves slack). A
+/// message admitted at the sequencing chokepoint must fit **every**
+/// frame that will ever carry it — `Message` broadcast, replay
+/// re-broadcast, and the `SendAck` echoed to the requesting joiner —
+/// or the ack path would silently exceed the wire cap that the
+/// message check just cleared. Pinned by
+/// `send_ack_of_max_message_fits_gossip_frame`.
+pub const SESSION_MESSAGE_CARRIER_OVERHEAD: usize = 128;
+
+/// Maximum encoded `GossipBody::Message` frame accepted at the host's chokepoint.
+///
+/// Enforced in `Registry::send`, sized so the same [`SessionMessage`]
+/// also fits its largest carrier — see
+/// [`SESSION_MESSAGE_CARRIER_OVERHEAD`].
+pub const MAX_SESSION_MESSAGE_FRAME: usize = MAX_GOSSIP_FRAME - SESSION_MESSAGE_CARRIER_OVERHEAD;
+
+/// Exact byte length `encode(&GossipBody::Message(msg))` would produce.
+///
+/// Computed without allocating the frame. Used by the host's send
+/// path to reject an over-[`MAX_GOSSIP_FRAME`] message *before* it is
+/// appended to the log — once appended, the broadcast (and every
+/// future replay of it) would be silently uncarryable.
+///
+/// # Panics
+///
+/// Panics if postcard cannot size `msg` — unreachable for the
+/// fixed-shape wire types, same contract as [`encode`].
+#[must_use]
+pub fn message_frame_len(msg: &SessionMessage) -> usize {
+    // [version: u8][variant discriminant: 1 byte (Message = 0)][postcard(msg)].
+    // Pinned against `encode` by `message_frame_len_matches_encode`.
+    2 + postcard::experimental::serialized_size(msg).expect("postcard size of fixed-shape types")
+}
 
 /// One frame on a session's gossip topic. Externally tagged so
 /// postcard can serialise it (see workspace memo on postcard +
@@ -333,6 +415,85 @@ mod tests {
         let bytes = encode(&body);
         let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn message_frame_len_matches_encode() {
+        // `message_frame_len` promises the exact length `encode` would
+        // produce, including the version byte and the `Message` variant
+        // discriminant. Check at several payload sizes so a postcard
+        // varint-length boundary can't hide a off-by-one.
+        for payload_len in [0, 1, 127, 128, 300, 16_384, 100_000] {
+            let mut msg = sample_msg();
+            msg.payload = vec![0xab; payload_len];
+            let body = GossipBody::Message(msg.clone());
+            assert_eq!(
+                message_frame_len(&msg),
+                encode(&body).len(),
+                "mismatch at payload_len {payload_len}",
+            );
+        }
+    }
+
+    #[test]
+    fn send_ack_of_max_message_fits_gossip_frame() {
+        // A message admitted at MAX_SESSION_MESSAGE_FRAME must also fit
+        // its largest carrier — the host's `SendAck { result: Ok(msg) }`
+        // echo — under MAX_GOSSIP_FRAME, or the ack for a max-size
+        // joiner send would be silently dropped by the transport that
+        // the message check just cleared. Build a message that encodes
+        // exactly at (or one byte under) the message cap and check the
+        // ack framing clears the wire cap.
+        let mut msg = sample_msg();
+        msg.payload = Vec::new();
+        let base = message_frame_len(&msg);
+        // Payload length is varint-prefixed; converge on the largest
+        // payload whose frame is <= MAX_SESSION_MESSAGE_FRAME.
+        let mut payload_len = MAX_SESSION_MESSAGE_FRAME - base;
+        loop {
+            msg.payload = vec![0xcd; payload_len];
+            if message_frame_len(&msg) <= MAX_SESSION_MESSAGE_FRAME {
+                break;
+            }
+            payload_len -= 1;
+        }
+        // The frame must sit close to the cap or the test is vacuous.
+        assert!(message_frame_len(&msg) > MAX_SESSION_MESSAGE_FRAME - 8);
+
+        let ack = GossipBody::SendAck {
+            req_id: Uuid::from_u128(u128::MAX),
+            result: Ok(msg),
+            host_sig: [0x44; 64],
+        };
+        let ack_len = encode(&ack).len();
+        assert!(
+            ack_len <= MAX_GOSSIP_FRAME,
+            "max-admissible message frames to a {ack_len}-byte SendAck, over the {MAX_GOSSIP_FRAME} wire cap",
+        );
+    }
+
+    #[test]
+    fn gossip_size_constants_are_ordered() {
+        // The derivation chain must stay strictly ordered:
+        // message cap < frame cap < transport cap. A refactor that
+        // inverts any link re-opens the silent-loss window. Compared
+        // as values (not the consts directly) so clippy's
+        // assertions_on_constants doesn't flag the guard.
+        let chain = [
+            MAX_SESSION_MESSAGE_FRAME,
+            MAX_GOSSIP_FRAME,
+            MAX_GOSSIP_MESSAGE_SIZE,
+        ];
+        assert!(chain.is_sorted());
+        assert!(chain[0] < chain[1] && chain[1] < chain[2]);
+        assert_eq!(
+            MAX_GOSSIP_FRAME,
+            MAX_GOSSIP_MESSAGE_SIZE - GOSSIP_ENVELOPE_OVERHEAD
+        );
+        assert_eq!(
+            MAX_SESSION_MESSAGE_FRAME,
+            MAX_GOSSIP_FRAME - SESSION_MESSAGE_CARRIER_OVERHEAD
+        );
     }
 
     #[test]

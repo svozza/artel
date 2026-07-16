@@ -704,6 +704,21 @@ impl GossipBridge {
             payload: signed_payload,
         };
         let bytes = Bytes::from(gossip::encode(&body));
+        // Gossip wire-size gate (finding #2): an over-cap broadcast is
+        // accepted by the actor channel and then silently dropped in
+        // iroh-gossip's send loop — the joiner would burn the full
+        // SEND_REMOTE_TIMEOUT waiting for an ack that can never come.
+        // Reject loudly before the broadcast instead. The host's
+        // sequencing chokepoint re-checks against the (tighter)
+        // MAX_SESSION_MESSAGE_FRAME, so this is the transport bound
+        // only, not the authoritative message-size policy.
+        if bytes.len() > gossip::MAX_GOSSIP_FRAME {
+            self.pending_sends.lock().await.remove(&req_id);
+            return Err(BridgeError::PayloadTooLarge {
+                size: bytes.len() as u64,
+                max: gossip::MAX_GOSSIP_FRAME as u64,
+            });
+        }
         if let Err(err) = sender.broadcast(bytes).await {
             // Drop the pending entry so it doesn't leak; nobody is
             // ever going to resolve it.
@@ -1503,6 +1518,21 @@ pub(crate) enum BridgeError {
     /// parser detail.
     #[error("invalid host addr in ticket: {0}")]
     InvalidAddr(String),
+
+    /// The encoded `SendRequest` frame would exceed
+    /// [`gossip::MAX_GOSSIP_FRAME`] — the gossip transport would
+    /// accept the broadcast into its actor channel and then silently
+    /// drop it in the per-connection send loop, leaving the joiner to
+    /// burn the full `SEND_REMOTE_TIMEOUT` on an ack that can never
+    /// come (finding #2). Rejected before the broadcast instead; maps
+    /// to [`crate::session::SessionError::PayloadTooLarge`].
+    #[error("send request too large for gossip transport: {size} bytes (max {max})")]
+    PayloadTooLarge {
+        /// Encoded frame length of the rejected request.
+        size: u64,
+        /// The ceiling it had to fit under.
+        max: u64,
+    },
 }
 
 /// Convert a wire-form [`WireEndpointAddr`] into an iroh

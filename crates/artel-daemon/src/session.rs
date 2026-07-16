@@ -235,6 +235,24 @@ pub enum SessionError {
     /// rejected action for diagnostics.
     #[error("reserved system action may not be sent by a member: {0}")]
     ReservedAction(&'static str),
+
+    /// The message, framed for the inter-daemon gossip wire, would
+    /// exceed [`artel_protocol::gossip::MAX_GOSSIP_MESSAGE_SIZE`].
+    /// Rejected at the sequencing chokepoint BEFORE the message gets a
+    /// seq or a log append — an appended-but-uncarryable message would
+    /// ack success to the sender and then silently never reach remote
+    /// mirrors, on the live broadcast and on every future replay
+    /// (adversarial-review finding #2). Enforced in every build mode
+    /// (not just `iroh`): the log must stay carryable by a future
+    /// iroh-enabled incarnation of the same daemon. Maps to
+    /// [`artel_protocol::ProtocolError::PayloadTooLarge`].
+    #[error("message too large for gossip transport: {size} bytes (max {max})")]
+    PayloadTooLarge {
+        /// Encoded gossip frame length the message would produce.
+        size: u64,
+        /// The ceiling it had to fit under.
+        max: u64,
+    },
 }
 
 // io::Error doesn't impl PartialEq, so we hand-roll one for the
@@ -275,6 +293,16 @@ impl PartialEq for SessionError {
             ) => a_peer == b_peer && a_had == b_had && a_needed == b_needed,
             (Self::UnknownTicket(a), Self::UnknownTicket(b)) => a == b,
             (Self::ReservedAction(a), Self::ReservedAction(b)) => a == b,
+            (
+                Self::PayloadTooLarge {
+                    size: a_size,
+                    max: a_max,
+                },
+                Self::PayloadTooLarge {
+                    size: b_size,
+                    max: b_max,
+                },
+            ) => a_size == b_size && a_max == b_max,
             (Self::InvalidTicket, Self::InvalidTicket)
             | (Self::NotHost, Self::NotHost)
             | (Self::TicketExpired, Self::TicketExpired)
@@ -347,6 +375,10 @@ impl From<&SessionError> for ProtocolError {
             SessionError::ReservedAction(action) => {
                 Self::Internal(format!("reserved system action: {action}"))
             }
+            SessionError::PayloadTooLarge { size, max } => Self::PayloadTooLarge {
+                size: *size,
+                max: *max,
+            },
         }
     }
 }
@@ -2393,6 +2425,21 @@ impl Registry {
             signature,
             host_sig,
         );
+        // Gossip wire-size gate (finding #2): a message the gossip
+        // transport can't carry must be rejected HERE, before it gets
+        // a seq and a log append — appended-but-uncarryable means the
+        // sender is acked success while remote mirrors silently never
+        // see it, live or via replay. Checked in every build mode so
+        // a no-iroh daemon can't grow a log a future iroh-enabled
+        // incarnation can't serve. Sized against the message's largest
+        // carrier frame (`SendAck`), not just the `Message` broadcast.
+        let frame_len = artel_protocol::gossip::message_frame_len(&message);
+        if frame_len > artel_protocol::gossip::MAX_SESSION_MESSAGE_FRAME {
+            return Err(SessionError::PayloadTooLarge {
+                size: frame_len as u64,
+                max: artel_protocol::gossip::MAX_SESSION_MESSAGE_FRAME as u64,
+            });
+        }
         if let Err(err) = self.store.append(session, &message).await {
             return Err(SessionError::Storage(err));
         }
@@ -3190,6 +3237,9 @@ fn map_send_remote_result(
         )),
         Err(crate::gossip_bridge::BridgeError::Iroh(msg)) => {
             Err(SessionError::Internal(format!("gossip: {msg}")))
+        }
+        Err(crate::gossip_bridge::BridgeError::PayloadTooLarge { size, max }) => {
+            Err(SessionError::PayloadTooLarge { size, max })
         }
         // `send_remote` doesn't take a wire-form addr, so `InvalidAddr`
         // shouldn't surface here today; map it defensively the same way
@@ -6311,6 +6361,111 @@ mod tests {
         let sub = r.subscribe(id, None).await.unwrap();
         assert_eq!(sub.replay[0].action, TICKET_ACTION);
         assert_eq!(sub.replay[0].payload, vec![0xCD; 48]);
+    }
+
+    // ---- gossip wire-size gate (finding #2) ----
+
+    /// Largest app payload that still clears the sequencing
+    /// chokepoint's `MAX_SESSION_MESSAGE_FRAME` for a message with
+    /// the fixture peer/action. Small envelope (~130 bytes of peer,
+    /// action, sigs, varints), so cap minus 1 KiB is safely inside
+    /// and cap plus anything is safely outside.
+    const NEAR_CAP_PAYLOAD: usize = artel_protocol::gossip::MAX_SESSION_MESSAGE_FRAME - 1024;
+
+    #[tokio::test]
+    async fn send_rejects_payload_too_large_for_gossip_before_append() {
+        let r = registry();
+        let host = peer(1, "alice");
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
+        let mut sub = r.subscribe(id, None).await.unwrap();
+
+        let err = r
+            .send(
+                id,
+                host,
+                MessageKind::Chat,
+                "chat.message".into(),
+                vec![0xEE; artel_protocol::gossip::MAX_SESSION_MESSAGE_FRAME + 1],
+                Authoring::Local,
+            )
+            .await
+            .unwrap_err();
+        let SessionError::PayloadTooLarge { size, max } = err else {
+            panic!("expected PayloadTooLarge, got {err:?}");
+        };
+        assert_eq!(
+            max,
+            artel_protocol::gossip::MAX_SESSION_MESSAGE_FRAME as u64
+        );
+        assert!(size > max);
+
+        // Rejected BEFORE seq assignment / append / emit: nothing on
+        // the live stream, nothing in the log, and the next send gets
+        // seq 1 (the head never moved).
+        let got = timeout(Duration::from_millis(300), sub.events.recv()).await;
+        assert!(got.is_err(), "oversized send must not emit: {got:?}");
+        let sub2 = r.subscribe(id, None).await.unwrap();
+        assert!(sub2.replay.is_empty(), "oversized send must not append");
+    }
+
+    #[tokio::test]
+    async fn send_accepts_payload_at_gossip_cap() {
+        // A payload near (but under) the frame cap must still be
+        // accepted — the gate rejects what the wire can't carry, not
+        // merely "large" messages. Guards against the ceiling being
+        // accidentally tightened to iroh-gossip's 4096-byte default.
+        let r = registry();
+        let host = peer(1, "alice");
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
+        let msg = r
+            .send(
+                id,
+                host,
+                MessageKind::Chat,
+                "chat.message".into(),
+                vec![0xEE; NEAR_CAP_PAYLOAD],
+                Authoring::Local,
+            )
+            .await
+            .unwrap();
+        assert_eq!(msg.payload.len(), NEAR_CAP_PAYLOAD);
+        assert!(
+            artel_protocol::gossip::message_frame_len(&msg)
+                <= artel_protocol::gossip::MAX_SESSION_MESSAGE_FRAME
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_send_does_not_burn_a_seq() {
+        // The prospective seq is computed but must not be committed on
+        // rejection: the next successful send takes seq 1, not seq 2.
+        let r = registry();
+        let host = peer(1, "alice");
+        let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
+
+        let _ = r
+            .send(
+                id,
+                host.clone(),
+                MessageKind::Chat,
+                "chat.message".into(),
+                vec![0xEE; artel_protocol::gossip::MAX_SESSION_MESSAGE_FRAME + 1],
+                Authoring::Local,
+            )
+            .await
+            .unwrap_err();
+        let msg = r
+            .send(
+                id,
+                host,
+                MessageKind::Chat,
+                "chat.message".into(),
+                b"small".to_vec(),
+                Authoring::Local,
+            )
+            .await
+            .unwrap();
+        assert_eq!(msg.seq, Seq::new(1));
     }
 
     // ---- reserved-action ingress rejection (forged-envelope leak) ----
