@@ -43,6 +43,19 @@ use artel_iroh_setup::EndpointSetup;
 #[cfg(feature = "iroh")]
 const DELIVER_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long graceful shutdown waits for outstanding IPC connection
+/// tasks to finish before force-aborting them (finding #8).
+///
+/// A client that requests a large replay and then stops reading fills
+/// the Unix socket send buffer; the connection task's blocking
+/// `send_frame` never returns and, unbounded, the drain loop in
+/// [`Daemon::run`] waited on it forever — the daemon never reached
+/// iroh teardown / PID-file cleanup, and a service manager saw `stop`
+/// hang past its grace period. Five seconds is far beyond what a live
+/// local client needs to drain a socket buffer, and comfortably inside
+/// typical `systemd`/`launchd` stop budgets (90s / 20s defaults).
+const CONNECTION_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Non-routable, non-authenticated id advertised in `Hello` when the
 /// `iroh` feature is disabled at compile time.
 ///
@@ -445,8 +458,28 @@ impl Daemon {
         }
 
         // Drain outstanding connection tasks so we don't leave clients
-        // half-served.
-        while connections.join_next().await.is_some() {}
+        // half-served. Bounded (finding #8): a stalled client — one
+        // that stopped reading with a send in flight — blocks its
+        // connection task in `send_frame` indefinitely, and IPC is a
+        // local trust boundary, so a stuck *client* must not be able
+        // to hold up daemon shutdown (headless/systemd operation is
+        // first-class). Tasks still running at the deadline are
+        // aborted; abort cancels them at their next await point,
+        // including a send blocked on a full socket buffer.
+        let drained = tokio::time::timeout(CONNECTION_DRAIN_TIMEOUT, async {
+            while connections.join_next().await.is_some() {}
+        })
+        .await;
+        if drained.is_err() {
+            warn!(
+                stuck = connections.len(),
+                "connection drain timed out; aborting remaining connection tasks",
+            );
+            connections.abort_all();
+            // Aborted tasks resolve promptly (JoinError::cancelled);
+            // this second drain cannot hang.
+            while connections.join_next().await.is_some() {}
+        }
 
         // Tear down the iroh stack cleanly so peers see a graceful
         // shutdown rather than a hung connection. Router::shutdown

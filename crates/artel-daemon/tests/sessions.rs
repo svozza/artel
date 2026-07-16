@@ -1012,6 +1012,126 @@ async fn hello_version_mismatch_returns_error_then_closes() {
 // state dir on the next start would then stumble over them.
 // =============================================================
 
+// =============================================================
+// Shutdown vs stalled client (adversarial-review finding #8): a
+// client that requests work and then stops reading eventually
+// fills the Unix socket send buffer, wedging its connection task
+// inside `send_frame`. Graceful shutdown must NOT wait on that
+// task forever — the drain loop is bounded and force-aborts
+// stragglers, so the daemon still reaches iroh teardown and
+// PID-file cleanup within a service manager's stop budget.
+// =============================================================
+
+#[tokio::test]
+async fn shutdown_completes_with_stalled_ipc_client() {
+    let (_root, state) = fresh_state_dir();
+    let daemon = common::spawn_local_daemon_at(&state).await;
+
+    // A well-behaved client hosts a session and pumps messages.
+    let client = Client::connect(&state.socket).await.unwrap();
+    let resp = client
+        .request(Request::HostSession {
+            display_name: "alice".into(),
+            session: None,
+        })
+        .await
+        .unwrap();
+    let session = match resp {
+        Response::HostSession { session, .. } => session,
+        other => panic!("expected HostSession, got {other:?}"),
+    };
+
+    // The stalled client: raw framed connection, completes Hello +
+    // Subscribe, then never reads again. The subscription forwarder
+    // pushes every event into this connection's socket; once the
+    // kernel buffer fills, the forwarder and any response send wedge.
+    let mut stalled = transport_connect(&state.socket).await.expect("connect");
+    stalled
+        .send(WireMessage::Request {
+            id: RequestId::new(1),
+            request: Request::Hello {
+                client_version: artel_protocol::PROTOCOL_VERSION,
+            },
+        })
+        .await
+        .unwrap();
+    let hello = timeout(Duration::from_secs(2), stalled.next())
+        .await
+        .expect("hello reply timeout")
+        .expect("stream open")
+        .expect("decode");
+    assert!(matches!(
+        hello,
+        WireMessage::Response {
+            response: Response::Hello { .. },
+            ..
+        }
+    ));
+    stalled
+        .send(WireMessage::Request {
+            id: RequestId::new(2),
+            request: Request::Subscribe {
+                session,
+                since: None,
+            },
+        })
+        .await
+        .unwrap();
+    // From here on the stalled client never reads. Flood messages big
+    // enough to fill its socket buffer (macOS/Linux Unix-socket
+    // buffers are a few hundred KiB) so its forwarder wedges in
+    // send_frame, holding the connection's sink mutex.
+    for i in 0..64u8 {
+        client
+            .request(Request::Send {
+                session,
+                payload: SendPayload {
+                    kind: MessageKind::Chat,
+                    action: "chat.message".into(),
+                    payload: vec![i; 64 * 1024],
+                },
+            })
+            .await
+            .unwrap();
+    }
+    // Now wedge the CONNECTION TASK itself, not just its forwarder
+    // (a wedged forwarder alone is aborted by ForwarderSet's Drop
+    // once the connection task exits at its cancellable select).
+    // One more request: its response send blocks on the sink mutex
+    // held by the wedged forwarder / the full socket, parking the
+    // connection task inside send_frame where the shutdown token
+    // can't reach it. Fire-and-forget — nobody will ever read the
+    // reply.
+    stalled
+        .send(WireMessage::Request {
+            id: RequestId::new(3),
+            request: Request::ListSessions,
+        })
+        .await
+        .unwrap();
+    // Give the daemon a moment to pick the request up and park in
+    // the response send.
+    sleep(Duration::from_millis(300)).await;
+
+    // Shutdown must complete despite the wedged connection task. The
+    // harness's stop() has its own 10s expect; time it ourselves too
+    // so a regression reads as this assert, not a generic panic.
+    // Budget: CONNECTION_DRAIN_TIMEOUT (5s) + teardown slack.
+    let started = Instant::now();
+    drop(client);
+    daemon.stop().await;
+    assert!(
+        started.elapsed() < Duration::from_secs(9),
+        "shutdown took {:?} — drain bound not applied?",
+        started.elapsed(),
+    );
+    // Cleanup still ran (the code AFTER the drain loop).
+    assert!(!state.socket.exists(), "socket must be removed");
+    assert!(!state.pid.exists(), "pid file must be removed");
+
+    drop(stalled);
+}
+
 #[tokio::test]
 async fn shutdown_removes_socket_and_pid_files() {
     let (_root, state) = fresh_state_dir();
