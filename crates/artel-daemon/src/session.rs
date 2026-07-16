@@ -944,161 +944,194 @@ impl Registry {
         granted_cap: Capability,
         expiry_ms: u64,
     ) -> Result<(SessionId, JoinTicket, TicketId), SessionError> {
-        // Resume path: caller supplied an id and we already have a
-        // matching local-host record. Reuse the in-memory session
-        // verbatim and re-stamp the ticket with the current addr.
-        if let Some(id) = requested_id {
-            let existing = {
-                let guard = self.sessions.read().await;
-                guard.get(&id).cloned()
-            };
-            if let Some(arc) = existing {
-                // Bump this host's incarnation epoch (Auth Slice B.5,
-                // D3) and persist it before returning the ticket or
-                // re-subscribing. This re-subscribe of an existing
-                // local-host record IS the incarnation boundary: a
-                // `SessionClosed` signed at the old epoch is rejected
-                // against a joiner whose beacon-advanced watermark has
-                // moved past it. A fresh create (below) uses the
-                // store's epoch floor, never a hardcoded 0.
-                //
-                // Read by the bridge re-subscribe below, which only
-                // exists with iroh on.
-                #[cfg_attr(not(feature = "iroh"), allow(unused_variables))]
-                let (host_epoch, ticket, ticket_id) = {
-                    let mut s = arc.lock().await;
-                    if s.host != host_peer.id || s.kind != SessionKind::Local {
-                        return Err(SessionError::SessionConflict(id));
-                    }
-                    let host_epoch = s.host_epoch.saturating_add(1);
-                    // Mint AFTER resolving the new epoch, not before —
-                    // the ticket's cap_sig binds host_epoch (session-
-                    // ID-reuse replay finding), so a stale value here
-                    // would seed a fresh joiner's watermark behind
-                    // where this incarnation actually starts.
-                    let (ticket, ticket_id) =
-                        self.mint_ticket(id, granted_cap, expiry_ms, host_epoch);
-                    // Every resume re-mints, so every resume appends a
-                    // ledger entry (deliberate — the bearer string just
-                    // handed back genuinely admits and must be
-                    // revocable; entries are tiny and session-scoped).
-                    let mut tickets = s.tickets.clone();
-                    tickets.push(Self::ledger_entry(ticket_id, granted_cap, expiry_ms));
-                    // Store-before-memory, with the lock held across
-                    // the writes like every other ledger mutation
-                    // (write_tickets' deterministic tmp name relies on
-                    // it). On store failure, surface it and leave
-                    // memory untouched.
-                    //
-                    // These are two writes to two separate files
-                    // (tickets.json, then meta.json's host_epoch) and
-                    // can't be made atomic without a journal, so ORDER
-                    // is the failure-mode lever: write the ledger FIRST,
-                    // bump the epoch LAST.
-                    // - put_tickets fails ⇒ nothing was bumped; disk
-                    //   epoch and ledger both stay at their prior values,
-                    //   consistent with the untouched memory. The ticket
-                    //   isn't returned, and issued-only admission means
-                    //   an unpersisted entry simply never admits.
-                    // - bump_host_epoch fails (ledger already written)
-                    //   ⇒ the durable epoch stays equal to memory, and
-                    //   the ledger carries one extra entry for the
-                    //   ticket we never returned — inert (no bearer holds
-                    //   its claim) and dropped by the next ledger
-                    //   rewrite. This is the documented "stale epoch"
-                    //   degradation: a resume that can't record its new
-                    //   epoch re-emits the prior one after restart.
-                    // The reverse order (bump, then put) would instead
-                    // leave the durable epoch AHEAD of the in-memory
-                    // signing epoch on a put failure. The incarnation
-                    // epoch fences stale SessionClosed replay on joiner
-                    // mirrors, so a disk epoch that outran memory is the
-                    // more dangerous divergence; prefer the benign inert
-                    // ledger entry.
-                    self.store
-                        .put_tickets(id, &tickets)
-                        .await
-                        .map_err(SessionError::Storage)?;
-                    self.store
-                        .bump_host_epoch(id, host_epoch)
-                        .await
-                        .map_err(SessionError::Storage)?;
-                    s.host_epoch = host_epoch;
-                    s.tickets = tickets;
-                    drop(s);
-                    (host_epoch, ticket, ticket_id)
+        // Loop: a create that loses the claim race (finding #4) retries
+        // and lands on the resume path — the same outcome as if the two
+        // calls had arrived sequentially. At most one retry can ever
+        // happen (the second pass finds the winner's entry and resumes;
+        // the resume path never continues the loop).
+        loop {
+            // Resume path: caller supplied an id and we already have a
+            // matching local-host record. Reuse the in-memory session
+            // verbatim and re-stamp the ticket with the current addr.
+            if let Some(id) = requested_id {
+                let existing = {
+                    let guard = self.sessions.read().await;
+                    guard.get(&id).cloned()
                 };
+                if let Some(arc) = existing {
+                    // Bump this host's incarnation epoch (Auth Slice B.5,
+                    // D3) and persist it before returning the ticket or
+                    // re-subscribing. This re-subscribe of an existing
+                    // local-host record IS the incarnation boundary: a
+                    // `SessionClosed` signed at the old epoch is rejected
+                    // against a joiner whose beacon-advanced watermark has
+                    // moved past it. A fresh create (below) uses the
+                    // store's epoch floor, never a hardcoded 0.
+                    //
+                    // Read by the bridge re-subscribe below, which only
+                    // exists with iroh on.
+                    #[cfg_attr(not(feature = "iroh"), allow(unused_variables))]
+                    let (host_epoch, ticket, ticket_id) = {
+                        let mut s = arc.lock().await;
+                        if s.host != host_peer.id || s.kind != SessionKind::Local {
+                            return Err(SessionError::SessionConflict(id));
+                        }
+                        let host_epoch = s.host_epoch.saturating_add(1);
+                        // Mint AFTER resolving the new epoch, not before —
+                        // the ticket's cap_sig binds host_epoch (session-
+                        // ID-reuse replay finding), so a stale value here
+                        // would seed a fresh joiner's watermark behind
+                        // where this incarnation actually starts.
+                        let (ticket, ticket_id) =
+                            self.mint_ticket(id, granted_cap, expiry_ms, host_epoch);
+                        // Every resume re-mints, so every resume appends a
+                        // ledger entry (deliberate — the bearer string just
+                        // handed back genuinely admits and must be
+                        // revocable; entries are tiny and session-scoped).
+                        let mut tickets = s.tickets.clone();
+                        tickets.push(Self::ledger_entry(ticket_id, granted_cap, expiry_ms));
+                        // Store-before-memory, with the lock held across
+                        // the writes like every other ledger mutation
+                        // (write_tickets' deterministic tmp name relies on
+                        // it). On store failure, surface it and leave
+                        // memory untouched.
+                        //
+                        // These are two writes to two separate files
+                        // (tickets.json, then meta.json's host_epoch) and
+                        // can't be made atomic without a journal, so ORDER
+                        // is the failure-mode lever: write the ledger FIRST,
+                        // bump the epoch LAST.
+                        // - put_tickets fails ⇒ nothing was bumped; disk
+                        //   epoch and ledger both stay at their prior values,
+                        //   consistent with the untouched memory. The ticket
+                        //   isn't returned, and issued-only admission means
+                        //   an unpersisted entry simply never admits.
+                        // - bump_host_epoch fails (ledger already written)
+                        //   ⇒ the durable epoch stays equal to memory, and
+                        //   the ledger carries one extra entry for the
+                        //   ticket we never returned — inert (no bearer holds
+                        //   its claim) and dropped by the next ledger
+                        //   rewrite. This is the documented "stale epoch"
+                        //   degradation: a resume that can't record its new
+                        //   epoch re-emits the prior one after restart.
+                        // The reverse order (bump, then put) would instead
+                        // leave the durable epoch AHEAD of the in-memory
+                        // signing epoch on a put failure. The incarnation
+                        // epoch fences stale SessionClosed replay on joiner
+                        // mirrors, so a disk epoch that outran memory is the
+                        // more dangerous divergence; prefer the benign inert
+                        // ledger entry.
+                        self.store
+                            .put_tickets(id, &tickets)
+                            .await
+                            .map_err(SessionError::Storage)?;
+                        self.store
+                            .bump_host_epoch(id, host_epoch)
+                            .await
+                            .map_err(SessionError::Storage)?;
+                        s.host_epoch = host_epoch;
+                        s.tickets = tickets;
+                        drop(s);
+                        (host_epoch, ticket, ticket_id)
+                    };
 
-                // Re-open the gossip topic. The bridge tracks per-
-                // session state by id; if the daemon was restarted
-                // since the original `host` call, the topic is gone
-                // and we need to re-subscribe. If it's still around
-                // (same-process resume), the existing entry is left
-                // in place and we just ignore the re-host. Best-
-                // effort: a bridge failure is non-fatal — the local
-                // session still works; we just won't reach the
-                // network until something else triggers a reattach.
-                // After (re)subscribing, broadcast a signed EpochBeacon
-                // so already-joined joiners learn the new epoch
-                // immediately, independent of session activity.
-                #[cfg(feature = "iroh")]
-                if let Some(bridge) = &self.bridge {
-                    if let Err(err) = bridge.host_session(id).await {
-                        tracing::warn!(?err, ?id, "gossip host_session failed on resume");
+                    // Re-open the gossip topic. The bridge tracks per-
+                    // session state by id; if the daemon was restarted
+                    // since the original `host` call, the topic is gone
+                    // and we need to re-subscribe. If it's still around
+                    // (same-process resume), the existing entry is left
+                    // in place and we just ignore the re-host. Best-
+                    // effort: a bridge failure is non-fatal — the local
+                    // session still works; we just won't reach the
+                    // network until something else triggers a reattach.
+                    // After (re)subscribing, broadcast a signed EpochBeacon
+                    // so already-joined joiners learn the new epoch
+                    // immediately, independent of session activity.
+                    #[cfg(feature = "iroh")]
+                    if let Some(bridge) = &self.bridge {
+                        if let Err(err) = bridge.host_session(id).await {
+                            tracing::warn!(?err, ?id, "gossip host_session failed on resume");
+                        }
+                        bridge.publish_epoch_beacon(id, host_epoch).await;
                     }
-                    bridge.publish_epoch_beacon(id, host_epoch).await;
+
+                    return Ok((id, ticket, ticket_id));
                 }
-
-                return Ok((id, ticket, ticket_id));
             }
+
+            // Create path. Either no `requested_id` (mint random) or
+            // `Some(id)` whose entry doesn't exist locally yet.
+            let session_id = requested_id.unwrap_or_else(SessionId::new_random);
+
+            // The whole create — floor read, mint, store write, in-memory
+            // insert — happens under ONE `sessions` write-lock hold
+            // (finding #4). Two racing `HostSession(Some(same_id))` calls
+            // used to both pass the resume check, both `store.create` (the
+            // loser's meta/tickets rewrite clobbering the winner's — the
+            // winner's just-returned ticket vanished from the durable
+            // ledger, so issued-only admission would reject it), and the
+            // loser's HashMap insert silently discarded the winner's
+            // in-memory session. Serializing on the map lock makes the
+            // loser's re-check see the winner's entry and retry into the
+            // resume path — the same outcome as sequential calls. The lock
+            // is held across two small-file awaits; creation is rare, so
+            // briefly blocking the map's readers is the cheapest correct
+            // shape (a reservation dance like `claim_remote_mirror`'s
+            // would also work but needs a rollback arm here).
+            let mut sessions = self.sessions.write().await;
+            if sessions.contains_key(&session_id) {
+                // Lost the race. `requested_id` was Some (a random fresh
+                // id cannot collide) — retry; the resume path picks the
+                // winner's entry up. `drop` before the `continue` so the
+                // retry doesn't self-deadlock on the read lock.
+                drop(sessions);
+                continue;
+            }
+            // The starting epoch is the store's floor for this id, not a
+            // hardcoded 0 (session-ID-reuse replay finding): if this id was
+            // ever hosted-and-fully-closed before, the floor is above 0 and
+            // a captured control frame from that prior incarnation can no
+            // longer satisfy a fresh joiner's watermark gate. For an id
+            // this store has never seen, the floor is 0 — identical to
+            // today's behavior.
+            let host_epoch = self
+                .store
+                .epoch_floor(session_id)
+                .await
+                .map_err(SessionError::Storage)?;
+            let (ticket, ticket_id) =
+                self.mint_ticket(session_id, granted_cap, expiry_ms, host_epoch);
+            let mut session = Session::new(session_id, &host_peer, SessionKind::Local);
+            session.host_epoch = host_epoch;
+            // Seed the ledger before record(): create() persists the
+            // initial entry together with the session, so there is no
+            // window where the ticket exists but its ledger entry doesn't.
+            session
+                .tickets
+                .push(Self::ledger_entry(ticket_id, granted_cap, expiry_ms));
+            let record = session.record();
+            // Store-before-memory, with the map lock held: on a store
+            // failure nothing was inserted and the error propagates.
+            self.store
+                .create(&record)
+                .await
+                .map_err(SessionError::Storage)?;
+            sessions.insert(session_id, Arc::new(Mutex::new(session)));
+            drop(sessions);
+
+            // If iroh is wired up, open a gossip topic for this session
+            // so future Sends can fan out to remote joiners. Bridge
+            // failure is non-fatal: the local session still works; we
+            // just won't reach the network. Surface as a warn for ops.
+            #[cfg(feature = "iroh")]
+            if let Some(bridge) = &self.bridge
+                && let Err(err) = bridge.host_session(session_id).await
+            {
+                tracing::warn!(?err, ?session_id, "gossip host_session failed");
+            }
+
+            return Ok((session_id, ticket, ticket_id));
         }
-
-        // Create path. Either no `requested_id` (mint random) or
-        // `Some(id)` whose entry doesn't exist locally yet.
-        let session_id = requested_id.unwrap_or_else(SessionId::new_random);
-        // The starting epoch is the store's floor for this id, not a
-        // hardcoded 0 (session-ID-reuse replay finding): if this id was
-        // ever hosted-and-fully-closed before, the floor is above 0 and
-        // a captured control frame from that prior incarnation can no
-        // longer satisfy a fresh joiner's watermark gate. For an id
-        // this store has never seen, the floor is 0 — identical to
-        // today's behavior.
-        let host_epoch = self
-            .store
-            .epoch_floor(session_id)
-            .await
-            .map_err(SessionError::Storage)?;
-        let (ticket, ticket_id) = self.mint_ticket(session_id, granted_cap, expiry_ms, host_epoch);
-        let mut session = Session::new(session_id, &host_peer, SessionKind::Local);
-        session.host_epoch = host_epoch;
-        // Seed the ledger before record(): create() persists the
-        // initial entry together with the session, so there is no
-        // window where the ticket exists but its ledger entry doesn't.
-        session
-            .tickets
-            .push(Self::ledger_entry(ticket_id, granted_cap, expiry_ms));
-        let record = session.record();
-        self.store
-            .create(&record)
-            .await
-            .map_err(SessionError::Storage)?;
-        self.sessions
-            .write()
-            .await
-            .insert(session_id, Arc::new(Mutex::new(session)));
-
-        // If iroh is wired up, open a gossip topic for this session
-        // so future Sends can fan out to remote joiners. Bridge
-        // failure is non-fatal: the local session still works; we
-        // just won't reach the network. Surface as a warn for ops.
-        #[cfg(feature = "iroh")]
-        if let Some(bridge) = &self.bridge
-            && let Err(err) = bridge.host_session(session_id).await
-        {
-            tracing::warn!(?err, ?session_id, "gossip host_session failed");
-        }
-
-        Ok((session_id, ticket, ticket_id))
     }
 
     /// Acquire the per-session lock for a locally-hosted session —
@@ -7643,6 +7676,9 @@ mod tests {
         inner: crate::store::MemoryStore,
         park_epoch: std::sync::atomic::AtomicBool,
         epoch_gate: tokio::sync::Semaphore,
+        park_create: std::sync::atomic::AtomicBool,
+        create_gate: tokio::sync::Semaphore,
+        create_count: std::sync::atomic::AtomicUsize,
         fail_next_put_tickets: std::sync::atomic::AtomicBool,
         fail_next_bump_epoch: std::sync::atomic::AtomicBool,
     }
@@ -7653,6 +7689,9 @@ mod tests {
                 inner: crate::store::MemoryStore::new(),
                 park_epoch: std::sync::atomic::AtomicBool::new(false),
                 epoch_gate: tokio::sync::Semaphore::new(0),
+                park_create: std::sync::atomic::AtomicBool::new(false),
+                create_gate: tokio::sync::Semaphore::new(0),
+                create_count: std::sync::atomic::AtomicUsize::new(0),
                 fail_next_put_tickets: std::sync::atomic::AtomicBool::new(false),
                 fail_next_bump_epoch: std::sync::atomic::AtomicBool::new(false),
             }
@@ -7665,6 +7704,21 @@ mod tests {
 
         fn release_epoch_writes(&self) {
             self.epoch_gate.add_permits(1);
+        }
+
+        fn park_create_writes(&self) {
+            self.park_create
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn release_create_writes(&self) {
+            self.park_create
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            self.create_gate.add_permits(usize::MAX >> 3);
+        }
+
+        fn create_count(&self) -> usize {
+            self.create_count.load(std::sync::atomic::Ordering::SeqCst)
         }
 
         fn fail_next_put_tickets(&self) {
@@ -7681,6 +7735,15 @@ mod tests {
     #[async_trait::async_trait]
     impl crate::store::SessionStore for ResumeProbeStore {
         async fn create(&self, record: &SessionRecord) -> std::io::Result<()> {
+            self.create_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.park_create.load(std::sync::atomic::Ordering::SeqCst) {
+                self.create_gate
+                    .acquire()
+                    .await
+                    .expect("gate never closed")
+                    .forget();
+            }
             self.inner.create(record).await
         }
 
@@ -7888,6 +7951,61 @@ mod tests {
             .map(|t| t.ticket_id)
             .collect();
         assert_eq!(persisted, vec![create_tid, issued]);
+    }
+
+    #[tokio::test]
+    async fn concurrent_host_same_id_creates_once_and_loser_resumes() {
+        // Finding #4: two racing `HostSession(Some(same_id))` calls
+        // must not both take the create path. Park the first caller
+        // inside its `store.create` (with the map write-lock held);
+        // the second caller blocks on that lock, then finds the
+        // winner's entry and retries into the RESUME path — exactly
+        // one store create, both callers succeed, both tickets in the
+        // one ledger, and the loser's epoch bump (+1) proves it
+        // resumed rather than re-created.
+        let probe = Arc::new(ResumeProbeStore::new());
+        let r = Arc::new(Registry::new(
+            PeerId::from_bytes([0xfe; 32]),
+            Arc::clone(&probe) as DynStore,
+        ));
+        let alice = peer(1, "alice");
+        let id = SessionId::from_bytes([0x77; 16]);
+
+        probe.park_create_writes();
+        let a = tokio::spawn({
+            let r = Arc::clone(&r);
+            let alice = alice.clone();
+            async move { r.host(alice, Some(id), Capability::ReadWrite, 0).await }
+        });
+        let b = tokio::spawn({
+            let r = Arc::clone(&r);
+            let alice = alice.clone();
+            async move { r.host(alice, Some(id), Capability::ReadWrite, 0).await }
+        });
+        // Let both callers run up against the gate / the map lock.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        probe.release_create_writes();
+
+        let (id_a, _ticket_a, tid_a) = a.await.unwrap().unwrap();
+        let (id_b, _ticket_b, tid_b) = b.await.unwrap().unwrap();
+        assert_eq!(id_a, id);
+        assert_eq!(id_b, id);
+        assert_ne!(tid_a, tid_b, "each caller gets its own minted ticket");
+
+        assert_eq!(
+            probe.create_count(),
+            1,
+            "exactly one store.create — the loser must resume, not re-create",
+        );
+        // One session record; BOTH tickets durable in its ledger. The
+        // pre-fix interleaving lost the winner's ticket to the loser's
+        // create() rewrite.
+        let records = r.store.load_all().await.unwrap();
+        assert_eq!(records.len(), 1);
+        let ledger: Vec<_> = records[0].tickets.iter().map(|t| t.ticket_id).collect();
+        assert!(ledger.contains(&tid_a) && ledger.contains(&tid_b));
+        // The loser went through the resume path's epoch bump.
+        assert_eq!(records[0].host_epoch, 1);
     }
 
     #[tokio::test]
