@@ -68,6 +68,26 @@ const WORKSPACE_TICKET_DELIVERY_RETRIES: u32 = 5;
 #[cfg(feature = "iroh")]
 const WORKSPACE_TICKET_DELIVERY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// Per-mirror byte budget for inbound `Message` frames spawned but not
+/// yet verified (finding #3). Each spawned apply task holds
+/// [`MIRROR_APPLY_FRAME_COST`] + payload-length permits until it
+/// completes; a frame that can't acquire is dropped with a warn (the
+/// mirror backfills via `Replay`). 4× the max gossip message keeps a
+/// handful of max-size frames (or thousands of chat-size ones) in
+/// flight per mirror while capping what an unauthenticated topic
+/// flooder can pin in memory.
+#[cfg(feature = "iroh")]
+const MIRROR_APPLY_BUDGET_BYTES: usize = 4 * artel_protocol::gossip::MAX_GOSSIP_MESSAGE_SIZE;
+
+/// Fixed per-frame floor charged against [`MIRROR_APPLY_BUDGET_BYTES`]
+/// on top of the payload length, so zero-payload frames still cost
+/// enough that task *count* (not just retained bytes) stays bounded —
+/// at most budget / cost ≈ 4096 concurrent apply tasks per mirror.
+/// Approximates a task's non-payload footprint (`SessionMessage`
+/// envelope + tokio task overhead).
+#[cfg(feature = "iroh")]
+const MIRROR_APPLY_FRAME_COST: usize = 1024;
+
 #[cfg(feature = "iroh")]
 use artel_protocol::{DOWNGRADE_ACTION, ROTATE_ACTION};
 use artel_protocol::{TICKET_ACTION, UPGRADE_ACTION};
@@ -1350,15 +1370,81 @@ impl Registry {
         session_id: SessionId,
         arc: &Arc<Mutex<Session>>,
     ) -> Box<dyn Fn(SessionMessage) + Send + Sync + 'static> {
+        self.mirror_on_message_with_budget(session_id, arc, MIRROR_APPLY_BUDGET_BYTES)
+    }
+
+    /// [`Self::mirror_on_message`] with an explicit inflight budget, so
+    /// tests can exhaust it without allocating tens of MiB.
+    ///
+    /// Each inbound frame spawns a verification task that retains the
+    /// full `SessionMessage` until it runs. Unbounded, that was a
+    /// denial-of-service vector (finding #3): topic subscription is
+    /// unauthenticated (see
+    /// roadmap, gossip-lurker entry), so any peer that derives the
+    /// topic id could flood unique-payload frames and inflate task +
+    /// memory count without limit — all checks (dedup, author sig,
+    /// host seq-sig) run inside the spawned task. The semaphore bounds
+    /// what an attacker can pin: permits are BYTES, each spawn holds
+    /// `MIRROR_APPLY_FRAME_COST + payload.len()` of them until its
+    /// task completes, so both aggregate retained memory and (via the
+    /// per-frame floor) task count stay capped per mirror.
+    ///
+    /// Over-budget frames are dropped with a warn, not queued —
+    /// equivalent to the at-least-once transport losing the frame.
+    /// Under attack that can shed a genuine broadcast; the mirror
+    /// backfills on its next `Replay` (join/re-subscribe), and an
+    /// attacker flooding the same topic could starve delivery at the
+    /// gossip layer anyway (`Lagged`).
+    #[cfg(feature = "iroh")]
+    fn mirror_on_message_with_budget(
+        &self,
+        session_id: SessionId,
+        arc: &Arc<Mutex<Session>>,
+        budget: usize,
+    ) -> Box<dyn Fn(SessionMessage) + Send + Sync + 'static> {
         let mirror = Arc::clone(arc);
         let store = self.store.clone();
+        let inflight = Arc::new(tokio::sync::Semaphore::new(budget));
         Box::new(move |msg: SessionMessage| {
+            // Opportunistic dedup BEFORE spawning (finding #3): a
+            // duplicate seq shouldn't cost a task or budget at all.
+            // `try_lock` because this callback is sync (the bridge's
+            // forwarder loop calls it inline) — when the mirror is
+            // uncontended (the common case; replay storms are the
+            // routine duplicate source) this sheds the frame here.
+            // Under contention we fall through and the spawned task's
+            // authoritative dedup (same check, under the held lock)
+            // catches it.
+            if let Ok(s) = mirror.try_lock() {
+                let pos = s.log.partition_point(|m| m.seq < msg.seq);
+                if pos < s.log.len() && s.log[pos].seq == msg.seq {
+                    return;
+                }
+            }
+            // Clamp to the budget so a frame whose cost alone exceeds
+            // it can still acquire (rather than being unprocessable
+            // forever); u32 is the acquire_many domain.
+            let cost = u32::try_from(
+                MIRROR_APPLY_FRAME_COST
+                    .saturating_add(msg.payload.len())
+                    .min(budget),
+            )
+            .unwrap_or(u32::MAX);
+            let Ok(permit) = Arc::clone(&inflight).try_acquire_many_owned(cost) else {
+                tracing::warn!(
+                    ?session_id,
+                    seq = ?msg.seq,
+                    "dropping inbound Message: mirror apply budget exhausted",
+                );
+                return;
+            };
             let mirror = Arc::clone(&mirror);
             let store = store.clone();
             // Spawn so the gossip forwarder doesn't block on each
             // message. Acceptable for now; if ordering ever matters we
             // can replace with a per-session mpsc.
             tokio::spawn(async move {
+                let _permit = permit;
                 apply_inbound_mirror_message(&store, &mirror, session_id, msg).await;
             });
         })
@@ -4648,6 +4734,123 @@ mod tests {
         // Re-feed the same seq; dedup drops it, log unchanged.
         apply_inbound_mirror_message(&store, &mirror, session, msg).await;
         assert_eq!(mirror.lock().await.log.len(), 1, "duplicate seq deduped");
+    }
+
+    // ---- mirror apply budget (finding #3) ----
+
+    /// Registry over the fixture's store, so
+    /// `mirror_on_message_with_budget` (which clones `self.store`)
+    /// persists into the same store the fixture asserts against.
+    #[cfg(feature = "iroh")]
+    fn registry_over(store: &DynStore) -> Registry {
+        Registry::new(PeerId::from_bytes([0xff; 32]), Arc::clone(store))
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "iroh")]
+    async fn mirror_callback_sheds_frames_when_budget_exhausted() {
+        // With the mirror lock held (so no spawned task can complete
+        // and release its permits — and the opportunistic pre-spawn
+        // dedup's try_lock fails, exercising the pure budget path),
+        // only budget/cost frames may spawn; the rest are shed at the
+        // callback. On the current-thread test runtime the spawned
+        // tasks can't run between sync callback invocations, so the
+        // budget accounting is deterministic.
+        let (host_key, session, author_key, mirror, store) = remote_mirror_fixture();
+        store.create(&mirror.lock().await.record()).await.unwrap();
+        let r = registry_over(&store);
+        // Room for exactly 2 near-zero-payload frames.
+        let budget = 2 * MIRROR_APPLY_FRAME_COST + MIRROR_APPLY_FRAME_COST / 2;
+        let on_message = r.mirror_on_message_with_budget(session, &mirror, budget);
+
+        let guard = mirror.lock().await;
+        for seq in 1..=4u64 {
+            on_message(host_signed_message(
+                &host_key,
+                &author_key,
+                session,
+                Seq::new(seq),
+                b"x",
+            ));
+        }
+        drop(guard);
+        // Let the admitted tasks run to completion.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            mirror.lock().await.log.len(),
+            2,
+            "budget for 2 frames must admit exactly 2 of 4",
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "iroh")]
+    async fn duplicate_seqs_are_shed_before_spawning_and_cost_no_budget() {
+        // Dedup-before-spawn: once seq 1 is applied, a flood of
+        // duplicate-seq frames must be dropped at the callback without
+        // consuming budget — so a fresh frame arriving right after the
+        // flood (before any spawned task could have run and released
+        // permits) still gets through. Without the pre-spawn dedup the
+        // duplicates would hold the whole budget and the fresh frame
+        // would be shed.
+        let (host_key, session, author_key, mirror, store) = remote_mirror_fixture();
+        store.create(&mirror.lock().await.record()).await.unwrap();
+        let r = registry_over(&store);
+        let budget = 2 * MIRROR_APPLY_FRAME_COST + MIRROR_APPLY_FRAME_COST / 2;
+        let on_message = r.mirror_on_message_with_budget(session, &mirror, budget);
+
+        let seq1 = host_signed_message(&host_key, &author_key, session, Seq::new(1), b"x");
+        on_message(seq1.clone());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(mirror.lock().await.log.len(), 1);
+
+        // Duplicate flood, way past the 2-frame budget, then a fresh
+        // frame — all fed synchronously, no await in between.
+        for _ in 0..16 {
+            on_message(seq1.clone());
+        }
+        on_message(host_signed_message(
+            &host_key,
+            &author_key,
+            session,
+            Seq::new(2),
+            b"y",
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let s = mirror.lock().await;
+        assert_eq!(
+            s.log.len(),
+            2,
+            "duplicates must not consume the budget the fresh frame needs",
+        );
+        assert_eq!(s.head, Seq::new(2));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "iroh")]
+    async fn oversize_cost_frame_still_acquires_clamped_budget() {
+        // A frame whose cost alone exceeds the whole budget must still
+        // be processable (clamped to the budget), not unprocessable
+        // forever.
+        let (host_key, session, author_key, mirror, store) = remote_mirror_fixture();
+        store.create(&mirror.lock().await.record()).await.unwrap();
+        let r = registry_over(&store);
+        // Budget smaller than one frame's fixed cost.
+        let budget = MIRROR_APPLY_FRAME_COST / 2;
+        let on_message = r.mirror_on_message_with_budget(session, &mirror, budget);
+        on_message(host_signed_message(
+            &host_key,
+            &author_key,
+            session,
+            Seq::new(1),
+            b"big-ish",
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            mirror.lock().await.log.len(),
+            1,
+            "over-budget-cost frame must clamp and apply, not wedge",
+        );
     }
 
     #[tokio::test]
