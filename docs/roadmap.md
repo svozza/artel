@@ -16,7 +16,7 @@ along the way.
 
 | Crate | State |
 |---|---|
-| `artel-protocol` | Wire types + Unix-socket transport. Done. `PROTOCOL_VERSION` `12` (`9` workspace-ticket unicast → `10` `Event::Gap` lag-recovery → `11` cooperative-demote downgrade → `12` host-authority `RemoveSessionMember`), `MESSAGE_FORMAT` `3`, `TICKET_VERSION` `4` (tiered tickets), `GOSSIP_WIRE_VERSION` `1`, upgrade ALPN `artel/upgrade/2`. |
+| `artel-protocol` | Wire types + Unix-socket transport. Done. `PROTOCOL_VERSION` `13` (`9` workspace-ticket unicast → `10` `Event::Gap` lag-recovery → `11` cooperative-demote downgrade → `12` host-authority `RemoveSessionMember` → `13` gossip payload-size cap / `PayloadTooLarge`), `MESSAGE_FORMAT` `3`, `TICKET_VERSION` `4` (tiered tickets), `GOSSIP_WIRE_VERSION` `3` (`2` ctrl-v2 signatures → `3` 1 MiB transport cap), upgrade ALPN `artel/upgrade/2`. |
 | `artel-daemon` | Persistent daemon + binary + flock-based pidfile (orphan-leak fix `9a1a773`) + issued-ticket ledger with revocation + lazy gossip re-subscribe for reloaded joiner mirrors (re-delivery after restart) + host-authority member removal (`RemoveSessionMember`, drops an evicted peer from durable membership). Done. |
 | `artel-client` | Stateless multiplexed client + `artel` CLI binary + `connect_or_spawn`. Done. |
 | `artel-fs` | Phase 3a (MVP) + 3b-1 (persistence) + 3b-3 (crash recovery) + host/join safety + PeerFilter shipped. Watcher new-subtree rescan landed (`e8244fe`, closes the inotify backfill race). Tier-1 write-revocation: namespace-secret rotation on evict + offline-peer re-delivery on rejoin, hardened 2026-06-21 (host-restart re-seed, `NODE_ID` re-delivery de-storm, evict drops daemon membership). Author identity (3b-2) and configurable filter (3b-4) remain. |
