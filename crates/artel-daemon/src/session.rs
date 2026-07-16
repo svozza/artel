@@ -766,6 +766,82 @@ pub struct Registry {
     /// for unit tests that don't wire up a full iroh runtime.
     #[cfg(feature = "iroh")]
     endpoint: Option<iroh::Endpoint>,
+    /// In-flight remote-mirror joins, keyed by session id (finding
+    /// #6). The claiming join registers a watch channel here (inside
+    /// [`Self::claim_remote_mirror`], before the mirror becomes
+    /// visible in `sessions`) and resolves it once its bridge
+    /// subscribe succeeds or its rollback completes. A concurrent
+    /// join that adopts the claimed slot waits on this outcome
+    /// instead of returning success for a mirror whose subscribe may
+    /// still fail and be rolled back out from under it. Absent entry
+    /// ⇒ the mirror is established (prior completed join, or a
+    /// reload from disk). Std mutex: every hold is brief and awaits
+    /// nothing; `RemoteJoinGuard::drop` needs a sync lock.
+    #[cfg(feature = "iroh")]
+    pending_remote_joins: PendingRemoteJoins,
+}
+
+/// Shared map of in-flight remote joins — see
+/// [`Registry::pending_remote_joins`]. `Arc` so [`RemoteJoinGuard`]
+/// can clean its entry up from `Drop` without a registry borrow.
+#[cfg(feature = "iroh")]
+type PendingRemoteJoins =
+    Arc<std::sync::Mutex<HashMap<SessionId, tokio::sync::watch::Receiver<Option<bool>>>>>;
+
+/// Result of [`Registry::claim_remote_mirror`]: either this join
+/// claimed a fresh slot (and owes the [`RemoteJoinGuard`] a
+/// resolution), or it adopted an existing mirror — possibly one whose
+/// claiming join is still subscribing, in which case `outcome` carries
+/// a receiver to wait on (finding #6).
+#[cfg(feature = "iroh")]
+enum MirrorClaim {
+    /// This caller claimed the slot and must drive the subscribe,
+    /// then resolve `guard` via [`RemoteJoinGuard::finish`].
+    Fresh {
+        arc: Arc<Mutex<Session>>,
+        guard: RemoteJoinGuard,
+    },
+    /// A prior or concurrent join owns the mirror. `outcome` is
+    /// `Some` while that join's subscribe is still in flight — wait
+    /// on it before reporting success; `None` once established.
+    Adopted {
+        arc: Arc<Mutex<Session>>,
+        outcome: Option<tokio::sync::watch::Receiver<Option<bool>>>,
+    },
+}
+
+/// Obligation held by the join that claimed a fresh mirror slot: the
+/// claimant MUST resolve the pending-join entry one way or the other,
+/// or concurrent adopters would wait forever. [`Self::finish`] posts
+/// the outcome (`true` = subscribed, `false` = rolled back) and
+/// removes the entry; `Drop` posts `false` if the claimant was
+/// cancelled or panicked before finishing, so waiters wake and retry
+/// rather than hang.
+#[cfg(feature = "iroh")]
+struct RemoteJoinGuard {
+    session: SessionId,
+    tx: tokio::sync::watch::Sender<Option<bool>>,
+    pending: PendingRemoteJoins,
+    done: bool,
+}
+
+#[cfg(feature = "iroh")]
+impl RemoteJoinGuard {
+    fn finish(mut self, ok: bool) {
+        let _ = self.tx.send(Some(ok));
+        self.pending.lock().expect("poisoned").remove(&self.session);
+        self.done = true;
+    }
+}
+
+#[cfg(feature = "iroh")]
+impl Drop for RemoteJoinGuard {
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = self.tx.send(Some(false));
+            self.pending.lock().expect("poisoned").remove(&self.session);
+        }
+    }
 }
 
 /// Where the body handed to [`Registry::send`] was authored.
@@ -826,6 +902,8 @@ impl Registry {
             signing_key: None,
             #[cfg(feature = "iroh")]
             endpoint: None,
+            #[cfg(feature = "iroh")]
+            pending_remote_joins: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -849,6 +927,7 @@ impl Registry {
             bridge: None,
             signing_key: Some(signing_key),
             endpoint: None,
+            pending_remote_joins: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -879,6 +958,8 @@ impl Registry {
             signing_key,
             #[cfg(feature = "iroh")]
             endpoint,
+            #[cfg(feature = "iroh")]
+            pending_remote_joins: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -1627,19 +1708,25 @@ impl Registry {
             // Atomically claim the slot: build + persist + insert the
             // mirror under the `sessions` write lock, or hand back the
             // existing arc if a concurrent/prior join already claimed
-            // this id. `fresh` tells us whether WE are the one that must
-            // drive the bridge subscribe — only the claiming caller does,
-            // so two racing joins can't double-subscribe or split-brain
-            // (the registry guard that replaces the FsLogStore O_EXCL
-            // reject now that `create` is idempotent).
-            let (arc, fresh) = self
+            // this id. Only the claiming caller drives the bridge
+            // subscribe, so two racing joins can't double-subscribe or
+            // split-brain (the registry guard that replaces the
+            // FsLogStore O_EXCL reject now that `create` is idempotent).
+            let (arc, join_guard) = match self
                 .claim_remote_mirror(session_id, host_peer_id, host_epoch)
-                .await?;
-            if !fresh {
-                // A prior/concurrent join owns the mirror and its
-                // subscription; reuse it.
-                return Ok(arc);
-            }
+                .await?
+            {
+                MirrorClaim::Adopted { arc, outcome: None } => {
+                    // Established mirror (prior completed join, or a
+                    // reload from disk); reuse it.
+                    return Ok(arc);
+                }
+                MirrorClaim::Adopted {
+                    arc,
+                    outcome: Some(rx),
+                } => return Self::await_claimant_outcome(arc, rx).await,
+                MirrorClaim::Fresh { arc, guard } => (arc, guard),
+            };
 
             // Seed the host-epoch watermark from the persisted mirror.
             // `claim_remote_mirror` seeded that record's `host_epoch`
@@ -1701,8 +1788,11 @@ impl Registry {
                 // would silently reuse forever — and that survives a
                 // restart. After rollback a retry re-materialises cleanly.
                 // (The bridge's own slot self-cleans: its `SlotReservation`
-                // frees on the failed-subscribe drop.)
+                // frees on the failed-subscribe drop.) Post the failure
+                // AFTER the rollback completes so a waiting adopter that
+                // retries doesn't race the delete (finding #6).
                 self.rollback_remote_mirror(session_id).await;
+                join_guard.finish(false);
                 return Err(match err {
                     crate::gossip_bridge::BridgeError::InvalidAddr(msg) => {
                         SessionError::InvalidAddr(msg)
@@ -1710,6 +1800,7 @@ impl Registry {
                     other => SessionError::Internal(other.to_string()),
                 });
             }
+            join_guard.finish(true);
 
             Ok(arc)
         }
@@ -1718,10 +1809,14 @@ impl Registry {
     /// Atomically claim the registry slot for a remote mirror.
     ///
     /// Under the `sessions` write lock: if `session_id` is already
-    /// present (a concurrent or prior join), return that arc with
-    /// `fresh = false` — the caller must NOT subscribe again. Otherwise
-    /// build a fresh `Remote` [`Session`], persist it, insert it, and
-    /// return `(arc, true)` — the caller drives the gossip subscribe.
+    /// present (a concurrent or prior join), return that arc as
+    /// [`MirrorClaim::Adopted`] — the caller must NOT subscribe again,
+    /// and if the claiming join is still in flight (its entry is in
+    /// `pending_remote_joins`) the adopter carries a receiver for its
+    /// outcome to wait on (finding #6). Otherwise build a fresh
+    /// `Remote` [`Session`], persist it, insert it, and return
+    /// [`MirrorClaim::Fresh`] with the [`RemoteJoinGuard`] the caller
+    /// must resolve after driving the gossip subscribe.
     ///
     /// `host_epoch` seeds the *fresh* mirror's `host_epoch` field — the
     /// caller's already-verified claim from the joining ticket (session-
@@ -1733,16 +1828,19 @@ impl Registry {
     /// Doing the existence check and the insert under one lock hold is
     /// what prevents two concurrent `join`s from each materialising a
     /// separate mirror (split-brain: the IPC-visible arc differs from the
-    /// one the live forwarder feeds). `store.create` is idempotent
-    /// ([`SessionStore::create`]), so persisting under the lock is safe
-    /// even if a crash left a half-built dir.
+    /// one the live forwarder feeds). The pending-join entry is
+    /// registered under that same hold, so an adopter either sees the
+    /// established mirror (no entry) or the in-flight entry — never a
+    /// gap. `store.create` is idempotent ([`SessionStore::create`]), so
+    /// persisting under the lock is safe even if a crash left a
+    /// half-built dir.
     #[cfg(feature = "iroh")]
     async fn claim_remote_mirror(
         &self,
         session_id: SessionId,
         host_peer_id: &PeerId,
         host_epoch: u64,
-    ) -> Result<(Arc<Mutex<Session>>, bool), SessionError> {
+    ) -> Result<MirrorClaim, SessionError> {
         // Build the prospective mirror before taking the lock so the
         // (async) store write happens outside the lock-held window — but
         // commit the in-memory insert and the existence check together.
@@ -1762,7 +1860,7 @@ impl Registry {
         // redundant store write on the common resume/concurrent case.
         let existing = self.sessions.read().await.get(&session_id).cloned();
         if let Some(existing) = existing {
-            return Ok((existing, false));
+            return Ok(self.adopt_claim(session_id, existing));
         }
 
         // Persist the new session so a later daemon restart doesn't lose
@@ -1775,17 +1873,79 @@ impl Registry {
 
         // Commit the insert under the write lock, re-checking for a
         // racer that slipped in between our read-check and here. The
-        // first writer wins; a loser hands back the winner's arc with
-        // `fresh = false` so it doesn't subscribe. The check and insert
-        // share one lock hold so the race can't split-brain.
+        // first writer wins; a loser adopts the winner's arc so it
+        // doesn't subscribe. The check and insert share one lock hold
+        // so the race can't split-brain, and the pending-join entry is
+        // registered under the same hold so adopters can't observe the
+        // mirror without its in-flight marker.
         let mut guard = self.sessions.write().await;
         if let Some(existing) = guard.get(&session_id).cloned() {
-            return Ok((existing, false));
+            drop(guard);
+            return Ok(self.adopt_claim(session_id, existing));
         }
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        self.pending_remote_joins
+            .lock()
+            .expect("poisoned")
+            .insert(session_id, rx);
         let arc = Arc::new(Mutex::new(session_obj));
         guard.insert(session_id, Arc::clone(&arc));
         drop(guard);
-        Ok((arc, true))
+        Ok(MirrorClaim::Fresh {
+            arc,
+            guard: RemoteJoinGuard {
+                session: session_id,
+                tx,
+                pending: Arc::clone(&self.pending_remote_joins),
+                done: false,
+            },
+        })
+    }
+
+    /// Adopter-side wait for an in-flight claim (finding #6). The
+    /// claiming join's subscribe is still running; don't report
+    /// success yet — if that subscribe fails, its rollback deletes
+    /// the mirror we'd be vouching for, and our caller would hold a
+    /// "joined" session that vanishes moments later. No timeout of
+    /// our own: the claimant's subscribe is itself bounded
+    /// (`JOIN_READY_TIMEOUT` inside the bridge) and the guard
+    /// resolves on drop, so this cannot outlive the claimant by more
+    /// than its own deadline. On failure (claimant rolled back, or
+    /// died — drop posts `false`, and a dropped-sender `RecvError`
+    /// maps to `false` too) surface a retryable error: the ticket is
+    /// still good, a fresh join re-materialises cleanly.
+    #[cfg(feature = "iroh")]
+    async fn await_claimant_outcome(
+        arc: Arc<Mutex<Session>>,
+        mut rx: tokio::sync::watch::Receiver<Option<bool>>,
+    ) -> Result<Arc<Mutex<Session>>, SessionError> {
+        let subscribed = rx
+            .wait_for(Option::is_some)
+            .await
+            .ok()
+            .and_then(|v| *v)
+            .unwrap_or(false);
+        if subscribed {
+            Ok(arc)
+        } else {
+            Err(SessionError::Internal(
+                "concurrent join failed to subscribe; retry".into(),
+            ))
+        }
+    }
+
+    /// Build the [`MirrorClaim::Adopted`] arm for an existing mirror:
+    /// attach the claiming join's outcome receiver when one is still
+    /// in flight, `None` for an established mirror.
+    #[cfg(feature = "iroh")]
+    fn adopt_claim(&self, session_id: SessionId, arc: Arc<Mutex<Session>>) -> MirrorClaim {
+        let outcome = self
+            .pending_remote_joins
+            .lock()
+            .expect("poisoned")
+            .get(&session_id)
+            .cloned();
+        MirrorClaim::Adopted { arc, outcome }
     }
 
     /// Undo a [`claim_remote_mirror`] whose bridge subscribe failed:
@@ -6139,20 +6299,41 @@ mod tests {
         .await
         .unwrap();
 
-        let (arc1, fresh1) = r
+        let MirrorClaim::Fresh { arc: arc1, guard } = r
             .claim_remote_mirror(session_id, &host.id, 0)
             .await
-            .unwrap();
-        assert!(fresh1, "first claim is fresh");
-        let (arc2, fresh2) = r
+            .unwrap()
+        else {
+            panic!("first claim must be fresh");
+        };
+        let MirrorClaim::Adopted {
+            arc: arc2,
+            outcome: Some(_),
+        } = r
             .claim_remote_mirror(session_id, &host.id, 0)
             .await
-            .unwrap();
-        assert!(!fresh2, "second claim reuses the existing mirror");
+            .unwrap()
+        else {
+            panic!("second claim must adopt the in-flight mirror");
+        };
         assert!(
             Arc::ptr_eq(&arc1, &arc2),
             "both claims must hand back the same Arc — no split-brain",
         );
+        // Once the claimant finishes, later claims adopt an
+        // ESTABLISHED mirror (no in-flight outcome to wait on).
+        guard.finish(true);
+        let MirrorClaim::Adopted {
+            arc: arc3,
+            outcome: None,
+        } = r
+            .claim_remote_mirror(session_id, &host.id, 0)
+            .await
+            .unwrap()
+        else {
+            panic!("post-finish claim must adopt with no pending outcome");
+        };
+        assert!(Arc::ptr_eq(&arc1, &arc3));
         // Exactly one persisted record + one in-memory entry.
         assert_eq!(store.load_all().await.unwrap().len(), 1);
         assert_eq!(r.list().await.len(), 1);
@@ -6181,15 +6362,18 @@ mod tests {
         .await
         .unwrap();
 
-        let (_arc, fresh) = r
+        let MirrorClaim::Fresh { arc: _arc, guard } = r
             .claim_remote_mirror(session_id, &host.id, 0)
             .await
-            .unwrap();
-        assert!(fresh);
+            .unwrap()
+        else {
+            panic!("first claim must be fresh");
+        };
         assert_eq!(r.list().await.len(), 1, "claimed");
         assert_eq!(store.load_all().await.unwrap().len(), 1, "persisted");
 
         r.rollback_remote_mirror(session_id).await;
+        guard.finish(false);
 
         assert!(r.list().await.is_empty(), "in-memory entry removed");
         assert!(
@@ -6197,11 +6381,140 @@ mod tests {
             "persisted record deleted — no durable orphan",
         );
         // A fresh re-claim succeeds and is fresh again (the slot is free).
-        let (_arc, fresh_again) = r
+        let claim = r
             .claim_remote_mirror(session_id, &host.id, 0)
             .await
             .unwrap();
-        assert!(fresh_again, "rollback frees the slot for a clean retry");
+        assert!(
+            matches!(claim, MirrorClaim::Fresh { .. }),
+            "rollback frees the slot for a clean retry",
+        );
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn adopter_waits_for_claimant_outcome_and_sees_failure() {
+        // Finding #6: an adopter of an in-flight claim must not report
+        // success before the claimant's subscribe resolves. Model B's
+        // wait directly on the claim's watch channel: park an adopter
+        // task on the in-flight outcome, then have the claimant roll
+        // back and post failure — the adopter must observe `false`
+        // (⇒ its join surfaces a retryable error), never a success for
+        // a mirror that was just deleted.
+        let daemon_peer = PeerId::from_bytes([7; 32]);
+        let host = peer(1, "alice");
+        let session_id = SessionId::from_bytes([0xab; 16]);
+        let store = Arc::new(crate::store::MemoryStore::new());
+        let r = Registry::load(
+            daemon_peer,
+            WireEndpointAddr::id_only(daemon_peer),
+            store.clone(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let MirrorClaim::Fresh { arc: _arc, guard } = r
+            .claim_remote_mirror(session_id, &host.id, 0)
+            .await
+            .unwrap()
+        else {
+            panic!("first claim must be fresh");
+        };
+        let MirrorClaim::Adopted {
+            outcome: Some(mut rx),
+            ..
+        } = r
+            .claim_remote_mirror(session_id, &host.id, 0)
+            .await
+            .unwrap()
+        else {
+            panic!("second claim must adopt with an in-flight outcome");
+        };
+
+        let waiter = tokio::spawn(async move {
+            rx.wait_for(Option::is_some)
+                .await
+                .ok()
+                .and_then(|v| *v)
+                .unwrap_or(false)
+        });
+        // The adopter is genuinely parked until the claimant resolves.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!waiter.is_finished(), "adopter must wait, not return early");
+
+        // Claimant's subscribe fails: rollback THEN post failure —
+        // the order materialise_remote_session uses, so a woken
+        // adopter can't race the delete.
+        r.rollback_remote_mirror(session_id).await;
+        guard.finish(false);
+
+        assert!(
+            !waiter.await.unwrap(),
+            "adopter must observe the claimant's failure",
+        );
+        assert!(r.list().await.is_empty(), "mirror rolled back");
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn dropped_claimant_wakes_adopters_with_failure() {
+        // The RemoteJoinGuard drop path: a claimant that panics or is
+        // cancelled before finish() must still resolve waiting
+        // adopters (as failure) and clear the pending entry — not
+        // leave them parked forever on a channel nobody will write.
+        let daemon_peer = PeerId::from_bytes([7; 32]);
+        let host = peer(1, "alice");
+        let session_id = SessionId::from_bytes([0xac; 16]);
+        let store = Arc::new(crate::store::MemoryStore::new());
+        let r = Registry::load(
+            daemon_peer,
+            WireEndpointAddr::id_only(daemon_peer),
+            store.clone(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let MirrorClaim::Fresh { arc: _arc, guard } = r
+            .claim_remote_mirror(session_id, &host.id, 0)
+            .await
+            .unwrap()
+        else {
+            panic!("first claim must be fresh");
+        };
+        let MirrorClaim::Adopted {
+            outcome: Some(mut rx),
+            ..
+        } = r
+            .claim_remote_mirror(session_id, &host.id, 0)
+            .await
+            .unwrap()
+        else {
+            panic!("second claim must adopt with an in-flight outcome");
+        };
+
+        drop(guard);
+        let outcome = timeout(Duration::from_secs(1), rx.wait_for(Option::is_some))
+            .await
+            .expect("drop must wake waiters, not strand them")
+            .ok()
+            .and_then(|v| *v)
+            .unwrap_or(false);
+        assert!(!outcome, "a dropped claimant reads as failure");
+        // Entry cleared: the next claim of the (still-present) mirror
+        // adopts an ESTABLISHED slot rather than a stale in-flight one.
+        let MirrorClaim::Adopted { outcome: None, .. } = r
+            .claim_remote_mirror(session_id, &host.id, 0)
+            .await
+            .unwrap()
+        else {
+            panic!("pending entry must be cleared on drop");
+        };
     }
 
     #[cfg(feature = "iroh")]
