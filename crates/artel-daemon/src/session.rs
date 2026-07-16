@@ -2235,12 +2235,33 @@ impl Registry {
     }
 
     /// Persist a beacon-advanced `host_epoch` watermark on a `Remote`
-    /// mirror record (Auth Slice B.5.3). Called from the bridge's
-    /// `EpochBeacon` arm after a host-signed beacon advances the
-    /// in-memory `AtomicU64` watermark, so the watermark survives a
-    /// daemon restart and keeps gating replayed closes. Monotonic: only
-    /// writes when `host_epoch` exceeds the stored value. A no-op for
-    /// an unknown or non-`Remote` session.
+    /// mirror record (Auth Slice B.5.3), so the watermark survives a
+    /// daemon restart and keeps gating replayed closes. Called from
+    /// the bridge's `EpochBeacon` arm BEFORE it advances the live
+    /// `AtomicU64` watermark. Monotonic: only writes when `host_epoch`
+    /// exceeds the stored value. A no-op for an unknown or non-`Remote`
+    /// session.
+    ///
+    /// Store-before-memory (finding #5): the disk write lands before
+    /// `s.host_epoch` advances, so a crash between the two leaves disk
+    /// AHEAD of memory — the safe divergence (a stricter close-gate
+    /// after restart; a genuine close is signed at the host's current
+    /// epoch, which every beacon-advanced watermark is `<=`, so a
+    /// too-high persisted value can never reject a genuine close). The
+    /// reverse order briefly reopened the epoch-floor gap fixed for the
+    /// host side in PR #24: memory advanced, persist failed or the
+    /// daemon crashed, restart rehydrated the stale value, and a
+    /// captured `SessionClosed` from the old incarnation passed the
+    /// gate. On a persist *failure* the in-memory epoch also stays put,
+    /// so a re-received beacon at the same epoch retries the persist
+    /// instead of no-oping on an already-advanced memory value.
+    ///
+    /// The store write happens while holding the session lock — same
+    /// discipline as `apply_inbound_mirror_message`'s append — so this
+    /// meta.json read-modify-write cannot interleave with the append
+    /// path's `meta.head` update for the same session (the lost-update
+    /// half of finding #5). Concurrent advances serialize on the lock;
+    /// the loser re-checks monotonicity and no-ops.
     #[cfg(feature = "iroh")]
     pub(crate) async fn advance_host_epoch_watermark(
         &self,
@@ -2254,22 +2275,16 @@ impl Registry {
         let Some(session_arc) = session_arc else {
             return Ok(());
         };
-        // Advance the in-memory watermark under the lock, then release
-        // it before the (monotonic, idempotent) store write. A
-        // concurrent advance is harmless: both write a value >= what
-        // they read, and `bump_host_epoch` is a last-writer-wins
-        // targeted set.
-        {
-            let mut s = session_arc.lock().await;
-            if s.kind != SessionKind::Remote || host_epoch <= s.host_epoch {
-                return Ok(());
-            }
-            s.host_epoch = host_epoch;
+        let mut s = session_arc.lock().await;
+        if s.kind != SessionKind::Remote || host_epoch <= s.host_epoch {
+            return Ok(());
         }
         self.store
             .bump_host_epoch(session, host_epoch)
             .await
             .map_err(SessionError::Storage)?;
+        s.host_epoch = host_epoch;
+        drop(s);
         Ok(())
     }
 
@@ -4718,6 +4733,71 @@ mod tests {
         // Monotonic: a lower epoch is a no-op.
         r.advance_host_epoch_watermark(session, 1).await.unwrap();
         assert_eq!(r.store.load_all().await.unwrap()[0].host_epoch, 3);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "iroh")]
+    async fn failed_watermark_persist_leaves_memory_untouched_and_is_retryable() {
+        // Store-before-memory on the joiner watermark (finding #5):
+        // when `bump_host_epoch` fails, the in-memory epoch must NOT
+        // advance — otherwise a re-received beacon at the same epoch
+        // would no-op on the already-advanced memory value and the
+        // stale on-disk watermark would survive until restart,
+        // reopening the replayed-SessionClosed gap.
+        let remote_host = peer(1, "alice");
+        let session = SessionId::from_bytes([0xcd; 16]);
+        let record = SessionRecord {
+            id: session,
+            host: remote_host.id,
+            members: HashSet::from([remote_host.id]),
+            head: Seq::ZERO,
+            log: Vec::new(),
+            kind: SessionKind::Remote,
+            host_epoch: 0,
+            tickets: Vec::new(),
+            workspace_ticket: None,
+        };
+        let probe = Arc::new(ResumeProbeStore::new());
+        probe.inner.create(&record).await.unwrap();
+        let daemon_peer = PeerId::from_bytes([7; 32]);
+        let r = Registry::load(
+            daemon_peer,
+            WireEndpointAddr::id_only(daemon_peer),
+            Arc::clone(&probe) as DynStore,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        probe.fail_next_bump_epoch();
+        let err = r
+            .advance_host_epoch_watermark(session, 5)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SessionError::Storage(_)));
+
+        // Memory did not advance past disk.
+        let mem_epoch = {
+            let arc = r.sessions.read().await.get(&session).cloned().unwrap();
+            arc.lock().await.host_epoch
+        };
+        assert_eq!(
+            mem_epoch, 0,
+            "failed persist must not advance the in-memory watermark",
+        );
+        assert_eq!(r.store.load_all().await.unwrap()[0].host_epoch, 0);
+
+        // The same epoch retries cleanly — not swallowed by the
+        // monotonic no-op check.
+        r.advance_host_epoch_watermark(session, 5).await.unwrap();
+        let mem_epoch = {
+            let arc = r.sessions.read().await.get(&session).cloned().unwrap();
+            arc.lock().await.host_epoch
+        };
+        assert_eq!(mem_epoch, 5);
+        assert_eq!(r.store.load_all().await.unwrap()[0].host_epoch, 5);
     }
 
     // ====================================================================
@@ -7350,11 +7430,11 @@ mod tests {
         assert_eq!(r.store.load_all().await.unwrap()[0].tickets.len(), 3);
     }
 
-    /// Delegates to [`MemoryStore`] but lets a test park the resume
-    /// path at its `bump_host_epoch` store write (only the resume
-    /// branch of `host` calls it) and fail the next `put_tickets`.
-    /// Pins the resume path's lock discipline and store-before-memory
-    /// ordering against the other ledger writers.
+    /// Delegates to [`MemoryStore`] but lets a test park or fail the
+    /// next `bump_host_epoch` store write (the resume branch of `host`
+    /// and the joiner-side `advance_host_epoch_watermark` call it) and
+    /// fail the next `put_tickets`. Pins both paths' lock discipline
+    /// and store-before-memory ordering against the other writers.
     #[derive(Debug)]
     struct ResumeProbeStore {
         inner: crate::store::MemoryStore,
