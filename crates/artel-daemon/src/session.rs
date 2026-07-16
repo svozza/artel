@@ -672,12 +672,12 @@ fn apply_capability_to(caps: &mut HashMap<PeerId, Capability>, host: PeerId, msg
     };
     // Host RW floor (H3): the host is the cap-log root and must always
     // retain ReadWrite — `Session::new`/`project_caps` seed it, and
-    // `ensure_can_write` / `auto_grant_on_join` depend on it. A
+    // `send`'s can-write gate / `auto_grant_on_join` depend on it. A
     // self-targeted action passes the authority gate above (the host
     // authored it), so without this guard a `Revoke{host}` would
     // `caps.remove(host)` (dropping the host to the absent⇒Read floor)
-    // and a `Grant{host, Read}` would downgrade it — after which
-    // `ensure_can_write` rejects every subsequent host send, INCLUDING
+    // and a `Grant{host, Read}` would downgrade it — after which the
+    // can-write gate rejects every subsequent host send, INCLUDING
     // the corrective `Grant{host, RW}`. The state is re-derived from the
     // log on every load, so the brick is permanent and unrecoverable.
     // Make any action targeting the host inert. (For P2P, where there is
@@ -694,36 +694,6 @@ fn apply_capability_to(caps: &mut HashMap<PeerId, Capability>, host: PeerId, msg
             caps.remove(&peer);
         }
     }
-}
-
-/// Host-side L2 capability gate (Auth Slice C). Returns
-/// [`SessionError::CapabilityDenied`] if `peer_id` does not currently
-/// hold `ReadWrite` in the session's projected cap set, leaving the
-/// caller to reject *before* the message is signed, sequenced, or
-/// appended — so an unauthorized write (or an unauthorized grant/revoke,
-/// which rides on the same `ReadWrite` requirement, Q2) never occupies a
-/// seq in the log (open item O1: drop-before-append). The host's cap set
-/// is at-seq by construction (it appends strictly in order). `Capability`
-/// and ordinary messages share one rule: the author must hold
-/// `ReadWrite`. Pulled out of [`Registry::send`] so the lock guard's
-/// scope is tight (no live `MutexGuard` held across the rest of `send`'s
-/// await points) and `send` stays under clippy's line cap.
-async fn ensure_can_write(
-    session_arc: &Arc<Mutex<Session>>,
-    peer_id: PeerId,
-) -> Result<(), SessionError> {
-    let (can_write, had) = {
-        let s = session_arc.lock().await;
-        (s.can_write(peer_id), s.caps.get(&peer_id).copied())
-    };
-    if can_write {
-        return Ok(());
-    }
-    Err(SessionError::CapabilityDenied {
-        peer_id,
-        had,
-        needed: Capability::ReadWrite,
-    })
 }
 
 /// In-memory session registry, backed by a `crate::store::SessionStore`
@@ -2567,6 +2537,48 @@ impl Registry {
         Ok(())
     }
 
+    /// The `Remote` arm of [`Self::send`]: forward via gossip
+    /// (`SendRequest`) and wait for the host's `SendAck`. The host's
+    /// local `Registry::send` will produce the broadcast `Message`
+    /// frame we'll see on our own forwarder; the IPC reply uses the
+    /// assigned [`SessionMessage`] from the ack.
+    #[cfg(feature = "iroh")]
+    async fn forward_remote_send(
+        &self,
+        session: SessionId,
+        peer: PeerInfo,
+        kind: MessageKind,
+        action: String,
+        payload: Vec<u8>,
+    ) -> Result<SessionMessage, SessionError> {
+        let bridge = self
+            .bridge
+            .as_ref()
+            .ok_or_else(|| SessionError::Internal("remote send requires gossip bridge".into()))?;
+        let send_payload = artel_protocol::rpc::SendPayload {
+            kind,
+            action,
+            payload,
+        };
+        // A `UnknownSession` here means this daemon reloaded the
+        // mirror from disk but never re-subscribed its gossip topic
+        // (the bridge's per-session state is empty after a restart).
+        // Surface it as a distinct, recoverable error so the IPC
+        // dispatch layer can re-subscribe and retry. We deliberately
+        // do NOT re-subscribe inside `send`: `send` is reachable from
+        // the host's gossip forwarder (`run_host_send`), and a
+        // re-subscribe spawns that same forwarder — calling it from
+        // here would make `send`'s future type-level recursive (and
+        // thus non-`Send`). The retry lives in `dispatch_send`, which
+        // only the IPC path reaches. See `resubscribe_remote_mirror`.
+        match bridge.send_remote(session, peer, send_payload).await {
+            Err(crate::gossip_bridge::BridgeError::UnknownSession(s)) => {
+                Err(SessionError::RemoteTopicMissing(s))
+            }
+            other => map_send_remote_result(other),
+        }
+    }
+
     /// Append a message to a session. Returns the freshly-built
     /// [`SessionMessage`] (with its host-assigned `seq`). Also
     /// broadcasts an [`Event::Message`] to local IPC subscribers and
@@ -2575,15 +2587,10 @@ impl Registry {
     ///
     /// Remote-mirror sessions can't append locally — the host is the
     /// sequencer. With iroh on, `send` forwards the body itself via
-    /// the bridge's `send_remote`, which publishes a
-    /// [`GossipBody::SendRequest`] and awaits the host-published
-    /// [`GossipBody::SendAck`]; the IPC dispatch calls `send`
+    /// [`Self::forward_remote_send`]; the IPC dispatch calls `send`
     /// unconditionally. Without iroh there is no transport to forward
     /// through, so a `Remote` mirror returns
     /// [`SessionError::NotHost`].
-    ///
-    /// [`GossipBody::SendRequest`]: artel_protocol::gossip::GossipBody::SendRequest
-    /// [`GossipBody::SendAck`]: artel_protocol::gossip::GossipBody::SendAck
     pub(crate) async fn send(
         &self,
         session: SessionId,
@@ -2627,45 +2634,16 @@ impl Registry {
         }
 
         // Remote-mirror sessions can't append locally — the host is
-        // the sequencer. Forward via gossip (`SendRequest`) and wait
-        // for the host's `SendAck`. The host's local `Registry::send`
-        // will produce the broadcast `Message` frame we'll see on
-        // our own forwarder; the IPC reply uses the assigned
-        // `SessionMessage` from the ack. Authoring on this arm is
-        // always `Local` — the joiner's daemon owns the body and
-        // signs it inside `bridge.send_remote`; reaching here with
-        // `Remote` is a wiring bug.
+        // the sequencer; forward via gossip. See `forward_remote_send`.
         #[cfg(feature = "iroh")]
         if kind_snapshot == SessionKind::Remote {
             debug_assert!(
                 matches!(authoring, Authoring::Local),
                 "Authoring::Remote is only valid for the host arm",
             );
-            let bridge = self.bridge.as_ref().ok_or_else(|| {
-                SessionError::Internal("remote send requires gossip bridge".into())
-            })?;
-            let send_payload = artel_protocol::rpc::SendPayload {
-                kind,
-                action,
-                payload,
-            };
-            // A `UnknownSession` here means this daemon reloaded the
-            // mirror from disk but never re-subscribed its gossip topic
-            // (the bridge's per-session state is empty after a restart).
-            // Surface it as a distinct, recoverable error so the IPC
-            // dispatch layer can re-subscribe and retry. We deliberately
-            // do NOT re-subscribe inside `send`: `send` is reachable from
-            // the host's gossip forwarder (`run_host_send`), and a
-            // re-subscribe spawns that same forwarder — calling it from
-            // here would make `send`'s future type-level recursive (and
-            // thus non-`Send`). The retry lives in `dispatch_send`, which
-            // only the IPC path reaches. See `resubscribe_remote_mirror`.
-            return match bridge.send_remote(session, peer, send_payload).await {
-                Err(crate::gossip_bridge::BridgeError::UnknownSession(s)) => {
-                    Err(SessionError::RemoteTopicMissing(s))
-                }
-                other => map_send_remote_result(other),
-            };
+            return self
+                .forward_remote_send(session, peer, kind, action, payload)
+                .await;
         }
         #[cfg(not(feature = "iroh"))]
         if kind_snapshot == SessionKind::Remote {
@@ -2675,25 +2653,49 @@ impl Registry {
             return Err(SessionError::NotHost);
         }
 
-        // L2 capability enforcement (Auth Slice C). Rejects an author who
-        // can't write *here* — before the message is signed, sequenced,
-        // or appended (O1: drop-before-append). See `ensure_can_write`.
-        ensure_can_write(&session_arc, peer.id).await?;
+        // Local-host arm: membership re-check, L2 capability check,
+        // authoring, seq assignment, and append all under ONE
+        // session-lock hold (finding #7). These used to be separate
+        // lock-acquire/check/release cycles; a capability revoke (or
+        // member removal) landing in the drop-then-reacquire window
+        // let one already-in-flight message slip through *after* the
+        // revoke committed — violating the drop-before-append O1
+        // invariant. `resolve_authoring` is synchronous (CPU-bound
+        // ed25519, no awaits), so holding the lock across it is a
+        // few tens of microseconds — cheap insurance for an airtight
+        // check-to-append window. The snapshot membership check above
+        // still exists because the Remote arm needs it BEFORE
+        // forwarding; for this arm it's just a fast-fail, and this
+        // re-check under the lock is the authoritative one.
+        let mut s = session_arc.lock().await;
+        if !s.members.contains(&peer.id) {
+            return Err(SessionError::NotMember(session));
+        }
+        // L2 capability enforcement (Auth Slice C). Rejects an author
+        // who can't write *here* — before the message is signed,
+        // sequenced, or appended (O1: drop-before-append). Inlined
+        // from the former `ensure_can_write` helper so the check
+        // shares this lock hold with the append it gates.
+        if !s.can_write(peer.id) {
+            return Err(SessionError::CapabilityDenied {
+                peer_id: peer.id,
+                had: s.caps.get(&peer.id).copied(),
+                needed: Capability::ReadWrite,
+            });
+        }
 
-        // Local-host arm. Either we authored the body ourselves
-        // (`Authoring::Local`: stamp now_ms + sign with our key) or a
-        // joiner authored it and we're appending on their behalf
-        // (`Authoring::Remote`: verify their signature against the
-        // body's peer.id BEFORE assigning seq + appending). The two
-        // arms split here so the typing makes "did we sign vs did
-        // they sign" explicit.
+        // Either we authored the body ourselves (`Authoring::Local`:
+        // stamp now_ms + sign with our key) or a joiner authored it
+        // and we're appending on their behalf (`Authoring::Remote`:
+        // verify their signature against the body's peer.id BEFORE
+        // assigning seq + appending). The two arms split here so the
+        // typing makes "did we sign vs did they sign" explicit.
         let (timestamp_ms, signature) =
             match self.resolve_authoring(authoring, &peer, kind, &action, &payload, session) {
                 Ok(pair) => pair,
                 Err(err) => return Err(err),
             };
 
-        let mut s = session_arc.lock().await;
         // Build the message under the session lock (so seq is stable),
         // then persist before bumping in-memory state and fanning out.
         // If the store fails, head and log are unchanged; the request
@@ -5285,7 +5287,7 @@ mod tests {
         // — even authored by the host, so it passes the authority gate —
         // must NOT drop the host below the RW root. Without the floor,
         // caps.remove(host) leaves the host at the absent⇒Read floor and
-        // ensure_can_write then rejects every subsequent host send,
+        // send's can-write gate then rejects every subsequent host send,
         // including the corrective Grant{host, RW} — an irreversible,
         // unrecoverable brick.
         let host = peer(1, "alice");
@@ -5666,6 +5668,84 @@ mod tests {
             )
             .await;
         assert!(sent.is_ok(), "auto-granted peer can write: {sent:?}");
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test]
+    async fn concurrent_revoke_and_send_never_seq_a_write_after_the_revoke() {
+        // Finding #7 (send TOCTOU): membership check, capability
+        // check, and append now share ONE session-lock hold, so a
+        // revoke can only land fully before bob's send (send rejected)
+        // or fully after it (bob's message seqs BELOW the revoke).
+        // Pre-fix, the check ran under one lock hold and the append
+        // under a later one — a revoke slipping into that gap let
+        // bob's write occupy a seq ABOVE the revoke that should have
+        // blocked it. Race the two repeatedly and assert the ordering
+        // invariant on every round.
+        for round in 0..50u8 {
+            let (r, host, _) = registry_with_signing_seed(0x41);
+            let r = Arc::new(r);
+            let (id, _) = r.host_rw(host.clone(), None).await.unwrap();
+            let bob = peer(2, "bob");
+            r.ensure_member(id, bob.clone(), None).await.unwrap();
+
+            let send = tokio::spawn({
+                let r = Arc::clone(&r);
+                let bob = bob.clone();
+                async move {
+                    r.send(
+                        id,
+                        bob,
+                        MessageKind::Chat,
+                        "chat.message".into(),
+                        b"racing".to_vec(),
+                        Authoring::Local,
+                    )
+                    .await
+                }
+            });
+            let revoke = tokio::spawn({
+                let r = Arc::clone(&r);
+                let host = host.clone();
+                async move {
+                    let action = CapabilityAction::Revoke { peer: bob_id() };
+                    r.send(
+                        id,
+                        host,
+                        MessageKind::Capability,
+                        action.action_str().to_string(),
+                        action.encode(),
+                        Authoring::Local,
+                    )
+                    .await
+                }
+            });
+            let send_result = send.await.unwrap();
+            let revoke_seq = revoke.await.unwrap().unwrap().seq;
+
+            match send_result {
+                // Bob's write got in first — it must be sequenced
+                // strictly below the revoke.
+                Ok(msg) => assert!(
+                    msg.seq < revoke_seq,
+                    "round {round}: bob's write (seq {}) sequenced at/after \
+                     the revoke (seq {revoke_seq}) — the TOCTOU window is back",
+                    msg.seq,
+                ),
+                // Revoke landed first — the denial is the only
+                // acceptable error.
+                Err(err) => assert!(
+                    matches!(err, SessionError::CapabilityDenied { .. }),
+                    "round {round}: unexpected error {err:?}",
+                ),
+            }
+        }
+    }
+
+    /// `peer(2, "bob").id` as a const-ish helper for the revoke task
+    /// above (the closure can't capture `bob` twice).
+    fn bob_id() -> PeerId {
+        peer(2, "bob").id
     }
 
     #[cfg(feature = "iroh")]
