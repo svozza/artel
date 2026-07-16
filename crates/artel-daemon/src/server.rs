@@ -2,8 +2,10 @@
 //!
 //! [`Daemon::start`] sets up the shared [`Registry`], binds the IPC
 //! socket, and acquires the PID file. [`Daemon::run`] drives the accept
-//! loop until shutdown is triggered, then joins all outstanding
-//! connection tasks before returning.
+//! loop until shutdown is triggered, then joins outstanding connection
+//! tasks — bounded by `CONNECTION_DRAIN_TIMEOUT`, after which
+//! stragglers (e.g. a task wedged on a stalled client's full socket
+//! buffer) are aborted — before returning.
 
 use std::collections::HashMap;
 use std::io;
@@ -412,8 +414,10 @@ impl Daemon {
         self.shutdown.trigger();
     }
 
-    /// Drive the accept loop until shutdown. Returns once every
-    /// outstanding connection task has finished.
+    /// Drive the accept loop until shutdown. Returns once outstanding
+    /// connection tasks have finished — or, past
+    /// `CONNECTION_DRAIN_TIMEOUT`, been aborted (finding #8: a
+    /// stalled client must not hold up daemon exit).
     pub async fn run(self) -> io::Result<()> {
         let Self {
             registry,
