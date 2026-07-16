@@ -1299,10 +1299,23 @@ async fn handle_inbound_frame(
         // Joiner receives a host epoch beacon. This is the ONLY site
         // that advances the watermark, and only on a host-signed
         // value: verify the ctrl-sig over `(session, host_epoch)`,
-        // then advance the watermark to max(watermark, host_epoch) and
-        // persist it to the mirror record. A wrong-key beacon is
-        // dropped; a replayed old beacon can't lower the monotonic
-        // watermark.
+        // persist the advance to the mirror record, then advance the
+        // live watermark to max(watermark, host_epoch). A wrong-key
+        // beacon is dropped; a replayed old beacon can't lower the
+        // monotonic watermark.
+        //
+        // Persist-BEFORE-advance (finding #5, the joiner-side sibling
+        // of PR #24's host-side epoch floor): if the live atomic moved
+        // first and the disk write then failed (or the daemon crashed
+        // between the two), a restart rehydrated the stale on-disk
+        // value — reopening the replayed-SessionClosed gap for exactly
+        // the closes the live watermark had already learned to reject.
+        // Persisting first means a crash leaves disk ahead of memory,
+        // which is safe: a genuine close is signed at the host's
+        // current epoch, which every beacon-advanced watermark is <=.
+        // On a persist failure the live watermark deliberately does
+        // NOT advance, so a re-received beacon at the same epoch
+        // retries the persist instead of no-oping.
         (
             SessionRole::Joiner {
                 host_pubkey,
@@ -1330,24 +1343,30 @@ async fn handle_inbound_frame(
                 return;
             }
             track_authenticated_peer(bridge, delivered_from);
-            // fetch_max returns the previous value; advance only logs /
-            // persists when the watermark actually moved forward.
-            let prev = host_epoch_watermark.fetch_max(host_epoch, Ordering::AcqRel);
-            if host_epoch > prev {
-                let registry_weak = bridge.registry.lock().await.clone();
-                if let Some(registry) = registry_weak.upgrade()
-                    && let Err(err) = registry
-                        .advance_host_epoch_watermark(session, host_epoch)
-                        .await
-                {
-                    warn!(
-                        ?err,
-                        ?session,
-                        host_epoch,
-                        "epoch_beacon: persist watermark failed"
-                    );
-                }
+            // Only a forward move needs work; a replayed old beacon is
+            // a no-op against the monotonic watermark.
+            if host_epoch <= host_epoch_watermark.load(Ordering::Acquire) {
+                return;
             }
+            let registry_weak = bridge.registry.lock().await.clone();
+            let Some(registry) = registry_weak.upgrade() else {
+                // Registry gone ⇒ daemon tearing down; nothing to
+                // persist against, and the live watermark dies with us.
+                return;
+            };
+            if let Err(err) = registry
+                .advance_host_epoch_watermark(session, host_epoch)
+                .await
+            {
+                warn!(
+                    ?err,
+                    ?session,
+                    host_epoch,
+                    "epoch_beacon: persist watermark failed; live watermark not advanced"
+                );
+                return;
+            }
+            host_epoch_watermark.fetch_max(host_epoch, Ordering::AcqRel);
         }
     }
 }
