@@ -5486,6 +5486,40 @@ mod tests {
     }
 
     #[test]
+    fn apply_temp_path_is_unique_hidden_and_tmp_suffixed() {
+        // Concurrent applies of one path must never share a temp
+        // (finding 3 of the issue-#33 adversarial review), and every
+        // temp must be caught by BOTH the `*.tmp` hardcoded skip and
+        // the dotfile default.
+        let dest = Path::new("/w/sub/data.bin");
+        let a = apply_temp_path(dest).unwrap();
+        let b = apply_temp_path(dest).unwrap();
+        assert_ne!(a, b, "two applies of one path must get distinct temps");
+        for tmp in [&a, &b] {
+            assert_eq!(tmp.parent(), dest.parent(), "temp must be a sibling");
+            let name = tmp.file_name().unwrap().to_str().unwrap();
+            assert!(name.starts_with(".artel-fs-tmp-"), "hidden prefix: {name}");
+            assert_eq!(
+                Path::new(name).extension(),
+                Some("tmp".as_ref()),
+                "hardcoded-skip suffix: {name}",
+            );
+            assert!(
+                WorkspaceFilter::is_hardcoded_skip(Path::new(name)),
+                "filter layer 1 must skip {name}",
+            );
+        }
+    }
+
+    #[test]
+    fn apply_temp_path_rejects_no_file_name() {
+        // A destination with no file name (the root itself) must be
+        // rejected — reachable only if key validation regressed, so
+        // fail loudly rather than compute a sibling-of-root temp.
+        assert!(apply_temp_path(Path::new("/")).is_err());
+    }
+
+    #[test]
     fn workspace_config_default_caps_at_64_mib() {
         // An unset config must mean "guarded" (64 MiB accident-guard),
         // not "unlimited" — the manual `Default` impl exists precisely
