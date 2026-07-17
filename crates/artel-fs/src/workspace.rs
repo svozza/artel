@@ -1013,6 +1013,7 @@ impl Workspace {
         scan_and_publish_existing(
             &root,
             &doc,
+            &node.blobs,
             author,
             &compiled_rules,
             &exclude,
@@ -1869,7 +1870,7 @@ impl Workspace {
     /// - [`ReimportSource::SurvivorTicket`] — a survivor receives the
     ///   host's Write `DocTicket`; `start_sync(ticket.nodes)` seeds the
     ///   addr-book so the brand-new namespace can sync from the host.
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
     pub(crate) async fn reimport_namespace(
         self: &Arc<Self>,
         source: ReimportSource,
@@ -2015,6 +2016,7 @@ impl Workspace {
             scan_and_publish_existing(
                 &self.root,
                 &scan_doc,
+                &self.blobs,
                 self.author,
                 &self.compiled_rules,
                 &self.exclude,
@@ -2698,6 +2700,84 @@ impl Drop for Workspace {
     }
 }
 
+/// Outcome of [`publish_file_streaming`].
+pub(crate) enum PublishOutcome {
+    /// The file was imported and its doc entry set. Carries the
+    /// content hash iroh computed during the import — callers hand it
+    /// to [`EchoGuard::record_local_publish`] so no second hash pass
+    /// over the file is ever needed.
+    Published {
+        /// iroh's content hash == the flat blake3 of the imported
+        /// bytes (see `echo_guard` module docs).
+        hash: blake3::Hash,
+    },
+    /// Zero-length file: skipped. iroh-docs reserves zero-length
+    /// entries for tombstones and rejects an explicit empty insert
+    /// with "Attempted to insert an empty entry". Once the file gets
+    /// actual content a later event picks it up.
+    ///
+    /// TODO: support genuinely-empty files (e.g. `touch sentinel`) —
+    /// probably by storing an inline marker in the entry's metadata
+    /// or splitting "presence" from "content" at the doc layer.
+    SkippedEmpty,
+    /// The file vanished between the triggering event and the stat.
+    /// The watcher converts this into a tombstone (macOS `FSEvents`
+    /// reports post-unlink `Modify` events); the scan just moves on.
+    NotFound,
+}
+
+/// Stream a file from disk into the doc: blob import via
+/// [`Doc::import_file`] (bounded memory at any size), then a
+/// `set_hash` entry pointing at it — the streaming replacement for
+/// `fs::read` + `set_bytes` (issue #33).
+///
+/// `ImportMode::Copy`: the file can change mid-import; Copy snapshots
+/// through the blob store rather than referencing a mutating path.
+/// (`TryReference` is a possible later optimization, not this issue.)
+///
+/// Zero-length handling: stat before import, [`PublishOutcome::SkippedEmpty`]
+/// if `len == 0`. A file that becomes empty *between* the stat and
+/// the import surfaces as an `Err` from the entry insert — rare
+/// race, reported like any other publish failure.
+pub(crate) async fn publish_file_streaming(
+    doc: &Doc,
+    blobs: &iroh_blobs::BlobsProtocol,
+    author: AuthorId,
+    key: Vec<u8>,
+    path: &Path,
+) -> Result<PublishOutcome, WorkspaceError> {
+    let meta = match tokio::fs::metadata(path).await {
+        Ok(m) => m,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Ok(PublishOutcome::NotFound);
+        }
+        Err(err) => return Err(WorkspaceError::Io(err)),
+    };
+    if meta.len() == 0 {
+        return Ok(PublishOutcome::SkippedEmpty);
+    }
+
+    let progress = doc
+        .import_file(
+            blobs.store(),
+            author,
+            Bytes::from(key),
+            path,
+            iroh_blobs::api::blobs::ImportMode::Copy,
+        )
+        .await
+        .map_err(|e| WorkspaceError::Doc(format!("import_file {}: {e}", path.display())))?;
+    // `ImportFileProgress` is a future: driving it to completion runs
+    // the blob import and the `set_hash` entry insert. The outcome
+    // carries the content hash + size iroh computed.
+    let outcome = progress
+        .await
+        .map_err(|e| WorkspaceError::Doc(format!("import {}: {e}", path.display())))?;
+    Ok(PublishOutcome::Published {
+        hash: outcome.hash.into(),
+    })
+}
+
 /// Walk `root` and publish every non-skipped file to `doc`. Errors
 /// on a single file surface as [`WorkspaceEvent::Error`]; we do not
 /// abort the scan.
@@ -2707,9 +2787,11 @@ impl Drop for Workspace {
 /// [`WorkspaceEvent::SkippedReadOnly`] (`Outgoing`). A
 /// `default: ReadOnly` workspace publishes nothing here — by design;
 /// see plan §"Bulk-export `ReadOnly`: yes, honour it".
+#[allow(clippy::too_many_arguments)]
 async fn scan_and_publish_existing(
     root: &Path,
     doc: &Doc,
+    blobs: &iroh_blobs::BlobsProtocol,
     author: AuthorId,
     rules: &CompiledPathRules,
     exclude: &ExcludeRules,
@@ -2774,47 +2856,36 @@ async fn scan_and_publish_existing(
             continue;
         }
 
-        let bytes = match tokio::fs::read(path).await {
-            Ok(b) => b,
-            Err(err) => {
-                let _ = events
-                    .send(WorkspaceEvent::Error(format!(
-                        "scan read {} failed: {err}",
-                        path.display(),
-                    )))
-                    .await;
-                continue;
-            }
-        };
         let key = match keys::path_to_key(root, path) {
             Ok(k) => k,
             Err(err) => {
-                let _ = events
-                    .send(WorkspaceEvent::Error(format!(
-                        "scan key {} failed: {err}",
-                        path.display(),
-                    )))
-                    .await;
+                // Error events use `emit_event` too — same
+                // constructor-context no-blocking-send constraint as
+                // the advisory skips above.
+                emit_event(
+                    events,
+                    WorkspaceEvent::Error(format!("scan key {} failed: {err}", path.display())),
+                );
                 continue;
             }
         };
-        let bytes = Bytes::from(bytes);
-        let len = bytes.len();
-        if let Err(err) = doc.set_bytes(author, key, bytes.clone()).await {
-            warn!(target: "artel_fs::workspace", path = %path.display(), len, %err, "scan: set_bytes failed");
-            let _ = events
-                .send(WorkspaceEvent::Error(format!(
-                    "scan publish {} failed: {err}",
-                    path.display(),
-                )))
-                .await;
-            continue;
+        match publish_file_streaming(doc, blobs, author, key, path).await {
+            Ok(PublishOutcome::Published { hash }) => {
+                published += 1;
+                debug!(target: "artel_fs::workspace", path = %path.display(), "scan: published");
+                echo_guard.record_local_publish(path, hash).await;
+            }
+            Ok(PublishOutcome::SkippedEmpty | PublishOutcome::NotFound) => {
+                skipped += 1;
+            }
+            Err(err) => {
+                warn!(target: "artel_fs::workspace", path = %path.display(), %err, "scan: publish failed");
+                emit_event(
+                    events,
+                    WorkspaceEvent::Error(format!("scan publish {} failed: {err}", path.display())),
+                );
+            }
         }
-        published += 1;
-        debug!(target: "artel_fs::workspace", path = %path.display(), len, "scan: published");
-        echo_guard
-            .record_local_publish(path, blake3::hash(&bytes))
-            .await;
     }
     debug!(target: "artel_fs::workspace", root = %root.display(), published, skipped, "scan_and_publish_existing complete");
     Ok(())
@@ -3217,6 +3288,7 @@ async fn wait_for_ticket(
 /// Pending-set entries are inserted via the echo guard so the
 /// watcher won't republish what we just wrote. They are released
 /// after [`PENDING_RELEASE_GRACE`].
+#[allow(clippy::too_many_arguments)]
 async fn bulk_export(
     root: &Path,
     doc: &Doc,

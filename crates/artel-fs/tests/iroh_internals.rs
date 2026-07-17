@@ -553,6 +553,7 @@ async fn host_with_unreachable_relay_returns_typed_error() {
 // =============================================================
 
 #[tokio::test]
+#[allow(clippy::cast_possible_truncation)]
 async fn iroh_content_hash_is_flat_blake3() {
     let store = MemStore::new();
     // Sizes straddling bao chunk (1 KiB) and chunk-group (16 KiB)

@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
 use notify::EventKind;
 use notify_debouncer_full::DebounceEventResult;
 use walkdir::WalkDir;
@@ -20,9 +19,12 @@ use walkdir::WalkDir;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
+use crate::echo_guard::hash_file;
 use crate::filter::{FilterDecision, SkipReason, WorkspaceFilter};
 use crate::rules::Mode;
-use crate::workspace::{Direction, Workspace, WorkspaceEvent, emit_event};
+use crate::workspace::{
+    Direction, PublishOutcome, Workspace, WorkspaceEvent, emit_event, publish_file_streaming,
+};
 use crate::{EchoGuard, keys};
 
 /// Local change observed by the debounced watcher. Two flavours
@@ -239,43 +241,31 @@ async fn on_modified(
         return;
     }
 
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(b) => b,
+    // Pre-hash by streaming the file (bounded memory at any size) so
+    // the echo guard can suppress peer-driven echoes *before* we pay
+    // for a blob import. NotFound doubles as the deletion signal:
+    // macOS FSEvents reports post-unlink `Modify(Metadata)` /
+    // `Modify(Data)` events instead of a clean `Remove` — converting
+    // them to a tombstone here is what makes deletion propagate
+    // cross-platform. Linux does send `Remove`, and `on_removed`
+    // would handle it before we got here.
+    let content_hash = match hash_file(&path).await {
+        Ok(h) => h,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            // macOS FSEvents reports post-unlink `Modify(Metadata)` /
-            // `Modify(Data)` events instead of a clean `Remove` —
-            // converting them to a tombstone here is what makes
-            // deletion propagate cross-platform. Linux does send
-            // `Remove`, and `on_removed` would handle it before we
-            // got here.
-            debug!(target: "artel_fs::watcher", path = %path.display(), "read NotFound -> tombstone");
+            debug!(target: "artel_fs::watcher", path = %path.display(), "hash NotFound -> tombstone");
             on_removed(workspace, filter, guard, path).await;
             return;
         }
         // Other read errors (permission, transient I/O) — drop
         // silently; a subsequent event will retry.
         Err(err) => {
-            warn!(target: "artel_fs::watcher", path = %path.display(), %err, "read failed; dropping event");
+            warn!(target: "artel_fs::watcher", path = %path.display(), %err, "hash failed; dropping event");
             return;
         }
     };
 
-    // Skip zero-length files: iroh-docs reserves zero-length entries
-    // for tombstones and rejects an explicit empty `set_bytes` with
-    // "Attempted to insert an empty entry". Once the file gets actual
-    // content the next debounced event picks it up.
-    //
-    // TODO: support genuinely-empty files (e.g. `touch sentinel`) —
-    // probably by storing an inline marker in the entry's metadata
-    // or splitting "presence" from "content" at the doc layer.
-    if bytes.is_empty() {
-        debug!(target: "artel_fs::watcher", path = %path.display(), "skip zero-length file");
-        return;
-    }
-
-    let content_hash = blake3::hash(&bytes);
     if guard.should_skip_local(&path, content_hash).await {
-        debug!(target: "artel_fs::watcher", path = %path.display(), len = bytes.len(), "echo-guard: skip local (peer-driven write)");
+        debug!(target: "artel_fs::watcher", path = %path.display(), "echo-guard: skip local (peer-driven write)");
         return;
     }
 
@@ -283,20 +273,38 @@ async fn on_modified(
         return;
     };
 
-    let bytes = Bytes::from(bytes);
-    let len = bytes.len();
-    debug!(target: "artel_fs::watcher", path = %path.display(), len, "publishing via set_bytes");
-    match workspace
-        .doc()
-        .set_bytes(workspace.author, key, bytes.clone())
-        .await
+    debug!(target: "artel_fs::watcher", path = %path.display(), "publishing via import_file");
+    match publish_file_streaming(
+        &workspace.doc(),
+        &workspace.blobs,
+        workspace.author,
+        key,
+        &path,
+    )
+    .await
     {
-        Ok(_) => {
-            debug!(target: "artel_fs::watcher", path = %path.display(), len, "set_bytes ok");
-            guard.record_local_publish(&path, content_hash).await;
+        // Record the hash of what was *actually imported* (the file
+        // can change between the pre-hash and the import snapshot;
+        // the doc holds the import's bytes, so its hash is the one
+        // future events must compare against).
+        Ok(PublishOutcome::Published { hash }) => {
+            debug!(target: "artel_fs::watcher", path = %path.display(), "import_file ok");
+            guard.record_local_publish(&path, hash).await;
+        }
+        // Zero-length: iroh-docs reserves empty entries for
+        // tombstones — see `PublishOutcome::SkippedEmpty`. Once the
+        // file gets content the next debounced event picks it up.
+        Ok(PublishOutcome::SkippedEmpty) => {
+            debug!(target: "artel_fs::watcher", path = %path.display(), "skip zero-length file");
+        }
+        // Vanished between the pre-hash and the import's stat: the
+        // same post-unlink race the NotFound arm above handles.
+        Ok(PublishOutcome::NotFound) => {
+            debug!(target: "artel_fs::watcher", path = %path.display(), "import NotFound -> tombstone");
+            on_removed(workspace, filter, guard, path).await;
         }
         Err(err) => {
-            warn!(target: "artel_fs::watcher", path = %path.display(), len, %err, "set_bytes failed");
+            warn!(target: "artel_fs::watcher", path = %path.display(), %err, "import_file failed");
             emit_event(
                 &workspace.events,
                 WorkspaceEvent::Error(format!("publish {} failed: {err}", path.display())),
