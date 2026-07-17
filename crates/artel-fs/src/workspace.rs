@@ -32,6 +32,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use iroh_docs::AuthorId;
 use iroh_docs::DocTicket;
+use iroh_docs::Entry;
 use iroh_docs::NamespaceId;
 use iroh_docs::api::Doc;
 use iroh_docs::api::protocol::{AddrInfoOptions, ShareMode};
@@ -197,6 +198,15 @@ pub enum AttachPolicy {
     InitFromExisting,
 }
 
+/// Default [`WorkspaceConfig::max_file_size`]: 64 MiB.
+///
+/// Deliberately conservative until the streaming sync path has
+/// real-world mileage. The cap is an accident-guard (a rogue ISO in
+/// the workspace shouldn't fan out to every peer), not a pipeline
+/// protection — both directions stream, so the pipeline itself has
+/// no size ceiling.
+pub const DEFAULT_MAX_FILE_SIZE: u64 = 64 << 20;
+
 /// Configurable knobs for [`Workspace::host_with`] /
 /// [`Workspace::join_with`].
 ///
@@ -204,7 +214,7 @@ pub enum AttachPolicy {
 /// `<root>/.artel-fs/`. Override via [`Self::with_state_dir`] when
 /// the workspace lives in a directory the user wouldn't want a
 /// dotfile inside (e.g. a read-only export root).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct WorkspaceConfig {
     /// Where the workspace persists its iroh secret, doc replica,
     /// and blob store. `None` resolves to `<root>/.artel-fs/`.
@@ -285,6 +295,45 @@ pub struct WorkspaceConfig {
     /// scanning, `.gitignore` semantics — is consumer policy: read
     /// the sources yourself and pass equivalent globs.
     pub exclude: Option<Vec<String>>,
+
+    /// Size cap for synced files (filter layer 4). `Some(bytes)`
+    /// skips files strictly larger, in **both** directions (publish
+    /// and apply), surfacing each skip as
+    /// [`WorkspaceEvent::SkippedTooLarge`]. `None` = unlimited.
+    ///
+    /// Defaults to [`DEFAULT_MAX_FILE_SIZE`] (64 MiB). This is an
+    /// **accident-guard**, not a pipeline protection: file bytes
+    /// stream through iroh-blobs in both directions (BLAKE3 verified
+    /// streaming), so a multi-GB file syncs in bounded memory once
+    /// the cap allows it.
+    ///
+    /// Like [`Self::exclude`], the cap is local to this node — never
+    /// ticket-borne. A host and joiner may run different caps; each
+    /// enforces its own on both its publishes and its applies.
+    ///
+    /// **Anti-pattern: append-heavy / ever-growing files.** artel-fs
+    /// republishes the *whole file per change*, so a growing log
+    /// costs O(n²) bytes over its life regardless of this cap. Apps
+    /// with growing logs (e.g. JSONL event logs) should rotate them
+    /// into bounded segments rather than raising the cap.
+    pub max_file_size: Option<u64>,
+}
+
+impl Default for WorkspaceConfig {
+    /// Everything unset except the size cap, which defaults to
+    /// [`DEFAULT_MAX_FILE_SIZE`] rather than `None` — an unset config
+    /// must mean "guarded", not "unlimited".
+    fn default() -> Self {
+        Self {
+            state_dir: None,
+            join_ticket_timeout: None,
+            endpoint_setup: EndpointSetup::default(),
+            rules: None,
+            daemon_socket: None,
+            exclude: None,
+            max_file_size: Some(DEFAULT_MAX_FILE_SIZE),
+        }
+    }
 }
 
 impl WorkspaceConfig {
@@ -338,6 +387,14 @@ impl WorkspaceConfig {
     #[must_use]
     pub fn with_exclude(mut self, exclude: Option<Vec<String>>) -> Self {
         self.exclude = exclude;
+        self
+    }
+
+    /// Set the size cap. `Some(bytes)` skips larger files (both
+    /// directions); `None` = unlimited. See [`Self::max_file_size`].
+    #[must_use]
+    pub const fn with_max_file_size(mut self, max_file_size: Option<u64>) -> Self {
+        self.max_file_size = max_file_size;
         self
     }
 
@@ -476,10 +533,12 @@ pub enum WorkspaceEvent {
 /// `WorkspaceEvent`s are advisory (diagnostics + skip notices), so
 /// dropping one when the consumer can't keep up is strictly better
 /// than wedging replication. Used by the live loops (applier,
-/// watcher); the construction-time emitters (scan / bulk-export /
-/// reconcile) keep their blocking `send` — they run bounded by the
-/// directory size, not a feedback loop, and aren't coupled to the
-/// live actor.
+/// watcher) AND by the construction-time emitters (scan /
+/// bulk-export / reconcile): those run inside the constructors,
+/// *before* the caller receives the event receiver, so nothing is
+/// draining yet — a blocking `send` there deadlocks construction as
+/// soon as emissions exceed [`EVENT_BUFFER`] (trivial for a scan of
+/// a large tree).
 pub(crate) fn emit_event(events: &mpsc::Sender<WorkspaceEvent>, ev: WorkspaceEvent) {
     use tokio::sync::mpsc::error::TrySendError;
     // `Ok` (delivered) and `Closed` (consumer dropped its stream) both
@@ -539,8 +598,8 @@ pub struct Workspace {
     /// check — required by the applier-side defence-in-depth test for
     /// [`crate::Mode::ReadOnly`].
     pub(crate) author: AuthorId,
-    /// Blobs API for fetching content the doc references. Cloned
-    /// out of the iroh node so the applier can `get_bytes` without
+    /// Blobs API for streaming content the doc references. Cloned
+    /// out of the iroh node so the applier can export blobs without
     /// taking the node lock.
     pub(crate) blobs: iroh_blobs::BlobsProtocol,
     /// Echo guard shared between the watcher and applier.
@@ -600,6 +659,11 @@ pub struct Workspace {
     /// node — never ticket-borne. Cloned into the watcher's and
     /// applier's [`WorkspaceFilter`]s.
     pub(crate) exclude: ExcludeRules,
+    /// Size cap (filter layer 4), from
+    /// [`WorkspaceConfig::max_file_size`]. `None` = unlimited. Local
+    /// to this node, like [`Self::exclude`]. Threaded into every
+    /// [`WorkspaceFilter`] this workspace constructs.
+    pub(crate) max_file_size: Option<u64>,
     /// The workspace's state directory (holds `iroh.key`, `doc-id`,
     /// `current-namespace`, the docs/blobs stores). Retained so
     /// namespace rotation can persist the new `current-namespace`.
@@ -776,6 +840,7 @@ impl Workspace {
         // Same treatment for the exclude globs: reject a malformed
         // list as a configuration error before any state is created.
         let exclude = ExcludeRules::compile(config.exclude.as_deref())?;
+        let max_file_size = config.max_file_size;
 
         ensure_state_dir(&state_dir)?;
         // Canonicalise after ensure_state_dir so the attachment payload
@@ -798,6 +863,7 @@ impl Workspace {
             rules,
             compiled_rules,
             exclude,
+            max_file_size,
             &config.endpoint_setup,
             config.daemon_socket.as_deref(),
             &mut rb,
@@ -824,6 +890,7 @@ impl Workspace {
         rules: PathRules,
         compiled_rules: CompiledPathRules,
         exclude: ExcludeRules,
+        max_file_size: Option<u64>,
         endpoint_setup: &EndpointSetup,
         daemon_socket: Option<&Path>,
         rb: &mut WorkspaceRollback,
@@ -939,7 +1006,7 @@ impl Workspace {
         // legitimate entries laid down by the scan.
         if returning {
             debug!(target: "artel_fs::workspace", root = %root.display(), "host_with: reconciling doc against disk");
-            reconcile_doc_against_disk(&root, &doc, author, &exclude, &tx).await?;
+            reconcile_doc_against_disk(&root, &doc, author, &exclude, max_file_size, &tx).await?;
         }
 
         // Pre-populate the doc from disk *before* we share the
@@ -949,9 +1016,11 @@ impl Workspace {
         scan_and_publish_existing(
             &root,
             &doc,
+            &node.blobs,
             author,
             &compiled_rules,
             &exclude,
+            max_file_size,
             &echo_guard,
             &tx,
         )
@@ -1102,6 +1171,7 @@ impl Workspace {
                 rules,
                 compiled_rules,
                 exclude,
+                max_file_size,
                 state_dir,
                 session_id,
                 join_ticket: Some(join_ticket),
@@ -1204,8 +1274,9 @@ impl Workspace {
         // configuration error, rejected before any state is created.
         // Unlike `rules` (host-authoritative, ticket-borne), the
         // exclude list is honoured on the joiner: it is local node
-        // hygiene, not workspace policy.
+        // hygiene, not workspace policy. Same for the size cap.
         let exclude = ExcludeRules::compile(config.exclude.as_deref())?;
+        let max_file_size = config.max_file_size;
 
         ensure_state_dir(&state_dir)?;
         // Canonicalise — see host_with for the same reasoning. The
@@ -1225,6 +1296,7 @@ impl Workspace {
             root,
             state_dir,
             exclude,
+            max_file_size,
             config.join_ticket_timeout,
             &config.endpoint_setup,
             config.daemon_socket.as_deref(),
@@ -1249,6 +1321,7 @@ impl Workspace {
         root: PathBuf,
         state_dir: PathBuf,
         exclude: ExcludeRules,
+        max_file_size: Option<u64>,
         join_ticket_timeout: Option<Duration>,
         endpoint_setup: &EndpointSetup,
         join_daemon_socket: Option<&Path>,
@@ -1354,6 +1427,7 @@ impl Workspace {
             &node.blobs,
             &compiled_rules,
             &exclude,
+            max_file_size,
             &echo_guard,
             &tx,
         )
@@ -1434,6 +1508,7 @@ impl Workspace {
                 rules,
                 compiled_rules,
                 exclude,
+                max_file_size,
                 state_dir,
                 session_id: session,
                 join_ticket: None,
@@ -1798,7 +1873,7 @@ impl Workspace {
     /// - [`ReimportSource::SurvivorTicket`] — a survivor receives the
     ///   host's Write `DocTicket`; `start_sync(ticket.nodes)` seeds the
     ///   addr-book so the brand-new namespace can sync from the host.
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
     pub(crate) async fn reimport_namespace(
         self: &Arc<Self>,
         source: ReimportSource,
@@ -1944,9 +2019,11 @@ impl Workspace {
             scan_and_publish_existing(
                 &self.root,
                 &scan_doc,
+                &self.blobs,
                 self.author,
                 &self.compiled_rules,
                 &self.exclude,
+                self.max_file_size,
                 &self.echo_guard,
                 &self.events,
             )
@@ -2626,6 +2703,252 @@ impl Drop for Workspace {
     }
 }
 
+/// Outcome of [`apply_entry_streaming`].
+pub(crate) enum ApplyOutcome {
+    /// The entry's bytes are on disk at the target path.
+    Applied,
+    /// The blob isn't fully available locally yet. Callers skip and
+    /// retry when `ContentReady` fires (the applier's existing retry
+    /// contract; bulk export is best-effort and just moves on).
+    NotReady,
+}
+
+/// Process-wide uniquifier for streaming-apply temp names. See
+/// [`apply_temp_path`].
+static APPLY_TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Compute the streaming-apply temp path for `path`.
+///
+/// Lives beside the destination (same directory ⇒ same filesystem ⇒
+/// atomic rename). The name embeds a process-wide sequence number so
+/// concurrent applies of the same path (public `run()` called twice;
+/// a rotation-respawned applier overlapping an old in-flight
+/// `handle_entry`) never truncate each other's export — each exports
+/// to its own temp and the renames serialize atomically, last-writer-
+/// wins, matching the doc layer's own LWW semantics. The `.tmp`
+/// suffix keeps every temp hardcoded-skipped (filter layer 1), so the
+/// watcher never publishes one regardless of exclude config; a stale
+/// temp left by a crash never syncs (and is bounded by crash count,
+/// not runtime — error paths clean up their own temp).
+fn apply_temp_path(path: &Path) -> Result<PathBuf, WorkspaceError> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| WorkspaceError::Doc(format!("apply: no file name in {}", path.display())))?
+        .to_os_string();
+    let seq = APPLY_TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut tmp_name = OsString::from(format!(".artel-fs-tmp-{}-{seq}-", std::process::id()));
+    tmp_name.push(&file_name);
+    tmp_name.push(".tmp");
+    Ok(path.with_file_name(tmp_name))
+}
+
+/// Stream a doc entry's blob onto disk: export to a temp file in the
+/// target's directory, then `rename()` into place — the streaming
+/// replacement for `get_bytes` + `fs::write` (issue #33).
+///
+/// Why temp-and-rename: streaming a large export directly onto the
+/// destination widens the torn-read window, and a concurrent watcher
+/// event on a half-written file would publish garbage. See
+/// [`apply_temp_path`] for the temp-name shape; `rename()` within one
+/// directory is atomic, so the destination path only ever holds
+/// complete content.
+///
+/// Availability: the blob's status is checked up front and
+/// [`ApplyOutcome::NotReady`] returned unless it is fully local —
+/// preserving the "wait for `ContentReady`" retry the buffered
+/// `get_bytes` path expressed by erroring.
+///
+/// Echo-guard ordering: the guard is marked (with
+/// `entry.content_hash()` — equal to the flat blake3 of the bytes)
+/// *after* the export but *before* the rename. The export touches
+/// only the temp file, which the watcher ignores, so the rename is
+/// the first watcher-visible mutation — marking just before it keeps
+/// the suppression window microseconds wide instead of spanning a
+/// potentially long export, during which a genuine local edit's
+/// publish would otherwise be swallowed as an echo (adversarial-
+/// review finding). On rename failure the mark is unwound
+/// ([`EchoGuard::unmark_remote_write`]): nothing was written, so
+/// suppressing future local events would be wrong. Callers release
+/// the pending entry after this returns `Applied`.
+pub(crate) async fn apply_entry_streaming(
+    doc: &Doc,
+    blobs: &iroh_blobs::BlobsProtocol,
+    guard: &EchoGuard,
+    entry: &Entry,
+    path: &Path,
+) -> Result<ApplyOutcome, WorkspaceError> {
+    use iroh_blobs::api::blobs::{BlobStatus, ExportMode};
+
+    let hash = entry.content_hash();
+    let status = blobs
+        .store()
+        .blobs()
+        .status(hash)
+        .await
+        .map_err(|e| WorkspaceError::Doc(format!("blob status {hash}: {e}")))?;
+    if !matches!(status, BlobStatus::Complete { .. }) {
+        return Ok(ApplyOutcome::NotReady);
+    }
+
+    if let Some(parent) = path.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+
+    let tmp_path = apply_temp_path(path)?;
+
+    let export = doc
+        .export_file(blobs.store(), entry.clone(), &tmp_path, ExportMode::Copy)
+        .await
+        .map_err(|e| WorkspaceError::Doc(format!("export_file {}: {e}", path.display())));
+    let exported = match export {
+        Ok(progress) => progress
+            .finish()
+            .await
+            .map_err(|e| WorkspaceError::Doc(format!("export {}: {e}", path.display()))),
+        Err(e) => Err(e),
+    };
+    if let Err(err) = exported {
+        // Best-effort cleanup; a leftover temp never syncs anyway.
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(err);
+    }
+
+    guard.mark_remote_write(path, hash.into()).await;
+    if let Err(err) = tokio::fs::rename(&tmp_path, path).await {
+        // Unwind: the destination was never touched, so the guard
+        // must not keep suppressing (or hash-deduping) local events
+        // for this path.
+        guard.unmark_remote_write(path).await;
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(WorkspaceError::Io(err));
+    }
+    Ok(ApplyOutcome::Applied)
+}
+
+/// Outcome of [`publish_file_streaming`].
+pub(crate) enum PublishOutcome {
+    /// The file was imported and its doc entry set. Carries the
+    /// content hash iroh computed during the import — callers hand it
+    /// to [`EchoGuard::record_local_publish`] so no second hash pass
+    /// over the file is ever needed.
+    Published {
+        /// iroh's content hash == the flat blake3 of the imported
+        /// bytes (see `echo_guard` module docs).
+        hash: blake3::Hash,
+    },
+    /// Zero-length file: skipped. iroh-docs reserves zero-length
+    /// entries for tombstones and rejects an explicit empty insert
+    /// with "Attempted to insert an empty entry". Once the file gets
+    /// actual content a later event picks it up.
+    ///
+    /// TODO: support genuinely-empty files (e.g. `touch sentinel`) —
+    /// probably by storing an inline marker in the entry's metadata
+    /// or splitting "presence" from "content" at the doc layer.
+    SkippedEmpty,
+    /// The file vanished between the triggering event and the stat.
+    /// The watcher converts this into a tombstone (macOS `FSEvents`
+    /// reports post-unlink `Modify` events); the scan just moves on.
+    NotFound,
+    /// The import observed a size over the configured cap. Emitted by
+    /// the in-import re-check (see [`publish_file_streaming`]): the
+    /// filter's pre-check statted the file earlier, but a file can
+    /// grow between that stat and the import snapshot — without this
+    /// the cap is bypassable by any at-cap file that grows mid-flight.
+    /// Callers emit [`WorkspaceEvent::SkippedTooLarge`].
+    SkippedTooLarge {
+        /// The size the import actually observed.
+        size: u64,
+    },
+}
+
+/// Stream a file from disk into the doc: blob import via
+/// [`Doc::import_file`] (bounded memory at any size), then a
+/// `set_hash` entry pointing at it — the streaming replacement for
+/// `fs::read` + `set_bytes` (issue #33).
+///
+/// `ImportMode::Copy`: the file can change mid-import; Copy snapshots
+/// through the blob store rather than referencing a mutating path.
+/// (`TryReference` is a possible later optimization, not this issue.)
+///
+/// Zero-length handling: stat before import, [`PublishOutcome::SkippedEmpty`]
+/// if `len == 0`. A file that becomes empty *between* the stat and
+/// the import surfaces as an `Err` from the entry insert — rare
+/// race, reported like any other publish failure.
+///
+/// Cap re-check: the import's own observed size is compared against
+/// `max_file_size` *before* the doc entry is inserted; over-cap
+/// aborts the progress stream (no `set_hash` runs), returning
+/// [`PublishOutcome::SkippedTooLarge`]. The already-imported blob
+/// stays in the store unreferenced — GC is a deferred follow-up
+/// regardless (issue #33 non-goals).
+pub(crate) async fn publish_file_streaming(
+    doc: &Doc,
+    blobs: &iroh_blobs::BlobsProtocol,
+    author: AuthorId,
+    key: Vec<u8>,
+    path: &Path,
+    max_file_size: Option<u64>,
+) -> Result<PublishOutcome, WorkspaceError> {
+    use iroh_blobs::api::blobs::AddProgressItem;
+    use iroh_docs::api::ImportFileProgressItem;
+
+    let meta = match tokio::fs::metadata(path).await {
+        Ok(m) => m,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Ok(PublishOutcome::NotFound);
+        }
+        Err(err) => return Err(WorkspaceError::Io(err)),
+    };
+    if meta.len() == 0 {
+        return Ok(PublishOutcome::SkippedEmpty);
+    }
+
+    let mut progress = doc
+        .import_file(
+            blobs.store(),
+            author,
+            Bytes::from(key),
+            path,
+            iroh_blobs::api::blobs::ImportMode::Copy,
+        )
+        .await
+        .map_err(|e| WorkspaceError::Doc(format!("import_file {}: {e}", path.display())))?;
+    // Drive the progress stream item-by-item (rather than awaiting it
+    // as a future) so the cap can be enforced on the size the import
+    // ACTUALLY observed, before the entry-insert stage runs. Dropping
+    // the stream after an over-cap Size aborts the import cleanly —
+    // `set_hash` never runs, so no doc entry is created.
+    loop {
+        match progress.next().await {
+            Some(ImportFileProgressItem::Blobs(AddProgressItem::Size(size))) => {
+                if let Some(cap) = max_file_size
+                    && size > cap
+                {
+                    return Ok(PublishOutcome::SkippedTooLarge { size });
+                }
+            }
+            Some(ImportFileProgressItem::Blobs(_)) => {}
+            Some(ImportFileProgressItem::Error(err)) => {
+                return Err(WorkspaceError::Doc(format!(
+                    "import {}: {err}",
+                    path.display()
+                )));
+            }
+            Some(ImportFileProgressItem::Done(outcome)) => {
+                return Ok(PublishOutcome::Published {
+                    hash: outcome.hash.into(),
+                });
+            }
+            None => {
+                return Err(WorkspaceError::Doc(format!(
+                    "import {}: progress stream ended without outcome",
+                    path.display()
+                )));
+            }
+        }
+    }
+}
+
 /// Walk `root` and publish every non-skipped file to `doc`. Errors
 /// on a single file surface as [`WorkspaceEvent::Error`]; we do not
 /// abort the scan.
@@ -2635,16 +2958,19 @@ impl Drop for Workspace {
 /// [`WorkspaceEvent::SkippedReadOnly`] (`Outgoing`). A
 /// `default: ReadOnly` workspace publishes nothing here — by design;
 /// see plan §"Bulk-export `ReadOnly`: yes, honour it".
+#[allow(clippy::too_many_arguments)]
 async fn scan_and_publish_existing(
     root: &Path,
     doc: &Doc,
+    blobs: &iroh_blobs::BlobsProtocol,
     author: AuthorId,
     rules: &CompiledPathRules,
     exclude: &ExcludeRules,
+    max_file_size: Option<u64>,
     echo_guard: &EchoGuard,
     events: &mpsc::Sender<WorkspaceEvent>,
 ) -> Result<(), WorkspaceError> {
-    let filter = WorkspaceFilter::new(root, exclude.clone());
+    let filter = WorkspaceFilter::new(root, exclude.clone(), max_file_size);
     let mut published = 0usize;
     let mut skipped = 0usize;
     for entry in WalkDir::new(root).follow_links(false).into_iter().flatten() {
@@ -2701,45 +3027,48 @@ async fn scan_and_publish_existing(
             continue;
         }
 
-        let bytes = match tokio::fs::read(path).await {
-            Ok(b) => b,
-            Err(err) => {
-                let _ = events
-                    .send(WorkspaceEvent::Error(format!(
-                        "scan read {} failed: {err}",
-                        path.display(),
-                    )))
-                    .await;
-                continue;
-            }
-        };
         let key = match keys::path_to_key(root, path) {
             Ok(k) => k,
             Err(err) => {
-                let _ = events
-                    .send(WorkspaceEvent::Error(format!(
-                        "scan key {} failed: {err}",
-                        path.display(),
-                    )))
-                    .await;
+                // Error events use `emit_event` too — same
+                // constructor-context no-blocking-send constraint as
+                // the advisory skips above.
+                emit_event(
+                    events,
+                    WorkspaceEvent::Error(format!("scan key {} failed: {err}", path.display())),
+                );
                 continue;
             }
         };
-        let bytes = Bytes::from(bytes);
-        let len = bytes.len();
-        if let Err(err) = doc.set_bytes(author, key, bytes.clone()).await {
-            warn!(target: "artel_fs::workspace", path = %path.display(), len, %err, "scan: set_bytes failed");
-            let _ = events
-                .send(WorkspaceEvent::Error(format!(
-                    "scan publish {} failed: {err}",
-                    path.display(),
-                )))
-                .await;
-            continue;
+        match publish_file_streaming(doc, blobs, author, key, path, max_file_size).await {
+            Ok(PublishOutcome::Published { hash }) => {
+                published += 1;
+                debug!(target: "artel_fs::workspace", path = %path.display(), "scan: published");
+                echo_guard.record_local_publish(path, hash).await;
+            }
+            Ok(PublishOutcome::SkippedEmpty | PublishOutcome::NotFound) => {
+                skipped += 1;
+            }
+            // Grew past the cap between the filter's stat and the
+            // import snapshot (in-import re-check; no entry inserted).
+            Ok(PublishOutcome::SkippedTooLarge { size }) => {
+                skipped += 1;
+                emit_event(
+                    events,
+                    WorkspaceEvent::SkippedTooLarge {
+                        path: path.to_path_buf(),
+                        size,
+                    },
+                );
+            }
+            Err(err) => {
+                warn!(target: "artel_fs::workspace", path = %path.display(), %err, "scan: publish failed");
+                emit_event(
+                    events,
+                    WorkspaceEvent::Error(format!("scan publish {} failed: {err}", path.display())),
+                );
+            }
         }
-        published += 1;
-        debug!(target: "artel_fs::workspace", path = %path.display(), len, "scan: published");
-        echo_guard.record_local_publish(path, &bytes).await;
     }
     debug!(target: "artel_fs::workspace", root = %root.display(), published, skipped, "scan_and_publish_existing complete");
     Ok(())
@@ -3142,12 +3471,14 @@ async fn wait_for_ticket(
 /// Pending-set entries are inserted via the echo guard so the
 /// watcher won't republish what we just wrote. They are released
 /// after [`PENDING_RELEASE_GRACE`].
+#[allow(clippy::too_many_arguments)]
 async fn bulk_export(
     root: &Path,
     doc: &Doc,
     blobs: &iroh_blobs::BlobsProtocol,
     rules: &CompiledPathRules,
     exclude: &ExcludeRules,
+    max_file_size: Option<u64>,
     echo_guard: &EchoGuard,
     events: &mpsc::Sender<WorkspaceEvent>,
 ) -> Result<(), WorkspaceError> {
@@ -3160,7 +3491,7 @@ async fn bulk_export(
         .await
         .map_err(|e| WorkspaceError::Doc(format!("get_many: {e}")))?;
     tokio::pin!(stream);
-    let filter = WorkspaceFilter::new(root, exclude.clone());
+    let filter = WorkspaceFilter::new(root, exclude.clone(), max_file_size);
 
     while let Some(res) = stream.next().await {
         let Ok(entry) = res else { continue };
@@ -3168,9 +3499,10 @@ async fn bulk_export(
         let path = match keys::key_to_path(root, entry.key()) {
             Ok(p) => p,
             Err(err) => {
-                let _ = events
-                    .send(WorkspaceEvent::Error(format!("invalid key: {err}")))
-                    .await;
+                // try_send, not send — constructor context (see the
+                // filter-skip comment below); a burst of bad keys
+                // must not deadlock `join_with`.
+                emit_event(events, WorkspaceEvent::Error(format!("invalid key: {err}")));
                 continue;
             }
         };
@@ -3221,6 +3553,23 @@ async fn bulk_export(
             FilterDecision::Include => {}
         }
 
+        // Incoming size cap on the entry's declared length — the
+        // filter's size layer stats the local path, absent for a
+        // file we haven't exported yet (see the applier's twin
+        // check). Tombstones (len 0) are never caught.
+        if let Some(cap) = max_file_size
+            && entry.content_len() > cap
+        {
+            emit_event(
+                events,
+                WorkspaceEvent::SkippedTooLarge {
+                    path,
+                    size: entry.content_len(),
+                },
+            );
+            continue;
+        }
+
         let rel = path.strip_prefix(root).unwrap_or(&path);
         if rules.mode_for(rel) == Mode::ReadOnly {
             emit_event(
@@ -3245,32 +3594,33 @@ async fn bulk_export(
             // can have raced onto the path before the watcher exists.
             let _ = echo_guard.mark_remote_delete(&path).await;
             let _ = tokio::fs::remove_file(&path).await;
-            let _ = events.send(WorkspaceEvent::PeerDeleted { path }).await;
+            // try_send, not send — constructor context: >EVENT_BUFFER
+            // tombstones in the doc would deadlock `join_with`.
+            emit_event(events, WorkspaceEvent::PeerDeleted { path });
             continue;
         }
 
-        // Bytes not yet available locally → skip; the applier
-        // retries on the next ContentReady. Bulk export is
-        // best-effort.
-        let Ok(bytes) = blobs.blobs().get_bytes(entry.content_hash()).await else {
-            continue;
-        };
-
-        echo_guard.mark_remote_write(&path, &bytes).await;
-        if let Some(parent) = path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
+        // Stream the blob to disk (temp + rename). `NotReady` = bytes
+        // not yet local → skip; the applier retries on the next
+        // ContentReady. Bulk export is best-effort.
+        match apply_entry_streaming(doc, blobs, echo_guard, &entry, &path).await {
+            Ok(ApplyOutcome::Applied) => {
+                echo_guard.release_after(path.clone(), PENDING_RELEASE_GRACE);
+                emit_event(events, WorkspaceEvent::PeerWrote { path });
+            }
+            Ok(ApplyOutcome::NotReady) => {}
+            Err(err) => {
+                // try_send, not send — constructor context (see the
+                // filter-skip comment above).
+                emit_event(
+                    events,
+                    WorkspaceEvent::Error(format!(
+                        "bulk export write {} failed: {err}",
+                        path.display(),
+                    )),
+                );
+            }
         }
-        if let Err(err) = tokio::fs::write(&path, &bytes).await {
-            let _ = events
-                .send(WorkspaceEvent::Error(format!(
-                    "bulk export write {} failed: {err}",
-                    path.display(),
-                )))
-                .await;
-            continue;
-        }
-        echo_guard.release_after(path.clone(), PENDING_RELEASE_GRACE);
-        let _ = events.send(WorkspaceEvent::PeerWrote { path }).await;
     }
     Ok(())
 }
@@ -3670,6 +4020,7 @@ async fn reconcile_doc_against_disk(
     doc: &Doc,
     author: AuthorId,
     exclude: &ExcludeRules,
+    max_file_size: Option<u64>,
     events: &mpsc::Sender<WorkspaceEvent>,
 ) -> Result<(), WorkspaceError> {
     // One entry per key — we only need to know the *latest* state of
@@ -3681,7 +4032,7 @@ async fn reconcile_doc_against_disk(
         .map_err(|e| WorkspaceError::Doc(format!("reconcile get_many: {e}")))?;
     tokio::pin!(stream);
 
-    let filter = WorkspaceFilter::new(root, exclude.clone());
+    let filter = WorkspaceFilter::new(root, exclude.clone(), max_file_size);
     let mut scanned = 0usize;
     let mut tombstoned = 0usize;
     while let Some(res) = stream.next().await {
@@ -5132,6 +5483,60 @@ mod tests {
         // forever" so a misconfigured single-process test has to opt
         // into a deadline.
         assert_eq!(WorkspaceConfig::default().join_ticket_timeout, None);
+    }
+
+    #[test]
+    fn apply_temp_path_is_unique_hidden_and_tmp_suffixed() {
+        // Concurrent applies of one path must never share a temp
+        // (finding 3 of the issue-#33 adversarial review), and every
+        // temp must be caught by BOTH the `*.tmp` hardcoded skip and
+        // the dotfile default.
+        let dest = Path::new("/w/sub/data.bin");
+        let a = apply_temp_path(dest).unwrap();
+        let b = apply_temp_path(dest).unwrap();
+        assert_ne!(a, b, "two applies of one path must get distinct temps");
+        for tmp in [&a, &b] {
+            assert_eq!(tmp.parent(), dest.parent(), "temp must be a sibling");
+            let name = tmp.file_name().unwrap().to_str().unwrap();
+            assert!(name.starts_with(".artel-fs-tmp-"), "hidden prefix: {name}");
+            assert_eq!(
+                Path::new(name).extension(),
+                Some("tmp".as_ref()),
+                "hardcoded-skip suffix: {name}",
+            );
+            assert!(
+                WorkspaceFilter::is_hardcoded_skip(Path::new(name)),
+                "filter layer 1 must skip {name}",
+            );
+        }
+    }
+
+    #[test]
+    fn apply_temp_path_rejects_no_file_name() {
+        // A destination with no file name (the root itself) must be
+        // rejected — reachable only if key validation regressed, so
+        // fail loudly rather than compute a sibling-of-root temp.
+        assert!(apply_temp_path(Path::new("/")).is_err());
+    }
+
+    #[test]
+    fn workspace_config_default_caps_at_64_mib() {
+        // An unset config must mean "guarded" (64 MiB accident-guard),
+        // not "unlimited" — the manual `Default` impl exists precisely
+        // to keep this from silently reverting to `None` via derive.
+        assert_eq!(
+            WorkspaceConfig::default().max_file_size,
+            Some(DEFAULT_MAX_FILE_SIZE)
+        );
+        assert_eq!(DEFAULT_MAX_FILE_SIZE, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn workspace_config_with_max_file_size_sets_field() {
+        let cfg = WorkspaceConfig::default().with_max_file_size(None);
+        assert_eq!(cfg.max_file_size, None);
+        let cfg = WorkspaceConfig::default().with_max_file_size(Some(123));
+        assert_eq!(cfg.max_file_size, Some(123));
     }
 
     #[test]

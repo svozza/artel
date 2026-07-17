@@ -6,8 +6,10 @@ Mirrors a directory across peers. Runs in your process and spawns its own small
 iroh endpoint; the host hands joiners a doc ticket over the session (the
 "ticket-handout" model — the daemon stays file-sync-agnostic). Provides the
 watcher/applier, configurable exclude + size filtering (hidden files are
-excluded by default; `WorkspaceConfig::exclude` overrides), and `PathRules`
-to scope which paths sync and at what capability.
+excluded by default, `WorkspaceConfig::exclude` overrides; files stream in
+both directions, with `WorkspaceConfig::max_file_size` — default 64 MiB,
+`None` = unlimited — as an accident-guard), and `PathRules` to scope which
+paths sync and at what capability.
 
 ```rust
 use artel_fs::{Workspace, WorkspaceConfig, AttachPolicy};

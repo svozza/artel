@@ -62,7 +62,7 @@ The joiner first joins the session itself (`Request::JoinSession { display_name,
 `WorkspaceEvent` includes:
 
 - `PeerWrote { path }` / `PeerDeleted { path }` — a peer's change landed on your disk.
-- `SkippedTooLarge { path, size }` — a file exceeded the size cap (either direction).
+- `SkippedTooLarge { path, size }` — a file exceeded the size cap (`WorkspaceConfig::max_file_size`, default 64 MiB; either direction).
 - `SkippedReadOnly { path, direction }` — a path-event was skipped by your `PathRules`. One event per skipped path-event, no coalescing — a `target/**: ReadOnly` rule with chatty editor saves will be noisy; dedupe in your app if needed.
 - `Demoted` — the host cooperatively downgraded this node RW → Read; the workspace has stopped publishing local changes. Reflect it in your UI (e.g. flip a send-gate).
 - `PeerRevoked { peer }` — this workspace's cap-listener applied a host-authored revoke; from this moment the transport gates block that peer. Fires on every application, including session-log replay after a reconnect or restart — treat it as idempotent state ("peer is out"), not an edge.
@@ -81,7 +81,11 @@ The joiner first joins the session itself (`Request::JoinSession { display_name,
 PathRules { /* root ReadOnly, ".app/**" ReadWrite */ }
 ```
 
-`PathRules::read_write()` is the permissive default. Built-in filtering also skips `.git`, `target`, `node_modules`, the `.artel-fs` state dir, `.DS_Store` and editor temp files (`*.swp`, `*.tmp`), symlinks, and files over the size cap (1 MiB).
+`PathRules::read_write()` is the permissive default. Built-in filtering also skips `.git`, `target`, `node_modules`, the `.artel-fs` state dir, `.DS_Store` and editor temp files (`*.swp`, `*.tmp`), symlinks, and files over the size cap.
+
+**Large files stream; the size cap is an accident-guard.** File bytes stream through iroh-blobs in both directions (BLAKE3 verified streaming), so a multi-GB file syncs in bounded memory. `WorkspaceConfig::max_file_size` (default 64 MiB, `None` = unlimited) exists so a rogue ISO dropped into the workspace doesn't fan out to every peer — raise it or disable it when your workspace legitimately holds big files. Like `exclude`, it's local to each node (not ticket-borne) and enforced in both directions, with every skip surfaced as `SkippedTooLarge`.
+
+**Append-heavy files are an anti-pattern regardless of the cap.** artel-fs republishes the *whole file per change*, so an ever-growing file (an unrotated JSONL event log, say) costs O(n²) bytes over its life even though each publish streams. Rotate growing logs into bounded segments (`.chat/<peer>.0001.jsonl`, …) — each closed segment syncs once and never changes again; only the active segment churns, and stays small.
 
 **Hidden (dot-prefixed) files don't sync by default.** `WorkspaceConfig::exclude` controls this: `None` (the default) skips any path with a dot-prefixed component; `Some(globs)` replaces that default with exactly your list (`Some(vec![])` = sync everything). The list is local to each node — it does not ride the ticket to joiners, and each side filters both directions by its own list. Every exclusion skip is surfaced as `WorkspaceEvent::SkippedExcluded`, so a subtree that isn't syncing is diagnosable from the event stream. An app with a hidden state dir (e.g. `.myapp/log/`) must pass an explicit exclude list or its subtree won't sync.
 

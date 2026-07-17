@@ -15,7 +15,11 @@
 //!    entirely. Surfaced as `FilterDecision::Skip(SkipReason::Excluded)`
 //!    so callers emit an observable event — an excluded path must
 //!    never vanish silently.
-//! 4. Size cap (1 MiB). Larger files are surfaced to consumers as
+//! 4. Size cap ([`crate::WorkspaceConfig::max_file_size`] — default
+//!    64 MiB, `None` = unlimited). An accident-guard against a rogue
+//!    ISO landing in the workspace, **not** a pipeline protection:
+//!    both sync directions stream file bytes, so the pipeline itself
+//!    has no size ceiling. Larger files are surfaced to consumers as
 //!    `FilterDecision::Skip(SkipReason::TooLarge)` so they can decide
 //!    whether to log/notify.
 //!
@@ -35,13 +39,6 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::rules::{PathRulesError, path_to_match_string, validate_glob};
-
-/// Files larger than this are skipped.
-///
-/// Whole-file reads and publishes (no streaming, no chunked diffing)
-/// keep the pipeline simple, and a cap keeps each of those operations
-/// cheap; revisit when large-file sync becomes a real need.
-pub const MAX_FILE_SIZE: u64 = 1 << 20;
 
 /// Compiled, consumer-owned exclusion rules — filter layer 3.
 ///
@@ -134,6 +131,10 @@ impl ExcludeRules {
 pub struct WorkspaceFilter {
     pub root: PathBuf,
     exclude: ExcludeRules,
+    /// Size cap (filter layer 4). `Some(bytes)` skips files strictly
+    /// larger; `None` = unlimited. From
+    /// [`crate::WorkspaceConfig::max_file_size`].
+    max_file_size: Option<u64>,
 }
 
 /// Outcome of [`WorkspaceFilter::check`].
@@ -157,7 +158,8 @@ pub enum SkipReason {
     Excluded,
     /// Path is a symlink. We never follow them.
     Symlink,
-    /// File exceeded [`MAX_FILE_SIZE`].
+    /// File exceeded the configured size cap
+    /// ([`crate::WorkspaceConfig::max_file_size`]).
     TooLarge {
         /// Actual size in bytes; surfaces to consumers so they can log.
         size: u64,
@@ -165,12 +167,14 @@ pub enum SkipReason {
 }
 
 impl WorkspaceFilter {
-    /// Build a filter for `root` with the given exclude rules.
+    /// Build a filter for `root` with the given exclude rules and
+    /// size cap (`None` = unlimited).
     #[must_use]
-    pub fn new(root: &Path, exclude: ExcludeRules) -> Self {
+    pub fn new(root: &Path, exclude: ExcludeRules, max_file_size: Option<u64>) -> Self {
         Self {
             root: root.to_path_buf(),
             exclude,
+            max_file_size,
         }
     }
 
@@ -199,12 +203,13 @@ impl WorkspaceFilter {
             return FilterDecision::Skip(SkipReason::Excluded);
         }
 
-        // 4. Size check.
-        if let Ok(meta) = fs::metadata(abs_path)
+        // 4. Size check (`None` = unlimited).
+        if let Some(cap) = self.max_file_size
+            && let Ok(meta) = fs::metadata(abs_path)
             && meta.is_file()
         {
             let size = meta.len();
-            if size > MAX_FILE_SIZE {
+            if size > cap {
                 return FilterDecision::Skip(SkipReason::TooLarge { size });
             }
         }
@@ -269,14 +274,22 @@ mod tests {
         p
     }
 
+    /// Small size cap for the boundary tests — the filter treats the
+    /// value opaquely, so a tiny cap keeps the fixtures cheap.
+    const TEST_CAP: u64 = 1 << 16;
+
     /// Filter with the default (dotfiles) exclude — the common case.
     fn default_filter(root: &Path) -> WorkspaceFilter {
-        WorkspaceFilter::new(root, ExcludeRules::default())
+        WorkspaceFilter::new(root, ExcludeRules::default(), Some(TEST_CAP))
     }
 
     /// Filter that excludes nothing (`Some(vec![])` in config terms).
     fn sync_everything_filter(root: &Path) -> WorkspaceFilter {
-        WorkspaceFilter::new(root, ExcludeRules::compile(Some(&[])).unwrap())
+        WorkspaceFilter::new(
+            root,
+            ExcludeRules::compile(Some(&[])).unwrap(),
+            Some(TEST_CAP),
+        )
     }
 
     #[test]
@@ -402,7 +415,7 @@ mod tests {
         let exclude =
             ExcludeRules::compile(Some(&["**/*.secret".to_string(), "*.secret".to_string()]))
                 .unwrap();
-        let filter = WorkspaceFilter::new(dir.path(), exclude);
+        let filter = WorkspaceFilter::new(dir.path(), exclude, Some(TEST_CAP));
 
         let p = write_file(dir.path(), "api.secret", b"x");
         assert_eq!(filter.check(&p), FilterDecision::Skip(SkipReason::Excluded));
@@ -436,7 +449,7 @@ mod tests {
     #[test]
     fn exclude_does_not_override_size_cap() {
         let dir = make_root();
-        let big = vec![0u8; (MAX_FILE_SIZE as usize) + 1];
+        let big = vec![0u8; (TEST_CAP as usize) + 1];
         let p = write_file(dir.path(), "big.bin", &big);
         let filter = sync_everything_filter(dir.path());
         assert!(matches!(
@@ -552,7 +565,7 @@ mod tests {
     #[test]
     fn rejects_oversize() {
         let dir = make_root();
-        let big = vec![0u8; (MAX_FILE_SIZE as usize) + 1];
+        let big = vec![0u8; (TEST_CAP as usize) + 1];
         let p = write_file(dir.path(), "big.bin", &big);
         let filter = default_filter(dir.path());
         match filter.check(&p) {
@@ -566,10 +579,35 @@ mod tests {
     #[test]
     fn accepts_at_size_limit() {
         let dir = make_root();
-        let exactly = vec![0u8; MAX_FILE_SIZE as usize];
+        let exactly = vec![0u8; TEST_CAP as usize];
         let p = write_file(dir.path(), "edge.bin", &exactly);
         let filter = default_filter(dir.path());
         assert_eq!(filter.check(&p), FilterDecision::Include);
+    }
+
+    #[test]
+    fn no_cap_means_unlimited() {
+        // `max_file_size: None` disables layer 4 entirely — a file
+        // over any would-be default must Include.
+        let dir = make_root();
+        let big = vec![0u8; (TEST_CAP as usize) + 1];
+        let p = write_file(dir.path(), "big.bin", &big);
+        let filter = WorkspaceFilter::new(dir.path(), ExcludeRules::default(), None);
+        assert_eq!(filter.check(&p), FilterDecision::Include);
+    }
+
+    #[test]
+    fn cap_is_strictly_greater_than() {
+        // Boundary: exactly-at-cap syncs, one byte over skips.
+        let dir = make_root();
+        let filter = default_filter(dir.path());
+        let at = write_file(dir.path(), "at.bin", &vec![0u8; TEST_CAP as usize]);
+        assert_eq!(filter.check(&at), FilterDecision::Include);
+        let over = write_file(dir.path(), "over.bin", &vec![0u8; (TEST_CAP as usize) + 1]);
+        assert_eq!(
+            filter.check(&over),
+            FilterDecision::Skip(SkipReason::TooLarge { size: TEST_CAP + 1 })
+        );
     }
 
     #[cfg(unix)]

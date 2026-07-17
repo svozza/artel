@@ -1,8 +1,9 @@
 //! Apply remote doc events to disk.
 //!
 //! Subscribes to `Doc::subscribe()` and:
-//! - on [`LiveEvent::InsertRemote`]: write the entry's content to
-//!   disk under [`Workspace::root`], guarded by [`EchoGuard`] so
+//! - on [`LiveEvent::InsertRemote`]: stream the entry's content to
+//!   disk under [`Workspace::root`] (temp file + atomic rename —
+//!   bounded memory at any size), guarded by [`EchoGuard`] so
 //!   the watcher won't republish what we just laid down,
 //! - on [`LiveEvent::ContentReady`]: scan the doc for entries with
 //!   the matching hash and apply them (covers the case where the
@@ -24,7 +25,9 @@ use tracing::{debug, warn};
 use crate::echo_guard::{PENDING_RELEASE_GRACE, RemoteDeleteMark};
 use crate::filter::{FilterDecision, SkipReason, WorkspaceFilter};
 use crate::rules::Mode;
-use crate::workspace::{Direction, Workspace, WorkspaceEvent, emit_event};
+use crate::workspace::{
+    ApplyOutcome, Direction, Workspace, WorkspaceEvent, apply_entry_streaming, emit_event,
+};
 use crate::{EchoGuard, keys};
 
 /// Subscribe to the doc's live event stream and apply incoming
@@ -74,7 +77,11 @@ pub(crate) async fn run(workspace: Arc<Workspace>, ready: oneshot::Sender<()>) {
     // A clone shares the workspace guard's state (Arc-backed), so the
     // watcher's clone observes everything we mark here.
     let guard = workspace.echo_guard.clone();
-    let filter = WorkspaceFilter::new(&workspace.root, workspace.exclude.clone());
+    let filter = WorkspaceFilter::new(
+        &workspace.root,
+        workspace.exclude.clone(),
+        workspace.max_file_size,
+    );
 
     // Doc-scoped token: cancelled at workspace shutdown AND on
     // namespace rotation. A child of the workspace shutdown token.
@@ -121,6 +128,7 @@ pub(crate) async fn run(workspace: Arc<Workspace>, ready: oneshot::Sender<()>) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_entry(
     workspace: &Arc<Workspace>,
     guard: &EchoGuard,
@@ -189,6 +197,27 @@ async fn handle_entry(
         FilterDecision::Include => {}
     }
 
+    // Incoming size cap on the *entry's* declared length. The
+    // filter's own size layer stats the local path, which doesn't
+    // exist yet for a new incoming file — without this check a peer
+    // running uncapped (or a larger cap) could push an arbitrarily
+    // large file straight past a capped node's guard. Tombstones
+    // (len 0) are never caught, preserving the tombstone flow below.
+    if let Some(cap) = workspace.max_file_size
+        && entry.content_len() > cap
+    {
+        let size = entry.content_len();
+        debug!(target: "artel_fs::applier", path = %path.display(), size, "entry over cap; skip incoming");
+        emit_event(
+            &workspace.events,
+            WorkspaceEvent::SkippedTooLarge {
+                path: path.clone(),
+                size,
+            },
+        );
+        return;
+    }
+
     let rel = path.strip_prefix(&workspace.root).unwrap_or(&path);
     if workspace.compiled_rules.mode_for(rel) == Mode::ReadOnly {
         debug!(target: "artel_fs::applier", path = %path.display(), "rules: skip ReadOnly incoming");
@@ -207,45 +236,36 @@ async fn handle_entry(
         return;
     }
 
-    // Bytes not yet available locally — applier::run will retry on
-    // ContentReady.
-    let bytes = match workspace
-        .blobs
-        .blobs()
-        .get_bytes(entry.content_hash())
-        .await
-    {
-        Ok(b) => b,
-        Err(err) => {
+    // Stream the blob to disk (temp file + rename — see
+    // `apply_entry_streaming`). `NotReady` preserves the old
+    // "bytes not yet local → wait for ContentReady" retry contract.
+    match apply_entry_streaming(&workspace.doc(), &workspace.blobs, guard, &entry, &path).await {
+        Ok(ApplyOutcome::Applied) => {
+            debug!(
+                target: "artel_fs::applier",
+                path = %path.display(),
+                len = entry.content_len(),
+                "applied remote write to disk"
+            );
+            guard.release_after(path.clone(), PENDING_RELEASE_GRACE);
+            emit_event(&workspace.events, WorkspaceEvent::PeerWrote { path });
+        }
+        Ok(ApplyOutcome::NotReady) => {
             debug!(
                 target: "artel_fs::applier",
                 path = %path.display(),
                 hash = %entry.content_hash(),
-                %err,
-                "blob bytes not yet available; awaiting ContentReady"
+                "blob not yet available; awaiting ContentReady"
             );
-            return;
         }
-    };
-
-    guard.mark_remote_write(&path, &bytes).await;
-
-    if let Some(parent) = path.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
+        Err(err) => {
+            warn!(target: "artel_fs::applier", path = %path.display(), %err, "apply failed");
+            emit_event(
+                &workspace.events,
+                WorkspaceEvent::Error(format!("write {} failed: {err}", path.display())),
+            );
+        }
     }
-
-    if let Err(err) = tokio::fs::write(&path, &bytes).await {
-        warn!(target: "artel_fs::applier", path = %path.display(), %err, "fs::write failed");
-        emit_event(
-            &workspace.events,
-            WorkspaceEvent::Error(format!("write {} failed: {err}", path.display())),
-        );
-        return;
-    }
-
-    debug!(target: "artel_fs::applier", path = %path.display(), len = bytes.len(), "applied remote write to disk");
-    guard.release_after(path.clone(), PENDING_RELEASE_GRACE);
-    emit_event(&workspace.events, WorkspaceEvent::PeerWrote { path });
 }
 
 /// Apply a peer tombstone to disk: mark the echo guard, remove the

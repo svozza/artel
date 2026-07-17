@@ -116,6 +116,7 @@ pub fn key_to_path(root: &Path, key: &[u8]) -> Result<PathBuf, WorkspaceError> {
     // but keeping the check costs nothing and matches the reference
     // implementation.
     let candidate = PathBuf::from(rel_str);
+    let mut normal_components = 0usize;
     for component in candidate.components() {
         match component {
             Component::ParentDir => {
@@ -128,8 +129,20 @@ pub fn key_to_path(root: &Path, key: &[u8]) -> Result<PathBuf, WorkspaceError> {
                     "key relative portion {rel_str:?} is absolute"
                 )));
             }
-            _ => {}
+            Component::Normal(_) => normal_components += 1,
+            Component::CurDir => {}
         }
+    }
+
+    // A key must name an actual entry UNDER the root. `path/` and
+    // `path/.` resolve to the root itself; downstream that path's
+    // "sibling temp file" (`apply_entry_streaming`) would land
+    // OUTSIDE the workspace — a peer-controlled key must never
+    // produce a path we'd touch outside root, so fail closed here.
+    if normal_components == 0 {
+        return Err(WorkspaceError::InvalidPath(format!(
+            "key relative portion {rel_str:?} names no path under the root"
+        )));
     }
 
     let native: String = if MAIN_SEPARATOR == '/' {
@@ -256,5 +269,22 @@ mod tests {
     fn drive_letter_is_rejected() {
         let r = root();
         assert!(key_to_path(&r, b"path/D:/leak").is_err());
+    }
+
+    #[test]
+    fn rejects_keys_that_resolve_to_the_root_itself() {
+        // `path/` and `path/.` map to the workspace root. Applying
+        // such an entry would compute the streaming temp file as a
+        // *sibling of the root* — outside the workspace — so these
+        // keys must be rejected outright (adversarial-review finding,
+        // issue #33 streaming slice).
+        let r = root();
+        for key in [b"path/".as_slice(), b"path/.", b"path/./."] {
+            assert!(
+                key_to_path(&r, key).is_err(),
+                "{:?} must be rejected — it names no entry under the root",
+                String::from_utf8_lossy(key),
+            );
+        }
     }
 }

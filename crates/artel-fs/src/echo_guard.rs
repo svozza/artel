@@ -16,11 +16,16 @@
 //!    the applier passes it to [`EchoGuard::release_after`]).
 //!
 //! 2. **Last-published hash.** Even after the pending entry has been
-//!    cleared, watch events can race. We hash whatever bytes the
-//!    watcher saw and compare against the last bytes we wrote for
+//!    cleared, watch events can race. We compare the hash of whatever
+//!    content the watcher saw against the last content we wrote for
 //!    that path; if they match it's an echo of *something we caused*
 //!    and we skip. Hashes are blake3 — fast and collision-immune in
-//!    practice.
+//!    practice. The guard takes hashes, not buffers: iroh's content
+//!    hash IS the flat blake3 hash of the content (the bao tree root
+//!    equals it — verified by `iroh_content_hash_is_flat_blake3` in
+//!    the wire tests), so callers hand us `entry.content_hash()` /
+//!    import-outcome hashes directly and no full file buffer ever
+//!    needs to exist for the guard's sake.
 //!
 //! 3. **Last-removed set.** The delete-side analogue of (2). When the
 //!    applier removes a file for a peer tombstone, the watcher sees
@@ -36,12 +41,41 @@
 //!    late it fires.
 
 use std::collections::{HashMap, HashSet};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use blake3::Hash;
 use tokio::sync::Mutex;
+
+/// Hash a file's contents by streaming — bounded memory at any size.
+///
+/// The publish path calls this *before* importing, so
+/// [`EchoGuard::should_skip_local`] can suppress echoes without a
+/// whole-file buffer ever existing. Runs on the blocking pool
+/// (`spawn_blocking`): `update_reader` is synchronous I/O + hashing,
+/// and a multi-GB file would otherwise stall the reactor. blake3's
+/// own docs recommend `update_reader`/`update_mmap` over manual
+/// chunked reads; the resulting hash equals iroh's content hash for
+/// the same bytes (bao root == flat blake3).
+///
+/// # Errors
+///
+/// Propagates I/O errors from opening or reading the file — callers
+/// treat them like the old `fs::read` failures (skip the event; a
+/// later event retries).
+pub async fn hash_file(path: &Path) -> io::Result<Hash> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(&path)?;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update_reader(io::BufReader::new(file))?;
+        Ok(hasher.finalize())
+    })
+    .await
+    .map_err(|join_err| io::Error::other(format!("hash_file task panicked: {join_err}")))?
+}
 
 /// How long the echo guard's pending entry survives after we apply
 /// a peer write.
@@ -100,14 +134,34 @@ impl EchoGuard {
 
     /// Record that a peer-driven write is about to land on disk for
     /// `path`. Inserts the path into the pending set and records the
-    /// hash of the bytes we're about to write. The path exists again,
-    /// so any peer-delete marker is cleared.
-    pub async fn mark_remote_write(&self, path: &Path, bytes: &[u8]) {
+    /// hash of the content we're about to write (the entry's iroh
+    /// content hash — identical to the flat blake3 of the bytes). The
+    /// path exists again, so any peer-delete marker is cleared.
+    ///
+    /// Call as close to the watcher-visible mutation (the rename) as
+    /// possible: while pending, EVERY local event for the path is
+    /// suppressed regardless of content, so a wide mark-to-write gap
+    /// swallows genuine local edits (see `apply_entry_streaming`).
+    pub async fn mark_remote_write(&self, path: &Path, hash: Hash) {
         let owned = path.to_path_buf();
-        let hash = blake3::hash(bytes);
         self.pending.lock().await.insert(owned.clone());
         self.peer_deleted.lock().await.remove(&owned);
         self.last_published.lock().await.insert(owned, hash);
+    }
+
+    /// Unwind [`Self::mark_remote_write`] when the write it announced
+    /// never happened (the streaming apply's rename failed). Removes
+    /// the pending entry and the recorded hash so future local events
+    /// for the path are neither suppressed nor hash-deduped against
+    /// content that never reached disk.
+    ///
+    /// Deliberately does NOT restore a previously-cleared peer-delete
+    /// marker: the marker's contract is "cleared on re-creation", and
+    /// erring toward publishing (worst case, one redundant tombstone)
+    /// beats erring toward suppression (a swallowed genuine delete).
+    pub async fn unmark_remote_write(&self, path: &Path) {
+        self.pending.lock().await.remove(path);
+        self.last_published.lock().await.remove(path);
     }
 
     /// Record that a peer-driven delete (tombstone) is about to be
@@ -158,13 +212,16 @@ impl EchoGuard {
         });
     }
 
-    /// Should the watcher skip a local change for `path` with these
-    /// `bytes`? `true` if the change is a known echo.
-    pub async fn should_skip_local(&self, path: &Path, bytes: &[u8]) -> bool {
+    /// Should the watcher skip a local change for `path` whose current
+    /// content hashes to `hash`? `true` if the change is a known echo.
+    ///
+    /// Callers on the publish path obtain `hash` by streaming the file
+    /// (see [`hash_file`]) — bounded memory at any size, and for small
+    /// files the same cost as the old hash-the-buffer shape.
+    pub async fn should_skip_local(&self, path: &Path, hash: Hash) -> bool {
         if self.pending.lock().await.contains(path) {
             return true;
         }
-        let hash = blake3::hash(bytes);
         self.last_published
             .lock()
             .await
@@ -172,12 +229,12 @@ impl EchoGuard {
             .is_some_and(|last| *last == hash)
     }
 
-    /// Note that we just published `bytes` for `path`. Future watcher
-    /// events with the same hash will be skipped via
-    /// [`Self::should_skip_local`]. The path exists again, so any
-    /// peer-delete marker is cleared.
-    pub async fn record_local_publish(&self, path: &Path, bytes: &[u8]) {
-        let hash = blake3::hash(bytes);
+    /// Note that we just published content hashing to `hash` for
+    /// `path` (the import outcome's hash — identical to the flat
+    /// blake3). Future watcher events with the same hash will be
+    /// skipped via [`Self::should_skip_local`]. The path exists again,
+    /// so any peer-delete marker is cleared.
+    pub async fn record_local_publish(&self, path: &Path, hash: Hash) {
         self.peer_deleted.lock().await.remove(path);
         self.last_published
             .lock()
@@ -245,15 +302,22 @@ mod tests {
         PathBuf::from(s)
     }
 
+    /// Shorthand: the hash a caller would derive for these bytes
+    /// (streamed pre-hash on publish, `entry.content_hash()` on
+    /// apply — both equal the flat blake3).
+    fn h(bytes: &[u8]) -> Hash {
+        blake3::hash(bytes)
+    }
+
     #[tokio::test]
     async fn skips_local_during_pending_window() {
         let guard = EchoGuard::new();
         let path = p("/w/a.txt");
-        let bytes = b"hello";
+        let hash = h(b"hello");
 
-        guard.mark_remote_write(&path, bytes).await;
+        guard.mark_remote_write(&path, hash).await;
         assert!(
-            guard.should_skip_local(&path, bytes).await,
+            guard.should_skip_local(&path, hash).await,
             "should skip local while remote write is in flight",
         );
     }
@@ -261,44 +325,44 @@ mod tests {
     #[tokio::test]
     async fn does_not_skip_unrelated_path() {
         let guard = EchoGuard::new();
-        guard.mark_remote_write(&p("/w/a.txt"), b"x").await;
-        assert!(!guard.should_skip_local(&p("/w/b.txt"), b"y").await);
+        guard.mark_remote_write(&p("/w/a.txt"), h(b"x")).await;
+        assert!(!guard.should_skip_local(&p("/w/b.txt"), h(b"y")).await);
     }
 
     #[tokio::test]
     async fn release_clears_pending() {
         let guard = EchoGuard::new();
         let path = p("/w/a.txt");
-        guard.mark_remote_write(&path, b"x").await;
+        guard.mark_remote_write(&path, h(b"x")).await;
         guard.release_after(path.clone(), Duration::from_millis(10));
         // Wall-clock margin for non-paused tests.
         tokio::time::sleep(Duration::from_millis(60)).await;
         assert!(
-            !guard.should_skip_local(&path, b"different").await,
-            "after release, unrelated bytes should not be skipped",
+            !guard.should_skip_local(&path, h(b"different")).await,
+            "after release, unrelated content should not be skipped",
         );
     }
 
     #[tokio::test]
-    async fn skips_when_bytes_match_last_published() {
+    async fn skips_when_hash_matches_last_published() {
         let guard = EchoGuard::new();
         let path = p("/w/a.txt");
-        let bytes = b"snapshot";
-        guard.record_local_publish(&path, bytes).await;
+        let hash = h(b"snapshot");
+        guard.record_local_publish(&path, hash).await;
         assert!(
-            guard.should_skip_local(&path, bytes).await,
-            "writing the same bytes we just published should be deduped",
+            guard.should_skip_local(&path, hash).await,
+            "writing the same content we just published should be deduped",
         );
     }
 
     #[tokio::test]
-    async fn does_not_skip_when_bytes_differ_from_last_published() {
+    async fn does_not_skip_when_hash_differs_from_last_published() {
         let guard = EchoGuard::new();
         let path = p("/w/a.txt");
-        guard.record_local_publish(&path, b"v1").await;
+        guard.record_local_publish(&path, h(b"v1")).await;
         assert!(
-            !guard.should_skip_local(&path, b"v2").await,
-            "different bytes should not be deduped",
+            !guard.should_skip_local(&path, h(b"v2")).await,
+            "different content should not be deduped",
         );
     }
 
@@ -306,12 +370,12 @@ mod tests {
     async fn forget_clears_last_published() {
         let guard = EchoGuard::new();
         let path = p("/w/a.txt");
-        let bytes = b"same bytes before and after delete";
-        guard.record_local_publish(&path, bytes).await;
+        let hash = h(b"same bytes before and after delete");
+        guard.record_local_publish(&path, hash).await;
 
         guard.forget(&path).await;
         assert!(
-            !guard.should_skip_local(&path, bytes).await,
+            !guard.should_skip_local(&path, hash).await,
             "after forget, re-creating identical bytes must publish, not be deduped",
         );
     }
@@ -320,11 +384,11 @@ mod tests {
     async fn forget_leaves_pending_intact() {
         let guard = EchoGuard::new();
         let path = p("/w/a.txt");
-        guard.mark_remote_write(&path, b"v1").await;
+        guard.mark_remote_write(&path, h(b"v1")).await;
 
         guard.forget(&path).await;
         assert!(
-            guard.should_skip_local(&path, b"v2").await,
+            guard.should_skip_local(&path, h(b"v2")).await,
             "forget must not evict a pending remote write still inside its grace window",
         );
     }
@@ -332,30 +396,91 @@ mod tests {
     #[tokio::test]
     async fn forget_unknown_path_is_noop() {
         let guard = EchoGuard::new();
-        guard.record_local_publish(&p("/w/a.txt"), b"x").await;
+        guard.record_local_publish(&p("/w/a.txt"), h(b"x")).await;
 
         guard.forget(&p("/w/never-seen.txt")).await;
         assert!(
-            guard.should_skip_local(&p("/w/a.txt"), b"x").await,
+            guard.should_skip_local(&p("/w/a.txt"), h(b"x")).await,
             "forgetting an unknown path must not disturb other entries",
+        );
+    }
+
+    #[tokio::test]
+    async fn unmark_clears_pending_and_hash() {
+        // The streaming apply's rename-failure unwind: after an
+        // unmark, local events for the path must be neither
+        // pending-suppressed nor hash-deduped against content that
+        // never reached disk.
+        let guard = EchoGuard::new();
+        let path = p("/w/a.txt");
+        let hash = h(b"never-written");
+        guard.mark_remote_write(&path, hash).await;
+
+        guard.unmark_remote_write(&path).await;
+        assert!(
+            !guard.should_skip_local(&path, hash).await,
+            "after unmark, even the marked hash must publish",
+        );
+        assert!(
+            !guard.should_skip_local(&path, h(b"other")).await,
+            "after unmark, the pending suppression must be gone",
+        );
+    }
+
+    #[tokio::test]
+    async fn unmark_does_not_restore_peer_delete_marker() {
+        // mark_remote_write cleared the peer-delete marker; the
+        // unwind deliberately does not restore it — err toward
+        // publishing (see method docs).
+        let guard = EchoGuard::new();
+        let path = p("/w/a.txt");
+        let _ = guard.mark_remote_delete(&path).await;
+        guard.mark_remote_write(&path, h(b"v1")).await;
+
+        guard.unmark_remote_write(&path).await;
+        assert!(
+            !guard.should_skip_removal(&path).await,
+            "unmark must not re-arm the peer-delete marker",
         );
     }
 
     #[tokio::test]
     async fn clones_share_state() {
         let original = EchoGuard::new();
-        original.mark_remote_write(&p("/w/x"), b"v").await;
+        original.mark_remote_write(&p("/w/x"), h(b"v")).await;
         let _ = original.mark_remote_delete(&p("/w/y")).await;
 
         let clone = original.clone();
         assert!(
-            clone.should_skip_local(&p("/w/x"), b"v").await,
+            clone.should_skip_local(&p("/w/x"), h(b"v")).await,
             "a clone must observe the original's write state",
         );
         assert!(
             clone.should_skip_removal(&p("/w/y")).await,
             "a clone must observe the original's delete state",
         );
+    }
+
+    #[tokio::test]
+    async fn hash_file_streams_and_matches_flat_blake3() {
+        // `hash_file` (streamed, blocking-pool) must equal
+        // `blake3::hash` over the same bytes — the guard compares the
+        // two shapes against each other (publish-side pre-hash vs
+        // import-outcome / entry content hash).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        // Not a round multiple of the reader's internal chunk size,
+        // to catch an off-by-one in the tail read.
+        let bytes: Vec<u8> = (0..123_457u32).map(|i| (i % 251) as u8).collect();
+        tokio::fs::write(&path, &bytes).await.unwrap();
+        assert_eq!(hash_file(&path).await.unwrap(), blake3::hash(&bytes));
+    }
+
+    #[tokio::test]
+    async fn hash_file_missing_file_is_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = hash_file(&dir.path().join("nope.bin")).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[tokio::test]
@@ -378,7 +503,7 @@ mod tests {
             "the marker must survive repeated events (macOS fans one unlink into several)",
         );
 
-        guard.mark_remote_write(&path, b"recreated").await;
+        guard.mark_remote_write(&path, h(b"recreated")).await;
         assert!(
             !guard.should_skip_removal(&path).await,
             "a peer re-creation clears the marker; the next removal is meaningful again",
@@ -388,16 +513,18 @@ mod tests {
     #[tokio::test]
     async fn forget_all_clears_every_last_published_hash() {
         let guard = EchoGuard::new();
-        guard.record_local_publish(&p("/w/a.txt"), b"alpha").await;
-        guard.record_local_publish(&p("/w/b.txt"), b"beta").await;
+        guard
+            .record_local_publish(&p("/w/a.txt"), h(b"alpha"))
+            .await;
+        guard.record_local_publish(&p("/w/b.txt"), h(b"beta")).await;
 
         guard.forget_all_published().await;
         assert!(
-            !guard.should_skip_local(&p("/w/a.txt"), b"alpha").await,
+            !guard.should_skip_local(&p("/w/a.txt"), h(b"alpha")).await,
             "after a namespace swap, re-writing identical bytes must publish",
         );
         assert!(
-            !guard.should_skip_local(&p("/w/b.txt"), b"beta").await,
+            !guard.should_skip_local(&p("/w/b.txt"), h(b"beta")).await,
             "the clear must cover every path, not just one",
         );
     }
@@ -405,12 +532,16 @@ mod tests {
     #[tokio::test]
     async fn forget_all_leaves_pending_and_peer_deleted_intact() {
         let guard = EchoGuard::new();
-        guard.mark_remote_write(&p("/w/pending.txt"), b"v1").await;
+        guard
+            .mark_remote_write(&p("/w/pending.txt"), h(b"v1"))
+            .await;
         let _ = guard.mark_remote_delete(&p("/w/deleted.txt")).await;
 
         guard.forget_all_published().await;
         assert!(
-            guard.should_skip_local(&p("/w/pending.txt"), b"v2").await,
+            guard
+                .should_skip_local(&p("/w/pending.txt"), h(b"v2"))
+                .await,
             "an applier write inside its grace window still echoes after the swap",
         );
         assert!(
@@ -435,14 +566,14 @@ mod tests {
             "second tombstone with no intervening re-creation is a duplicate",
         );
 
-        guard.mark_remote_write(&path, b"recreated").await;
+        guard.mark_remote_write(&path, h(b"recreated")).await;
         assert_eq!(
             guard.mark_remote_delete(&path).await,
             RemoteDeleteMark::Fresh,
             "a peer re-creation clears the marker; the next tombstone is fresh again",
         );
 
-        guard.record_local_publish(&path, b"local").await;
+        guard.record_local_publish(&path, h(b"local")).await;
         assert_eq!(
             guard.mark_remote_delete(&path).await,
             RemoteDeleteMark::Fresh,
@@ -471,12 +602,12 @@ mod tests {
     async fn peer_delete_clears_last_published() {
         let guard = EchoGuard::new();
         let path = p("/w/a.txt");
-        let bytes = b"same bytes before and after delete";
-        guard.record_local_publish(&path, bytes).await;
+        let hash = h(b"same bytes before and after delete");
+        guard.record_local_publish(&path, hash).await;
 
         let _ = guard.mark_remote_delete(&path).await;
         assert!(
-            !guard.should_skip_local(&path, bytes).await,
+            !guard.should_skip_local(&path, hash).await,
             "after a peer delete, re-creating identical bytes must publish, not be deduped",
         );
     }
