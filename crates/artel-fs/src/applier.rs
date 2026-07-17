@@ -24,7 +24,9 @@ use tracing::{debug, warn};
 use crate::echo_guard::{PENDING_RELEASE_GRACE, RemoteDeleteMark};
 use crate::filter::{FilterDecision, SkipReason, WorkspaceFilter};
 use crate::rules::Mode;
-use crate::workspace::{Direction, Workspace, WorkspaceEvent, emit_event};
+use crate::workspace::{
+    ApplyOutcome, Direction, Workspace, WorkspaceEvent, apply_entry_streaming, emit_event,
+};
 use crate::{EchoGuard, keys};
 
 /// Subscribe to the doc's live event stream and apply incoming
@@ -211,50 +213,36 @@ async fn handle_entry(
         return;
     }
 
-    // Bytes not yet available locally — applier::run will retry on
-    // ContentReady.
-    let bytes = match workspace
-        .blobs
-        .blobs()
-        .get_bytes(entry.content_hash())
-        .await
-    {
-        Ok(b) => b,
-        Err(err) => {
+    // Stream the blob to disk (temp file + rename — see
+    // `apply_entry_streaming`). `NotReady` preserves the old
+    // "bytes not yet local → wait for ContentReady" retry contract.
+    match apply_entry_streaming(&workspace.doc(), &workspace.blobs, guard, &entry, &path).await {
+        Ok(ApplyOutcome::Applied) => {
+            debug!(
+                target: "artel_fs::applier",
+                path = %path.display(),
+                len = entry.content_len(),
+                "applied remote write to disk"
+            );
+            guard.release_after(path.clone(), PENDING_RELEASE_GRACE);
+            emit_event(&workspace.events, WorkspaceEvent::PeerWrote { path });
+        }
+        Ok(ApplyOutcome::NotReady) => {
             debug!(
                 target: "artel_fs::applier",
                 path = %path.display(),
                 hash = %entry.content_hash(),
-                %err,
-                "blob bytes not yet available; awaiting ContentReady"
+                "blob not yet available; awaiting ContentReady"
             );
-            return;
         }
-    };
-
-    // The entry's iroh content hash IS the flat blake3 of the bytes
-    // (bao root equivalence — see echo_guard module docs), so the
-    // guard needs no buffer to mark this write.
-    guard
-        .mark_remote_write(&path, entry.content_hash().into())
-        .await;
-
-    if let Some(parent) = path.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
+        Err(err) => {
+            warn!(target: "artel_fs::applier", path = %path.display(), %err, "apply failed");
+            emit_event(
+                &workspace.events,
+                WorkspaceEvent::Error(format!("write {} failed: {err}", path.display())),
+            );
+        }
     }
-
-    if let Err(err) = tokio::fs::write(&path, &bytes).await {
-        warn!(target: "artel_fs::applier", path = %path.display(), %err, "fs::write failed");
-        emit_event(
-            &workspace.events,
-            WorkspaceEvent::Error(format!("write {} failed: {err}", path.display())),
-        );
-        return;
-    }
-
-    debug!(target: "artel_fs::applier", path = %path.display(), len = bytes.len(), "applied remote write to disk");
-    guard.release_after(path.clone(), PENDING_RELEASE_GRACE);
-    emit_event(&workspace.events, WorkspaceEvent::PeerWrote { path });
 }
 
 /// Apply a peer tombstone to disk: mark the echo guard, remove the

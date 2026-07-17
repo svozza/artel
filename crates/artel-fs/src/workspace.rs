@@ -32,6 +32,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use iroh_docs::AuthorId;
 use iroh_docs::DocTicket;
+use iroh_docs::Entry;
 use iroh_docs::NamespaceId;
 use iroh_docs::api::Doc;
 use iroh_docs::api::protocol::{AddrInfoOptions, ShareMode};
@@ -532,10 +533,12 @@ pub enum WorkspaceEvent {
 /// `WorkspaceEvent`s are advisory (diagnostics + skip notices), so
 /// dropping one when the consumer can't keep up is strictly better
 /// than wedging replication. Used by the live loops (applier,
-/// watcher); the construction-time emitters (scan / bulk-export /
-/// reconcile) keep their blocking `send` — they run bounded by the
-/// directory size, not a feedback loop, and aren't coupled to the
-/// live actor.
+/// watcher) AND by the construction-time emitters (scan /
+/// bulk-export / reconcile): those run inside the constructors,
+/// *before* the caller receives the event receiver, so nothing is
+/// draining yet — a blocking `send` there deadlocks construction as
+/// soon as emissions exceed [`EVENT_BUFFER`] (trivial for a scan of
+/// a large tree).
 pub(crate) fn emit_event(events: &mpsc::Sender<WorkspaceEvent>, ev: WorkspaceEvent) {
     use tokio::sync::mpsc::error::TrySendError;
     // `Ok` (delivered) and `Closed` (consumer dropped its stream) both
@@ -2700,6 +2703,104 @@ impl Drop for Workspace {
     }
 }
 
+/// Outcome of [`apply_entry_streaming`].
+pub(crate) enum ApplyOutcome {
+    /// The entry's bytes are on disk at the target path.
+    Applied,
+    /// The blob isn't fully available locally yet. Callers skip and
+    /// retry when `ContentReady` fires (the applier's existing retry
+    /// contract; bulk export is best-effort and just moves on).
+    NotReady,
+}
+
+/// Stream a doc entry's blob onto disk: export to a temp file in the
+/// target's directory, then `rename()` into place — the streaming
+/// replacement for `get_bytes` + `fs::write` (issue #33).
+///
+/// Why temp-and-rename: streaming a large export directly onto the
+/// destination widens the torn-read window, and a concurrent watcher
+/// event on a half-written file would publish garbage. The temp name
+/// ends in `.tmp`, which the filter hardcode-skips (layer 1), so the
+/// watcher never publishes the in-flight file regardless of exclude
+/// configuration; `rename()` within one directory is atomic, so the
+/// destination path only ever holds complete content. This also
+/// keeps the echo-guard story simple: mark → export to temp →
+/// rename → release.
+///
+/// Availability: the blob's status is checked up front and
+/// [`ApplyOutcome::NotReady`] returned unless it is fully local —
+/// preserving the "wait for `ContentReady`" retry the buffered
+/// `get_bytes` path expressed by erroring.
+///
+/// The echo guard is marked (with `entry.content_hash()` — equal to
+/// the flat blake3 of the bytes) *before* any disk mutation, so the
+/// watcher can't observe the rename first. Callers release the
+/// pending entry after this returns `Applied`.
+pub(crate) async fn apply_entry_streaming(
+    doc: &Doc,
+    blobs: &iroh_blobs::BlobsProtocol,
+    guard: &EchoGuard,
+    entry: &Entry,
+    path: &Path,
+) -> Result<ApplyOutcome, WorkspaceError> {
+    use iroh_blobs::api::blobs::{BlobStatus, ExportMode};
+
+    let hash = entry.content_hash();
+    let status = blobs
+        .store()
+        .blobs()
+        .status(hash)
+        .await
+        .map_err(|e| WorkspaceError::Doc(format!("blob status {hash}: {e}")))?;
+    if !matches!(status, BlobStatus::Complete { .. }) {
+        return Ok(ApplyOutcome::NotReady);
+    }
+
+    guard.mark_remote_write(path, hash.into()).await;
+
+    if let Some(parent) = path.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+
+    // Temp file beside the destination (same directory ⇒ same
+    // filesystem ⇒ atomic rename). The name is deterministic per
+    // destination: the applier and bulk export never race each other
+    // (bulk export completes before the applier spawns), and a stale
+    // temp left by a crash is simply overwritten by the next export
+    // and never syncs (`*.tmp` is hardcoded-skipped).
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| WorkspaceError::Doc(format!("apply: no file name in {}", path.display())))?
+        .to_os_string();
+    let mut tmp_name = OsString::from(".artel-fs-tmp-");
+    tmp_name.push(&file_name);
+    tmp_name.push(".tmp");
+    let tmp_path = path.with_file_name(tmp_name);
+
+    let export = doc
+        .export_file(blobs.store(), entry.clone(), &tmp_path, ExportMode::Copy)
+        .await
+        .map_err(|e| WorkspaceError::Doc(format!("export_file {}: {e}", path.display())));
+    let exported = match export {
+        Ok(progress) => progress
+            .finish()
+            .await
+            .map_err(|e| WorkspaceError::Doc(format!("export {}: {e}", path.display()))),
+        Err(e) => Err(e),
+    };
+    if let Err(err) = exported {
+        // Best-effort cleanup; a leftover temp never syncs anyway.
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(err);
+    }
+
+    if let Err(err) = tokio::fs::rename(&tmp_path, path).await {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(WorkspaceError::Io(err));
+    }
+    Ok(ApplyOutcome::Applied)
+}
+
 /// Outcome of [`publish_file_streaming`].
 pub(crate) enum PublishOutcome {
     /// The file was imported and its doc entry set. Carries the
@@ -3316,9 +3417,10 @@ async fn bulk_export(
         let path = match keys::key_to_path(root, entry.key()) {
             Ok(p) => p,
             Err(err) => {
-                let _ = events
-                    .send(WorkspaceEvent::Error(format!("invalid key: {err}")))
-                    .await;
+                // try_send, not send — constructor context (see the
+                // filter-skip comment below); a burst of bad keys
+                // must not deadlock `join_with`.
+                emit_event(events, WorkspaceEvent::Error(format!("invalid key: {err}")));
                 continue;
             }
         };
@@ -3393,34 +3495,33 @@ async fn bulk_export(
             // can have raced onto the path before the watcher exists.
             let _ = echo_guard.mark_remote_delete(&path).await;
             let _ = tokio::fs::remove_file(&path).await;
-            let _ = events.send(WorkspaceEvent::PeerDeleted { path }).await;
+            // try_send, not send — constructor context: >EVENT_BUFFER
+            // tombstones in the doc would deadlock `join_with`.
+            emit_event(events, WorkspaceEvent::PeerDeleted { path });
             continue;
         }
 
-        // Bytes not yet available locally → skip; the applier
-        // retries on the next ContentReady. Bulk export is
-        // best-effort.
-        let Ok(bytes) = blobs.blobs().get_bytes(entry.content_hash()).await else {
-            continue;
-        };
-
-        echo_guard
-            .mark_remote_write(&path, entry.content_hash().into())
-            .await;
-        if let Some(parent) = path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
+        // Stream the blob to disk (temp + rename). `NotReady` = bytes
+        // not yet local → skip; the applier retries on the next
+        // ContentReady. Bulk export is best-effort.
+        match apply_entry_streaming(doc, blobs, echo_guard, &entry, &path).await {
+            Ok(ApplyOutcome::Applied) => {
+                echo_guard.release_after(path.clone(), PENDING_RELEASE_GRACE);
+                emit_event(events, WorkspaceEvent::PeerWrote { path });
+            }
+            Ok(ApplyOutcome::NotReady) => {}
+            Err(err) => {
+                // try_send, not send — constructor context (see the
+                // filter-skip comment above).
+                emit_event(
+                    events,
+                    WorkspaceEvent::Error(format!(
+                        "bulk export write {} failed: {err}",
+                        path.display(),
+                    )),
+                );
+            }
         }
-        if let Err(err) = tokio::fs::write(&path, &bytes).await {
-            let _ = events
-                .send(WorkspaceEvent::Error(format!(
-                    "bulk export write {} failed: {err}",
-                    path.display(),
-                )))
-                .await;
-            continue;
-        }
-        echo_guard.release_after(path.clone(), PENDING_RELEASE_GRACE);
-        let _ = events.send(WorkspaceEvent::PeerWrote { path }).await;
     }
     Ok(())
 }
