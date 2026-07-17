@@ -939,7 +939,7 @@ impl Workspace {
         // legitimate entries laid down by the scan.
         if returning {
             debug!(target: "artel_fs::workspace", root = %root.display(), "host_with: reconciling doc against disk");
-            reconcile_doc_against_disk(&root, &doc, author, &tx).await?;
+            reconcile_doc_against_disk(&root, &doc, author, &exclude, &tx).await?;
         }
 
         // Pre-populate the doc from disk *before* we share the
@@ -2652,24 +2652,33 @@ async fn scan_and_publish_existing(
             continue;
         }
         let path = entry.path();
+        // Advisory skips use `emit_event` (try_send, drop-on-full),
+        // NOT a blocking `send`: this scan runs inside the
+        // constructor, before the caller ever receives the event
+        // receiver, so nothing is draining yet. A blocking send here
+        // deadlocks construction as soon as the walk produces more
+        // than EVENT_BUFFER skips — trivial under the dotfile default
+        // (any `.venv/`-sized hidden tree).
         match filter.check(path) {
             FilterDecision::Skip(SkipReason::TooLarge { size }) => {
-                let _ = events
-                    .send(WorkspaceEvent::SkippedTooLarge {
+                emit_event(
+                    events,
+                    WorkspaceEvent::SkippedTooLarge {
                         path: path.to_path_buf(),
                         size,
-                    })
-                    .await;
+                    },
+                );
                 continue;
             }
             FilterDecision::Skip(SkipReason::Excluded) => {
                 skipped += 1;
-                let _ = events
-                    .send(WorkspaceEvent::SkippedExcluded {
+                emit_event(
+                    events,
+                    WorkspaceEvent::SkippedExcluded {
                         path: path.to_path_buf(),
                         direction: Direction::Outgoing,
-                    })
-                    .await;
+                    },
+                );
                 continue;
             }
             FilterDecision::Skip(_) => {
@@ -2682,12 +2691,13 @@ async fn scan_and_publish_existing(
         let rel = path.strip_prefix(root).unwrap_or(path);
         if rules.mode_for(rel) == Mode::ReadOnly {
             skipped += 1;
-            let _ = events
-                .send(WorkspaceEvent::SkippedReadOnly {
+            emit_event(
+                events,
+                WorkspaceEvent::SkippedReadOnly {
                     path: path.to_path_buf(),
                     direction: Direction::Outgoing,
-                })
-                .await;
+                },
+            );
             continue;
         }
 
@@ -3176,38 +3186,51 @@ async fn bulk_export(
         // incoming tombstone must not trigger `remove_file`, and a
         // `ReadOnly` path's incoming write must not be applied
         // even if the filter would have let it through.
-        let rel = path.strip_prefix(root).unwrap_or(&path);
-        if rules.mode_for(rel) == Mode::ReadOnly {
-            let _ = events
-                .send(WorkspaceEvent::SkippedReadOnly {
-                    path,
-                    direction: Direction::Incoming,
-                })
-                .await;
-            continue;
-        }
-
+        // Advisory skips use `emit_event` (try_send, drop-on-full),
+        // NOT a blocking `send`: bulk_export runs inside `join_with`,
+        // before the caller ever receives the event receiver, so
+        // nothing is draining yet — a blocking send deadlocks the
+        // constructor once skips exceed EVENT_BUFFER (trivial under
+        // the dotfile default against a doc with a large hidden tree).
+        //
+        // Filter BEFORE rules, matching the watcher/scan outgoing
+        // order, so a path that is both excluded and `ReadOnly`
+        // reports the same skip reason in both directions.
         match filter.check(&path) {
             FilterDecision::Skip(SkipReason::TooLarge { size }) => {
-                let _ = events
-                    .send(WorkspaceEvent::SkippedTooLarge {
+                emit_event(
+                    events,
+                    WorkspaceEvent::SkippedTooLarge {
                         path: path.clone(),
                         size,
-                    })
-                    .await;
+                    },
+                );
                 continue;
             }
             FilterDecision::Skip(SkipReason::Excluded) => {
-                let _ = events
-                    .send(WorkspaceEvent::SkippedExcluded {
+                emit_event(
+                    events,
+                    WorkspaceEvent::SkippedExcluded {
                         path,
                         direction: Direction::Incoming,
-                    })
-                    .await;
+                    },
+                );
                 continue;
             }
             FilterDecision::Skip(_) => continue,
             FilterDecision::Include => {}
+        }
+
+        let rel = path.strip_prefix(root).unwrap_or(&path);
+        if rules.mode_for(rel) == Mode::ReadOnly {
+            emit_event(
+                events,
+                WorkspaceEvent::SkippedReadOnly {
+                    path,
+                    direction: Direction::Incoming,
+                },
+            );
+            continue;
         }
 
         if entry.content_len() == 0 {
@@ -3646,6 +3669,7 @@ async fn reconcile_doc_against_disk(
     root: &Path,
     doc: &Doc,
     author: AuthorId,
+    exclude: &ExcludeRules,
     events: &mpsc::Sender<WorkspaceEvent>,
 ) -> Result<(), WorkspaceError> {
     // One entry per key — we only need to know the *latest* state of
@@ -3657,6 +3681,7 @@ async fn reconcile_doc_against_disk(
         .map_err(|e| WorkspaceError::Doc(format!("reconcile get_many: {e}")))?;
     tokio::pin!(stream);
 
+    let filter = WorkspaceFilter::new(root, exclude.clone());
     let mut scanned = 0usize;
     let mut tombstoned = 0usize;
     while let Some(res) = stream.next().await {
@@ -3676,14 +3701,24 @@ async fn reconcile_doc_against_disk(
                     %err,
                     "reconcile: invalid key"
                 );
-                let _ = events
-                    .send(WorkspaceEvent::Error(format!(
-                        "reconcile invalid key: {err}"
-                    )))
-                    .await;
+                emit_event(
+                    events,
+                    WorkspaceEvent::Error(format!("reconcile invalid key: {err}")),
+                );
                 continue;
             }
         };
+        // A path this node's filter refuses is expected to be absent
+        // from disk — it was never applied here. Tombstoning it would
+        // destroy a peer's live entry just because our local hygiene
+        // hides it (e.g. a returning host whose exclude list covers a
+        // dotfile another peer legitimately publishes). "Missing from
+        // disk" is only evidence of deletion for paths this node
+        // actually mirrors. No event: nothing was skipped that this
+        // node would ever have synced.
+        if !matches!(filter.check(&path), FilterDecision::Include) {
+            continue;
+        }
         if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
             debug!(target: "artel_fs::workspace", path = %path.display(), "reconcile: tombstoning entry not on disk");
             // `Doc::del` writes a tombstone for `prefix`. The key
@@ -3691,12 +3726,13 @@ async fn reconcile_doc_against_disk(
             // entry.
             if let Err(err) = doc.del(author, entry.key().to_vec()).await {
                 warn!(target: "artel_fs::workspace", path = %path.display(), %err, "reconcile: tombstone failed");
-                let _ = events
-                    .send(WorkspaceEvent::Error(format!(
-                        "reconcile tombstone {}: {err}",
-                        path.display(),
-                    )))
-                    .await;
+                // try_send, not send: reconcile runs inside the
+                // constructor before the receiver is handed back —
+                // a blocking send with no drainer deadlocks it.
+                emit_event(
+                    events,
+                    WorkspaceEvent::Error(format!("reconcile tombstone {}: {err}", path.display())),
+                );
             } else {
                 tombstoned += 1;
             }

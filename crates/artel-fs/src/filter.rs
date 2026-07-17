@@ -108,13 +108,15 @@ impl ExcludeRules {
     /// prefix) match nothing under [`Self::Globs`] — defensive
     /// fall-through, mirroring [`crate::PathRules`]. Under
     /// [`Self::Dotfiles`] every `Normal` component is checked
-    /// regardless.
+    /// regardless, on its raw OS bytes — a non-UTF-8 hidden name
+    /// (`.caf\xE9`) is still hidden, rather than falling through a
+    /// lossy `to_str` to "not excluded".
     #[must_use]
     pub fn matches(&self, rel: &Path) -> bool {
         match self {
             Self::Dotfiles => rel.components().any(|component| {
                 matches!(component, std::path::Component::Normal(part)
-                    if part.to_str().is_some_and(|s| s.starts_with('.')))
+                    if part.as_encoded_bytes().first() == Some(&b'.'))
             }),
             Self::Globs(set) => {
                 path_to_match_string(rel).is_some_and(|hay| set.is_match(hay.as_str()))
@@ -483,12 +485,58 @@ mod tests {
 
     #[test]
     fn compile_rejects_malformed_globs() {
-        for bad in ["", "/abs/**", "../up/**"] {
+        // Empty, absolute, parent-traversal, and glob-syntax errors
+        // (unclosed bracket / alternation) — same validation as
+        // PathRules globs.
+        for bad in ["", "/abs/**", "../up/**", "a/../b/**", "[unclosed", "{a,b"] {
             assert!(
                 ExcludeRules::compile(Some(&[bad.to_string()])).is_err(),
                 "{bad:?} should be rejected",
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dotfile_default_catches_non_utf8_hidden_names() {
+        // A hidden component whose bytes aren't valid UTF-8 must
+        // still be excluded — the check reads the leading OS byte,
+        // not a lossy `to_str`.
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let hidden = Path::new(OsStr::from_bytes(b".caf\xe9/data.txt"));
+        assert!(ExcludeRules::Dotfiles.matches(hidden));
+        let visible = Path::new(OsStr::from_bytes(b"caf\xe9/.hidden"));
+        assert!(ExcludeRules::Dotfiles.matches(visible));
+        let clean = Path::new(OsStr::from_bytes(b"caf\xe9/data.txt"));
+        assert!(!ExcludeRules::Dotfiles.matches(clean));
+    }
+
+    #[test]
+    fn dot_in_middle_of_name_is_not_hidden() {
+        // Only a LEADING dot marks a component hidden.
+        for rel in ["foo.bar", "a/foo.d/b.txt", "v1.2.3/notes.md"] {
+            assert!(
+                !ExcludeRules::Dotfiles.matches(Path::new(rel)),
+                "{rel} must not be treated as hidden",
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_refused_even_under_empty_exclude() {
+        // Layer 2 (symlink) precedes layer 3 (exclude): a
+        // sync-everything exclude cannot resurrect symlinks.
+        let dir = make_root();
+        let target = write_file(dir.path(), "real.txt", b"x");
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let filter = sync_everything_filter(dir.path());
+        assert_eq!(
+            filter.check(&link),
+            FilterDecision::Skip(SkipReason::Symlink)
+        );
     }
 
     #[test]

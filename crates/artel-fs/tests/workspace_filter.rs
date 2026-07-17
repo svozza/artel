@@ -1501,6 +1501,7 @@ impl ExcludePair {
             AttachPolicy::AllowExisting,
             WorkspaceConfig::default()
                 .with_endpoint_setup(testing_setup(dns_pkarr))
+                .with_daemon_socket(daemon_a.socket.clone())
                 .with_exclude(host_exclude),
         )
         .await
@@ -1530,6 +1531,7 @@ impl ExcludePair {
             AttachPolicy::RequireEmpty,
             WorkspaceConfig::default()
                 .with_endpoint_setup(testing_setup(dns_pkarr))
+                .with_daemon_socket(daemon_b.socket.clone())
                 .with_exclude(join_exclude),
         )
         .await
@@ -1738,6 +1740,85 @@ async fn explicit_exclude_replaces_default_and_hidden_dir_syncs() {
         !bob_dir.path().join("api.secret").exists(),
         "explicitly-excluded glob must still block",
     );
+
+    pair.teardown().await;
+    daemon_a.stop().await;
+    daemon_b.stop().await;
+}
+
+/// Deleting a locally-excluded path must not publish a tombstone —
+/// the delete-side twin of the exclude gate. With asymmetric lists,
+/// a permissive host publishes `.env`; the default-exclude joiner
+/// never applies it but has its own local `.env`. When the joiner
+/// deletes that local file, its watcher must NOT tombstone the key:
+/// the host's live entry would be destroyed by a peer whose own
+/// hygiene merely hides the path. (The hole was Linux-specific —
+/// direct `Remove` events reach `on_removed`, which pre-fix had no
+/// filter; macOS deletes ride `on_modified`'s already-gated `NotFound`
+/// fallthrough. CI on Linux is where this test bites.)
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_locally_excluded_path_does_not_tombstone_peer_entry() {
+    let Pair {
+        daemon_a,
+        daemon_b,
+        dns_pkarr,
+    } = spawn_pair().await;
+
+    let alice_dir = tempfile::tempdir().unwrap();
+    let bob_dir = tempfile::tempdir().unwrap();
+    // Host syncs everything; joiner keeps the dotfile default.
+    let pair = ExcludePair::spawn(
+        &daemon_a,
+        &daemon_b,
+        &dns_pkarr,
+        alice_dir.path(),
+        bob_dir.path(),
+        Some(vec![]),
+        None,
+    )
+    .await;
+
+    // Bob needs RW for his marker/delete writes to propagate at all.
+    common::grant_rw_and_wait(
+        &pair.alice,
+        pair.alice_ws.session_id(),
+        pair.bob.daemon_peer_id(),
+        bob_dir.path(),
+        alice_dir.path(),
+    )
+    .await;
+
+    // Alice publishes .env (her empty exclude list allows it) and a
+    // visible marker to gate on.
+    tokio::fs::write(alice_dir.path().join(".env"), b"SECRET=1")
+        .await
+        .unwrap();
+    tokio::fs::write(alice_dir.path().join("marker1.txt"), b"m1")
+        .await
+        .unwrap();
+    wait_for_file(&bob_dir.path().join("marker1.txt"), b"m1").await;
+
+    // Bob has his own local .env — never synced (his applier refused
+    // Alice's), purely local state.
+    tokio::fs::write(bob_dir.path().join(".env"), b"BOB_LOCAL=1")
+        .await
+        .unwrap();
+    sleep(Duration::from_millis(500)).await; // let the watcher chew (and skip) it
+    tokio::fs::remove_file(bob_dir.path().join(".env"))
+        .await
+        .unwrap();
+
+    // Second marker from Bob proves his watcher processed past the
+    // delete; then Alice's .env must still exist — no tombstone leaked.
+    tokio::fs::write(bob_dir.path().join("marker2.txt"), b"m2")
+        .await
+        .unwrap();
+    wait_for_file(&alice_dir.path().join("marker2.txt"), b"m2").await;
+    sleep(Duration::from_millis(500)).await; // grace for a (buggy) tombstone to apply
+    let alice_env = tokio::fs::read(alice_dir.path().join(".env"))
+        .await
+        .expect("alice's .env must survive bob deleting his locally-excluded copy");
+    assert_eq!(alice_env, b"SECRET=1");
 
     pair.teardown().await;
     daemon_a.stop().await;

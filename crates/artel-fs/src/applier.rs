@@ -146,28 +146,19 @@ async fn handle_entry(
 
     // Rule + filter checks sit ABOVE the tombstone branch on
     // purpose: a `ReadOnly` path's incoming tombstone must not
-    // trigger `remove_file`, AND a hardcoded-skip / gitignored /
+    // trigger `remove_file`, AND a hardcoded-skip / excluded /
     // too-large path's incoming tombstone must not either. A
     // peer-published tombstone whose key resolves to a path the
-    // local filter rejects — asymmetric ignore globs across peers,
+    // local filter rejects — asymmetric exclude lists across peers,
     // version drift, an attacker-crafted key targeting `.git/HEAD`
     // — would otherwise reach `tokio::fs::remove_file` regardless,
     // deleting state the workspace was never supposed to touch.
     // `handle_content_ready` retries entries through this function,
     // so this single gate covers both cold and ready paths.
-    let rel = path.strip_prefix(&workspace.root).unwrap_or(&path);
-    if workspace.compiled_rules.mode_for(rel) == Mode::ReadOnly {
-        debug!(target: "artel_fs::applier", path = %path.display(), "rules: skip ReadOnly incoming");
-        emit_event(
-            &workspace.events,
-            WorkspaceEvent::SkippedReadOnly {
-                path,
-                direction: Direction::Incoming,
-            },
-        );
-        return;
-    }
-
+    //
+    // Filter BEFORE rules, matching the watcher's outgoing order, so
+    // a path that is both excluded and `ReadOnly` reports the same
+    // skip reason in both directions.
     match filter.check(&path) {
         FilterDecision::Skip(SkipReason::TooLarge { size }) => {
             debug!(target: "artel_fs::applier", path = %path.display(), size, "filter: skip too-large incoming");
@@ -196,6 +187,19 @@ async fn handle_entry(
             return;
         }
         FilterDecision::Include => {}
+    }
+
+    let rel = path.strip_prefix(&workspace.root).unwrap_or(&path);
+    if workspace.compiled_rules.mode_for(rel) == Mode::ReadOnly {
+        debug!(target: "artel_fs::applier", path = %path.display(), "rules: skip ReadOnly incoming");
+        emit_event(
+            &workspace.events,
+            WorkspaceEvent::SkippedReadOnly {
+                path,
+                direction: Direction::Incoming,
+            },
+        );
+        return;
     }
 
     if entry.content_len() == 0 {
