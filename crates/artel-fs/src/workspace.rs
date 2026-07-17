@@ -197,6 +197,15 @@ pub enum AttachPolicy {
     InitFromExisting,
 }
 
+/// Default [`WorkspaceConfig::max_file_size`]: 64 MiB.
+///
+/// Deliberately conservative until the streaming sync path has
+/// real-world mileage. The cap is an accident-guard (a rogue ISO in
+/// the workspace shouldn't fan out to every peer), not a pipeline
+/// protection — both directions stream, so the pipeline itself has
+/// no size ceiling.
+pub const DEFAULT_MAX_FILE_SIZE: u64 = 64 << 20;
+
 /// Configurable knobs for [`Workspace::host_with`] /
 /// [`Workspace::join_with`].
 ///
@@ -204,7 +213,7 @@ pub enum AttachPolicy {
 /// `<root>/.artel-fs/`. Override via [`Self::with_state_dir`] when
 /// the workspace lives in a directory the user wouldn't want a
 /// dotfile inside (e.g. a read-only export root).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct WorkspaceConfig {
     /// Where the workspace persists its iroh secret, doc replica,
     /// and blob store. `None` resolves to `<root>/.artel-fs/`.
@@ -285,6 +294,45 @@ pub struct WorkspaceConfig {
     /// scanning, `.gitignore` semantics — is consumer policy: read
     /// the sources yourself and pass equivalent globs.
     pub exclude: Option<Vec<String>>,
+
+    /// Size cap for synced files (filter layer 4). `Some(bytes)`
+    /// skips files strictly larger, in **both** directions (publish
+    /// and apply), surfacing each skip as
+    /// [`WorkspaceEvent::SkippedTooLarge`]. `None` = unlimited.
+    ///
+    /// Defaults to [`DEFAULT_MAX_FILE_SIZE`] (64 MiB). This is an
+    /// **accident-guard**, not a pipeline protection: file bytes
+    /// stream through iroh-blobs in both directions (BLAKE3 verified
+    /// streaming), so a multi-GB file syncs in bounded memory once
+    /// the cap allows it.
+    ///
+    /// Like [`Self::exclude`], the cap is local to this node — never
+    /// ticket-borne. A host and joiner may run different caps; each
+    /// enforces its own on both its publishes and its applies.
+    ///
+    /// **Anti-pattern: append-heavy / ever-growing files.** artel-fs
+    /// republishes the *whole file per change*, so a growing log
+    /// costs O(n²) bytes over its life regardless of this cap. Apps
+    /// with growing logs (e.g. JSONL event logs) should rotate them
+    /// into bounded segments rather than raising the cap.
+    pub max_file_size: Option<u64>,
+}
+
+impl Default for WorkspaceConfig {
+    /// Everything unset except the size cap, which defaults to
+    /// [`DEFAULT_MAX_FILE_SIZE`] rather than `None` — an unset config
+    /// must mean "guarded", not "unlimited".
+    fn default() -> Self {
+        Self {
+            state_dir: None,
+            join_ticket_timeout: None,
+            endpoint_setup: EndpointSetup::default(),
+            rules: None,
+            daemon_socket: None,
+            exclude: None,
+            max_file_size: Some(DEFAULT_MAX_FILE_SIZE),
+        }
+    }
 }
 
 impl WorkspaceConfig {
@@ -338,6 +386,14 @@ impl WorkspaceConfig {
     #[must_use]
     pub fn with_exclude(mut self, exclude: Option<Vec<String>>) -> Self {
         self.exclude = exclude;
+        self
+    }
+
+    /// Set the size cap. `Some(bytes)` skips larger files (both
+    /// directions); `None` = unlimited. See [`Self::max_file_size`].
+    #[must_use]
+    pub const fn with_max_file_size(mut self, max_file_size: Option<u64>) -> Self {
+        self.max_file_size = max_file_size;
         self
     }
 
@@ -600,6 +656,11 @@ pub struct Workspace {
     /// node — never ticket-borne. Cloned into the watcher's and
     /// applier's [`WorkspaceFilter`]s.
     pub(crate) exclude: ExcludeRules,
+    /// Size cap (filter layer 4), from
+    /// [`WorkspaceConfig::max_file_size`]. `None` = unlimited. Local
+    /// to this node, like [`Self::exclude`]. Threaded into every
+    /// [`WorkspaceFilter`] this workspace constructs.
+    pub(crate) max_file_size: Option<u64>,
     /// The workspace's state directory (holds `iroh.key`, `doc-id`,
     /// `current-namespace`, the docs/blobs stores). Retained so
     /// namespace rotation can persist the new `current-namespace`.
@@ -776,6 +837,7 @@ impl Workspace {
         // Same treatment for the exclude globs: reject a malformed
         // list as a configuration error before any state is created.
         let exclude = ExcludeRules::compile(config.exclude.as_deref())?;
+        let max_file_size = config.max_file_size;
 
         ensure_state_dir(&state_dir)?;
         // Canonicalise after ensure_state_dir so the attachment payload
@@ -798,6 +860,7 @@ impl Workspace {
             rules,
             compiled_rules,
             exclude,
+            max_file_size,
             &config.endpoint_setup,
             config.daemon_socket.as_deref(),
             &mut rb,
@@ -824,6 +887,7 @@ impl Workspace {
         rules: PathRules,
         compiled_rules: CompiledPathRules,
         exclude: ExcludeRules,
+        max_file_size: Option<u64>,
         endpoint_setup: &EndpointSetup,
         daemon_socket: Option<&Path>,
         rb: &mut WorkspaceRollback,
@@ -939,7 +1003,7 @@ impl Workspace {
         // legitimate entries laid down by the scan.
         if returning {
             debug!(target: "artel_fs::workspace", root = %root.display(), "host_with: reconciling doc against disk");
-            reconcile_doc_against_disk(&root, &doc, author, &exclude, &tx).await?;
+            reconcile_doc_against_disk(&root, &doc, author, &exclude, max_file_size, &tx).await?;
         }
 
         // Pre-populate the doc from disk *before* we share the
@@ -952,6 +1016,7 @@ impl Workspace {
             author,
             &compiled_rules,
             &exclude,
+            max_file_size,
             &echo_guard,
             &tx,
         )
@@ -1102,6 +1167,7 @@ impl Workspace {
                 rules,
                 compiled_rules,
                 exclude,
+                max_file_size,
                 state_dir,
                 session_id,
                 join_ticket: Some(join_ticket),
@@ -1204,8 +1270,9 @@ impl Workspace {
         // configuration error, rejected before any state is created.
         // Unlike `rules` (host-authoritative, ticket-borne), the
         // exclude list is honoured on the joiner: it is local node
-        // hygiene, not workspace policy.
+        // hygiene, not workspace policy. Same for the size cap.
         let exclude = ExcludeRules::compile(config.exclude.as_deref())?;
+        let max_file_size = config.max_file_size;
 
         ensure_state_dir(&state_dir)?;
         // Canonicalise — see host_with for the same reasoning. The
@@ -1225,6 +1292,7 @@ impl Workspace {
             root,
             state_dir,
             exclude,
+            max_file_size,
             config.join_ticket_timeout,
             &config.endpoint_setup,
             config.daemon_socket.as_deref(),
@@ -1249,6 +1317,7 @@ impl Workspace {
         root: PathBuf,
         state_dir: PathBuf,
         exclude: ExcludeRules,
+        max_file_size: Option<u64>,
         join_ticket_timeout: Option<Duration>,
         endpoint_setup: &EndpointSetup,
         join_daemon_socket: Option<&Path>,
@@ -1354,6 +1423,7 @@ impl Workspace {
             &node.blobs,
             &compiled_rules,
             &exclude,
+            max_file_size,
             &echo_guard,
             &tx,
         )
@@ -1434,6 +1504,7 @@ impl Workspace {
                 rules,
                 compiled_rules,
                 exclude,
+                max_file_size,
                 state_dir,
                 session_id: session,
                 join_ticket: None,
@@ -1947,6 +2018,7 @@ impl Workspace {
                 self.author,
                 &self.compiled_rules,
                 &self.exclude,
+                self.max_file_size,
                 &self.echo_guard,
                 &self.events,
             )
@@ -2641,10 +2713,11 @@ async fn scan_and_publish_existing(
     author: AuthorId,
     rules: &CompiledPathRules,
     exclude: &ExcludeRules,
+    max_file_size: Option<u64>,
     echo_guard: &EchoGuard,
     events: &mpsc::Sender<WorkspaceEvent>,
 ) -> Result<(), WorkspaceError> {
-    let filter = WorkspaceFilter::new(root, exclude.clone());
+    let filter = WorkspaceFilter::new(root, exclude.clone(), max_file_size);
     let mut published = 0usize;
     let mut skipped = 0usize;
     for entry in WalkDir::new(root).follow_links(false).into_iter().flatten() {
@@ -3148,6 +3221,7 @@ async fn bulk_export(
     blobs: &iroh_blobs::BlobsProtocol,
     rules: &CompiledPathRules,
     exclude: &ExcludeRules,
+    max_file_size: Option<u64>,
     echo_guard: &EchoGuard,
     events: &mpsc::Sender<WorkspaceEvent>,
 ) -> Result<(), WorkspaceError> {
@@ -3160,7 +3234,7 @@ async fn bulk_export(
         .await
         .map_err(|e| WorkspaceError::Doc(format!("get_many: {e}")))?;
     tokio::pin!(stream);
-    let filter = WorkspaceFilter::new(root, exclude.clone());
+    let filter = WorkspaceFilter::new(root, exclude.clone(), max_file_size);
 
     while let Some(res) = stream.next().await {
         let Ok(entry) = res else { continue };
@@ -3670,6 +3744,7 @@ async fn reconcile_doc_against_disk(
     doc: &Doc,
     author: AuthorId,
     exclude: &ExcludeRules,
+    max_file_size: Option<u64>,
     events: &mpsc::Sender<WorkspaceEvent>,
 ) -> Result<(), WorkspaceError> {
     // One entry per key — we only need to know the *latest* state of
@@ -3681,7 +3756,7 @@ async fn reconcile_doc_against_disk(
         .map_err(|e| WorkspaceError::Doc(format!("reconcile get_many: {e}")))?;
     tokio::pin!(stream);
 
-    let filter = WorkspaceFilter::new(root, exclude.clone());
+    let filter = WorkspaceFilter::new(root, exclude.clone(), max_file_size);
     let mut scanned = 0usize;
     let mut tombstoned = 0usize;
     while let Some(res) = stream.next().await {
@@ -5132,6 +5207,26 @@ mod tests {
         // forever" so a misconfigured single-process test has to opt
         // into a deadline.
         assert_eq!(WorkspaceConfig::default().join_ticket_timeout, None);
+    }
+
+    #[test]
+    fn workspace_config_default_caps_at_64_mib() {
+        // An unset config must mean "guarded" (64 MiB accident-guard),
+        // not "unlimited" — the manual `Default` impl exists precisely
+        // to keep this from silently reverting to `None` via derive.
+        assert_eq!(
+            WorkspaceConfig::default().max_file_size,
+            Some(DEFAULT_MAX_FILE_SIZE)
+        );
+        assert_eq!(DEFAULT_MAX_FILE_SIZE, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn workspace_config_with_max_file_size_sets_field() {
+        let cfg = WorkspaceConfig::default().with_max_file_size(None);
+        assert_eq!(cfg.max_file_size, None);
+        let cfg = WorkspaceConfig::default().with_max_file_size(Some(123));
+        assert_eq!(cfg.max_file_size, Some(123));
     }
 
     #[test]

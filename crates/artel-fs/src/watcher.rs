@@ -119,7 +119,11 @@ pub(crate) async fn run(workspace: Arc<Workspace>, ready: oneshot::Sender<()>) {
     // — fine to ignore.
     let _ = ready.send(());
 
-    let filter = WorkspaceFilter::new(&workspace.root, workspace.exclude.clone());
+    let filter = WorkspaceFilter::new(
+        &workspace.root,
+        workspace.exclude.clone(),
+        workspace.max_file_size,
+    );
     // A clone shares the workspace guard's state (Arc-backed), so we
     // observe everything the applier's clone marks.
     let guard = workspace.echo_guard.clone();
