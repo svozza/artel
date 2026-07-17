@@ -137,11 +137,31 @@ impl EchoGuard {
     /// hash of the content we're about to write (the entry's iroh
     /// content hash — identical to the flat blake3 of the bytes). The
     /// path exists again, so any peer-delete marker is cleared.
+    ///
+    /// Call as close to the watcher-visible mutation (the rename) as
+    /// possible: while pending, EVERY local event for the path is
+    /// suppressed regardless of content, so a wide mark-to-write gap
+    /// swallows genuine local edits (see `apply_entry_streaming`).
     pub async fn mark_remote_write(&self, path: &Path, hash: Hash) {
         let owned = path.to_path_buf();
         self.pending.lock().await.insert(owned.clone());
         self.peer_deleted.lock().await.remove(&owned);
         self.last_published.lock().await.insert(owned, hash);
+    }
+
+    /// Unwind [`Self::mark_remote_write`] when the write it announced
+    /// never happened (the streaming apply's rename failed). Removes
+    /// the pending entry and the recorded hash so future local events
+    /// for the path are neither suppressed nor hash-deduped against
+    /// content that never reached disk.
+    ///
+    /// Deliberately does NOT restore a previously-cleared peer-delete
+    /// marker: the marker's contract is "cleared on re-creation", and
+    /// erring toward publishing (worst case, one redundant tombstone)
+    /// beats erring toward suppression (a swallowed genuine delete).
+    pub async fn unmark_remote_write(&self, path: &Path) {
+        self.pending.lock().await.remove(path);
+        self.last_published.lock().await.remove(path);
     }
 
     /// Record that a peer-driven delete (tombstone) is about to be
@@ -382,6 +402,45 @@ mod tests {
         assert!(
             guard.should_skip_local(&p("/w/a.txt"), h(b"x")).await,
             "forgetting an unknown path must not disturb other entries",
+        );
+    }
+
+    #[tokio::test]
+    async fn unmark_clears_pending_and_hash() {
+        // The streaming apply's rename-failure unwind: after an
+        // unmark, local events for the path must be neither
+        // pending-suppressed nor hash-deduped against content that
+        // never reached disk.
+        let guard = EchoGuard::new();
+        let path = p("/w/a.txt");
+        let hash = h(b"never-written");
+        guard.mark_remote_write(&path, hash).await;
+
+        guard.unmark_remote_write(&path).await;
+        assert!(
+            !guard.should_skip_local(&path, hash).await,
+            "after unmark, even the marked hash must publish",
+        );
+        assert!(
+            !guard.should_skip_local(&path, h(b"other")).await,
+            "after unmark, the pending suppression must be gone",
+        );
+    }
+
+    #[tokio::test]
+    async fn unmark_does_not_restore_peer_delete_marker() {
+        // mark_remote_write cleared the peer-delete marker; the
+        // unwind deliberately does not restore it — err toward
+        // publishing (see method docs).
+        let guard = EchoGuard::new();
+        let path = p("/w/a.txt");
+        let _ = guard.mark_remote_delete(&path).await;
+        guard.mark_remote_write(&path, h(b"v1")).await;
+
+        guard.unmark_remote_write(&path).await;
+        assert!(
+            !guard.should_skip_removal(&path).await,
+            "unmark must not re-arm the peer-delete marker",
         );
     }
 

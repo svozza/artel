@@ -401,7 +401,8 @@ async fn apply_is_atomic_and_temp_files_never_publish() {
         let Ok(entry) = res else { continue };
         let key = String::from_utf8_lossy(entry.key()).into_owned();
         assert!(
-            !key.contains(".artel-fs-tmp-") && std::path::Path::new(&key).extension() != Some("tmp".as_ref()),
+            !key.contains(".artel-fs-tmp-")
+                && std::path::Path::new(&key).extension() != Some("tmp".as_ref()),
             "temp file leaked into the doc: {key}",
         );
     }

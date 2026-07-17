@@ -160,6 +160,7 @@ pub(crate) async fn run(workspace: Arc<Workspace>, ready: oneshot::Sender<()>) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn on_modified(
     workspace: &Arc<Workspace>,
     filter: &WorkspaceFilter,
@@ -280,6 +281,7 @@ async fn on_modified(
         workspace.author,
         key,
         &path,
+        workspace.max_file_size,
     )
     .await
     {
@@ -302,6 +304,16 @@ async fn on_modified(
         Ok(PublishOutcome::NotFound) => {
             debug!(target: "artel_fs::watcher", path = %path.display(), "import NotFound -> tombstone");
             on_removed(workspace, filter, guard, path).await;
+        }
+        // Grew past the cap between the filter's stat and the import
+        // snapshot — the in-import re-check caught it (no doc entry
+        // was inserted). Same event the filter's own skip emits.
+        Ok(PublishOutcome::SkippedTooLarge { size }) => {
+            debug!(target: "artel_fs::watcher", path = %path.display(), size, "import: skip too-large (grew mid-flight)");
+            emit_event(
+                &workspace.events,
+                WorkspaceEvent::SkippedTooLarge { path, size },
+            );
         }
         Err(err) => {
             warn!(target: "artel_fs::watcher", path = %path.display(), %err, "import_file failed");

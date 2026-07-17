@@ -2713,29 +2713,63 @@ pub(crate) enum ApplyOutcome {
     NotReady,
 }
 
+/// Process-wide uniquifier for streaming-apply temp names. See
+/// [`apply_temp_path`].
+static APPLY_TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Compute the streaming-apply temp path for `path`.
+///
+/// Lives beside the destination (same directory ⇒ same filesystem ⇒
+/// atomic rename). The name embeds a process-wide sequence number so
+/// concurrent applies of the same path (public `run()` called twice;
+/// a rotation-respawned applier overlapping an old in-flight
+/// `handle_entry`) never truncate each other's export — each exports
+/// to its own temp and the renames serialize atomically, last-writer-
+/// wins, matching the doc layer's own LWW semantics. The `.tmp`
+/// suffix keeps every temp hardcoded-skipped (filter layer 1), so the
+/// watcher never publishes one regardless of exclude config; a stale
+/// temp left by a crash never syncs (and is bounded by crash count,
+/// not runtime — error paths clean up their own temp).
+fn apply_temp_path(path: &Path) -> Result<PathBuf, WorkspaceError> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| WorkspaceError::Doc(format!("apply: no file name in {}", path.display())))?
+        .to_os_string();
+    let seq = APPLY_TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut tmp_name = OsString::from(format!(".artel-fs-tmp-{}-{seq}-", std::process::id()));
+    tmp_name.push(&file_name);
+    tmp_name.push(".tmp");
+    Ok(path.with_file_name(tmp_name))
+}
+
 /// Stream a doc entry's blob onto disk: export to a temp file in the
 /// target's directory, then `rename()` into place — the streaming
 /// replacement for `get_bytes` + `fs::write` (issue #33).
 ///
 /// Why temp-and-rename: streaming a large export directly onto the
 /// destination widens the torn-read window, and a concurrent watcher
-/// event on a half-written file would publish garbage. The temp name
-/// ends in `.tmp`, which the filter hardcode-skips (layer 1), so the
-/// watcher never publishes the in-flight file regardless of exclude
-/// configuration; `rename()` within one directory is atomic, so the
-/// destination path only ever holds complete content. This also
-/// keeps the echo-guard story simple: mark → export to temp →
-/// rename → release.
+/// event on a half-written file would publish garbage. See
+/// [`apply_temp_path`] for the temp-name shape; `rename()` within one
+/// directory is atomic, so the destination path only ever holds
+/// complete content.
 ///
 /// Availability: the blob's status is checked up front and
 /// [`ApplyOutcome::NotReady`] returned unless it is fully local —
 /// preserving the "wait for `ContentReady`" retry the buffered
 /// `get_bytes` path expressed by erroring.
 ///
-/// The echo guard is marked (with `entry.content_hash()` — equal to
-/// the flat blake3 of the bytes) *before* any disk mutation, so the
-/// watcher can't observe the rename first. Callers release the
-/// pending entry after this returns `Applied`.
+/// Echo-guard ordering: the guard is marked (with
+/// `entry.content_hash()` — equal to the flat blake3 of the bytes)
+/// *after* the export but *before* the rename. The export touches
+/// only the temp file, which the watcher ignores, so the rename is
+/// the first watcher-visible mutation — marking just before it keeps
+/// the suppression window microseconds wide instead of spanning a
+/// potentially long export, during which a genuine local edit's
+/// publish would otherwise be swallowed as an echo (adversarial-
+/// review finding). On rename failure the mark is unwound
+/// ([`EchoGuard::unmark_remote_write`]): nothing was written, so
+/// suppressing future local events would be wrong. Callers release
+/// the pending entry after this returns `Applied`.
 pub(crate) async fn apply_entry_streaming(
     doc: &Doc,
     blobs: &iroh_blobs::BlobsProtocol,
@@ -2756,26 +2790,11 @@ pub(crate) async fn apply_entry_streaming(
         return Ok(ApplyOutcome::NotReady);
     }
 
-    guard.mark_remote_write(path, hash.into()).await;
-
     if let Some(parent) = path.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
 
-    // Temp file beside the destination (same directory ⇒ same
-    // filesystem ⇒ atomic rename). The name is deterministic per
-    // destination: the applier and bulk export never race each other
-    // (bulk export completes before the applier spawns), and a stale
-    // temp left by a crash is simply overwritten by the next export
-    // and never syncs (`*.tmp` is hardcoded-skipped).
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| WorkspaceError::Doc(format!("apply: no file name in {}", path.display())))?
-        .to_os_string();
-    let mut tmp_name = OsString::from(".artel-fs-tmp-");
-    tmp_name.push(&file_name);
-    tmp_name.push(".tmp");
-    let tmp_path = path.with_file_name(tmp_name);
+    let tmp_path = apply_temp_path(path)?;
 
     let export = doc
         .export_file(blobs.store(), entry.clone(), &tmp_path, ExportMode::Copy)
@@ -2794,7 +2813,12 @@ pub(crate) async fn apply_entry_streaming(
         return Err(err);
     }
 
+    guard.mark_remote_write(path, hash.into()).await;
     if let Err(err) = tokio::fs::rename(&tmp_path, path).await {
+        // Unwind: the destination was never touched, so the guard
+        // must not keep suppressing (or hash-deduping) local events
+        // for this path.
+        guard.unmark_remote_write(path).await;
         let _ = tokio::fs::remove_file(&tmp_path).await;
         return Err(WorkspaceError::Io(err));
     }
@@ -2825,6 +2849,16 @@ pub(crate) enum PublishOutcome {
     /// The watcher converts this into a tombstone (macOS `FSEvents`
     /// reports post-unlink `Modify` events); the scan just moves on.
     NotFound,
+    /// The import observed a size over the configured cap. Emitted by
+    /// the in-import re-check (see [`publish_file_streaming`]): the
+    /// filter's pre-check statted the file earlier, but a file can
+    /// grow between that stat and the import snapshot — without this
+    /// the cap is bypassable by any at-cap file that grows mid-flight.
+    /// Callers emit [`WorkspaceEvent::SkippedTooLarge`].
+    SkippedTooLarge {
+        /// The size the import actually observed.
+        size: u64,
+    },
 }
 
 /// Stream a file from disk into the doc: blob import via
@@ -2840,13 +2874,24 @@ pub(crate) enum PublishOutcome {
 /// if `len == 0`. A file that becomes empty *between* the stat and
 /// the import surfaces as an `Err` from the entry insert — rare
 /// race, reported like any other publish failure.
+///
+/// Cap re-check: the import's own observed size is compared against
+/// `max_file_size` *before* the doc entry is inserted; over-cap
+/// aborts the progress stream (no `set_hash` runs), returning
+/// [`PublishOutcome::SkippedTooLarge`]. The already-imported blob
+/// stays in the store unreferenced — GC is a deferred follow-up
+/// regardless (issue #33 non-goals).
 pub(crate) async fn publish_file_streaming(
     doc: &Doc,
     blobs: &iroh_blobs::BlobsProtocol,
     author: AuthorId,
     key: Vec<u8>,
     path: &Path,
+    max_file_size: Option<u64>,
 ) -> Result<PublishOutcome, WorkspaceError> {
+    use iroh_blobs::api::blobs::AddProgressItem;
+    use iroh_docs::api::ImportFileProgressItem;
+
     let meta = match tokio::fs::metadata(path).await {
         Ok(m) => m,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -2858,7 +2903,7 @@ pub(crate) async fn publish_file_streaming(
         return Ok(PublishOutcome::SkippedEmpty);
     }
 
-    let progress = doc
+    let mut progress = doc
         .import_file(
             blobs.store(),
             author,
@@ -2868,15 +2913,40 @@ pub(crate) async fn publish_file_streaming(
         )
         .await
         .map_err(|e| WorkspaceError::Doc(format!("import_file {}: {e}", path.display())))?;
-    // `ImportFileProgress` is a future: driving it to completion runs
-    // the blob import and the `set_hash` entry insert. The outcome
-    // carries the content hash + size iroh computed.
-    let outcome = progress
-        .await
-        .map_err(|e| WorkspaceError::Doc(format!("import {}: {e}", path.display())))?;
-    Ok(PublishOutcome::Published {
-        hash: outcome.hash.into(),
-    })
+    // Drive the progress stream item-by-item (rather than awaiting it
+    // as a future) so the cap can be enforced on the size the import
+    // ACTUALLY observed, before the entry-insert stage runs. Dropping
+    // the stream after an over-cap Size aborts the import cleanly —
+    // `set_hash` never runs, so no doc entry is created.
+    loop {
+        match progress.next().await {
+            Some(ImportFileProgressItem::Blobs(AddProgressItem::Size(size))) => {
+                if let Some(cap) = max_file_size
+                    && size > cap
+                {
+                    return Ok(PublishOutcome::SkippedTooLarge { size });
+                }
+            }
+            Some(ImportFileProgressItem::Blobs(_)) => {}
+            Some(ImportFileProgressItem::Error(err)) => {
+                return Err(WorkspaceError::Doc(format!(
+                    "import {}: {err}",
+                    path.display()
+                )));
+            }
+            Some(ImportFileProgressItem::Done(outcome)) => {
+                return Ok(PublishOutcome::Published {
+                    hash: outcome.hash.into(),
+                });
+            }
+            None => {
+                return Err(WorkspaceError::Doc(format!(
+                    "import {}: progress stream ended without outcome",
+                    path.display()
+                )));
+            }
+        }
+    }
 }
 
 /// Walk `root` and publish every non-skipped file to `doc`. Errors
@@ -2970,7 +3040,7 @@ async fn scan_and_publish_existing(
                 continue;
             }
         };
-        match publish_file_streaming(doc, blobs, author, key, path).await {
+        match publish_file_streaming(doc, blobs, author, key, path, max_file_size).await {
             Ok(PublishOutcome::Published { hash }) => {
                 published += 1;
                 debug!(target: "artel_fs::workspace", path = %path.display(), "scan: published");
@@ -2978,6 +3048,18 @@ async fn scan_and_publish_existing(
             }
             Ok(PublishOutcome::SkippedEmpty | PublishOutcome::NotFound) => {
                 skipped += 1;
+            }
+            // Grew past the cap between the filter's stat and the
+            // import snapshot (in-import re-check; no entry inserted).
+            Ok(PublishOutcome::SkippedTooLarge { size }) => {
+                skipped += 1;
+                emit_event(
+                    events,
+                    WorkspaceEvent::SkippedTooLarge {
+                        path: path.to_path_buf(),
+                        size,
+                    },
+                );
             }
             Err(err) => {
                 warn!(target: "artel_fs::workspace", path = %path.display(), %err, "scan: publish failed");
