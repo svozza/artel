@@ -530,3 +530,44 @@ async fn host_with_unreachable_relay_returns_typed_error() {
     drop(client);
     harness.stop().await;
 }
+
+// =============================================================
+// bao-root == flat-blake3 equivalence (Tier A, no network).
+//
+// The hash-based `EchoGuard` (issue #33) compares hashes from two
+// different derivations against each other:
+// - publish side: a streamed flat `blake3::Hasher` over the file
+//   (`echo_guard::hash_file`), and later the `import_file` outcome's
+//   iroh hash for the same bytes;
+// - apply side: `entry.content_hash()` — the bao tree root iroh
+//   computed when the blob was added.
+//
+// The guard is sound only if iroh's content hash IS the flat blake3
+// hash of the content (the bao outboard changes how the tree is
+// *stored*, not the root). That's documented BLAKE3/bao behaviour,
+// but it is load-bearing for echo suppression, so we pin it with a
+// test instead of trusting it: if an iroh-blobs upgrade ever changed
+// the hash derivation (domain separation, chunk-group tweak to the
+// root, ...), echo suppression would silently break everywhere —
+// this test turns that into a loud versioned failure.
+// =============================================================
+
+#[tokio::test]
+async fn iroh_content_hash_is_flat_blake3() {
+    let store = MemStore::new();
+    // Sizes straddling bao chunk (1 KiB) and chunk-group (16 KiB)
+    // boundaries, where a tree-vs-flat divergence would show up:
+    // sub-chunk, exact chunk, chunk+1, exact group, group+1, and a
+    // multi-group size with a ragged tail.
+    for size in [1usize, 1024, 1025, 16 * 1024, 16 * 1024 + 1, 123_457] {
+        let bytes: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let tag = store.blobs().add_bytes(bytes.clone()).await.unwrap();
+        let flat = blake3::hash(&bytes);
+        assert_eq!(
+            blake3::Hash::from(tag.hash),
+            flat,
+            "iroh content hash != flat blake3 at size {size} — \
+             the hash-based EchoGuard's equivalence assumption is broken",
+        );
+    }
+}

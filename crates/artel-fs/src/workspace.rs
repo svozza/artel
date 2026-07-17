@@ -2812,7 +2812,9 @@ async fn scan_and_publish_existing(
         }
         published += 1;
         debug!(target: "artel_fs::workspace", path = %path.display(), len, "scan: published");
-        echo_guard.record_local_publish(path, &bytes).await;
+        echo_guard
+            .record_local_publish(path, blake3::hash(&bytes))
+            .await;
     }
     debug!(target: "artel_fs::workspace", root = %root.display(), published, skipped, "scan_and_publish_existing complete");
     Ok(())
@@ -3330,7 +3332,9 @@ async fn bulk_export(
             continue;
         };
 
-        echo_guard.mark_remote_write(&path, &bytes).await;
+        echo_guard
+            .mark_remote_write(&path, entry.content_hash().into())
+            .await;
         if let Some(parent) = path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }

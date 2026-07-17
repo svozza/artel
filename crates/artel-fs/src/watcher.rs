@@ -273,7 +273,8 @@ async fn on_modified(
         return;
     }
 
-    if guard.should_skip_local(&path, &bytes).await {
+    let content_hash = blake3::hash(&bytes);
+    if guard.should_skip_local(&path, content_hash).await {
         debug!(target: "artel_fs::watcher", path = %path.display(), len = bytes.len(), "echo-guard: skip local (peer-driven write)");
         return;
     }
@@ -292,7 +293,7 @@ async fn on_modified(
     {
         Ok(_) => {
             debug!(target: "artel_fs::watcher", path = %path.display(), len, "set_bytes ok");
-            guard.record_local_publish(&path, &bytes).await;
+            guard.record_local_publish(&path, content_hash).await;
         }
         Err(err) => {
             warn!(target: "artel_fs::watcher", path = %path.display(), len, %err, "set_bytes failed");

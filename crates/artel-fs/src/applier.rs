@@ -232,7 +232,12 @@ async fn handle_entry(
         }
     };
 
-    guard.mark_remote_write(&path, &bytes).await;
+    // The entry's iroh content hash IS the flat blake3 of the bytes
+    // (bao root equivalence — see echo_guard module docs), so the
+    // guard needs no buffer to mark this write.
+    guard
+        .mark_remote_write(&path, entry.content_hash().into())
+        .await;
 
     if let Some(parent) = path.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
