@@ -306,7 +306,7 @@ async fn on_modified(
 /// [`on_modified`]): a file that landed before notify's watch
 /// backfill produces no event of its own, so the directory's event
 /// is the only signal it exists. Walking is bounded by the workspace
-/// filter at each file (hardcoded skips, gitignore, size cap), and
+/// filter at each file (hardcoded skips, exclude rules, size cap), and
 /// the echo guard's last-published hash turns the common "file's own
 /// event already published it" case into a no-op.
 async fn rescan_dir(

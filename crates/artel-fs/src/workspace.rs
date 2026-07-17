@@ -3178,7 +3178,7 @@ async fn bulk_export(
         // Filter + rules sit ABOVE the tombstone branch on both
         // sides (here and in `applier::handle_entry`). A
         // peer-published tombstone whose key resolves to a path the
-        // local filter rejects — asymmetric ignore globs across
+        // local filter rejects — asymmetric exclude lists across
         // peers, version drift, an attacker-crafted key targeting a
         // hardcoded-skip path like `.git/HEAD` — would otherwise
         // reach `tokio::fs::remove_file` regardless. The `ReadOnly`
