@@ -74,7 +74,7 @@ pub(crate) async fn run(workspace: Arc<Workspace>, ready: oneshot::Sender<()>) {
     // A clone shares the workspace guard's state (Arc-backed), so the
     // watcher's clone observes everything we mark here.
     let guard = workspace.echo_guard.clone();
-    let filter = WorkspaceFilter::new(&workspace.root);
+    let filter = WorkspaceFilter::new(&workspace.root, workspace.exclude.clone());
 
     // Doc-scoped token: cancelled at workspace shutdown AND on
     // namespace rotation. A child of the workspace shutdown token.
@@ -176,6 +176,17 @@ async fn handle_entry(
                 WorkspaceEvent::SkippedTooLarge {
                     path: path.clone(),
                     size,
+                },
+            );
+            return;
+        }
+        FilterDecision::Skip(SkipReason::Excluded) => {
+            debug!(target: "artel_fs::applier", path = %path.display(), "filter: skip excluded incoming");
+            emit_event(
+                &workspace.events,
+                WorkspaceEvent::SkippedExcluded {
+                    path: path.clone(),
+                    direction: Direction::Incoming,
                 },
             );
             return;

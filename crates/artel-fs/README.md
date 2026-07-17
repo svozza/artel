@@ -5,8 +5,9 @@ Filesystem workspace sync built on top of artel sessions.
 Mirrors a directory across peers. Runs in your process and spawns its own small
 iroh endpoint; the host hands joiners a doc ticket over the session (the
 "ticket-handout" model — the daemon stays file-sync-agnostic). Provides the
-watcher/applier, gitignore + size filtering, and `PathRules` to scope which
-paths sync and at what capability.
+watcher/applier, configurable exclude + size filtering (hidden files are
+excluded by default; `WorkspaceConfig::exclude` overrides), and `PathRules`
+to scope which paths sync and at what capability.
 
 ```rust
 use artel_fs::{Workspace, WorkspaceConfig, AttachPolicy};

@@ -81,7 +81,11 @@ The joiner first joins the session itself (`Request::JoinSession { display_name,
 PathRules { /* root ReadOnly, ".app/**" ReadWrite */ }
 ```
 
-`PathRules::read_write()` is the permissive default. Built-in filtering also skips `.git`, `target`, `node_modules`, the `.artel-fs` state dir, `.DS_Store` and editor temp files (`*.swp`, `*.tmp`), symlinks, files over the size cap (1 MiB), and anything matched by the workspace root's `.gitignore`.
+`PathRules::read_write()` is the permissive default. Built-in filtering also skips `.git`, `target`, `node_modules`, the `.artel-fs` state dir, `.DS_Store` and editor temp files (`*.swp`, `*.tmp`), symlinks, and files over the size cap (1 MiB).
+
+**Hidden (dot-prefixed) files don't sync by default.** `WorkspaceConfig::exclude` controls this: `None` (the default) skips any path with a dot-prefixed component; `Some(globs)` replaces that default with exactly your list (`Some(vec![])` = sync everything). The list is local to each node — it does not ride the ticket to joiners, and each side filters both directions by its own list. Every exclusion skip is surfaced as `WorkspaceEvent::SkippedExcluded`, so a subtree that isn't syncing is diagnosable from the event stream. An app with a hidden state dir (e.g. `.myapp/log/`) must pass an explicit exclude list or its subtree won't sync.
+
+`.gitignore` is **not** consulted. What's project-relevant — and what's secret — is your policy, not the substrate's: if you want gitignore semantics, read the file yourself and pass equivalent globs via `exclude`; if you keep secrets in non-hidden files, exclude them explicitly. artel-fs is not your secret scanner.
 
 ## Patterns that work
 

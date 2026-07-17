@@ -339,12 +339,14 @@ async fn workspace_state_survives_graceful_restart() {
     // must see. This blocks until iroh-docs' gossip neighbors are
     // mutually registered — without it, alice's subsequent writes
     // race the NeighborUp event and may never gossip-broadcast.
-    tokio::fs::write(bob_root.path().join(".sync_probe"), b"ok")
+    // Not dot-prefixed: hidden files are excluded from sync by
+    // default (WorkspaceConfig::exclude).
+    tokio::fs::write(bob_root.path().join("sync_probe"), b"ok")
         .await
         .unwrap();
     phase(
         "p2: bob→alice gossip probe",
-        wait_for_file(&alice_root.path().join(".sync_probe"), b"ok"),
+        wait_for_file(&alice_root.path().join("sync_probe"), b"ok"),
     )
     .await;
 

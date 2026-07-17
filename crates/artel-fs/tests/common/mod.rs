@@ -597,7 +597,10 @@ pub async fn grant_rw_and_wait(
 ) {
     grant_rw(client, session, target_peer).await;
     let probe = b"rw-probe";
-    let probe_name = format!(".artel_rw_probe_{}", &target_peer.to_hex()[..10]);
+    // Not dot-prefixed: hidden files are excluded from sync by
+    // default (WorkspaceConfig::exclude), and the probe must ride the
+    // real sync path.
+    let probe_name = format!("artel_rw_probe_{}", &target_peer.to_hex()[..10]);
     let joiner_probe = joiner_dir.join(&probe_name);
     let host_probe = host_dir.join(&probe_name);
     // Poll: write the probe repeatedly until the host sees it,

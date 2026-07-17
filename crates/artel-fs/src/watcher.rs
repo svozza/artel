@@ -119,7 +119,7 @@ pub(crate) async fn run(workspace: Arc<Workspace>, ready: oneshot::Sender<()>) {
     // — fine to ignore.
     let _ = ready.send(());
 
-    let filter = WorkspaceFilter::new(&workspace.root);
+    let filter = WorkspaceFilter::new(&workspace.root, workspace.exclude.clone());
     // A clone shares the workspace guard's state (Arc-backed), so we
     // observe everything the applier's clone marks.
     let guard = workspace.echo_guard.clone();
@@ -176,6 +176,17 @@ async fn on_modified(
                 WorkspaceEvent::SkippedTooLarge {
                     path: path.clone(),
                     size,
+                },
+            );
+            return;
+        }
+        FilterDecision::Skip(SkipReason::Excluded) => {
+            debug!(target: "artel_fs::watcher", path = %path.display(), "filter: skip excluded");
+            emit_event(
+                &workspace.events,
+                WorkspaceEvent::SkippedExcluded {
+                    path: path.clone(),
+                    direction: Direction::Outgoing,
                 },
             );
             return;

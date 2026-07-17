@@ -45,7 +45,7 @@ use walkdir::WalkDir;
 
 use crate::echo_guard::{EchoGuard, PENDING_RELEASE_GRACE};
 use crate::error::{PolicyViolation, WorkspaceError};
-use crate::filter::{FilterDecision, SkipReason, WorkspaceFilter};
+use crate::filter::{ExcludeRules, FilterDecision, SkipReason, WorkspaceFilter};
 use crate::keys;
 use crate::node::WorkspaceNode;
 use crate::peer_map::PeerMap;
@@ -259,6 +259,32 @@ pub struct WorkspaceConfig {
     /// construction) but cannot observe revocations that happen
     /// after the workspace is up.
     pub daemon_socket: Option<PathBuf>,
+
+    /// Consumer-owned sync exclusions (filter layer 3).
+    ///
+    /// - `None` (default): hidden (dot-prefixed) files and
+    ///   directories don't sync — a filesystem convention, not a
+    ///   policy interpretation.
+    /// - `Some(globs)`: **exactly** that list, replace not merge.
+    ///   `Some(vec![])` syncs everything, dotfiles included. Globs
+    ///   use the same workspace-relative shape as [`PathRules`]
+    ///   globs and are validated identically.
+    ///
+    /// **Local to this node, not ticket-borne.** Unlike
+    /// [`Self::rules`], the exclude list does not travel to joiners
+    /// — it is each node's own hygiene, and nothing about it rides
+    /// the synced tree. A host and a joiner may run different
+    /// excludes; each filters both its outgoing publishes and its
+    /// incoming applies by its own list, and every such skip is
+    /// surfaced as [`WorkspaceEvent::SkippedExcluded`].
+    ///
+    /// An app with a **hidden state dir** (say a per-peer event log
+    /// under `<root>/.myapp/log/`) must opt back in or its subtree
+    /// won't sync: pass `Some(vec![])`, or restate the exclusions it
+    /// wants minus its own dir. Anything beyond this knob — secrets
+    /// scanning, `.gitignore` semantics — is consumer policy: read
+    /// the sources yourself and pass equivalent globs.
+    pub exclude: Option<Vec<String>>,
 }
 
 impl WorkspaceConfig {
@@ -303,6 +329,15 @@ impl WorkspaceConfig {
     #[must_use]
     pub fn with_daemon_socket(mut self, path: PathBuf) -> Self {
         self.daemon_socket = Some(path);
+        self
+    }
+
+    /// Set the sync-exclusion globs. `Some(vec![])` syncs everything
+    /// (dotfiles included); an explicit list **replaces** the dotfile
+    /// default. See [`Self::exclude`].
+    #[must_use]
+    pub fn with_exclude(mut self, exclude: Option<Vec<String>>) -> Self {
+        self.exclude = exclude;
         self
     }
 
@@ -367,6 +402,23 @@ pub enum WorkspaceEvent {
     /// noisy (e.g. for a `target/**: ReadOnly` rule with chatty
     /// editor saves) should dedupe themselves.
     SkippedReadOnly {
+        /// Absolute path under the workspace root that was skipped.
+        path: PathBuf,
+        /// Whether the skip happened on the publish side (`Outgoing`)
+        /// or the apply side (`Incoming`).
+        direction: Direction,
+    },
+    /// A path-event was skipped because the path matched this node's
+    /// sync exclusions ([`WorkspaceConfig::exclude`] — the dotfile
+    /// default or an explicit glob list).
+    ///
+    /// Advisory, one event per skipped path-event, both directions.
+    /// A workspace scan over a tree with many hidden files emits many
+    /// of these; treat them as noise, not errors. Exists so an
+    /// excluded path never vanishes *silently* — an app whose state
+    /// dir isn't syncing finds the answer on this stream instead of
+    /// in a debug log.
+    SkippedExcluded {
         /// Absolute path under the workspace root that was skipped.
         path: PathBuf,
         /// Whether the skip happened on the publish side (`Outgoing`)
@@ -543,6 +595,11 @@ pub struct Workspace {
     /// Precompiled rules; built once from `rules` at construction
     /// and read per event. See [`Self::rules`].
     pub(crate) compiled_rules: CompiledPathRules,
+    /// Compiled sync exclusions (filter layer 3), built once from
+    /// [`WorkspaceConfig::exclude`] at construction. Local to this
+    /// node — never ticket-borne. Cloned into the watcher's and
+    /// applier's [`WorkspaceFilter`]s.
+    pub(crate) exclude: ExcludeRules,
     /// The workspace's state directory (holds `iroh.key`, `doc-id`,
     /// `current-namespace`, the docs/blobs stores). Retained so
     /// namespace rotation can persist the new `current-namespace`.
@@ -716,6 +773,9 @@ impl Workspace {
         // set is rejected as a configuration error, not a runtime one.
         let rules = config.rules.unwrap_or_else(PathRules::read_write);
         let compiled_rules = rules.compile()?;
+        // Same treatment for the exclude globs: reject a malformed
+        // list as a configuration error before any state is created.
+        let exclude = ExcludeRules::compile(config.exclude.as_deref())?;
 
         ensure_state_dir(&state_dir)?;
         // Canonicalise after ensure_state_dir so the attachment payload
@@ -737,6 +797,7 @@ impl Workspace {
             state_dir,
             rules,
             compiled_rules,
+            exclude,
             &config.endpoint_setup,
             config.daemon_socket.as_deref(),
             &mut rb,
@@ -762,6 +823,7 @@ impl Workspace {
         state_dir: PathBuf,
         rules: PathRules,
         compiled_rules: CompiledPathRules,
+        exclude: ExcludeRules,
         endpoint_setup: &EndpointSetup,
         daemon_socket: Option<&Path>,
         rb: &mut WorkspaceRollback,
@@ -884,7 +946,16 @@ impl Workspace {
         // ticket — joiners that import after this scan see the
         // current snapshot via initial sync.
         debug!(target: "artel_fs::workspace", root = %root.display(), "host_with: scan_and_publish_existing");
-        scan_and_publish_existing(&root, &doc, author, &compiled_rules, &echo_guard, &tx).await?;
+        scan_and_publish_existing(
+            &root,
+            &doc,
+            author,
+            &compiled_rules,
+            &exclude,
+            &echo_guard,
+            &tx,
+        )
+        .await?;
 
         // Share with full addressing info (relay URL + direct
         // addrs) so the ticket carries everything a joiner needs
@@ -1030,6 +1101,7 @@ impl Workspace {
                 node: tokio::sync::Mutex::new(Some(node)),
                 rules,
                 compiled_rules,
+                exclude,
                 state_dir,
                 session_id,
                 join_ticket: Some(join_ticket),
@@ -1128,6 +1200,13 @@ impl Workspace {
         // and zero IPC state.
         enforce_attach_policy(&root, &state_dir, policy, AttachSide::Join)?;
 
+        // Compile the exclude globs up front — a malformed list is a
+        // configuration error, rejected before any state is created.
+        // Unlike `rules` (host-authoritative, ticket-borne), the
+        // exclude list is honoured on the joiner: it is local node
+        // hygiene, not workspace policy.
+        let exclude = ExcludeRules::compile(config.exclude.as_deref())?;
+
         ensure_state_dir(&state_dir)?;
         // Canonicalise — see host_with for the same reasoning. The
         // attachment payload + iroh node + every later use of
@@ -1145,6 +1224,7 @@ impl Workspace {
             session,
             root,
             state_dir,
+            exclude,
             config.join_ticket_timeout,
             &config.endpoint_setup,
             config.daemon_socket.as_deref(),
@@ -1168,6 +1248,7 @@ impl Workspace {
         session: SessionId,
         root: PathBuf,
         state_dir: PathBuf,
+        exclude: ExcludeRules,
         join_ticket_timeout: Option<Duration>,
         endpoint_setup: &EndpointSetup,
         join_daemon_socket: Option<&Path>,
@@ -1267,7 +1348,16 @@ impl Workspace {
 
         let echo_guard = EchoGuard::new();
 
-        bulk_export(&root, &doc, &node.blobs, &compiled_rules, &echo_guard, &tx).await?;
+        bulk_export(
+            &root,
+            &doc,
+            &node.blobs,
+            &compiled_rules,
+            &exclude,
+            &echo_guard,
+            &tx,
+        )
+        .await?;
 
         // Spawn the cap-listener on its own dedicated connection so it
         // owns the `Client` it drains — required for M3 recovery, which
@@ -1343,6 +1433,7 @@ impl Workspace {
                 node: tokio::sync::Mutex::new(Some(node)),
                 rules,
                 compiled_rules,
+                exclude,
                 state_dir,
                 session_id: session,
                 join_ticket: None,
@@ -1855,6 +1946,7 @@ impl Workspace {
                 &scan_doc,
                 self.author,
                 &self.compiled_rules,
+                &self.exclude,
                 &self.echo_guard,
                 &self.events,
             )
@@ -2548,10 +2640,11 @@ async fn scan_and_publish_existing(
     doc: &Doc,
     author: AuthorId,
     rules: &CompiledPathRules,
+    exclude: &ExcludeRules,
     echo_guard: &EchoGuard,
     events: &mpsc::Sender<WorkspaceEvent>,
 ) -> Result<(), WorkspaceError> {
-    let filter = WorkspaceFilter::new(root);
+    let filter = WorkspaceFilter::new(root, exclude.clone());
     let mut published = 0usize;
     let mut skipped = 0usize;
     for entry in WalkDir::new(root).follow_links(false).into_iter().flatten() {
@@ -2565,6 +2658,16 @@ async fn scan_and_publish_existing(
                     .send(WorkspaceEvent::SkippedTooLarge {
                         path: path.to_path_buf(),
                         size,
+                    })
+                    .await;
+                continue;
+            }
+            FilterDecision::Skip(SkipReason::Excluded) => {
+                skipped += 1;
+                let _ = events
+                    .send(WorkspaceEvent::SkippedExcluded {
+                        path: path.to_path_buf(),
+                        direction: Direction::Outgoing,
                     })
                     .await;
                 continue;
@@ -3034,6 +3137,7 @@ async fn bulk_export(
     doc: &Doc,
     blobs: &iroh_blobs::BlobsProtocol,
     rules: &CompiledPathRules,
+    exclude: &ExcludeRules,
     echo_guard: &EchoGuard,
     events: &mpsc::Sender<WorkspaceEvent>,
 ) -> Result<(), WorkspaceError> {
@@ -3046,7 +3150,7 @@ async fn bulk_export(
         .await
         .map_err(|e| WorkspaceError::Doc(format!("get_many: {e}")))?;
     tokio::pin!(stream);
-    let filter = WorkspaceFilter::new(root);
+    let filter = WorkspaceFilter::new(root, exclude.clone());
 
     while let Some(res) = stream.next().await {
         let Ok(entry) = res else { continue };
@@ -3089,6 +3193,15 @@ async fn bulk_export(
                     .send(WorkspaceEvent::SkippedTooLarge {
                         path: path.clone(),
                         size,
+                    })
+                    .await;
+                continue;
+            }
+            FilterDecision::Skip(SkipReason::Excluded) => {
+                let _ = events
+                    .send(WorkspaceEvent::SkippedExcluded {
+                        path,
+                        direction: Direction::Incoming,
                     })
                     .await;
                 continue;
