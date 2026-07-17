@@ -229,7 +229,9 @@ impl CompiledPathRules {
     }
 }
 
-fn validate_glob(g: &str) -> Result<(), PathRulesError> {
+/// Shared glob validation: also used by [`crate::filter::ExcludeRules`]
+/// so exclude globs and rule globs can't drift in what they accept.
+pub(crate) fn validate_glob(g: &str) -> Result<(), PathRulesError> {
     if g.is_empty() {
         return Err(PathRulesError::EmptyGlob);
     }
@@ -251,8 +253,9 @@ fn validate_glob(g: &str) -> Result<(), PathRulesError> {
 
 /// NFC + forward-slash + reject-traversal. Mirrors
 /// [`crate::keys::path_to_key`]'s normalisation so glob shapes line
-/// up with doc-key shapes.
-fn path_to_match_string(rel: &Path) -> Option<String> {
+/// up with doc-key shapes. Shared with
+/// [`crate::filter::ExcludeRules`] for the same reason.
+pub(crate) fn path_to_match_string(rel: &Path) -> Option<String> {
     let mut parts = Vec::new();
     for component in rel.components() {
         match component {

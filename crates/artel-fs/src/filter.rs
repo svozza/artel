@@ -5,19 +5,36 @@
 //! 1. Hardcoded skips (`.git`, `target`, `node_modules`, `.DS_Store`,
 //!    `.artel-fs` — the workspace's own state dir — plus `*.swp`,
 //!    `*.tmp`). Highest priority — these never sync regardless of
-//!    `.gitignore` config.
+//!    configuration. They are the substrate's *self*-protection
+//!    (its own state dir, VCS/build event storms, editor churn), not
+//!    consumer policy.
 //! 2. Symlink check. We deliberately do not follow links.
-//! 3. `.gitignore` patterns at the workspace root, parsed via the
-//!    `ignore` crate. Honoured for everything *except* the
-//!    `.gitignore` file itself.
+//! 3. Exclude rules ([`ExcludeRules`]). Consumer-owned: defaults to
+//!    skipping hidden (dot-prefixed) entries; an explicit glob list
+//!    from [`crate::WorkspaceConfig::exclude`] replaces the default
+//!    entirely. Surfaced as `FilterDecision::Skip(SkipReason::Excluded)`
+//!    so callers emit an observable event — an excluded path must
+//!    never vanish silently.
 //! 4. Size cap (1 MiB). Larger files are surfaced to consumers as
 //!    `FilterDecision::Skip(SkipReason::TooLarge)` so they can decide
 //!    whether to log/notify.
+//!
+//! There is deliberately **no** `.gitignore` layer. Honouring it made
+//! the substrate interpret another tool's policy file, and because the
+//! `.gitignore` file itself synced, a host's ignore rules propagated to
+//! every joiner and then filtered the same paths everywhere — the
+//! silent-sync-death bug this module's redesign fixed. What is
+//! project-relevant (and what is secret) is consumer policy: embedders
+//! that want gitignore semantics should read it themselves and pass
+//! equivalent globs via [`crate::WorkspaceConfig::exclude`].
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use ignore::gitignore::Gitignore;
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use unicode_normalization::UnicodeNormalization;
+
+use crate::rules::{PathRulesError, path_to_match_string, validate_glob};
 
 /// Files larger than this are skipped.
 ///
@@ -26,15 +43,97 @@ use ignore::gitignore::Gitignore;
 /// cheap; revisit when large-file sync becomes a real need.
 pub const MAX_FILE_SIZE: u64 = 1 << 20;
 
-/// Pre-parsed view of the workspace root + its `.gitignore` (if any).
+/// Compiled, consumer-owned exclusion rules — filter layer 3.
 ///
-/// Cheap to construct (one stat, one parse). Kept around so the
-/// watcher and applier can call [`Self::check`] without re-parsing
-/// the gitignore on every event.
+/// Built from [`crate::WorkspaceConfig::exclude`] at workspace
+/// construction:
+///
+/// - `None` → [`Self::Dotfiles`]: any path with a hidden
+///   (dot-prefixed) component is skipped. A filesystem convention,
+///   not a policy interpretation — it requires parsing nothing and is
+///   predictable from the filename alone.
+/// - `Some(globs)` → [`Self::Globs`]: exactly that list, **replace
+///   not merge**. `Some(vec![])` compiles to a set matching nothing —
+///   everything syncs, dotfiles included.
+///
+/// Local to each node (never ticket-borne): the exclude list is this
+/// node's hygiene, and nothing about it rides the synced tree.
+#[derive(Debug, Clone, Default)]
+pub enum ExcludeRules {
+    /// Skip any path containing a hidden (dot-prefixed) component.
+    #[default]
+    Dotfiles,
+    /// Skip paths matching an explicit glob set. Globs use the same
+    /// workspace-relative, forward-slash, NFC-normalised shape as
+    /// [`crate::PathRules`] globs.
+    Globs(GlobSet),
+}
+
+impl ExcludeRules {
+    /// Compile the [`crate::WorkspaceConfig::exclude`] value.
+    ///
+    /// `None` yields the dotfile default; `Some(globs)` validates and
+    /// compiles the explicit list (replace-not-merge — see type docs).
+    ///
+    /// # Errors
+    ///
+    /// Returns the same [`PathRulesError`] variants as
+    /// [`crate::PathRules::validate`] for a malformed glob: empty,
+    /// absolute, parent traversal, or a pattern `globset` won't
+    /// compile.
+    pub fn compile(exclude: Option<&[String]>) -> Result<Self, PathRulesError> {
+        let Some(globs) = exclude else {
+            return Ok(Self::Dotfiles);
+        };
+        let mut builder = GlobSetBuilder::new();
+        for g in globs {
+            validate_glob(g)?;
+            let normalised: String = g.nfc().collect();
+            let glob = Glob::new(&normalised).map_err(|e| PathRulesError::InvalidGlob {
+                glob: g.clone(),
+                reason: e.to_string(),
+            })?;
+            builder.add(glob);
+        }
+        let set = builder.build().map_err(|e| PathRulesError::InvalidGlob {
+            glob: String::new(),
+            reason: e.to_string(),
+        })?;
+        Ok(Self::Globs(set))
+    }
+
+    /// Does `rel` (workspace-relative path) match these rules?
+    ///
+    /// Paths that escape the workspace (parent traversal, absolute
+    /// prefix) match nothing under [`Self::Globs`] — defensive
+    /// fall-through, mirroring [`crate::PathRules`]. Under
+    /// [`Self::Dotfiles`] every `Normal` component is checked
+    /// regardless, on its raw OS bytes — a non-UTF-8 hidden name
+    /// (`.caf\xE9`) is still hidden, rather than falling through a
+    /// lossy `to_str` to "not excluded".
+    #[must_use]
+    pub fn matches(&self, rel: &Path) -> bool {
+        match self {
+            Self::Dotfiles => rel.components().any(|component| {
+                matches!(component, std::path::Component::Normal(part)
+                    if part.as_encoded_bytes().first() == Some(&b'.'))
+            }),
+            Self::Globs(set) => {
+                path_to_match_string(rel).is_some_and(|hay| set.is_match(hay.as_str()))
+            }
+        }
+    }
+}
+
+/// Pre-parsed view of the workspace root + its exclude rules.
+///
+/// Cheap to construct (the exclude rules are compiled once at
+/// workspace construction and cloned in). Kept around so the watcher
+/// and applier can call [`Self::check`] without recompiling per event.
 #[derive(Debug)]
 pub struct WorkspaceFilter {
     pub root: PathBuf,
-    gitignore: Option<Gitignore>,
+    exclude: ExcludeRules,
 }
 
 /// Outcome of [`WorkspaceFilter::check`].
@@ -51,8 +150,11 @@ pub enum FilterDecision {
 pub enum SkipReason {
     /// Matched one of the hardcoded skips.
     Hardcoded,
-    /// Matched a `.gitignore` pattern.
-    Gitignored,
+    /// Matched the workspace's [`ExcludeRules`] (the dotfile default
+    /// or an explicit [`crate::WorkspaceConfig::exclude`] list).
+    /// Callers must surface this via
+    /// [`crate::WorkspaceEvent::SkippedExcluded`] — never silently.
+    Excluded,
     /// Path is a symlink. We never follow them.
     Symlink,
     /// File exceeded [`MAX_FILE_SIZE`].
@@ -63,22 +165,13 @@ pub enum SkipReason {
 }
 
 impl WorkspaceFilter {
-    /// Build a filter for `root`. If `root/.gitignore` exists, it's
-    /// parsed eagerly; parse errors are ignored silently to match the
-    /// reference impl.
+    /// Build a filter for `root` with the given exclude rules.
     #[must_use]
-    pub fn new(root: &Path) -> Self {
-        let root = root.to_path_buf();
-        let gitignore_path = root.join(".gitignore");
-        let gitignore = if gitignore_path.exists() {
-            let mut builder = ignore::gitignore::GitignoreBuilder::new(&root);
-            // `add` returns Option<Error>; ignore parse errors silently.
-            let _ = builder.add(&gitignore_path);
-            builder.build().ok()
-        } else {
-            None
-        };
-        Self { root, gitignore }
+    pub fn new(root: &Path, exclude: ExcludeRules) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            exclude,
+        }
     }
 
     /// Decide whether `abs_path` should sync. Cheap; expects
@@ -86,8 +179,7 @@ impl WorkspaceFilter {
     #[must_use]
     pub fn check(&self, abs_path: &Path) -> FilterDecision {
         // Compute path relative to root, when possible. Fall back to
-        // the raw path for hardcoded-component matching if it isn't
-        // under root.
+        // the raw path for component matching if it isn't under root.
         let rel = abs_path.strip_prefix(&self.root).unwrap_or(abs_path);
 
         // 1. Hardcoded matches (highest priority).
@@ -102,13 +194,9 @@ impl WorkspaceFilter {
             return FilterDecision::Skip(SkipReason::Symlink);
         }
 
-        // 3. Gitignore — but never flag the .gitignore file itself.
-        let is_gitignore_file = rel.file_name().and_then(|n| n.to_str()) == Some(".gitignore");
-        if !is_gitignore_file && let Some(gi) = &self.gitignore {
-            let is_dir = fs::metadata(abs_path).is_ok_and(|m| m.is_dir());
-            if gi.matched_path_or_any_parents(abs_path, is_dir).is_ignore() {
-                return FilterDecision::Skip(SkipReason::Gitignored);
-            }
+        // 3. Exclude rules (consumer-owned; dotfiles by default).
+        if self.exclude.matches(rel) {
+            return FilterDecision::Skip(SkipReason::Excluded);
         }
 
         // 4. Size check.
@@ -181,11 +269,21 @@ mod tests {
         p
     }
 
+    /// Filter with the default (dotfiles) exclude — the common case.
+    fn default_filter(root: &Path) -> WorkspaceFilter {
+        WorkspaceFilter::new(root, ExcludeRules::default())
+    }
+
+    /// Filter that excludes nothing (`Some(vec![])` in config terms).
+    fn sync_everything_filter(root: &Path) -> WorkspaceFilter {
+        WorkspaceFilter::new(root, ExcludeRules::compile(Some(&[])).unwrap())
+    }
+
     #[test]
     fn includes_normal_file() {
         let dir = make_root();
         let p = write_file(dir.path(), "src/main.rs", b"hello");
-        let filter = WorkspaceFilter::new(dir.path());
+        let filter = default_filter(dir.path());
         assert_eq!(filter.check(&p), FilterDecision::Include);
     }
 
@@ -193,7 +291,7 @@ mod tests {
     fn skips_dot_git() {
         let dir = make_root();
         let p = write_file(dir.path(), ".git/HEAD", b"ref: refs/heads/main\n");
-        let filter = WorkspaceFilter::new(dir.path());
+        let filter = default_filter(dir.path());
         assert_eq!(
             filter.check(&p),
             FilterDecision::Skip(SkipReason::Hardcoded)
@@ -204,7 +302,7 @@ mod tests {
     fn skips_target() {
         let dir = make_root();
         let p = write_file(dir.path(), "target/debug/foo", b"x");
-        let filter = WorkspaceFilter::new(dir.path());
+        let filter = default_filter(dir.path());
         assert_eq!(
             filter.check(&p),
             FilterDecision::Skip(SkipReason::Hardcoded)
@@ -215,7 +313,7 @@ mod tests {
     fn skips_node_modules() {
         let dir = make_root();
         let p = write_file(dir.path(), "node_modules/foo/index.js", b"x");
-        let filter = WorkspaceFilter::new(dir.path());
+        let filter = default_filter(dir.path());
         assert_eq!(
             filter.check(&p),
             FilterDecision::Skip(SkipReason::Hardcoded)
@@ -225,7 +323,7 @@ mod tests {
     #[test]
     fn skips_swp_and_tmp_and_ds_store() {
         let dir = make_root();
-        let filter = WorkspaceFilter::new(dir.path());
+        let filter = default_filter(dir.path());
         for rel in ["foo.swp", "foo.tmp", "sub/.DS_Store"] {
             let p = write_file(dir.path(), rel, b"x");
             assert_eq!(
@@ -242,7 +340,7 @@ mod tests {
         // by default; without this skip, the watcher would loop on
         // its own redb / blobs writes.
         let dir = make_root();
-        let filter = WorkspaceFilter::new(dir.path());
+        let filter = default_filter(dir.path());
         for rel in [
             ".artel-fs/iroh.key",
             ".artel-fs/doc-id",
@@ -259,30 +357,196 @@ mod tests {
     }
 
     #[test]
-    fn respects_gitignore() {
+    fn default_excludes_dotfiles_at_any_depth() {
         let dir = make_root();
-        write_file(dir.path(), ".gitignore", b"build/\n*.log\n");
-        let p1 = write_file(dir.path(), "build/foo", b"x");
-        let p2 = write_file(dir.path(), "app.log", b"x");
-        let p3 = write_file(dir.path(), "src/main.rs", b"x");
-        let filter = WorkspaceFilter::new(dir.path());
-        assert_eq!(
-            filter.check(&p1),
-            FilterDecision::Skip(SkipReason::Gitignored),
-        );
-        assert_eq!(
-            filter.check(&p2),
-            FilterDecision::Skip(SkipReason::Gitignored),
-        );
-        assert_eq!(filter.check(&p3), FilterDecision::Include);
+        let filter = default_filter(dir.path());
+        for rel in [
+            ".env",
+            ".harness/log/peer.jsonl",
+            "sub/.hidden",
+            "sub/.state/db.sqlite",
+        ] {
+            let p = write_file(dir.path(), rel, b"x");
+            assert_eq!(
+                filter.check(&p),
+                FilterDecision::Skip(SkipReason::Excluded),
+                "{rel} should be excluded by the dotfile default",
+            );
+        }
+        // Non-hidden neighbours still sync.
+        let p = write_file(dir.path(), "sub/visible.txt", b"x");
+        assert_eq!(filter.check(&p), FilterDecision::Include);
     }
 
     #[test]
-    fn gitignore_file_itself_is_synced() {
+    fn empty_exclude_list_syncs_dotfiles() {
+        // `Some(vec![])` = replace the default with nothing: sync
+        // everything, dotfiles included.
         let dir = make_root();
-        let p = write_file(dir.path(), ".gitignore", b"*.log\n");
-        let filter = WorkspaceFilter::new(dir.path());
-        assert_eq!(filter.check(&p), FilterDecision::Include);
+        let filter = sync_everything_filter(dir.path());
+        for rel in [".env", ".harness/log/peer.jsonl", "sub/.hidden"] {
+            let p = write_file(dir.path(), rel, b"x");
+            assert_eq!(
+                filter.check(&p),
+                FilterDecision::Include,
+                "{rel} should sync under an empty exclude list",
+            );
+        }
+    }
+
+    #[test]
+    fn custom_exclude_replaces_default_not_merges() {
+        // An explicit list is exactly that list: `*.secret` is
+        // excluded, but dotfiles (the replaced default) now sync.
+        let dir = make_root();
+        let exclude =
+            ExcludeRules::compile(Some(&["**/*.secret".to_string(), "*.secret".to_string()]))
+                .unwrap();
+        let filter = WorkspaceFilter::new(dir.path(), exclude);
+
+        let p = write_file(dir.path(), "api.secret", b"x");
+        assert_eq!(filter.check(&p), FilterDecision::Skip(SkipReason::Excluded));
+        let p = write_file(dir.path(), "sub/deep.secret", b"x");
+        assert_eq!(filter.check(&p), FilterDecision::Skip(SkipReason::Excluded));
+
+        let p = write_file(dir.path(), ".env", b"x");
+        assert_eq!(
+            filter.check(&p),
+            FilterDecision::Include,
+            "dotfiles sync once the default list is replaced",
+        );
+    }
+
+    #[test]
+    fn exclude_does_not_override_hardcoded_skips() {
+        // Even a sync-everything exclude can't resurrect the
+        // substrate's self-protection skips.
+        let dir = make_root();
+        let filter = sync_everything_filter(dir.path());
+        for rel in [".git/HEAD", ".artel-fs/iroh.key", "target/debug/foo"] {
+            let p = write_file(dir.path(), rel, b"x");
+            assert_eq!(
+                filter.check(&p),
+                FilterDecision::Skip(SkipReason::Hardcoded),
+                "{rel} must stay hardcoded-skipped regardless of exclude config",
+            );
+        }
+    }
+
+    #[test]
+    fn exclude_does_not_override_size_cap() {
+        let dir = make_root();
+        let big = vec![0u8; (MAX_FILE_SIZE as usize) + 1];
+        let p = write_file(dir.path(), "big.bin", &big);
+        let filter = sync_everything_filter(dir.path());
+        assert!(matches!(
+            filter.check(&p),
+            FilterDecision::Skip(SkipReason::TooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn gitignore_is_not_consulted_and_is_itself_just_a_dotfile() {
+        // Regression test for the silent-sync-death bug: a
+        // `.gitignore` listing a path must NOT stop that path from
+        // syncing. And the `.gitignore` file itself gets no special
+        // treatment any more — it's a dotfile, excluded by the
+        // default, synced under an explicit empty list.
+        let dir = make_root();
+        write_file(dir.path(), ".gitignore", b"build/\n*.log\n.state/\n");
+        let ignored_by_git = [
+            write_file(dir.path(), "build/foo", b"x"),
+            write_file(dir.path(), "app.log", b"x"),
+            write_file(dir.path(), "state-adjacent.log", b"x"),
+        ];
+
+        let filter = default_filter(dir.path());
+        for p in &ignored_by_git {
+            assert_eq!(
+                filter.check(p),
+                FilterDecision::Include,
+                "{} is gitignored but must sync anyway",
+                p.display(),
+            );
+        }
+        assert_eq!(
+            filter.check(&dir.path().join(".gitignore")),
+            FilterDecision::Skip(SkipReason::Excluded),
+            ".gitignore is an ordinary dotfile under the default",
+        );
+
+        let filter = sync_everything_filter(dir.path());
+        assert_eq!(
+            filter.check(&dir.path().join(".gitignore")),
+            FilterDecision::Include,
+            ".gitignore syncs like any other file under an empty exclude list",
+        );
+    }
+
+    #[test]
+    fn compile_rejects_malformed_globs() {
+        // Empty, absolute, parent-traversal, and glob-syntax errors
+        // (unclosed bracket / alternation) — same validation as
+        // PathRules globs.
+        for bad in ["", "/abs/**", "../up/**", "a/../b/**", "[unclosed", "{a,b"] {
+            assert!(
+                ExcludeRules::compile(Some(&[bad.to_string()])).is_err(),
+                "{bad:?} should be rejected",
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dotfile_default_catches_non_utf8_hidden_names() {
+        // A hidden component whose bytes aren't valid UTF-8 must
+        // still be excluded — the check reads the leading OS byte,
+        // not a lossy `to_str`.
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let hidden = Path::new(OsStr::from_bytes(b".caf\xe9/data.txt"));
+        assert!(ExcludeRules::Dotfiles.matches(hidden));
+        let visible = Path::new(OsStr::from_bytes(b"caf\xe9/.hidden"));
+        assert!(ExcludeRules::Dotfiles.matches(visible));
+        let clean = Path::new(OsStr::from_bytes(b"caf\xe9/data.txt"));
+        assert!(!ExcludeRules::Dotfiles.matches(clean));
+    }
+
+    #[test]
+    fn dot_in_middle_of_name_is_not_hidden() {
+        // Only a LEADING dot marks a component hidden.
+        for rel in ["foo.bar", "a/foo.d/b.txt", "v1.2.3/notes.md"] {
+            assert!(
+                !ExcludeRules::Dotfiles.matches(Path::new(rel)),
+                "{rel} must not be treated as hidden",
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_refused_even_under_empty_exclude() {
+        // Layer 2 (symlink) precedes layer 3 (exclude): a
+        // sync-everything exclude cannot resurrect symlinks.
+        let dir = make_root();
+        let target = write_file(dir.path(), "real.txt", b"x");
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let filter = sync_everything_filter(dir.path());
+        assert_eq!(
+            filter.check(&link),
+            FilterDecision::Skip(SkipReason::Symlink)
+        );
+    }
+
+    #[test]
+    fn glob_exclude_ignores_paths_outside_workspace() {
+        // Parent-traversal / absolute paths match no glob — defensive
+        // fall-through mirroring PathRules.
+        let exclude = ExcludeRules::compile(Some(&["etc/**".to_string()])).unwrap();
+        assert!(!exclude.matches(Path::new("../etc/passwd")));
+        assert!(!exclude.matches(Path::new("/etc/passwd")));
+        assert!(exclude.matches(Path::new("etc/passwd")));
     }
 
     #[test]
@@ -290,7 +554,7 @@ mod tests {
         let dir = make_root();
         let big = vec![0u8; (MAX_FILE_SIZE as usize) + 1];
         let p = write_file(dir.path(), "big.bin", &big);
-        let filter = WorkspaceFilter::new(dir.path());
+        let filter = default_filter(dir.path());
         match filter.check(&p) {
             FilterDecision::Skip(SkipReason::TooLarge { size }) => {
                 assert_eq!(size as usize, big.len());
@@ -304,7 +568,7 @@ mod tests {
         let dir = make_root();
         let exactly = vec![0u8; MAX_FILE_SIZE as usize];
         let p = write_file(dir.path(), "edge.bin", &exactly);
-        let filter = WorkspaceFilter::new(dir.path());
+        let filter = default_filter(dir.path());
         assert_eq!(filter.check(&p), FilterDecision::Include);
     }
 
@@ -315,7 +579,7 @@ mod tests {
         let target = write_file(dir.path(), "real.txt", b"x");
         let link = dir.path().join("link.txt");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        let filter = WorkspaceFilter::new(dir.path());
+        let filter = default_filter(dir.path());
         assert_eq!(
             filter.check(&link),
             FilterDecision::Skip(SkipReason::Symlink)

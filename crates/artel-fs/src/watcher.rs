@@ -119,7 +119,7 @@ pub(crate) async fn run(workspace: Arc<Workspace>, ready: oneshot::Sender<()>) {
     // — fine to ignore.
     let _ = ready.send(());
 
-    let filter = WorkspaceFilter::new(&workspace.root);
+    let filter = WorkspaceFilter::new(&workspace.root, workspace.exclude.clone());
     // A clone shares the workspace guard's state (Arc-backed), so we
     // observe everything the applier's clone marks.
     let guard = workspace.echo_guard.clone();
@@ -142,7 +142,7 @@ pub(crate) async fn run(workspace: Arc<Workspace>, ready: oneshot::Sender<()>) {
                         on_modified(&workspace, &filter, &guard, path).await;
                     }
                     Some(LocalChange::Removed(path)) => {
-                        on_removed(&workspace, &guard, path).await;
+                        on_removed(&workspace, &filter, &guard, path).await;
                     }
                     None => {
                         debug!(target: "artel_fs::watcher", "notify channel closed, exiting watcher loop");
@@ -176,6 +176,17 @@ async fn on_modified(
                 WorkspaceEvent::SkippedTooLarge {
                     path: path.clone(),
                     size,
+                },
+            );
+            return;
+        }
+        FilterDecision::Skip(SkipReason::Excluded) => {
+            debug!(target: "artel_fs::watcher", path = %path.display(), "filter: skip excluded");
+            emit_event(
+                &workspace.events,
+                WorkspaceEvent::SkippedExcluded {
+                    path: path.clone(),
+                    direction: Direction::Outgoing,
                 },
             );
             return;
@@ -234,7 +245,7 @@ async fn on_modified(
             // `Remove`, and `on_removed` would handle it before we
             // got here.
             debug!(target: "artel_fs::watcher", path = %path.display(), "read NotFound -> tombstone");
-            on_removed(workspace, guard, path).await;
+            on_removed(workspace, filter, guard, path).await;
             return;
         }
         // Other read errors (permission, transient I/O) — drop
@@ -295,7 +306,7 @@ async fn on_modified(
 /// [`on_modified`]): a file that landed before notify's watch
 /// backfill produces no event of its own, so the directory's event
 /// is the only signal it exists. Walking is bounded by the workspace
-/// filter at each file (hardcoded skips, gitignore, size cap), and
+/// filter at each file (hardcoded skips, exclude rules, size cap), and
 /// the echo guard's last-published hash turns the common "file's own
 /// event already published it" case into a no-op.
 async fn rescan_dir(
@@ -321,7 +332,12 @@ async fn rescan_dir(
     debug!(target: "artel_fs::watcher", dir = %dir.display(), files, "rescan_dir complete");
 }
 
-async fn on_removed(workspace: &Arc<Workspace>, guard: &EchoGuard, path: PathBuf) {
+async fn on_removed(
+    workspace: &Arc<Workspace>,
+    filter: &WorkspaceFilter,
+    guard: &EchoGuard,
+    path: PathBuf,
+) {
     debug!(target: "artel_fs::watcher", path = %path.display(), "on_removed entered");
     // Echo check: is this unlink the filesystem shadow of a tombstone
     // our applier just applied? Publishing it would re-tombstone the
@@ -335,15 +351,44 @@ async fn on_removed(workspace: &Arc<Workspace>, guard: &EchoGuard, path: PathBuf
     // A genuine local delete. The file is gone, so its last-published
     // hash must go with it — a later re-creation with identical bytes
     // would otherwise be swallowed as an echo (see EchoGuard::forget).
-    // Before the write-halt / ReadOnly gates on purpose: those
-    // suppress the *tombstone publish*, but the local state fact
-    // "this path no longer exists" holds regardless.
+    // Before the write-halt / ReadOnly / filter gates on purpose:
+    // those suppress the *tombstone publish*, but the local state
+    // fact "this path no longer exists" holds regardless.
     guard.forget(&path).await;
     // Cooperative demotion: a downgraded node stops propagating its
     // own deletes too (voluntary write-stop).
     if workspace.is_write_halted() {
         debug!(target: "artel_fs::watcher", path = %path.display(), "write-halted: skip delete");
         return;
+    }
+    // Filter gate, mirroring `on_modified`: a path this node's filter
+    // refuses to publish must not have its *deletion* published
+    // either. Without this, deleting a locally-excluded path would
+    // tombstone a peer-published entry for the same key (asymmetric
+    // exclude lists across peers) — an outbound write-path leak
+    // through the delete side. On macOS, deletes often arrive via
+    // `on_modified`'s NotFound fallthrough, which has already run
+    // this check; on Linux, `Remove` events land here directly, so
+    // the gate must live here too. The symlink/size layers stat the
+    // (now-gone) path and pass — only the pure path-shape layers
+    // (hardcoded, excluded) can and should gate a removal.
+    match filter.check(&path) {
+        FilterDecision::Skip(SkipReason::Excluded) => {
+            debug!(target: "artel_fs::watcher", path = %path.display(), "filter: skip excluded tombstone");
+            emit_event(
+                &workspace.events,
+                WorkspaceEvent::SkippedExcluded {
+                    path,
+                    direction: Direction::Outgoing,
+                },
+            );
+            return;
+        }
+        FilterDecision::Skip(reason) => {
+            debug!(target: "artel_fs::watcher", path = %path.display(), reason = ?reason, "filter: skip tombstone");
+            return;
+        }
+        FilterDecision::Include => {}
     }
     // Belt-and-braces with `on_modified`: on macOS, FSEvents reports
     // post-unlink as `Modify(Metadata)` and `on_modified` already

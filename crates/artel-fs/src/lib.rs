@@ -53,7 +53,7 @@ pub use artel_iroh_setup::EndpointSetup;
 pub use artel_iroh_setup::TEST_DNS_ORIGIN;
 pub use echo_guard::EchoGuard;
 pub use error::{PolicyViolation, WorkspaceError};
-pub use filter::{FilterDecision, MAX_FILE_SIZE, SkipReason, WorkspaceFilter};
+pub use filter::{ExcludeRules, FilterDecision, MAX_FILE_SIZE, SkipReason, WorkspaceFilter};
 pub use keys::{KEY_PREFIX, key_to_path, path_to_key};
 pub use rules::{CompiledPathRules, Mode, PathRule, PathRules, PathRulesError};
 pub use session_id::session_id_for;

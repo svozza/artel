@@ -1460,3 +1460,471 @@ async fn bulk_export_filter_check_gates_tombstone_for_hardcoded_skip() {
     daemon_a.stop().await;
     daemon_b.stop().await;
 }
+
+// =============================================================
+// Sync exclusions (`WorkspaceConfig::exclude`) on the wire — issue
+// #34. The gitignore layer is gone: a `.gitignore` listing a synced
+// path must not stop it from syncing. The replacement is a local,
+// consumer-owned exclude list defaulting to dotfiles, with every
+// exclusion surfaced as `SkippedExcluded` (never silently).
+// =============================================================
+
+/// Host + joiner with per-side `WorkspaceConfig::exclude` values.
+/// The caller pre-populates the host dir before calling, so the scan
+/// path is exercised; the joiner's event stream is drained, the
+/// host's is returned for assertions.
+struct ExcludePair {
+    alice_ws: Arc<Workspace>,
+    bob_ws: Arc<Workspace>,
+    alice_events: tokio::sync::mpsc::Receiver<WorkspaceEvent>,
+    alice: Client,
+    bob: Client,
+    alice_handle: tokio::task::JoinHandle<()>,
+    bob_handle: tokio::task::JoinHandle<()>,
+}
+
+impl ExcludePair {
+    async fn spawn(
+        daemon_a: &common::RunningDaemon,
+        daemon_b: &common::RunningDaemon,
+        dns_pkarr: &Arc<iroh::test_utils::DnsPkarrServer>,
+        alice_dir: &Path,
+        bob_dir: &Path,
+        host_exclude: Option<Vec<String>>,
+        join_exclude: Option<Vec<String>>,
+    ) -> Self {
+        let alice = Client::connect(&daemon_a.socket).await.unwrap();
+        let (alice_ws, alice_events) = Workspace::host_with(
+            &alice,
+            "alice",
+            alice_dir.to_path_buf(),
+            AttachPolicy::AllowExisting,
+            WorkspaceConfig::default()
+                .with_endpoint_setup(testing_setup(dns_pkarr))
+                .with_daemon_socket(daemon_a.socket.clone())
+                .with_exclude(host_exclude),
+        )
+        .await
+        .expect("Workspace::host_with");
+        let session = alice_ws.session_id();
+        let ticket = alice_ws
+            .join_ticket()
+            .expect("host has join_ticket")
+            .clone();
+        let alice_ws = Arc::new(alice_ws);
+        let alice_handle = Arc::clone(&alice_ws).run().await;
+
+        let bob = Client::connect(&daemon_b.socket).await.unwrap();
+        let resp = bob
+            .request(Request::JoinSession {
+                display_name: "bob".into(),
+                ticket,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(resp, Response::JoinSession { .. }), "{resp:?}");
+
+        let (bob_ws, bob_events) = Workspace::join_with(
+            &bob,
+            session,
+            bob_dir.to_path_buf(),
+            AttachPolicy::RequireEmpty,
+            WorkspaceConfig::default()
+                .with_endpoint_setup(testing_setup(dns_pkarr))
+                .with_daemon_socket(daemon_b.socket.clone())
+                .with_exclude(join_exclude),
+        )
+        .await
+        .expect("Workspace::join_with");
+        common::drain_ws_events(bob_events);
+        let bob_ws = Arc::new(bob_ws);
+        let bob_handle = Arc::clone(&bob_ws).run().await;
+
+        Self {
+            alice_ws,
+            bob_ws,
+            alice_events,
+            alice,
+            bob,
+            alice_handle,
+            bob_handle,
+        }
+    }
+
+    async fn teardown(self) {
+        self.alice_ws.shutdown().await.expect("shutdown");
+        self.bob_ws.shutdown().await.expect("shutdown");
+        let _ = timeout(Duration::from_secs(5), self.alice_handle).await;
+        let _ = timeout(Duration::from_secs(5), self.bob_handle).await;
+        drop(self.alice);
+        drop(self.bob);
+    }
+}
+
+/// Regression test for issue #34: a workspace-root `.gitignore`
+/// listing a synced path must have NO effect on sync. Pre-fix, the
+/// filter honoured it and `state/log.jsonl` never left the host —
+/// silently.
+#[tokio::test(flavor = "multi_thread")]
+async fn gitignored_path_syncs_anyway() {
+    let Pair {
+        daemon_a,
+        daemon_b,
+        dns_pkarr,
+    } = spawn_pair().await;
+
+    let alice_dir = tempfile::tempdir().unwrap();
+    // The trap from the bug report: the app's state dir is
+    // gitignored (the normal thing for a user to do). Also exercise
+    // scan (pre-existing file) and watcher (live write) paths.
+    tokio::fs::write(alice_dir.path().join(".gitignore"), b"state/\n*.log\n")
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(alice_dir.path().join("state"))
+        .await
+        .unwrap();
+    tokio::fs::write(alice_dir.path().join("state/log.jsonl"), b"preseed")
+        .await
+        .unwrap();
+
+    let bob_dir = tempfile::tempdir().unwrap();
+    let pair = ExcludePair::spawn(
+        &daemon_a,
+        &daemon_b,
+        &dns_pkarr,
+        alice_dir.path(),
+        bob_dir.path(),
+        None,
+        None,
+    )
+    .await;
+
+    // Scan path: the gitignored pre-seed reaches Bob.
+    wait_for_file(&bob_dir.path().join("state/log.jsonl"), b"preseed").await;
+
+    // Watcher path: a live gitignored write propagates too.
+    tokio::fs::write(alice_dir.path().join("app.log"), b"live")
+        .await
+        .unwrap();
+    wait_for_file(&bob_dir.path().join("app.log"), b"live").await;
+
+    pair.teardown().await;
+    daemon_a.stop().await;
+    daemon_b.stop().await;
+}
+
+/// The default exclude (dotfiles) blocks a hidden subtree on the
+/// watcher path AND surfaces it as `SkippedExcluded { Outgoing }` —
+/// the skip must be observable, not a debug-log whisper.
+#[tokio::test(flavor = "multi_thread")]
+async fn default_exclude_blocks_dotfiles_and_emits_event() {
+    let Pair {
+        daemon_a,
+        daemon_b,
+        dns_pkarr,
+    } = spawn_pair().await;
+
+    let alice_dir = tempfile::tempdir().unwrap();
+    let bob_dir = tempfile::tempdir().unwrap();
+    let mut pair = ExcludePair::spawn(
+        &daemon_a,
+        &daemon_b,
+        &dns_pkarr,
+        alice_dir.path(),
+        bob_dir.path(),
+        None,
+        None,
+    )
+    .await;
+
+    // Live write into a hidden subtree: watcher must skip + emit.
+    tokio::fs::create_dir_all(alice_dir.path().join(".state/log"))
+        .await
+        .unwrap();
+    tokio::fs::write(alice_dir.path().join(".state/log/peer.jsonl"), b"nope")
+        .await
+        .unwrap();
+
+    // The watcher may emit `SkippedExcluded` for the `.state`
+    // directory itself (mkdir event) before the file's — wait for
+    // the file's specifically.
+    wait_for_event(
+        &mut pair.alice_events,
+        PROPAGATE_BUDGET,
+        "SkippedExcluded(Outgoing) for the hidden write",
+        |ev| {
+            matches!(
+                ev,
+                WorkspaceEvent::SkippedExcluded {
+                    direction: Direction::Outgoing,
+                    path,
+                } if path.ends_with(".state/log/peer.jsonl")
+            )
+        },
+    )
+    .await;
+
+    // Marker idiom: a visible write that lands on Bob proves the
+    // pipeline chewed past the hidden one — which must be absent.
+    tokio::fs::write(alice_dir.path().join("marker.txt"), b"go")
+        .await
+        .unwrap();
+    wait_for_file(&bob_dir.path().join("marker.txt"), b"go").await;
+    assert!(
+        !bob_dir.path().join(".state/log/peer.jsonl").exists(),
+        "hidden subtree must not reach the joiner under the default exclude",
+    );
+
+    pair.teardown().await;
+    daemon_a.stop().await;
+    daemon_b.stop().await;
+}
+
+/// An explicit exclude list REPLACES the dotfile default: a hidden
+/// state dir opted back in via a non-default list syncs end-to-end
+/// (the harness-style consumer pattern), while a listed glob still
+/// blocks.
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_exclude_replaces_default_and_hidden_dir_syncs() {
+    let Pair {
+        daemon_a,
+        daemon_b,
+        dns_pkarr,
+    } = spawn_pair().await;
+
+    let alice_dir = tempfile::tempdir().unwrap();
+    // Pre-seed a hidden state dir (scan path) — the app pattern from
+    // issue #34.
+    tokio::fs::create_dir_all(alice_dir.path().join(".harness/log"))
+        .await
+        .unwrap();
+    tokio::fs::write(alice_dir.path().join(".harness/log/peer.jsonl"), b"preseed")
+        .await
+        .unwrap();
+
+    let bob_dir = tempfile::tempdir().unwrap();
+    // Both sides opt out of the dotfile default but still exclude
+    // `*.secret` — proving replace-not-merge on the wire. The list is
+    // local per node, so BOTH sides pass it (the joiner's applier
+    // filters incoming entries by its own list).
+    let excl = || Some(vec!["**/*.secret".to_string(), "*.secret".to_string()]);
+    let pair = ExcludePair::spawn(
+        &daemon_a,
+        &daemon_b,
+        &dns_pkarr,
+        alice_dir.path(),
+        bob_dir.path(),
+        excl(),
+        excl(),
+    )
+    .await;
+
+    // Scan path: the hidden pre-seed reaches Bob.
+    wait_for_file(&bob_dir.path().join(".harness/log/peer.jsonl"), b"preseed").await;
+
+    // Watcher path: live hidden append propagates.
+    tokio::fs::write(alice_dir.path().join(".harness/log/live.jsonl"), b"live")
+        .await
+        .unwrap();
+    wait_for_file(&bob_dir.path().join(".harness/log/live.jsonl"), b"live").await;
+
+    // The explicit glob still blocks: `api.secret` never lands.
+    tokio::fs::write(alice_dir.path().join("api.secret"), b"hush")
+        .await
+        .unwrap();
+    tokio::fs::write(alice_dir.path().join("marker.txt"), b"go")
+        .await
+        .unwrap();
+    wait_for_file(&bob_dir.path().join("marker.txt"), b"go").await;
+    assert!(
+        !bob_dir.path().join("api.secret").exists(),
+        "explicitly-excluded glob must still block",
+    );
+
+    pair.teardown().await;
+    daemon_a.stop().await;
+    daemon_b.stop().await;
+}
+
+/// Deleting a locally-excluded path must not publish a tombstone —
+/// the delete-side twin of the exclude gate. With asymmetric lists,
+/// a permissive host publishes `.env`; the default-exclude joiner
+/// never applies it but has its own local `.env`. When the joiner
+/// deletes that local file, its watcher must NOT tombstone the key:
+/// the host's live entry would be destroyed by a peer whose own
+/// hygiene merely hides the path. (The hole was Linux-specific —
+/// direct `Remove` events reach `on_removed`, which pre-fix had no
+/// filter; macOS deletes ride `on_modified`'s already-gated `NotFound`
+/// fallthrough. CI on Linux is where this test bites.)
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_locally_excluded_path_does_not_tombstone_peer_entry() {
+    let Pair {
+        daemon_a,
+        daemon_b,
+        dns_pkarr,
+    } = spawn_pair().await;
+
+    let alice_dir = tempfile::tempdir().unwrap();
+    let bob_dir = tempfile::tempdir().unwrap();
+    // Host syncs everything; joiner keeps the dotfile default.
+    let pair = ExcludePair::spawn(
+        &daemon_a,
+        &daemon_b,
+        &dns_pkarr,
+        alice_dir.path(),
+        bob_dir.path(),
+        Some(vec![]),
+        None,
+    )
+    .await;
+
+    // Bob needs RW for his marker/delete writes to propagate at all.
+    common::grant_rw_and_wait(
+        &pair.alice,
+        pair.alice_ws.session_id(),
+        pair.bob.daemon_peer_id(),
+        bob_dir.path(),
+        alice_dir.path(),
+    )
+    .await;
+
+    // Alice publishes .env (her empty exclude list allows it) and a
+    // visible marker to gate on.
+    tokio::fs::write(alice_dir.path().join(".env"), b"SECRET=1")
+        .await
+        .unwrap();
+    tokio::fs::write(alice_dir.path().join("marker1.txt"), b"m1")
+        .await
+        .unwrap();
+    wait_for_file(&bob_dir.path().join("marker1.txt"), b"m1").await;
+
+    // Bob has his own local .env — never synced (his applier refused
+    // Alice's), purely local state.
+    tokio::fs::write(bob_dir.path().join(".env"), b"BOB_LOCAL=1")
+        .await
+        .unwrap();
+    sleep(Duration::from_millis(500)).await; // let the watcher chew (and skip) it
+    tokio::fs::remove_file(bob_dir.path().join(".env"))
+        .await
+        .unwrap();
+
+    // Second marker from Bob proves his watcher processed past the
+    // delete; then Alice's .env must still exist — no tombstone leaked.
+    tokio::fs::write(bob_dir.path().join("marker2.txt"), b"m2")
+        .await
+        .unwrap();
+    wait_for_file(&alice_dir.path().join("marker2.txt"), b"m2").await;
+    sleep(Duration::from_millis(500)).await; // grace for a (buggy) tombstone to apply
+    let alice_env = tokio::fs::read(alice_dir.path().join(".env"))
+        .await
+        .expect("alice's .env must survive bob deleting his locally-excluded copy");
+    assert_eq!(alice_env, b"SECRET=1");
+
+    pair.teardown().await;
+    daemon_a.stop().await;
+    daemon_b.stop().await;
+}
+
+/// The joiner's own exclude list gates its applier (Incoming): a
+/// host with a permissive list publishes a dotfile, but a joiner on
+/// the default (dotfiles) refuses to apply it — and says so via
+/// `SkippedExcluded { Incoming }` on the joiner's stream. Asymmetric
+/// on purpose: the exclude list is local hygiene, not ticket-borne
+/// workspace policy.
+#[tokio::test(flavor = "multi_thread")]
+async fn joiner_exclude_gates_incoming_applies() {
+    let Pair {
+        daemon_a,
+        daemon_b,
+        dns_pkarr,
+    } = spawn_pair().await;
+
+    let alice_dir = tempfile::tempdir().unwrap();
+    let bob_dir = tempfile::tempdir().unwrap();
+    // Host syncs everything; joiner keeps the dotfile default. We
+    // need the JOINER's events here, so build this pair by hand
+    // rather than via ExcludePair (which drains bob's).
+    let alice = Client::connect(&daemon_a.socket).await.unwrap();
+    let (alice_ws, alice_events) = Workspace::host_with(
+        &alice,
+        "alice",
+        alice_dir.path().to_path_buf(),
+        AttachPolicy::AllowExisting,
+        WorkspaceConfig::default()
+            .with_endpoint_setup(testing_setup(&dns_pkarr))
+            .with_exclude(Some(vec![])),
+    )
+    .await
+    .expect("Workspace::host_with");
+    common::drain_ws_events(alice_events);
+    let session = alice_ws.session_id();
+    let ticket = alice_ws
+        .join_ticket()
+        .expect("host has join_ticket")
+        .clone();
+    let alice_ws = Arc::new(alice_ws);
+    let alice_handle = Arc::clone(&alice_ws).run().await;
+
+    let bob = Client::connect(&daemon_b.socket).await.unwrap();
+    let resp = bob
+        .request(Request::JoinSession {
+            display_name: "bob".into(),
+            ticket,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(resp, Response::JoinSession { .. }), "{resp:?}");
+
+    let (bob_ws, mut bob_events) = Workspace::join_with(
+        &bob,
+        session,
+        bob_dir.path().to_path_buf(),
+        AttachPolicy::RequireEmpty,
+        WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr)),
+    )
+    .await
+    .expect("Workspace::join_with");
+    let bob_ws = Arc::new(bob_ws);
+    let bob_handle = Arc::clone(&bob_ws).run().await;
+
+    // Host publishes a dotfile (its empty exclude list allows it).
+    tokio::fs::write(alice_dir.path().join(".env"), b"SECRET=1")
+        .await
+        .unwrap();
+
+    // Joiner's applier must refuse it — observably.
+    let ev = wait_for_event(
+        &mut bob_events,
+        PROPAGATE_BUDGET,
+        "SkippedExcluded(Incoming) on the joiner",
+        |ev| {
+            matches!(
+                ev,
+                WorkspaceEvent::SkippedExcluded {
+                    direction: Direction::Incoming,
+                    ..
+                }
+            )
+        },
+    )
+    .await;
+    match ev {
+        WorkspaceEvent::SkippedExcluded { path, .. } => {
+            assert!(path.ends_with(".env"), "{path:?}");
+        }
+        other => panic!("expected SkippedExcluded, got {other:?}"),
+    }
+    assert!(
+        !bob_dir.path().join(".env").exists(),
+        "joiner-side exclude must keep the dotfile off disk",
+    );
+
+    alice_ws.shutdown().await.expect("shutdown");
+    bob_ws.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), alice_handle).await;
+    let _ = timeout(Duration::from_secs(5), bob_handle).await;
+    drop(alice);
+    drop(bob);
+    daemon_a.stop().await;
+    daemon_b.stop().await;
+}

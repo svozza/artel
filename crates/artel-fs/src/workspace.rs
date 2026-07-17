@@ -45,7 +45,7 @@ use walkdir::WalkDir;
 
 use crate::echo_guard::{EchoGuard, PENDING_RELEASE_GRACE};
 use crate::error::{PolicyViolation, WorkspaceError};
-use crate::filter::{FilterDecision, SkipReason, WorkspaceFilter};
+use crate::filter::{ExcludeRules, FilterDecision, SkipReason, WorkspaceFilter};
 use crate::keys;
 use crate::node::WorkspaceNode;
 use crate::peer_map::PeerMap;
@@ -259,6 +259,32 @@ pub struct WorkspaceConfig {
     /// construction) but cannot observe revocations that happen
     /// after the workspace is up.
     pub daemon_socket: Option<PathBuf>,
+
+    /// Consumer-owned sync exclusions (filter layer 3).
+    ///
+    /// - `None` (default): hidden (dot-prefixed) files and
+    ///   directories don't sync — a filesystem convention, not a
+    ///   policy interpretation.
+    /// - `Some(globs)`: **exactly** that list, replace not merge.
+    ///   `Some(vec![])` syncs everything, dotfiles included. Globs
+    ///   use the same workspace-relative shape as [`PathRules`]
+    ///   globs and are validated identically.
+    ///
+    /// **Local to this node, not ticket-borne.** Unlike
+    /// [`Self::rules`], the exclude list does not travel to joiners
+    /// — it is each node's own hygiene, and nothing about it rides
+    /// the synced tree. A host and a joiner may run different
+    /// excludes; each filters both its outgoing publishes and its
+    /// incoming applies by its own list, and every such skip is
+    /// surfaced as [`WorkspaceEvent::SkippedExcluded`].
+    ///
+    /// An app with a **hidden state dir** (say a per-peer event log
+    /// under `<root>/.myapp/log/`) must opt back in or its subtree
+    /// won't sync: pass `Some(vec![])`, or restate the exclusions it
+    /// wants minus its own dir. Anything beyond this knob — secrets
+    /// scanning, `.gitignore` semantics — is consumer policy: read
+    /// the sources yourself and pass equivalent globs.
+    pub exclude: Option<Vec<String>>,
 }
 
 impl WorkspaceConfig {
@@ -303,6 +329,15 @@ impl WorkspaceConfig {
     #[must_use]
     pub fn with_daemon_socket(mut self, path: PathBuf) -> Self {
         self.daemon_socket = Some(path);
+        self
+    }
+
+    /// Set the sync-exclusion globs. `Some(vec![])` syncs everything
+    /// (dotfiles included); an explicit list **replaces** the dotfile
+    /// default. See [`Self::exclude`].
+    #[must_use]
+    pub fn with_exclude(mut self, exclude: Option<Vec<String>>) -> Self {
+        self.exclude = exclude;
         self
     }
 
@@ -367,6 +402,23 @@ pub enum WorkspaceEvent {
     /// noisy (e.g. for a `target/**: ReadOnly` rule with chatty
     /// editor saves) should dedupe themselves.
     SkippedReadOnly {
+        /// Absolute path under the workspace root that was skipped.
+        path: PathBuf,
+        /// Whether the skip happened on the publish side (`Outgoing`)
+        /// or the apply side (`Incoming`).
+        direction: Direction,
+    },
+    /// A path-event was skipped because the path matched this node's
+    /// sync exclusions ([`WorkspaceConfig::exclude`] — the dotfile
+    /// default or an explicit glob list).
+    ///
+    /// Advisory, one event per skipped path-event, both directions.
+    /// A workspace scan over a tree with many hidden files emits many
+    /// of these; treat them as noise, not errors. Exists so an
+    /// excluded path never vanishes *silently* — an app whose state
+    /// dir isn't syncing finds the answer on this stream instead of
+    /// in a debug log.
+    SkippedExcluded {
         /// Absolute path under the workspace root that was skipped.
         path: PathBuf,
         /// Whether the skip happened on the publish side (`Outgoing`)
@@ -543,6 +595,11 @@ pub struct Workspace {
     /// Precompiled rules; built once from `rules` at construction
     /// and read per event. See [`Self::rules`].
     pub(crate) compiled_rules: CompiledPathRules,
+    /// Compiled sync exclusions (filter layer 3), built once from
+    /// [`WorkspaceConfig::exclude`] at construction. Local to this
+    /// node — never ticket-borne. Cloned into the watcher's and
+    /// applier's [`WorkspaceFilter`]s.
+    pub(crate) exclude: ExcludeRules,
     /// The workspace's state directory (holds `iroh.key`, `doc-id`,
     /// `current-namespace`, the docs/blobs stores). Retained so
     /// namespace rotation can persist the new `current-namespace`.
@@ -716,6 +773,9 @@ impl Workspace {
         // set is rejected as a configuration error, not a runtime one.
         let rules = config.rules.unwrap_or_else(PathRules::read_write);
         let compiled_rules = rules.compile()?;
+        // Same treatment for the exclude globs: reject a malformed
+        // list as a configuration error before any state is created.
+        let exclude = ExcludeRules::compile(config.exclude.as_deref())?;
 
         ensure_state_dir(&state_dir)?;
         // Canonicalise after ensure_state_dir so the attachment payload
@@ -737,6 +797,7 @@ impl Workspace {
             state_dir,
             rules,
             compiled_rules,
+            exclude,
             &config.endpoint_setup,
             config.daemon_socket.as_deref(),
             &mut rb,
@@ -762,6 +823,7 @@ impl Workspace {
         state_dir: PathBuf,
         rules: PathRules,
         compiled_rules: CompiledPathRules,
+        exclude: ExcludeRules,
         endpoint_setup: &EndpointSetup,
         daemon_socket: Option<&Path>,
         rb: &mut WorkspaceRollback,
@@ -877,14 +939,23 @@ impl Workspace {
         // legitimate entries laid down by the scan.
         if returning {
             debug!(target: "artel_fs::workspace", root = %root.display(), "host_with: reconciling doc against disk");
-            reconcile_doc_against_disk(&root, &doc, author, &tx).await?;
+            reconcile_doc_against_disk(&root, &doc, author, &exclude, &tx).await?;
         }
 
         // Pre-populate the doc from disk *before* we share the
         // ticket — joiners that import after this scan see the
         // current snapshot via initial sync.
         debug!(target: "artel_fs::workspace", root = %root.display(), "host_with: scan_and_publish_existing");
-        scan_and_publish_existing(&root, &doc, author, &compiled_rules, &echo_guard, &tx).await?;
+        scan_and_publish_existing(
+            &root,
+            &doc,
+            author,
+            &compiled_rules,
+            &exclude,
+            &echo_guard,
+            &tx,
+        )
+        .await?;
 
         // Share with full addressing info (relay URL + direct
         // addrs) so the ticket carries everything a joiner needs
@@ -1030,6 +1101,7 @@ impl Workspace {
                 node: tokio::sync::Mutex::new(Some(node)),
                 rules,
                 compiled_rules,
+                exclude,
                 state_dir,
                 session_id,
                 join_ticket: Some(join_ticket),
@@ -1128,6 +1200,13 @@ impl Workspace {
         // and zero IPC state.
         enforce_attach_policy(&root, &state_dir, policy, AttachSide::Join)?;
 
+        // Compile the exclude globs up front — a malformed list is a
+        // configuration error, rejected before any state is created.
+        // Unlike `rules` (host-authoritative, ticket-borne), the
+        // exclude list is honoured on the joiner: it is local node
+        // hygiene, not workspace policy.
+        let exclude = ExcludeRules::compile(config.exclude.as_deref())?;
+
         ensure_state_dir(&state_dir)?;
         // Canonicalise — see host_with for the same reasoning. The
         // attachment payload + iroh node + every later use of
@@ -1145,6 +1224,7 @@ impl Workspace {
             session,
             root,
             state_dir,
+            exclude,
             config.join_ticket_timeout,
             &config.endpoint_setup,
             config.daemon_socket.as_deref(),
@@ -1168,6 +1248,7 @@ impl Workspace {
         session: SessionId,
         root: PathBuf,
         state_dir: PathBuf,
+        exclude: ExcludeRules,
         join_ticket_timeout: Option<Duration>,
         endpoint_setup: &EndpointSetup,
         join_daemon_socket: Option<&Path>,
@@ -1267,7 +1348,16 @@ impl Workspace {
 
         let echo_guard = EchoGuard::new();
 
-        bulk_export(&root, &doc, &node.blobs, &compiled_rules, &echo_guard, &tx).await?;
+        bulk_export(
+            &root,
+            &doc,
+            &node.blobs,
+            &compiled_rules,
+            &exclude,
+            &echo_guard,
+            &tx,
+        )
+        .await?;
 
         // Spawn the cap-listener on its own dedicated connection so it
         // owns the `Client` it drains — required for M3 recovery, which
@@ -1343,6 +1433,7 @@ impl Workspace {
                 node: tokio::sync::Mutex::new(Some(node)),
                 rules,
                 compiled_rules,
+                exclude,
                 state_dir,
                 session_id: session,
                 join_ticket: None,
@@ -1855,6 +1946,7 @@ impl Workspace {
                 &scan_doc,
                 self.author,
                 &self.compiled_rules,
+                &self.exclude,
                 &self.echo_guard,
                 &self.events,
             )
@@ -2548,10 +2640,11 @@ async fn scan_and_publish_existing(
     doc: &Doc,
     author: AuthorId,
     rules: &CompiledPathRules,
+    exclude: &ExcludeRules,
     echo_guard: &EchoGuard,
     events: &mpsc::Sender<WorkspaceEvent>,
 ) -> Result<(), WorkspaceError> {
-    let filter = WorkspaceFilter::new(root);
+    let filter = WorkspaceFilter::new(root, exclude.clone());
     let mut published = 0usize;
     let mut skipped = 0usize;
     for entry in WalkDir::new(root).follow_links(false).into_iter().flatten() {
@@ -2559,14 +2652,33 @@ async fn scan_and_publish_existing(
             continue;
         }
         let path = entry.path();
+        // Advisory skips use `emit_event` (try_send, drop-on-full),
+        // NOT a blocking `send`: this scan runs inside the
+        // constructor, before the caller ever receives the event
+        // receiver, so nothing is draining yet. A blocking send here
+        // deadlocks construction as soon as the walk produces more
+        // than EVENT_BUFFER skips — trivial under the dotfile default
+        // (any `.venv/`-sized hidden tree).
         match filter.check(path) {
             FilterDecision::Skip(SkipReason::TooLarge { size }) => {
-                let _ = events
-                    .send(WorkspaceEvent::SkippedTooLarge {
+                emit_event(
+                    events,
+                    WorkspaceEvent::SkippedTooLarge {
                         path: path.to_path_buf(),
                         size,
-                    })
-                    .await;
+                    },
+                );
+                continue;
+            }
+            FilterDecision::Skip(SkipReason::Excluded) => {
+                skipped += 1;
+                emit_event(
+                    events,
+                    WorkspaceEvent::SkippedExcluded {
+                        path: path.to_path_buf(),
+                        direction: Direction::Outgoing,
+                    },
+                );
                 continue;
             }
             FilterDecision::Skip(_) => {
@@ -2579,12 +2691,13 @@ async fn scan_and_publish_existing(
         let rel = path.strip_prefix(root).unwrap_or(path);
         if rules.mode_for(rel) == Mode::ReadOnly {
             skipped += 1;
-            let _ = events
-                .send(WorkspaceEvent::SkippedReadOnly {
+            emit_event(
+                events,
+                WorkspaceEvent::SkippedReadOnly {
                     path: path.to_path_buf(),
                     direction: Direction::Outgoing,
-                })
-                .await;
+                },
+            );
             continue;
         }
 
@@ -3034,6 +3147,7 @@ async fn bulk_export(
     doc: &Doc,
     blobs: &iroh_blobs::BlobsProtocol,
     rules: &CompiledPathRules,
+    exclude: &ExcludeRules,
     echo_guard: &EchoGuard,
     events: &mpsc::Sender<WorkspaceEvent>,
 ) -> Result<(), WorkspaceError> {
@@ -3046,7 +3160,7 @@ async fn bulk_export(
         .await
         .map_err(|e| WorkspaceError::Doc(format!("get_many: {e}")))?;
     tokio::pin!(stream);
-    let filter = WorkspaceFilter::new(root);
+    let filter = WorkspaceFilter::new(root, exclude.clone());
 
     while let Some(res) = stream.next().await {
         let Ok(entry) = res else { continue };
@@ -3064,7 +3178,7 @@ async fn bulk_export(
         // Filter + rules sit ABOVE the tombstone branch on both
         // sides (here and in `applier::handle_entry`). A
         // peer-published tombstone whose key resolves to a path the
-        // local filter rejects — asymmetric ignore globs across
+        // local filter rejects — asymmetric exclude lists across
         // peers, version drift, an attacker-crafted key targeting a
         // hardcoded-skip path like `.git/HEAD` — would otherwise
         // reach `tokio::fs::remove_file` regardless. The `ReadOnly`
@@ -3072,29 +3186,51 @@ async fn bulk_export(
         // incoming tombstone must not trigger `remove_file`, and a
         // `ReadOnly` path's incoming write must not be applied
         // even if the filter would have let it through.
-        let rel = path.strip_prefix(root).unwrap_or(&path);
-        if rules.mode_for(rel) == Mode::ReadOnly {
-            let _ = events
-                .send(WorkspaceEvent::SkippedReadOnly {
-                    path,
-                    direction: Direction::Incoming,
-                })
-                .await;
-            continue;
-        }
-
+        // Advisory skips use `emit_event` (try_send, drop-on-full),
+        // NOT a blocking `send`: bulk_export runs inside `join_with`,
+        // before the caller ever receives the event receiver, so
+        // nothing is draining yet — a blocking send deadlocks the
+        // constructor once skips exceed EVENT_BUFFER (trivial under
+        // the dotfile default against a doc with a large hidden tree).
+        //
+        // Filter BEFORE rules, matching the watcher/scan outgoing
+        // order, so a path that is both excluded and `ReadOnly`
+        // reports the same skip reason in both directions.
         match filter.check(&path) {
             FilterDecision::Skip(SkipReason::TooLarge { size }) => {
-                let _ = events
-                    .send(WorkspaceEvent::SkippedTooLarge {
+                emit_event(
+                    events,
+                    WorkspaceEvent::SkippedTooLarge {
                         path: path.clone(),
                         size,
-                    })
-                    .await;
+                    },
+                );
+                continue;
+            }
+            FilterDecision::Skip(SkipReason::Excluded) => {
+                emit_event(
+                    events,
+                    WorkspaceEvent::SkippedExcluded {
+                        path,
+                        direction: Direction::Incoming,
+                    },
+                );
                 continue;
             }
             FilterDecision::Skip(_) => continue,
             FilterDecision::Include => {}
+        }
+
+        let rel = path.strip_prefix(root).unwrap_or(&path);
+        if rules.mode_for(rel) == Mode::ReadOnly {
+            emit_event(
+                events,
+                WorkspaceEvent::SkippedReadOnly {
+                    path,
+                    direction: Direction::Incoming,
+                },
+            );
+            continue;
         }
 
         if entry.content_len() == 0 {
@@ -3533,6 +3669,7 @@ async fn reconcile_doc_against_disk(
     root: &Path,
     doc: &Doc,
     author: AuthorId,
+    exclude: &ExcludeRules,
     events: &mpsc::Sender<WorkspaceEvent>,
 ) -> Result<(), WorkspaceError> {
     // One entry per key — we only need to know the *latest* state of
@@ -3544,6 +3681,7 @@ async fn reconcile_doc_against_disk(
         .map_err(|e| WorkspaceError::Doc(format!("reconcile get_many: {e}")))?;
     tokio::pin!(stream);
 
+    let filter = WorkspaceFilter::new(root, exclude.clone());
     let mut scanned = 0usize;
     let mut tombstoned = 0usize;
     while let Some(res) = stream.next().await {
@@ -3563,14 +3701,24 @@ async fn reconcile_doc_against_disk(
                     %err,
                     "reconcile: invalid key"
                 );
-                let _ = events
-                    .send(WorkspaceEvent::Error(format!(
-                        "reconcile invalid key: {err}"
-                    )))
-                    .await;
+                emit_event(
+                    events,
+                    WorkspaceEvent::Error(format!("reconcile invalid key: {err}")),
+                );
                 continue;
             }
         };
+        // A path this node's filter refuses is expected to be absent
+        // from disk — it was never applied here. Tombstoning it would
+        // destroy a peer's live entry just because our local hygiene
+        // hides it (e.g. a returning host whose exclude list covers a
+        // dotfile another peer legitimately publishes). "Missing from
+        // disk" is only evidence of deletion for paths this node
+        // actually mirrors. No event: nothing was skipped that this
+        // node would ever have synced.
+        if !matches!(filter.check(&path), FilterDecision::Include) {
+            continue;
+        }
         if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
             debug!(target: "artel_fs::workspace", path = %path.display(), "reconcile: tombstoning entry not on disk");
             // `Doc::del` writes a tombstone for `prefix`. The key
@@ -3578,12 +3726,13 @@ async fn reconcile_doc_against_disk(
             // entry.
             if let Err(err) = doc.del(author, entry.key().to_vec()).await {
                 warn!(target: "artel_fs::workspace", path = %path.display(), %err, "reconcile: tombstone failed");
-                let _ = events
-                    .send(WorkspaceEvent::Error(format!(
-                        "reconcile tombstone {}: {err}",
-                        path.display(),
-                    )))
-                    .await;
+                // try_send, not send: reconcile runs inside the
+                // constructor before the receiver is handed back —
+                // a blocking send with no drainer deadlocks it.
+                emit_event(
+                    events,
+                    WorkspaceEvent::Error(format!("reconcile tombstone {}: {err}", path.display())),
+                );
             } else {
                 tombstoned += 1;
             }
