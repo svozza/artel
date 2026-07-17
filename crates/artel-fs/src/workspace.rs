@@ -598,8 +598,8 @@ pub struct Workspace {
     /// check — required by the applier-side defence-in-depth test for
     /// [`crate::Mode::ReadOnly`].
     pub(crate) author: AuthorId,
-    /// Blobs API for fetching content the doc references. Cloned
-    /// out of the iroh node so the applier can `get_bytes` without
+    /// Blobs API for streaming content the doc references. Cloned
+    /// out of the iroh node so the applier can export blobs without
     /// taking the node lock.
     pub(crate) blobs: iroh_blobs::BlobsProtocol,
     /// Echo guard shared between the watcher and applier.
@@ -3469,6 +3469,23 @@ async fn bulk_export(
             }
             FilterDecision::Skip(_) => continue,
             FilterDecision::Include => {}
+        }
+
+        // Incoming size cap on the entry's declared length — the
+        // filter's size layer stats the local path, absent for a
+        // file we haven't exported yet (see the applier's twin
+        // check). Tombstones (len 0) are never caught.
+        if let Some(cap) = max_file_size
+            && entry.content_len() > cap
+        {
+            emit_event(
+                events,
+                WorkspaceEvent::SkippedTooLarge {
+                    path,
+                    size: entry.content_len(),
+                },
+            );
+            continue;
         }
 
         let rel = path.strip_prefix(root).unwrap_or(&path);

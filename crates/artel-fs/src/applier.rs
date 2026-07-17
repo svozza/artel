@@ -1,8 +1,9 @@
 //! Apply remote doc events to disk.
 //!
 //! Subscribes to `Doc::subscribe()` and:
-//! - on [`LiveEvent::InsertRemote`]: write the entry's content to
-//!   disk under [`Workspace::root`], guarded by [`EchoGuard`] so
+//! - on [`LiveEvent::InsertRemote`]: stream the entry's content to
+//!   disk under [`Workspace::root`] (temp file + atomic rename —
+//!   bounded memory at any size), guarded by [`EchoGuard`] so
 //!   the watcher won't republish what we just laid down,
 //! - on [`LiveEvent::ContentReady`]: scan the doc for entries with
 //!   the matching hash and apply them (covers the case where the
@@ -127,6 +128,7 @@ pub(crate) async fn run(workspace: Arc<Workspace>, ready: oneshot::Sender<()>) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_entry(
     workspace: &Arc<Workspace>,
     guard: &EchoGuard,
@@ -193,6 +195,27 @@ async fn handle_entry(
             return;
         }
         FilterDecision::Include => {}
+    }
+
+    // Incoming size cap on the *entry's* declared length. The
+    // filter's own size layer stats the local path, which doesn't
+    // exist yet for a new incoming file — without this check a peer
+    // running uncapped (or a larger cap) could push an arbitrarily
+    // large file straight past a capped node's guard. Tombstones
+    // (len 0) are never caught, preserving the tombstone flow below.
+    if let Some(cap) = workspace.max_file_size
+        && entry.content_len() > cap
+    {
+        let size = entry.content_len();
+        debug!(target: "artel_fs::applier", path = %path.display(), size, "entry over cap; skip incoming");
+        emit_event(
+            &workspace.events,
+            WorkspaceEvent::SkippedTooLarge {
+                path: path.clone(),
+                size,
+            },
+        );
+        return;
     }
 
     let rel = path.strip_prefix(&workspace.root).unwrap_or(&path);

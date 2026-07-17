@@ -1,10 +1,10 @@
 //! Filesystem-side change feed.
 //!
 //! Wraps `notify-debouncer-full` so a flurry of saves coalesces into
-//! one debounced event per path, then publishes the resulting bytes
-//! into the doc — guarded by [`crate::EchoGuard`] so peer-driven
-//! writes (which the applier just laid down on disk) don't get
-//! re-published in a loop.
+//! one debounced event per path, then streams the resulting file
+//! into the doc (blob import — bounded memory at any size) — guarded
+//! by [`crate::EchoGuard`] so peer-driven writes (which the applier
+//! just laid down on disk) don't get re-published in a loop.
 
 #![allow(clippy::redundant_pub_crate)]
 

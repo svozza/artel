@@ -41,7 +41,8 @@ pub(crate) struct WorkspaceNode {
     /// Doc + author handles. `Clone` is cheap.
     pub docs: Docs,
     /// Blob protocol handler over the same store; `BlobsProtocol`
-    /// derefs to the `Store` so callers can `.blobs().get_bytes(...)`.
+    /// derefs to the `Store` so callers can drive streaming
+    /// imports/exports (`store().blobs()`).
     pub blobs: BlobsProtocol,
     /// The workspace node's peer map (shared with `DocsGate`).
     /// Retained for test access; production code accesses via the
