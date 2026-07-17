@@ -19,9 +19,9 @@ along the way.
 | `artel-protocol` | Wire types + Unix-socket transport. Done. `PROTOCOL_VERSION` `13` (`9` workspace-ticket unicast → `10` `Event::Gap` lag-recovery → `11` cooperative-demote downgrade → `12` host-authority `RemoveSessionMember` → `13` gossip payload-size cap / `PayloadTooLarge`), `MESSAGE_FORMAT` `3`, `TICKET_VERSION` `4` (tiered tickets), `GOSSIP_WIRE_VERSION` `3` (`2` ctrl-v2 signatures → `3` 1 MiB transport cap), upgrade ALPN `artel/upgrade/2`. |
 | `artel-daemon` | Persistent daemon + binary + flock-based pidfile (orphan-leak fix `9a1a773`) + issued-ticket ledger with revocation + lazy gossip re-subscribe for reloaded joiner mirrors (re-delivery after restart) + host-authority member removal (`RemoveSessionMember`, drops an evicted peer from durable membership). Done. |
 | `artel-client` | Stateless multiplexed client + `artel` CLI binary + `connect_or_spawn`. Done. |
-| `artel-fs` | Phase 3a (MVP) + 3b-1 (persistence) + 3b-3 (crash recovery) + host/join safety + PeerFilter shipped. Watcher new-subtree rescan landed (`e8244fe`, closes the inotify backfill race). Tier-1 write-revocation: namespace-secret rotation on evict + offline-peer re-delivery on rejoin, hardened 2026-06-21 (host-restart re-seed, `NODE_ID` re-delivery de-storm, evict drops daemon membership). Author identity (3b-2) and configurable filter (3b-4) remain. |
+| `artel-fs` | Phase 3a (MVP) + 3b-1 (persistence) + 3b-3 (crash recovery) + host/join safety + PeerFilter shipped. Watcher new-subtree rescan landed (`e8244fe`, closes the inotify backfill race). Tier-1 write-revocation: namespace-secret rotation on evict + offline-peer re-delivery on rejoin, hardened 2026-06-21 (host-restart re-seed, `NODE_ID` re-delivery de-storm, evict drops daemon membership). Configurable filter (3b-4) shipped as consumer-owned exclude list (#35) + streaming large-file sync with a configurable size cap (#33, `max_file_size` default 64 MiB, `None` = unlimited; publish/apply stream via iroh-blobs). Author identity (3b-2) remains. |
 
-807 tests passing on Tier A+B (`make test`), 17 more on Tier C
+885 tests passing on Tier A+B (`make test`), 18 more on Tier C
 (`make test-n0`, real n0). fmt + clippy clean in both feature modes.
 CI runs ubuntu + macos on stable; workspace `rust-version` is 1.95.
 
@@ -395,10 +395,16 @@ re-publishes. Disk-backed Docs/Blobs is a follow-up slice.
   commit firing leaves a `doc-id` pointing at a non-existent
   namespace; `open_or_create_doc` self-heals by recreating the doc
   when `Docs::open` doesn't find the persisted namespace.
-- **3b-4 — Configurable filter.** `WorkspaceConfig::filter:
-  FilterRules` so apps can extend or override the hardcoded skip
-  list (`.git`, `target`, `node_modules`, `.DS_Store`, `*.swp`,
-  `*.tmp`, `.artel-fs`).
+- **3b-4 — Configurable filter.** DONE, in a different shape than
+  sketched. The original sketch (`WorkspaceConfig::filter:
+  FilterRules` extending or overriding the hardcoded skip list) was
+  rejected: the hardcoded skips (`.git`, `target`, `node_modules`,
+  `.DS_Store`, `*.swp`, `*.tmp`, `.artel-fs`) are the substrate's
+  *self*-protection and stay non-overridable by design. What shipped
+  instead: `WorkspaceConfig::exclude` (consumer-owned glob list,
+  dotfile default, replace-not-merge — #35, which also removed the
+  `.gitignore` layer) and `WorkspaceConfig::max_file_size`
+  (streaming large-file sync, cap as accident-guard — #33).
 
 None block the next phase; pick them up when a real consumer needs
 them.
