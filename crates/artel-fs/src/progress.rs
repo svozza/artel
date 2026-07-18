@@ -14,13 +14,24 @@
 //! one blob. The tracker holds the path set and emits one event per
 //! path (paths are what consumers key on).
 //!
+//! # Ordering barrier
+//!
+//! The tracker task emits **while holding the path-set lock**, and
+//! [`TransferTrackers::supersede`] removes a path under the same
+//! lock. Once `supersede` returns, any event for the removed path is
+//! already in the channel — so everything the applier enqueues
+//! afterwards (a `PeerWrote` for a different hash, a `PeerDeleted`)
+//! is FIFO-ordered after every stale emission. No `Transferring` can
+//! trail its path's terminal event.
+//!
 //! [`ApplyOutcome::NotReady`]: crate::workspace::ApplyOutcome::NotReady
 //! [`Bitfield`]: iroh_blobs::api::proto::Bitfield
 
 #![allow(clippy::redundant_pub_crate)]
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -86,10 +97,19 @@ impl ProgressThrottle {
 /// One live tracker: the task driving `observe()`, the path set it
 /// fans events out to, and the token that kills it.
 struct Tracker {
-    /// Doc keys (as absolute paths) currently pointing at this hash.
-    /// Shared with the tracker task, which snapshots it per emission;
-    /// the applier mutates it on supersede / additional keys.
-    paths: Arc<Mutex<BTreeSet<PathBuf>>>,
+    /// Doc keys (as absolute paths) currently pointing at this hash,
+    /// each mapped to *its* entry's declared content length —
+    /// entries sharing a hash may declare different lengths, and a
+    /// path's events must carry its own entry's `total`. Shared with
+    /// the tracker task; see the module docs for the emit-under-lock
+    /// ordering barrier this mutex provides.
+    paths: Arc<Mutex<BTreeMap<PathBuf, u64>>>,
+    /// Highest `received` the task has observed (the task only ever
+    /// raises it). Lets [`TransferTrackers::track`] emit an
+    /// immediate, current event for a path that joins after the
+    /// download started — or after it silently completed and the
+    /// task already exited.
+    latest: Arc<AtomicU64>,
     /// Child of the applier's doc token — rotation or shutdown
     /// cancels the parent and every tracker dies with it.
     cancel: CancellationToken,
@@ -122,10 +142,15 @@ impl TransferTrackers {
         }
     }
 
-    /// A new entry for `path` points at `keep` (or is a tombstone /
-    /// skipped entry — `None`): every tracker for a *different* hash
-    /// still holding this path is stale. Drop the path; drop the
-    /// tracker when its path set empties.
+    /// A new entry for `path` points at `keep` (or at nothing worth
+    /// tracking — a tombstone, an applied blob, a skipped entry:
+    /// `None`): every tracker for a *different* hash still holding
+    /// this path is stale. Drop the path; drop the tracker when its
+    /// path set empties.
+    ///
+    /// Ordering: the path is removed under the same lock the tracker
+    /// task emits under, so when this returns no further event for
+    /// `path` can be enqueued by those trackers (module docs).
     pub(crate) fn supersede(&mut self, path: &Path, keep: Option<Hash>) {
         self.trackers.retain(|hash, tracker| {
             if Some(*hash) == keep {
@@ -149,8 +174,16 @@ impl TransferTrackers {
         });
     }
 
-    /// Start (or extend) tracking `hash`: an entry for `path` passed
-    /// all apply gates but its blob isn't fully local yet.
+    /// Start (or extend) tracking `hash`: an entry for `path` with
+    /// declared length `total` passed all apply gates but its blob
+    /// isn't fully local yet.
+    ///
+    /// A path joining an *existing* tracker gets an immediate event
+    /// carrying the download's current state — its "transfer
+    /// started" signal must not wait for the next throttled update
+    /// (which may never come if the blob completed and the task
+    /// already exited; the entry's `ContentReady` retry still
+    /// applies it).
     ///
     /// `doc_token` must be the token the calling applier captured at
     /// spawn — not re-read from the workspace, where rotation may
@@ -166,11 +199,27 @@ impl TransferTrackers {
     ) {
         self.supersede(&path, Some(hash));
         if let Some(tracker) = self.trackers.get(&hash) {
-            tracker
-                .paths
-                .lock()
-                .expect("tracker paths mutex")
-                .insert(path);
+            // Re-announce of a known (path, hash) — e.g. the
+            // ContentReady rescan re-feeding an entry — refreshes the
+            // total but must not duplicate the join event. Emitting
+            // after the lock drops is safe here: supersede only ever
+            // runs on this same applier task, so no removal can
+            // interleave before the emit.
+            let newly_joined = {
+                let mut paths = tracker.paths.lock().expect("tracker paths mutex");
+                paths.insert(path.clone(), total).is_none()
+            };
+            if newly_joined {
+                let received = tracker.latest.load(Ordering::Relaxed).min(total);
+                emit_event(
+                    events,
+                    WorkspaceEvent::Transferring {
+                        path,
+                        received,
+                        total,
+                    },
+                );
+            }
             return;
         }
         debug!(
@@ -180,12 +229,14 @@ impl TransferTrackers {
             path = %path.display(),
             "spawning transfer tracker"
         );
-        let paths = Arc::new(Mutex::new(BTreeSet::from([path])));
+        let paths = Arc::new(Mutex::new(BTreeMap::from([(path, total)])));
+        let latest = Arc::new(AtomicU64::new(0));
         let cancel = doc_token.child_token();
         let task = tokio::spawn(track_task(
             blobs.clone(),
             events.clone(),
             Arc::clone(&paths),
+            Arc::clone(&latest),
             cancel.clone(),
             hash,
             total,
@@ -194,17 +245,18 @@ impl TransferTrackers {
             hash,
             Tracker {
                 paths,
+                latest,
                 cancel,
                 task,
             },
         );
     }
 
-    /// The blob behind `hash` is being applied (its `ContentReady`
-    /// arrived, or an entry applied directly): stop the tracker and
-    /// **await its death** so no `Transferring` can be emitted after
-    /// the caller's `PeerWrote` (the events channel is FIFO — a
-    /// tracker awaited here cannot enqueue behind it).
+    /// The blob behind `hash` is ready (its `ContentReady` arrived,
+    /// or an entry applied directly): stop the tracker and **await
+    /// its death**. Combined with the emit-under-lock barrier this
+    /// guarantees nothing for the hash's paths trails the terminal
+    /// `PeerWrote` the caller emits next (FIFO channel).
     pub(crate) async fn finish(&mut self, hash: Hash) {
         if let Some(mut tracker) = self.trackers.remove(&hash) {
             tracker.cancel.cancel();
@@ -217,40 +269,64 @@ impl TransferTrackers {
 
 /// Drive `observe(hash)` and emit throttled [`WorkspaceEvent::Transferring`]
 /// events for every path currently referencing the hash.
+///
+/// `throttle_total` is the spawning entry's declared length — used
+/// only for the percent gate; each path's event carries the path's
+/// own total from the shared map.
 async fn track_task(
     blobs: iroh_blobs::BlobsProtocol,
     events: tokio::sync::mpsc::Sender<WorkspaceEvent>,
-    paths: Arc<Mutex<BTreeSet<PathBuf>>>,
+    paths: Arc<Mutex<BTreeMap<PathBuf, u64>>>,
+    latest: Arc<AtomicU64>,
     cancel: CancellationToken,
     hash: Hash,
-    total: u64,
+    throttle_total: u64,
 ) {
-    let stream = match blobs.store().blobs().observe(hash).stream().await {
-        Ok(s) => s,
-        Err(err) => {
-            debug!(target: "artel_fs::progress", %hash, %err, "observe failed; no progress events");
-            return;
-        }
+    // Setup is select-guarded too: if the store's observe request
+    // stalls, `finish()`'s cancel must still terminate this task
+    // rather than leaving the applier awaiting it forever.
+    let stream = tokio::select! {
+        () = cancel.cancelled() => return,
+        s = blobs.store().blobs().observe(hash).stream() => match s {
+            Ok(s) => s,
+            Err(err) => {
+                debug!(target: "artel_fs::progress", %hash, %err, "observe failed; no progress events");
+                return;
+            }
+        },
     };
     tokio::pin!(stream);
-    let mut throttle = ProgressThrottle::new(total);
+    let mut throttle = ProgressThrottle::new(throttle_total);
     loop {
         tokio::select! {
             () = cancel.cancelled() => return,
             item = stream.next() => {
                 let Some(bitfield) = item else { return };
-                // An early bitfield may not know the blob's size yet
-                // (0), and a bitfield's own size may disagree with the
-                // entry's declared length; clamp so `received <= total`
-                // always holds for consumers.
-                let received = bitfield.total_bytes().min(total);
+                // Monotone by construction: a later bitfield never
+                // reports less than the max we've already seen (the
+                // store's observations are cumulative, but the
+                // documented non-decreasing guarantee must not lean
+                // on that implementation detail).
+                let raw = bitfield.total_bytes();
+                let received = latest.fetch_max(raw, Ordering::Relaxed).max(raw);
                 if throttle.should_emit(received, Instant::now()) {
-                    let snapshot: Vec<PathBuf> = {
-                        let paths = paths.lock().expect("tracker paths mutex");
-                        paths.iter().cloned().collect()
-                    };
-                    for path in snapshot {
-                        emit_event(&events, WorkspaceEvent::Transferring { path, received, total });
+                    // Emit under the lock — the supersede barrier
+                    // (module docs). `emit_event` is try_send: no
+                    // await, no blocking, safe under a std mutex.
+                    let paths = paths.lock().expect("tracker paths mutex");
+                    for (path, total) in paths.iter() {
+                        emit_event(
+                            &events,
+                            WorkspaceEvent::Transferring {
+                                path: path.clone(),
+                                // A path's entry may declare a length
+                                // differing from the bitfield's size;
+                                // clamp so received <= total holds
+                                // per event.
+                                received: received.min(*total),
+                                total: *total,
+                            },
+                        );
                     }
                 }
                 if bitfield.is_complete() {
@@ -330,10 +406,9 @@ mod tests {
     use iroh_blobs::BlobsProtocol;
     use iroh_blobs::store::mem::MemStore;
 
-    /// Spawn a registry + one tracked hash over an in-memory store
-    /// that holds nothing — `observe` reports an empty bitfield, so
-    /// the tracker emits its first observation (`received == 0`) and
-    /// then idles until cancelled.
+    /// In-memory store that holds nothing — `observe` reports an
+    /// empty bitfield, so a tracker emits its first observation
+    /// (`received == 0`) and then idles until cancelled.
     fn test_blobs() -> BlobsProtocol {
         let store = MemStore::new();
         BlobsProtocol::new(&store, None)
@@ -356,6 +431,12 @@ mod tests {
         }
     }
 
+    fn tracked_paths(registry: &TransferTrackers, hash: Hash) -> BTreeMap<PathBuf, u64> {
+        let tracker = registry.trackers.get(&hash).expect("tracker present");
+        let paths = tracker.paths.lock().expect("tracker paths mutex");
+        paths.clone()
+    }
+
     #[tokio::test]
     async fn two_paths_one_hash_each_get_first_observation() {
         let blobs = test_blobs();
@@ -364,27 +445,56 @@ mod tests {
         let mut registry = TransferTrackers::new();
         let hash = Hash::new(b"absent blob");
 
-        // Both paths registered before the spawned task first polls
-        // (current-thread runtime: spawn doesn't run until an await),
-        // so the single first-observation emission covers both.
         registry.track(&blobs, &tx, &doc_token, hash, 1_000, "/ws/a.bin".into());
+        // b.bin joins the existing tracker: its join event fires
+        // immediately (current-thread runtime — the spawned task
+        // hasn't polled yet, so `latest` is still 0).
         registry.track(&blobs, &tx, &doc_token, hash, 1_000, "/ws/b.bin".into());
         assert_eq!(registry.trackers.len(), 1, "one tracker per hash");
 
-        let mut seen = std::collections::BTreeSet::new();
-        for _ in 0..2 {
+        // Expected: b.bin's join event, then the task's first
+        // observation fans out to both paths. Every event reads
+        // received == 0 (nothing is local).
+        let mut counts: BTreeMap<PathBuf, usize> = BTreeMap::new();
+        for _ in 0..3 {
             let (path, received, total) = recv_transferring(&mut rx).await;
             assert_eq!(received, 0);
             assert_eq!(total, 1_000);
-            seen.insert(path);
+            *counts.entry(path).or_default() += 1;
         }
-        assert_eq!(
-            seen,
-            BTreeSet::from([PathBuf::from("/ws/a.bin"), PathBuf::from("/ws/b.bin")]),
+        assert!(
+            counts.contains_key(Path::new("/ws/a.bin"))
+                && counts.contains_key(Path::new("/ws/b.bin")),
+            "both paths must be narrated: {counts:?}",
         );
 
         registry.finish(hash).await;
         assert!(registry.trackers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn late_join_gets_immediate_event_with_its_own_total() {
+        let blobs = test_blobs();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let doc_token = CancellationToken::new();
+        let mut registry = TransferTrackers::new();
+        let hash = Hash::new(b"absent blob");
+
+        registry.track(&blobs, &tx, &doc_token, hash, 1_000, "/ws/a.bin".into());
+        let (path, _, _) = recv_transferring(&mut rx).await;
+        assert_eq!(path, PathBuf::from("/ws/a.bin"));
+
+        // The task has polled (its first observation arrived above).
+        // A second key with a *different declared length* joins: it
+        // must get an immediate event carrying ITS total, not wait
+        // for the next throttled update.
+        registry.track(&blobs, &tx, &doc_token, hash, 500, "/ws/b.bin".into());
+        let (path, received, total) = recv_transferring(&mut rx).await;
+        assert_eq!(path, PathBuf::from("/ws/b.bin"));
+        assert_eq!(total, 500, "join event must carry the path's own total");
+        assert!(received <= total);
+
+        registry.finish(hash).await;
     }
 
     #[tokio::test]
@@ -422,7 +532,7 @@ mod tests {
 
         registry.track(&blobs, &tx, &doc_token, hash, 1_000, "/ws/a.bin".into());
         registry.track(&blobs, &tx, &doc_token, hash, 1_000, "/ws/b.bin".into());
-        for _ in 0..2 {
+        for _ in 0..3 {
             let _ = recv_transferring(&mut rx).await;
         }
 
@@ -430,12 +540,10 @@ mod tests {
         // stale path but keeps the tracker (b.bin still pending).
         let newer = Hash::new(b"newer content");
         registry.supersede(Path::new("/ws/a.bin"), Some(newer));
-        let remaining = {
-            let tracker = registry.trackers.get(&hash).expect("tracker kept");
-            let paths = tracker.paths.lock().expect("tracker paths mutex");
-            paths.clone()
-        };
-        assert_eq!(remaining, BTreeSet::from([PathBuf::from("/ws/b.bin")]));
+        assert_eq!(
+            tracked_paths(&registry, hash),
+            BTreeMap::from([(PathBuf::from("/ws/b.bin"), 1_000)]),
+        );
 
         // Evicting the last path cancels and drops the tracker.
         registry.supersede(Path::new("/ws/b.bin"), None);
@@ -446,9 +554,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_hash_reuses_tracker_and_supersede_keeps_own_hash() {
+    async fn same_hash_reannounce_does_not_duplicate_join_event() {
         let blobs = test_blobs();
-        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let doc_token = CancellationToken::new();
         let mut registry = TransferTrackers::new();
         let hash = Hash::new(b"absent blob");
@@ -456,13 +564,22 @@ mod tests {
         registry.track(&blobs, &tx, &doc_token, hash, 1_000, "/ws/a.bin".into());
         // Re-announce of the same (path, hash) — e.g. the
         // ContentReady rescan re-feeding the entry — must not evict
-        // the path from its own tracker.
+        // the path from its own tracker, and must not emit a second
+        // join event for a path already present.
         registry.track(&blobs, &tx, &doc_token, hash, 1_000, "/ws/a.bin".into());
-        let paths = {
-            let tracker = registry.trackers.get(&hash).expect("tracker present");
-            let paths = tracker.paths.lock().expect("tracker paths mutex");
-            paths.clone()
-        };
-        assert_eq!(paths, BTreeSet::from([PathBuf::from("/ws/a.bin")]));
+        assert_eq!(
+            tracked_paths(&registry, hash),
+            BTreeMap::from([(PathBuf::from("/ws/a.bin"), 1_000)]),
+        );
+
+        // Exactly one event: the task's first observation. (The
+        // re-announce emitted nothing.)
+        let _ = recv_transferring(&mut rx).await;
+        registry.finish(hash).await;
+        drop(tx);
+        assert!(
+            rx.recv().await.is_none(),
+            "re-announce must not duplicate events",
+        );
     }
 }
