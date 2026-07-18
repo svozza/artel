@@ -24,6 +24,7 @@ use tracing::{debug, warn};
 
 use crate::echo_guard::{PENDING_RELEASE_GRACE, RemoteDeleteMark};
 use crate::filter::{FilterDecision, SkipReason, WorkspaceFilter};
+use crate::progress::TransferTrackers;
 use crate::rules::Mode;
 use crate::workspace::{
     ApplyOutcome, Direction, Workspace, WorkspaceEvent, apply_entry_streaming, emit_event,
@@ -87,6 +88,13 @@ pub(crate) async fn run(workspace: Arc<Workspace>, ready: oneshot::Sender<()>) {
     // namespace rotation. A child of the workspace shutdown token.
     let doc_token = workspace.doc_token();
 
+    // Progress trackers for in-flight blob downloads (issue #38),
+    // keyed by content hash. Applier-owned: single-threaded access,
+    // no locks. Dropping the registry (any exit from this loop)
+    // cancels every tracker task; rotation additionally cancels them
+    // via the doc token their tokens are children of.
+    let mut trackers = TransferTrackers::new();
+
     loop {
         tokio::select! {
             () = doc_token.cancelled() => {
@@ -102,11 +110,15 @@ pub(crate) async fn run(workspace: Arc<Workspace>, ready: oneshot::Sender<()>) {
                             content_len = entry.content_len(),
                             "InsertRemote"
                         );
-                        handle_entry(&workspace, &guard, &filter, entry).await;
+                        handle_entry(&workspace, &guard, &filter, &mut trackers, &doc_token, entry)
+                            .await;
                     }
                     Some(Ok(LiveEvent::ContentReady { hash })) => {
                         debug!(target: "artel_fs::applier", %hash, "ContentReady");
-                        handle_content_ready(&workspace, &guard, &filter, hash).await;
+                        handle_content_ready(
+                            &workspace, &guard, &filter, &mut trackers, &doc_token, hash,
+                        )
+                        .await;
                     }
                     Some(Ok(other)) => {
                         debug!(target: "artel_fs::applier", event = ?other, "ignored live event");
@@ -133,6 +145,8 @@ async fn handle_entry(
     workspace: &Arc<Workspace>,
     guard: &EchoGuard,
     filter: &WorkspaceFilter,
+    trackers: &mut TransferTrackers,
+    doc_token: &tokio_util::sync::CancellationToken,
     entry: Entry,
 ) {
     let path = match keys::key_to_path(&workspace.root, entry.key()) {
@@ -208,6 +222,12 @@ async fn handle_entry(
     {
         let size = entry.content_len();
         debug!(target: "artel_fs::applier", path = %path.display(), size, "entry over cap; skip incoming");
+        // Unlike the filter gates above (constant per path — an
+        // earlier entry would have been skipped identically, so no
+        // tracker can exist), the length cap is per *entry*: a newer
+        // over-cap entry supersedes a pending under-cap download for
+        // the same key.
+        trackers.supersede(&path, None);
         emit_event(
             &workspace.events,
             WorkspaceEvent::SkippedTooLarge {
@@ -232,6 +252,10 @@ async fn handle_entry(
     }
 
     if entry.content_len() == 0 {
+        // A tombstone supersedes any pending download for this path:
+        // the key's newest state is "deleted", so a stale tracker's
+        // progress events would advertise a file that will never land.
+        trackers.supersede(&path, None);
         apply_tombstone(guard, &workspace.events, path).await;
         return;
     }
@@ -248,6 +272,11 @@ async fn handle_entry(
                 "applied remote write to disk"
             );
             guard.release_after(path.clone(), PENDING_RELEASE_GRACE);
+            // Await the tracker's death BEFORE PeerWrote: the events
+            // channel is FIFO, so a tracker that is provably dead
+            // here cannot enqueue a Transferring after the terminal
+            // signal.
+            trackers.finish(entry.content_hash()).await;
             emit_event(&workspace.events, WorkspaceEvent::PeerWrote { path });
         }
         Ok(ApplyOutcome::NotReady) => {
@@ -256,6 +285,17 @@ async fn handle_entry(
                 path = %path.display(),
                 hash = %entry.content_hash(),
                 "blob not yet available; awaiting ContentReady"
+            );
+            // Every gate above passed — we genuinely intend to apply
+            // this entry once its bytes arrive. Surface the download
+            // as throttled Transferring events (issue #38).
+            trackers.track(
+                &workspace.blobs,
+                &workspace.events,
+                doc_token,
+                entry.content_hash(),
+                entry.content_len(),
+                path,
             );
         }
         Err(err) => {
@@ -310,6 +350,8 @@ async fn handle_content_ready(
     workspace: &Arc<Workspace>,
     guard: &EchoGuard,
     filter: &WorkspaceFilter,
+    trackers: &mut TransferTrackers,
+    doc_token: &tokio_util::sync::CancellationToken,
     hash: iroh_blobs::Hash,
 ) {
     // No direct rule check here — every entry funnels through
@@ -335,8 +377,13 @@ async fn handle_content_ready(
         let Ok(entry) = res else { continue };
         if entry.content_hash() == hash {
             matched += 1;
-            handle_entry(workspace, guard, filter, entry).await;
+            handle_entry(workspace, guard, filter, trackers, doc_token, entry).await;
         }
     }
+    // handle_entry's Applied arm reaps the tracker per entry; this
+    // covers the residue when NO doc entry for the hash survived the
+    // gates (all superseded/skipped) — nothing will ever apply, so
+    // the download is no longer worth narrating.
+    trackers.finish(hash).await;
     debug!(target: "artel_fs::applier", %hash, matched, "ContentReady scan complete");
 }

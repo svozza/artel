@@ -35,6 +35,7 @@ mod keystore;
 mod node;
 mod peer_filter;
 pub(crate) mod peer_map;
+mod progress;
 pub mod rules;
 pub mod session_id;
 pub mod ticket;

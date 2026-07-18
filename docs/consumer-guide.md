@@ -62,6 +62,7 @@ The joiner first joins the session itself (`Request::JoinSession { display_name,
 `WorkspaceEvent` includes:
 
 - `PeerWrote { path }` / `PeerDeleted { path }` — a peer's change landed on your disk.
+- `Transferring { path, received, total }` — a peer-authored file's content is downloading: `received` of `total` bytes are locally present. Throttled (≥1% progressed, or ≥500 ms elapsed with a change) and advisory; the first observation always fires, so it doubles as a "transfer started" signal. The terminal signal is `PeerWrote` — don't treat `received == total` as completion (the export + rename still follow), and don't treat a stopped stream as an error (a stall is indistinguishable by design; watch for `PeerWrote` within your own budget if you need liveness).
 - `SkippedTooLarge { path, size }` — a file exceeded the size cap (`WorkspaceConfig::max_file_size`, default 64 MiB; either direction).
 - `SkippedReadOnly { path, direction }` — a path-event was skipped by your `PathRules`. One event per skipped path-event, no coalescing — a `target/**: ReadOnly` rule with chatty editor saves will be noisy; dedupe in your app if needed.
 - `Demoted` — the host cooperatively downgraded this node RW → Read; the workspace has stopped publishing local changes. Reflect it in your UI (e.g. flip a send-gate).
@@ -84,6 +85,8 @@ PathRules { /* root ReadOnly, ".app/**" ReadWrite */ }
 `PathRules::read_write()` is the permissive default. Built-in filtering also skips `.git`, `target`, `node_modules`, the `.artel-fs` state dir, `.DS_Store` and editor temp files (`*.swp`, `*.tmp`), symlinks, and files over the size cap.
 
 **Large files stream; the size cap is an accident-guard.** File bytes stream through iroh-blobs in both directions (BLAKE3 verified streaming), so a multi-GB file syncs in bounded memory. `WorkspaceConfig::max_file_size` (default 64 MiB, `None` = unlimited) exists so a rogue ISO dropped into the workspace doesn't fan out to every peer — raise it or disable it when your workspace legitimately holds big files. Like `exclude`, it's local to each node (not ticket-borne) and enforced in both directions, with every skip surfaced as `SkippedTooLarge`.
+
+**Watching a big transfer.** While a large incoming file downloads, the receiving side's event stream carries throttled `Transferring { path, received, total }` events — enough to drive a progress bar or distinguish "8 GB at 60%" from "sync is wedged". The stream is receive-side only (iroh-docs is pull-based; senders don't know who is fetching what) and carries no rate or ETA — derive those from successive events. Completion is `PeerWrote`, never `received == total`; and because both the channel and the throttle drop events freely, treat any individual event as a sample, not a ledger.
 
 **Append-heavy files are an anti-pattern regardless of the cap.** artel-fs republishes the *whole file per change*, so an ever-growing file (an unrotated JSONL event log, say) costs O(n²) bytes over its life even though each publish streams. Rotate growing logs into bounded segments (`.chat/<peer>.0001.jsonl`, …) — each closed segment syncs once and never changes again; only the active segment churns, and stays small.
 
