@@ -1618,6 +1618,7 @@ async fn gitignored_path_syncs_anyway() {
 /// the skip must be observable, not a debug-log whisper.
 #[tokio::test(flavor = "multi_thread")]
 async fn default_exclude_blocks_dotfiles_and_emits_event() {
+    init_tracing();
     let Pair {
         daemon_a,
         daemon_b,
@@ -1638,16 +1639,44 @@ async fn default_exclude_blocks_dotfiles_and_emits_event() {
     .await;
 
     // Live write into a hidden subtree: watcher must skip + emit.
+    //
+    // Two steps, and the ordering is load-bearing. inotify attaches
+    // one watch per directory, and notify backfills watches for a
+    // freshly created subtree only after it processes the parent's
+    // CREATE — a file written into `.state/log` before that backfill
+    // produces NO event, ever. For *synced* subtrees the watcher's
+    // rescan_dir closes that gap, but an excluded directory is
+    // (correctly) never descended into, so the file-level
+    // SkippedExcluded would be a coin flip under load (observed as a
+    // CI-only flake on Linux, diagnosed 2026-07-19: the failing
+    // trace shows both Create(Folder) events and no Create(File)).
+    // Waiting for the directory's own SkippedExcluded first proves
+    // notify processed the subtree's creation — its watch backfill
+    // runs in that same processing pass, ≥300 ms (debounce) before
+    // the event reaches us — so the file write below reliably gets
+    // an inotify event of its own.
     tokio::fs::create_dir_all(alice_dir.path().join(".state/log"))
         .await
         .unwrap();
+    wait_for_event(
+        &mut pair.alice_events,
+        PROPAGATE_BUDGET,
+        "SkippedExcluded(Outgoing) for the hidden directory",
+        |ev| {
+            matches!(
+                ev,
+                WorkspaceEvent::SkippedExcluded {
+                    direction: Direction::Outgoing,
+                    path,
+                } if path.ends_with(".state/log") || path.ends_with(".state")
+            )
+        },
+    )
+    .await;
+
     tokio::fs::write(alice_dir.path().join(".state/log/peer.jsonl"), b"nope")
         .await
         .unwrap();
-
-    // The watcher may emit `SkippedExcluded` for the `.state`
-    // directory itself (mkdir event) before the file's — wait for
-    // the file's specifically.
     wait_for_event(
         &mut pair.alice_events,
         PROPAGATE_BUDGET,
