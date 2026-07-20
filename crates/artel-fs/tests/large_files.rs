@@ -73,6 +73,55 @@ async fn wait_for_file_hash(path: &std::path::Path, expected_hash: blake3::Hash,
     }
 }
 
+/// Drain `rx` until `PeerWrote` for `name` arrives, collecting every
+/// `Transferring { received, total }` for that file on the way.
+/// Panics if the budget expires first. Shared by the Tier B and
+/// Tier C progress tests (issue #38).
+async fn transferring_until_peer_wrote(
+    rx: &mut tokio::sync::mpsc::Receiver<WorkspaceEvent>,
+    name: &str,
+) -> Vec<(u64, u64)> {
+    let mut samples = Vec::new();
+    let deadline = tokio::time::sleep(BIG_FILE_BUDGET);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            ev = rx.recv() => {
+                match ev.expect("event stream open") {
+                    WorkspaceEvent::Transferring { path, received, total }
+                        if path.file_name().is_some_and(|n| n == name) =>
+                    {
+                        samples.push((received, total));
+                    }
+                    WorkspaceEvent::PeerWrote { path }
+                        if path.file_name().is_some_and(|n| n == name) =>
+                    {
+                        return samples;
+                    }
+                    _ => {}
+                }
+            }
+            () = &mut deadline => panic!("PeerWrote({name}) never arrived"),
+        }
+    }
+}
+
+/// Assert the issue-#38 shape over one download's samples: `total`
+/// always the entry length, `received` monotone non-decreasing and
+/// never over `total`.
+fn assert_progress_shape(samples: &[(u64, u64)], len: u64) {
+    for window in samples.windows(2) {
+        assert!(
+            window[1].0 >= window[0].0,
+            "received regressed: {samples:?}",
+        );
+    }
+    for &(received, total) in samples {
+        assert_eq!(total, len, "total must be the entry's content length");
+        assert!(received <= total, "received exceeded total: {samples:?}");
+    }
+}
+
 /// Two-daemon host/joiner pair with per-side `WorkspaceConfig`s.
 /// Returns everything a test needs to drive both sides and shut
 /// down cleanly.
@@ -466,10 +515,94 @@ async fn echo_guard_suppresses_large_peer_write() {
 }
 
 // =============================================================
+// Transfer-progress events (issue #38): while a multi-MiB blob
+// downloads, the joiner's event stream carries throttled
+// Transferring events for the destination path — received monotone
+// non-decreasing, always <= total, total == the entry's length —
+// terminated by PeerWrote with nothing trailing it (the applier
+// awaits the tracker's death before emitting the terminal event, and
+// the channel is FIFO). A second file with identical content arrives
+// with its blob already local (Applied without NotReady) and must
+// emit zero Transferring events.
+// =============================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn transferring_events_narrate_download_then_stop_at_peer_wrote() {
+    let big = payload(8 * 1024 * 1024 + 321);
+    let big_hash = blake3::hash(&big);
+
+    let mut pair = spawn_synced_pair(None, None, &[]).await;
+    common::drain_ws_events(pair.alice_rx.take().expect("alice_rx"));
+    let mut bob_rx = pair.bob_rx.take().expect("bob_rx");
+
+    tokio::fs::write(pair.alice_ws.root.join("progress.bin"), &big)
+        .await
+        .unwrap();
+
+    // Drain bob's stream up to PeerWrote(progress.bin), collecting
+    // every Transferring for the path on the way.
+    let samples = transferring_until_peer_wrote(&mut bob_rx, "progress.bin").await;
+
+    let len = u64::try_from(big.len()).unwrap();
+    assert!(
+        !samples.is_empty(),
+        "multi-MiB transfer emitted no Transferring events",
+    );
+    assert_progress_shape(&samples, len);
+    assert!(
+        samples.iter().any(|&(received, _)| received < len),
+        "no in-flight observation: every sample was already complete",
+    );
+
+    // Same content, new key: bob already holds the blob, so the
+    // entry applies without a NotReady window — PeerWrote arrives
+    // with zero Transferring for the new path, and nothing may trail
+    // the big file's PeerWrote either.
+    tokio::fs::write(pair.alice_ws.root.join("progress-copy.bin"), &big)
+        .await
+        .unwrap();
+    let deadline = tokio::time::sleep(BIG_FILE_BUDGET);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            ev = bob_rx.recv() => {
+                match ev.expect("bob event stream open") {
+                    WorkspaceEvent::Transferring { path, .. } => {
+                        panic!(
+                            "Transferring after PeerWrote / for an already-local blob: {}",
+                            path.display(),
+                        );
+                    }
+                    WorkspaceEvent::PeerWrote { path }
+                        if path.file_name().is_some_and(|n| n == "progress-copy.bin") =>
+                    {
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            () = &mut deadline => panic!("PeerWrote(progress-copy.bin) never arrived"),
+        }
+    }
+    wait_for_file_hash(
+        &pair.bob_ws.root.join("progress-copy.bin"),
+        big_hash,
+        big.len(),
+    )
+    .await;
+
+    common::drain_ws_events(bob_rx);
+    pair.teardown().await;
+}
+
+// =============================================================
 // Tier C: multi-MiB round-trip over the bin-shared localhost relay
 // (real QUIC transport, production discovery wiring — the closest
 // harness to production the suite runs; see
 // project_noq_proto_handshake_poisoning for why localhost relay).
+// Also asserts the issue-#38 progress contract on a real transport:
+// the joiner's stream carries well-formed Transferring events for
+// the file, none after its PeerWrote.
 // =============================================================
 
 #[tokio::test(flavor = "multi_thread")]
@@ -533,15 +666,32 @@ async fn large_file_round_trip_localhost_relay_n0() {
     )
     .await
     .expect("join_with over localhost relay");
-    common::drain_ws_events(bob_rx);
+    let mut bob_rx = bob_rx;
     let bob_ws = Arc::new(bob_ws);
     let bob_handle = Arc::clone(&bob_ws).run().await;
 
     // Live write on the host → streamed import → blob transfer over
-    // the relay → streamed export on the joiner.
+    // the relay → streamed export on the joiner. Watch bob's event
+    // stream on the way: any Transferring for the file must be
+    // well-formed (received <= total == len, monotone), and none may
+    // trail its PeerWrote. Relay throughput varies, so emission
+    // count isn't asserted here — the Tier B sibling pins ≥1.
     tokio::fs::write(alice_ws.root.join("relay-big.bin"), &big)
         .await
         .unwrap();
+
+    let samples = transferring_until_peer_wrote(&mut bob_rx, "relay-big.bin").await;
+    assert_progress_shape(&samples, u64::try_from(big.len()).unwrap());
+    // FIFO channel + tracker awaited before PeerWrote: anything still
+    // queued now would be a post-terminal Transferring. Drain what's
+    // buffered and assert none.
+    while let Ok(ev) = bob_rx.try_recv() {
+        assert!(
+            !matches!(ev, WorkspaceEvent::Transferring { .. }),
+            "Transferring trailed PeerWrote",
+        );
+    }
+    common::drain_ws_events(bob_rx);
     wait_for_file_hash(&bob_ws.root.join("relay-big.bin"), big_hash, big.len()).await;
 
     alice_ws.shutdown().await.expect("alice shutdown");

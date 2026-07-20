@@ -11,6 +11,14 @@ both directions, with `WorkspaceConfig::max_file_size` — default 64 MiB,
 `None` = unlimited — as an accident-guard), and `PathRules` to scope which
 paths sync and at what capability.
 
+The `WorkspaceEvent` stream surfaces what the live loops did (all advisory —
+dropped rather than blocking when the consumer lags): `PeerWrote` /
+`PeerDeleted` (a peer's change landed), `Transferring` (throttled download
+progress for a large incoming file; terminal signal is `PeerWrote`),
+`SkippedTooLarge` / `SkippedReadOnly` / `SkippedExcluded` (a path was refused,
+with direction), `Demoted`, `PeerRevoked` / `RevokedPeerBlocked` (capability
+enforcement), and `Error` (non-fatal live-loop failures).
+
 ```rust
 use artel_fs::{Workspace, WorkspaceConfig, AttachPolicy};
 

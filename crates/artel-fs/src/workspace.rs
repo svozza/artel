@@ -482,6 +482,32 @@ pub enum WorkspaceEvent {
         /// or the apply side (`Incoming`).
         direction: Direction,
     },
+    /// A peer-authored entry's content is being downloaded: `received`
+    /// of `total` bytes are locally present so far.
+    ///
+    /// Emitted by a per-hash tracker the applier spawns when an
+    /// incoming entry passes every apply gate but its blob is not yet
+    /// fully local (see `crate::progress`). Advisory and throttled
+    /// (≥1% progressed, or ≥500 ms elapsed with a change), and the
+    /// first observation always fires — an immediate "transfer
+    /// started" signal with `received ≈ 0`.
+    ///
+    /// Contract: the terminal signal is [`Self::PeerWrote`] (success)
+    /// or nothing at all (the download stalled; the entry stays
+    /// pending until its `ContentReady`). Do **not** treat
+    /// `received == total` as completion — the export + rename still
+    /// follow — and do not treat a missing or dropped event as an
+    /// error (the stream is lossy by design, like every live-loop
+    /// event).
+    Transferring {
+        /// Absolute path under the workspace root the entry maps to.
+        path: PathBuf,
+        /// Bytes locally present so far. Monotonically non-decreasing
+        /// across the events for one download; always `<= total`.
+        received: u64,
+        /// Total content length from the doc entry.
+        total: u64,
+    },
     /// The host cooperatively demoted this node (RW → Read). The
     /// watcher has stopped publishing local changes (a voluntary
     /// write-stop); the node keeps reading peer writes. Surfaced so a
