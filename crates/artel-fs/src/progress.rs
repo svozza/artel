@@ -52,6 +52,23 @@ const MIN_DELTA_PERCENT: u64 = 1;
 /// hasn't been crossed but `received` has still changed.
 const MIN_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Ceiling on the number of distinct-hash tracker tasks
+/// [`TransferTrackers`] will have live at once.
+///
+/// Every previously-unseen hash reaching [`TransferTrackers::track`]
+/// spawns a task plus a `blobs().observe(hash)` stream — real,
+/// unbounded-by-default resource use (task, channel, `Arc<Mutex<_>>`)
+/// keyed purely on *entry count*, not bytes: a peer with write access
+/// can drive this by publishing many distinct-hash entries just under
+/// `max_file_size`, without ever having to serve real content for any
+/// of them (`apply_entry_streaming`'s `NotReady` check is a purely
+/// local blob-status read). Once the cap is hit, a newly-seen hash is
+/// simply not narrated — the entry stays pending and is still applied
+/// whenever its `ContentReady` fires; only the advisory `Transferring`
+/// progress feed for that download is missing, same lossy contract as
+/// any other event this module already documents as best-effort.
+const MAX_CONCURRENT_TRACKERS: usize = 256;
+
 /// Decides whether a progress observation is worth an event.
 ///
 /// Emits when either (a) at least [`MIN_DELTA_PERCENT`] of `total`
@@ -188,6 +205,11 @@ impl TransferTrackers {
     /// `doc_token` must be the token the calling applier captured at
     /// spawn — not re-read from the workspace, where rotation may
     /// already have installed the next namespace's token.
+    ///
+    /// A hash not already tracked is silently dropped once
+    /// [`MAX_CONCURRENT_TRACKERS`] live trackers exist — the entry
+    /// itself is unaffected (still applied on `ContentReady`), only
+    /// its progress narration is skipped.
     pub(crate) fn track(
         &mut self,
         blobs: &iroh_blobs::BlobsProtocol,
@@ -220,6 +242,17 @@ impl TransferTrackers {
                     },
                 );
             }
+            return;
+        }
+        if self.trackers.len() >= MAX_CONCURRENT_TRACKERS {
+            debug!(
+                target: "artel_fs::progress",
+                %hash,
+                total,
+                path = %path.display(),
+                cap = MAX_CONCURRENT_TRACKERS,
+                "tracker cap reached; not narrating this download's progress"
+            );
             return;
         }
         debug!(
@@ -581,5 +614,114 @@ mod tests {
             rx.recv().await.is_none(),
             "re-announce must not duplicate events",
         );
+    }
+
+    /// A flood of distinct-hash `NotReady` entries — the resource-
+    /// exhaustion vector this cap closes — must not grow the tracker
+    /// registry past [`MAX_CONCURRENT_TRACKERS`]. Every hash claims a
+    /// distinct, never-served blob: no real bytes need exist for the
+    /// attack, only distinct doc-entry hashes.
+    #[tokio::test]
+    async fn tracker_count_is_capped() {
+        let blobs = test_blobs();
+        let (tx, rx) = tokio::sync::mpsc::channel(4096);
+        let doc_token = CancellationToken::new();
+        let mut registry = TransferTrackers::new();
+
+        for i in 0..(MAX_CONCURRENT_TRACKERS + 50) {
+            let hash = Hash::new(format!("distinct-blob-{i}"));
+            registry.track(
+                &blobs,
+                &tx,
+                &doc_token,
+                hash,
+                1_000,
+                PathBuf::from(format!("/ws/file-{i}.bin")),
+            );
+        }
+
+        assert_eq!(
+            registry.trackers.len(),
+            MAX_CONCURRENT_TRACKERS,
+            "tracker registry must never grow past the cap regardless of \
+             how many distinct hashes are announced",
+        );
+
+        drop(tx);
+        drop(rx);
+    }
+
+    /// Once at the cap, a hash already being tracked must still be
+    /// extendable (a second path joining it, or a re-announce) — the
+    /// cap bounds *distinct hashes*, not updates to hashes already
+    /// admitted.
+    #[tokio::test]
+    async fn existing_tracker_still_extendable_once_at_cap() {
+        let blobs = test_blobs();
+        let (tx, rx) = tokio::sync::mpsc::channel(4096);
+        let doc_token = CancellationToken::new();
+        let mut registry = TransferTrackers::new();
+
+        let admitted_hash = Hash::new(b"admitted first");
+        registry.track(
+            &blobs,
+            &tx,
+            &doc_token,
+            admitted_hash,
+            1_000,
+            "/ws/a.bin".into(),
+        );
+
+        // Fill the rest of the cap with other distinct hashes.
+        for i in 0..(MAX_CONCURRENT_TRACKERS - 1) {
+            let hash = Hash::new(format!("filler-{i}"));
+            registry.track(
+                &blobs,
+                &tx,
+                &doc_token,
+                hash,
+                1_000,
+                PathBuf::from(format!("/ws/filler-{i}.bin")),
+            );
+        }
+        assert_eq!(registry.trackers.len(), MAX_CONCURRENT_TRACKERS);
+
+        // A brand-new hash is dropped (cap reached)...
+        let over_cap_hash = Hash::new(b"over the cap");
+        registry.track(
+            &blobs,
+            &tx,
+            &doc_token,
+            over_cap_hash,
+            1_000,
+            "/ws/over-cap.bin".into(),
+        );
+        assert_eq!(registry.trackers.len(), MAX_CONCURRENT_TRACKERS);
+        assert!(
+            !registry.trackers.contains_key(&over_cap_hash),
+            "a hash announced past the cap must not get a tracker",
+        );
+
+        // ...but a second path joining the already-admitted hash still
+        // works, and the already-admitted hash is unaffected.
+        registry.track(
+            &blobs,
+            &tx,
+            &doc_token,
+            admitted_hash,
+            1_000,
+            "/ws/b.bin".into(),
+        );
+        assert_eq!(
+            tracked_paths(&registry, admitted_hash),
+            BTreeMap::from([
+                (PathBuf::from("/ws/a.bin"), 1_000),
+                (PathBuf::from("/ws/b.bin"), 1_000),
+            ]),
+            "an already-admitted hash must still accept new paths at the cap",
+        );
+
+        drop(tx);
+        drop(rx);
     }
 }
