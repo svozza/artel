@@ -191,10 +191,16 @@ impl WorkspaceFilter {
             return FilterDecision::Skip(SkipReason::Hardcoded);
         }
 
-        // 2. Symlink check.
-        if let Ok(meta) = fs::symlink_metadata(abs_path)
-            && meta.file_type().is_symlink()
-        {
+        // 2. Symlink check: the leaf itself, plus every ancestor
+        // directory between root and the leaf. A peer-controlled key
+        // with no `..` anywhere (e.g. `path/uploads/evil.sh`) can
+        // still resolve outside root if `uploads` is a symlinked
+        // directory — checking only the leaf would miss that escape.
+        // Only components below `root` are walked: `root` itself may
+        // legitimately sit under a symlink in the ambient filesystem
+        // (e.g. macOS's `/tmp` -> `/private/tmp`), which is none of
+        // this check's business.
+        if self.has_symlink_in_path(rel) {
             return FilterDecision::Skip(SkipReason::Symlink);
         }
 
@@ -215,6 +221,39 @@ impl WorkspaceFilter {
         }
 
         FilterDecision::Include
+    }
+
+    /// Does any component of `rel` (workspace-relative), rebuilt
+    /// under [`Self::root`], resolve to a symlink?
+    ///
+    /// `fs::symlink_metadata` on the leaf alone only catches a
+    /// symlinked *leaf* — a leaf reached through a symlinked
+    /// *ancestor* directory (e.g. `<root>/uploads/evil.sh` where
+    /// `uploads` is a symlink to somewhere outside root) would lstat
+    /// clean and let `rename`/`remove_file` follow the ancestor link
+    /// straight out of the workspace. Walking every component below
+    /// `root` closes that gap; `symlink_metadata` never follows
+    /// links, so this is still a pure lstat walk, no traversal into
+    /// the linked-to tree.
+    fn has_symlink_in_path(&self, rel: &Path) -> bool {
+        // Only `Normal` components extend the walk — `rel` is
+        // usually workspace-relative, but `check`'s fallback hands us
+        // the raw (possibly absolute) path when `abs_path` isn't
+        // under `root`. Pushing an absolute/root component onto a
+        // `PathBuf` *replaces* it rather than appending, which would
+        // walk the wrong tree entirely; skipping non-`Normal`
+        // components keeps the walk anchored under `root`.
+        let mut current = self.root.clone();
+        for component in rel.components() {
+            let std::path::Component::Normal(part) = component else {
+                continue;
+            };
+            current.push(part);
+            if fs::symlink_metadata(&current).is_ok_and(|m| m.file_type().is_symlink()) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Single source of truth for the hardcoded-skip predicate.
@@ -622,5 +661,76 @@ mod tests {
             filter.check(&link),
             FilterDecision::Skip(SkipReason::Symlink)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_path_through_symlinked_ancestor_directory() {
+        // A key like `path/uploads/evil.sh` contains no `..` and its
+        // leaf doesn't exist yet, so a leaf-only lstat sees nothing —
+        // but if `uploads` is a symlinked directory (a realistic
+        // convenience symlink, e.g. `uploads -> /mnt/shared`), the
+        // resolved location is outside the workspace root. The
+        // ancestor walk must catch this even when the leaf is absent.
+        let dir = make_root();
+        let outside = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("uploads")).unwrap();
+
+        let filter = default_filter(dir.path());
+        let leaf = dir.path().join("uploads").join("evil.sh");
+        assert_eq!(
+            filter.check(&leaf),
+            FilterDecision::Skip(SkipReason::Symlink),
+            "a leaf reached through a symlinked ancestor must be rejected \
+             even though the leaf itself doesn't exist",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_existing_file_through_symlinked_ancestor_directory() {
+        // Same escape, but targeting a pre-existing file outside root
+        // (the delete-side exploit: a crafted tombstone for a path
+        // that resolves through the symlink to a real file).
+        let dir = make_root();
+        let outside = TempDir::new().unwrap();
+        fs::write(outside.path().join("important.txt"), b"do not delete").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("uploads")).unwrap();
+
+        let filter = default_filter(dir.path());
+        let leaf = dir.path().join("uploads").join("important.txt");
+        assert_eq!(
+            filter.check(&leaf),
+            FilterDecision::Skip(SkipReason::Symlink),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_nested_ancestor_symlink_several_levels_deep() {
+        // The escape isn't limited to the direct parent — a symlink
+        // several components up the chain must be caught too.
+        let dir = make_root();
+        let outside = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("a/b/c")).unwrap();
+
+        let filter = default_filter(dir.path());
+        let leaf = dir.path().join("a/b/c/d/evil.sh");
+        assert_eq!(
+            filter.check(&leaf),
+            FilterDecision::Skip(SkipReason::Symlink),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_nested_path_with_no_symlink_still_includes() {
+        // Regression guard: the ancestor walk must not over-trigger
+        // on a perfectly normal nested path with no symlink anywhere.
+        let dir = make_root();
+        let p = write_file(dir.path(), "a/b/c/d.txt", b"x");
+        let filter = default_filter(dir.path());
+        assert_eq!(filter.check(&p), FilterDecision::Include);
     }
 }
