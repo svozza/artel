@@ -70,9 +70,65 @@ const POLICY_OFFENDING_LIMIT: usize = 5;
 pub const TICKET_ACTION: &str = artel_protocol::TICKET_ACTION;
 
 /// Action stamped on the `MessageKind::System` message a joiner sends
-/// to announce its workspace `EndpointId` to the host. Payload is the
-/// raw 32-byte `EndpointId`.
+/// to announce its workspace `EndpointId` to the host.
+///
+/// Payload is a postcard-encoded `NodeIdAnnouncePayload`
+/// (crate-private: a claimed `EndpointId` plus a proof-of-possession
+/// signature over it).
 pub const NODE_ID_ACTION: &str = "workspace.node_id";
+
+/// Domain tag for the [`NodeIdAnnouncePayload`] proof-of-possession
+/// signature.
+///
+/// `NODE_ID_ACTION` is not a daemon-reserved action — any RW peer's
+/// daemon can author one via the ordinary `Send` IPC path — so the
+/// message's authenticated `message.peer.id` proves only *who sent
+/// it*, never that the sender controls the *claimed* `workspace_id`.
+/// Without a binding, a peer could announce another peer's real
+/// workspace `EndpointId` as its own, poisoning every receiver's
+/// `PeerMap.id_map` entry for that endpoint (see
+/// [`handle_node_id_message`]). The signature is minted by the
+/// workspace node's own secret key over `session_id || sender's
+/// daemon PeerId || claimed EndpointId`, so a receiver can verify the
+/// announcer actually holds that endpoint's private key before ever
+/// calling [`PeerMap::register`]. Binding in the sender's `PeerId`
+/// (not just the endpoint id) stops the signature being replayed by a
+/// different daemon; binding in the session id stops cross-session
+/// replay.
+const NODE_ID_ANNOUNCE_DOMAIN_TAG: &[u8] = b"artel-fs/node-id-announce/v1";
+
+/// Wire payload for [`NODE_ID_ACTION`]: a workspace `EndpointId` plus a
+/// proof-of-possession signature over it (see
+/// [`NODE_ID_ANNOUNCE_DOMAIN_TAG`]).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct NodeIdAnnouncePayload {
+    /// The announcer's workspace `EndpointId`, raw bytes.
+    #[serde(with = "serde_bytes")]
+    workspace_id: [u8; 32],
+    /// Ed25519 signature (raw bytes) over
+    /// [`node_id_announce_signed_bytes`], signed by the secret key
+    /// behind `workspace_id`.
+    #[serde(with = "serde_bytes")]
+    signature: [u8; 64],
+}
+
+/// Build the canonical bytes a `NODE_ID_ACTION` announcer signs (and a
+/// receiver re-derives to verify). Binding the session id and the
+/// sender's own daemon `PeerId` alongside the claimed endpoint id
+/// forecloses both cross-session and cross-sender replay of a
+/// legitimately-signed announce.
+fn node_id_announce_signed_bytes(
+    session: SessionId,
+    sender_daemon_peer: PeerId,
+    workspace_id: iroh::EndpointId,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(NODE_ID_ANNOUNCE_DOMAIN_TAG.len() + 16 + 32 + 32);
+    out.extend_from_slice(NODE_ID_ANNOUNCE_DOMAIN_TAG);
+    out.extend_from_slice(session.as_bytes());
+    out.extend_from_slice(sender_daemon_peer.as_bytes());
+    out.extend_from_slice(workspace_id.as_bytes());
+    out
+}
 
 use artel_protocol::{
     DOWNGRADE_ACTION, DowngradePayload, ROTATE_ACTION, RotatePayload, UPGRADE_ACTION,
@@ -1492,14 +1548,24 @@ impl Workspace {
         .await?;
 
         // Announce our workspace EndpointId to the host so it can
-        // register our mapping in its own PeerMap.
+        // register our mapping in its own PeerMap. Sign the claim with
+        // our own endpoint secret so the receiver can verify we
+        // actually hold this EndpointId's private key before trusting
+        // the mapping (see `NODE_ID_ANNOUNCE_DOMAIN_TAG`).
+        let announce_signed_bytes =
+            node_id_announce_signed_bytes(session, client.daemon_peer_id(), node.endpoint_id);
+        let announce_payload = NodeIdAnnouncePayload {
+            workspace_id: *node.endpoint_id.as_bytes(),
+            signature: node.sign(&announce_signed_bytes).to_bytes(),
+        };
         let announce_resp = client
             .request(Request::Send {
                 session,
                 payload: SendPayload {
                     kind: MessageKind::System,
                     action: NODE_ID_ACTION.to_string(),
-                    payload: node.endpoint_id.as_bytes().to_vec(),
+                    payload: postcard::to_allocvec(&announce_payload)
+                        .expect("NodeIdAnnouncePayload always encodes"),
                 },
             })
             .await;
@@ -4318,16 +4384,38 @@ enum CapOutcome {
 /// epoch 0). Gated on `has_rw` *after* `register`, so a since-revoked
 /// peer gets nothing. Best-effort spawn.
 fn handle_node_id_message(
+    session: SessionId,
     message: &SessionMessage,
     peer_map: &Arc<PeerMap>,
     host_ctx: Option<&HostUpgradeCtx>,
 ) {
-    let Ok(bytes) = <[u8; 32]>::try_from(message.payload.as_slice()) else {
+    let Ok(announce) = postcard::from_bytes::<NodeIdAnnouncePayload>(&message.payload) else {
         return;
     };
-    let Ok(workspace_id) = iroh::EndpointId::from_bytes(&bytes) else {
+    let Ok(workspace_id) = iroh::EndpointId::from_bytes(&announce.workspace_id) else {
         return;
     };
+    // Verify the announcer actually holds `workspace_id`'s private
+    // key before trusting the claim — otherwise any RW peer could
+    // announce another peer's real endpoint id as its own and poison
+    // this receiver's `id_map` for that endpoint (see
+    // `NODE_ID_ANNOUNCE_DOMAIN_TAG`).
+    let signed_bytes = node_id_announce_signed_bytes(session, message.peer.id, workspace_id);
+    if workspace_id
+        .verify(
+            &signed_bytes,
+            &iroh::Signature::from_bytes(&announce.signature),
+        )
+        .is_err()
+    {
+        warn!(
+            target: "artel_fs::workspace",
+            peer = %message.peer.id,
+            claimed_workspace_id = %workspace_id,
+            "node_id announce: proof-of-possession signature failed verification; ignoring",
+        );
+        return;
+    }
     peer_map.register(workspace_id, message.peer.id);
 
     if let Some(ctx) = host_ctx
@@ -4591,7 +4679,7 @@ async fn handle_cap_event(
                     handle_capability_message(&message, peer_map, host_ctx, events_tx);
                 }
                 MessageKind::System if message.action == NODE_ID_ACTION => {
-                    handle_node_id_message(&message, peer_map, host_ctx);
+                    handle_node_id_message(session, &message, peer_map, host_ctx);
                 }
                 MessageKind::System if message.action == UPGRADE_ACTION => {
                     if let Some(ctx) = joiner_ctx
@@ -4971,25 +5059,54 @@ mod tests {
         assert!(matches!(out, CapOutcome::Ignored));
     }
 
+    /// Build a correctly-signed `NODE_ID_ACTION` message: `ws_key`
+    /// signs its own claimed endpoint id, bound to `session` and
+    /// `peer_daemon` per [`node_id_announce_signed_bytes`]. Uses
+    /// `iroh::SecretKey` (the same type `WorkspaceNode::sign` signs
+    /// with in production) rather than a raw `ed25519_dalek` key, so
+    /// the test path matches the real one.
+    fn signed_node_id_message(
+        session: SessionId,
+        seq: u64,
+        peer_daemon: PeerId,
+        ws_key: &iroh::SecretKey,
+    ) -> SessionMessage {
+        let workspace_id = ws_key.public();
+        let signed_bytes = node_id_announce_signed_bytes(session, peer_daemon, workspace_id);
+        let announce = NodeIdAnnouncePayload {
+            workspace_id: *workspace_id.as_bytes(),
+            signature: ws_key.sign(&signed_bytes).to_bytes(),
+        };
+        SessionMessage::new(
+            Seq::new(seq),
+            1,
+            artel_protocol::PeerInfo::new(peer_daemon, "bob"),
+            MessageKind::System,
+            NODE_ID_ACTION,
+            postcard::to_allocvec(&announce).unwrap(),
+            artel_protocol::message::SIGNATURE_UNSIGNED,
+            artel_protocol::message::SIGNATURE_UNSIGNED,
+        )
+    }
+
     /// `handle_node_id_message` registers the announcing peer's
-    /// workspace-id -> daemon-id mapping. With `host_ctx = None` (the
-    /// joiner side, or any non-host) there is no secret re-delivery — we
-    /// pin the registration half here, which is observable without a live
-    /// `Client`. The host-side RW-gated re-delivery is exercised
-    /// end-to-end in the real-n0 integration suite (a spawned unicast
-    /// needs a real daemon).
+    /// workspace-id -> daemon-id mapping, but only once the announce's
+    /// proof-of-possession signature verifies. With `host_ctx = None`
+    /// (the joiner side, or any non-host) there is no secret
+    /// re-delivery — we pin the registration half here, which is
+    /// observable without a live `Client`. The host-side RW-gated
+    /// re-delivery is exercised end-to-end in the real-n0 integration
+    /// suite (a spawned unicast needs a real daemon).
     #[test]
     fn node_id_message_registers_mapping() {
         let host = PeerId::from_bytes([0xa0; 32]);
         let peer_map = Arc::new(PeerMap::new(host));
+        let session = SessionId::from_bytes([9; 16]);
 
         // A returning peer's daemon id + its workspace endpoint id.
-        // The workspace id must be a valid ed25519 public key, so derive
-        // it from a signing key rather than using arbitrary bytes.
         let peer_daemon = PeerId::from_bytes([0xb0; 32]);
-        let ws_key = artel_protocol::signing::SigningKey::from_bytes(&[0xc0; 32]);
-        let workspace_id =
-            iroh::EndpointId::from_bytes(&ws_key.verifying_key().to_bytes()).unwrap();
+        let ws_key = iroh::SecretKey::from_bytes(&[0xc0; 32]);
+        let workspace_id = ws_key.public();
 
         // Before the NODE_ID announce the workspace id is unresolvable.
         assert_eq!(
@@ -4997,19 +5114,10 @@ mod tests {
             crate::peer_map::AuthorDisposition::Unresolvable,
         );
 
-        let msg = SessionMessage::new(
-            Seq::new(1),
-            1,
-            artel_protocol::PeerInfo::new(peer_daemon, "bob"),
-            MessageKind::System,
-            NODE_ID_ACTION,
-            workspace_id.as_bytes().to_vec(),
-            artel_protocol::message::SIGNATURE_UNSIGNED,
-            artel_protocol::message::SIGNATURE_UNSIGNED,
-        );
+        let msg = signed_node_id_message(session, 1, peer_daemon, &ws_key);
 
         // host_ctx None: registers the mapping, no delivery side-effect.
-        handle_node_id_message(&msg, &peer_map, None);
+        handle_node_id_message(session, &msg, &peer_map, None);
 
         // Mapping now resolves. The peer holds no cap yet, so it's NotRw
         // (resolvable but not RW) — proving the register landed without a
@@ -5023,12 +5131,88 @@ mod tests {
         // precondition the host-side re-delivery gates on (`has_rw` after
         // register).
         peer_map.apply_capability(host, &grant_rw_payload(peer_daemon));
-        handle_node_id_message(&msg, &peer_map, None);
+        handle_node_id_message(session, &msg, &peer_map, None);
         assert_eq!(
             peer_map.classify_author(workspace_id),
             crate::peer_map::AuthorDisposition::Rw,
         );
         assert!(peer_map.has_rw(peer_daemon));
+    }
+
+    /// The core exploit this fix closes: an RW peer (Mallory) cannot
+    /// hijack another peer's (Bob's) real workspace `EndpointId` by
+    /// simply announcing it — without Bob's private key, Mallory can't
+    /// produce a signature that verifies against Bob's public key, so
+    /// `handle_node_id_message` must reject the forged announce and
+    /// leave Bob's endpoint unresolvable (not silently pointing at
+    /// Mallory).
+    #[test]
+    fn forged_node_id_announce_is_rejected() {
+        let host = PeerId::from_bytes([0xa0; 32]);
+        let peer_map = Arc::new(PeerMap::new(host));
+        let session = SessionId::from_bytes([9; 16]);
+
+        // Bob's real workspace key (never revealed to Mallory).
+        let bob_ws_key = iroh::SecretKey::from_bytes(&[0xb0; 32]);
+        let bob_workspace_id = bob_ws_key.public();
+
+        // Mallory's own daemon identity and workspace key — distinct
+        // from Bob's in every respect.
+        let mallory_daemon = PeerId::from_bytes([0xd0; 32]);
+        let mallory_ws_key = iroh::SecretKey::from_bytes(&[0xd1; 32]);
+
+        // Mallory signs with HER OWN key but claims Bob's EndpointId in
+        // the payload — the forgery this fix must catch.
+        let signed_bytes = node_id_announce_signed_bytes(session, mallory_daemon, bob_workspace_id);
+        let forged = NodeIdAnnouncePayload {
+            workspace_id: *bob_workspace_id.as_bytes(),
+            signature: mallory_ws_key.sign(&signed_bytes).to_bytes(),
+        };
+        let msg = SessionMessage::new(
+            Seq::new(1),
+            1,
+            artel_protocol::PeerInfo::new(mallory_daemon, "mallory"),
+            MessageKind::System,
+            NODE_ID_ACTION,
+            postcard::to_allocvec(&forged).unwrap(),
+            artel_protocol::message::SIGNATURE_UNSIGNED,
+            artel_protocol::message::SIGNATURE_UNSIGNED,
+        );
+
+        handle_node_id_message(session, &msg, &peer_map, None);
+
+        // The forged mapping must NOT have landed: Bob's endpoint stays
+        // unresolvable rather than resolving to Mallory.
+        assert_eq!(
+            peer_map.classify_author(bob_workspace_id),
+            crate::peer_map::AuthorDisposition::Unresolvable,
+            "a forged announce must not poison the id_map",
+        );
+    }
+
+    /// A signature that verifies but is bound to a different session
+    /// must be rejected — otherwise a legitimately-signed announce
+    /// captured on one session could be replayed on another.
+    #[test]
+    fn node_id_announce_replayed_cross_session_is_rejected() {
+        let host = PeerId::from_bytes([0xa0; 32]);
+        let peer_map = Arc::new(PeerMap::new(host));
+        let original_session = SessionId::from_bytes([9; 16]);
+        let other_session = SessionId::from_bytes([10; 16]);
+
+        let peer_daemon = PeerId::from_bytes([0xb0; 32]);
+        let ws_key = iroh::SecretKey::from_bytes(&[0xc0; 32]);
+        let workspace_id = ws_key.public();
+
+        // Signed for `original_session`, replayed against `other_session`.
+        let msg = signed_node_id_message(original_session, 1, peer_daemon, &ws_key);
+        handle_node_id_message(other_session, &msg, &peer_map, None);
+
+        assert_eq!(
+            peer_map.classify_author(workspace_id),
+            crate::peer_map::AuthorDisposition::Unresolvable,
+            "a cross-session replay must not verify",
+        );
     }
 
     /// Encode a host-authored `Grant{peer, ReadWrite}` capability payload.

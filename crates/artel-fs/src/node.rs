@@ -22,7 +22,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use iroh::protocol::Router;
-use iroh::{Endpoint, EndpointId};
+use iroh::{Endpoint, EndpointId, Signature};
 use iroh_blobs::BlobsProtocol;
 use iroh_blobs::store::fs::FsStore;
 use iroh_docs::protocol::Docs;
@@ -231,6 +231,18 @@ impl WorkspaceNode {
             #[cfg(feature = "test-utils")]
             shutdown_failure_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
+    }
+
+    /// Sign `msg` with this node's own endpoint secret key.
+    ///
+    /// Lets a caller prove possession of [`Self::endpoint_id`]'s
+    /// private key to a remote verifier — used by the
+    /// `NODE_ID_ACTION` announce so a receiving peer can check that
+    /// the announcer actually controls the workspace `EndpointId` it
+    /// claims, rather than trusting a bare self-declared value (see
+    /// [`crate::workspace::handle_node_id_message`]).
+    pub(crate) fn sign(&self, msg: &[u8]) -> Signature {
+        self.router.endpoint().secret_key().sign(msg)
     }
 
     /// Tear the node down gracefully.
