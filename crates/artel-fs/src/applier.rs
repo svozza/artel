@@ -375,27 +375,69 @@ async fn handle_content_ready(
     // filter or write work. Keep that ordering invariant if this
     // function ever grows a fast-path: `Mode::ReadOnly` must be
     // honoured *before* the disk write.
-    let stream = match workspace.doc().get_many(Query::all()).await {
-        Ok(s) => s,
-        Err(err) => {
-            warn!(target: "artel_fs::applier", %hash, %err, "get_many failed in ContentReady handler");
-            emit_event(
-                &workspace.events,
-                WorkspaceEvent::Error(format!("get_many failed: {err}")),
-            );
-            return;
-        }
-    };
-    let mut stream = Box::pin(stream);
-
+    //
+    // `trackers.tracked_paths(hash)` already holds exactly the keys
+    // NotReady-registered for this hash (`TransferTrackers::track`,
+    // issue #38) — the tracker's path set IS the set of pending
+    // consumers, kept in sync by `supersede`/`track` on every
+    // `handle_entry` call. Re-deriving them via one `key_exact` lookup
+    // per key is a bounded by-key-index range scan (O(matches)), vs.
+    // `Query::all()`'s O(total live entries) scan. A hash with no
+    // tracker (never registered, or dropped by the
+    // `MAX_CONCURRENT_TRACKERS` cap) falls back to the full scan —
+    // rare enough that the fallback's cost doesn't matter, and it
+    // preserves the "every entry is retried on ContentReady, tracked
+    // or not" correctness contract the cap fix relies on.
+    let tracked = trackers.tracked_paths(hash);
     let mut matched = 0usize;
     let mut still_pending = false;
-    while let Some(res) = stream.next().await {
-        let Ok(entry) = res else { continue };
-        if entry.content_hash() == hash {
-            matched += 1;
-            still_pending |=
-                handle_entry(workspace, guard, filter, trackers, doc_token, entry).await;
+    if tracked.is_empty() {
+        let stream = match workspace.doc().get_many(Query::all()).await {
+            Ok(s) => s,
+            Err(err) => {
+                warn!(target: "artel_fs::applier", %hash, %err, "get_many failed in ContentReady handler");
+                emit_event(
+                    &workspace.events,
+                    WorkspaceEvent::Error(format!("get_many failed: {err}")),
+                );
+                return;
+            }
+        };
+        let mut stream = Box::pin(stream);
+        while let Some(res) = stream.next().await {
+            let Ok(entry) = res else { continue };
+            if entry.content_hash() == hash {
+                matched += 1;
+                still_pending |=
+                    handle_entry(workspace, guard, filter, trackers, doc_token, entry).await;
+            }
+        }
+    } else {
+        for path in tracked {
+            let Ok(key) = keys::path_to_key(&workspace.root, &path) else {
+                continue;
+            };
+            let entry = match workspace
+                .doc()
+                .get_one(Query::single_latest_per_key().key_exact(key))
+                .await
+            {
+                Ok(entry) => entry,
+                Err(err) => {
+                    warn!(target: "artel_fs::applier", %hash, path = %path.display(), %err, "get_one failed in ContentReady handler");
+                    emit_event(
+                        &workspace.events,
+                        WorkspaceEvent::Error(format!("get_one failed: {err}")),
+                    );
+                    continue;
+                }
+            };
+            let Some(entry) = entry else { continue };
+            if entry.content_hash() == hash {
+                matched += 1;
+                still_pending |=
+                    handle_entry(workspace, guard, filter, trackers, doc_token, entry).await;
+            }
         }
     }
     // handle_entry's Applied arm reaps the tracker per entry; this
