@@ -596,6 +596,65 @@ async fn transferring_events_narrate_download_then_stop_at_peer_wrote() {
 }
 
 // =============================================================
+// Two doc keys sharing one content hash, both NotReady at
+// ContentReady time (applier.rs::handle_content_ready's targeted
+// per-key lookup, replacing a full-document scan). Both files are
+// written before either's blob can complete locally, so the single
+// ContentReady for their shared hash must resolve and apply both
+// tracked paths.
+// =============================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shared_hash_content_ready_resolves_every_tracked_path() {
+    let big = payload(6 * 1024 * 1024 + 999);
+    let big_hash = blake3::hash(&big);
+
+    let mut pair = spawn_synced_pair(None, None, &[]).await;
+    common::drain_ws_events(pair.alice_rx.take().expect("alice_rx"));
+    let mut bob_rx = pair.bob_rx.take().expect("bob_rx");
+
+    // Two distinct keys, identical bytes: both InsertRemote events
+    // reach bob's applier before either's blob is locally complete,
+    // so both are NotReady-registered under the one shared hash's
+    // tracker before its single ContentReady fires.
+    tokio::fs::write(pair.alice_ws.root.join("shared-a.bin"), &big)
+        .await
+        .unwrap();
+    tokio::fs::write(pair.alice_ws.root.join("shared-b.bin"), &big)
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::sleep(BIG_FILE_BUDGET);
+    tokio::pin!(deadline);
+    let mut seen_a = false;
+    let mut seen_b = false;
+    while !(seen_a && seen_b) {
+        tokio::select! {
+            ev = bob_rx.recv() => {
+                match ev.expect("bob event stream open") {
+                    WorkspaceEvent::PeerWrote { path } if path.file_name().is_some_and(|n| n == "shared-a.bin") => {
+                        seen_a = true;
+                    }
+                    WorkspaceEvent::PeerWrote { path } if path.file_name().is_some_and(|n| n == "shared-b.bin") => {
+                        seen_b = true;
+                    }
+                    _ => {}
+                }
+            }
+            () = &mut deadline => panic!(
+                "PeerWrote for both shared-hash paths never arrived (a={seen_a}, b={seen_b})",
+            ),
+        }
+    }
+
+    wait_for_file_hash(&pair.bob_ws.root.join("shared-a.bin"), big_hash, big.len()).await;
+    wait_for_file_hash(&pair.bob_ws.root.join("shared-b.bin"), big_hash, big.len()).await;
+
+    common::drain_ws_events(bob_rx);
+    pair.teardown().await;
+}
+
+// =============================================================
 // Tier C: multi-MiB round-trip over the bin-shared localhost relay
 // (real QUIC transport, production discovery wiring — the closest
 // harness to production the suite runs; see

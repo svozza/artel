@@ -285,6 +285,26 @@ impl TransferTrackers {
         );
     }
 
+    /// Paths currently pointing at `hash`, if any tracker exists for
+    /// it. Lets [`crate::applier::handle_content_ready`] resolve which
+    /// doc keys a `ContentReady` hash affects without a full-document
+    /// scan — only paths this registry already knows are waiting on
+    /// `hash` need re-checking.
+    pub(crate) fn tracked_paths(&self, hash: Hash) -> Vec<PathBuf> {
+        self.trackers
+            .get(&hash)
+            .map(|tracker| {
+                tracker
+                    .paths
+                    .lock()
+                    .expect("tracker paths mutex")
+                    .keys()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The blob behind `hash` is ready (its `ContentReady` arrived,
     /// or an entry applied directly): stop the tracker and **await
     /// its death**. Combined with the emit-under-lock barrier this
