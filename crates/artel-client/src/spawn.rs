@@ -275,13 +275,36 @@ fn spawn_detached(opts: &SpawnOptions) -> Result<(), ClientError> {
         socket = %opts.socket_path.display(),
         "spawning daemon",
     );
-    cmd.spawn().map_err(|source| {
+    let child = cmd.spawn().map_err(|source| {
         ClientError::Spawn(SpawnError::Launch {
             path: opts.daemon_binary.clone(),
             source,
         })
     })?;
+    reap_in_background(child);
     Ok(())
+}
+
+/// Wait on `child` from a detached background thread so it never
+/// becomes a zombie.
+///
+/// The daemon is meant to outlive this process — we don't want to
+/// block `connect_or_spawn` on its exit, or hold any tokio resources
+/// for however long it runs (hours to indefinitely). But `spawn()`'s
+/// returned [`std::process::Child`] must still be waited on by
+/// *someone*, or an exited child (e.g. a fast crash from a bad
+/// `--state-dir` or a startup permission error, surfaced separately
+/// to the caller as [`SpawnError::Timeout`] once `wait_for_socket`
+/// gives up) leaves an entry in the process table for the rest of
+/// this process's lifetime. A plain OS thread doing a blocking
+/// `wait()` is the whole fix: it costs one thread for the life of the
+/// child, exits the moment the child does, and needs no tokio
+/// runtime or executor feature.
+fn reap_in_background(mut child: std::process::Child) {
+    std::thread::spawn(move || match child.wait() {
+        Ok(status) => debug!(%status, "spawned daemon process exited; reaped"),
+        Err(err) => warn!(%err, "failed to reap spawned daemon process"),
+    });
 }
 
 /// Poll for `socket` to become connectable, up to `timeout`. We don't
@@ -370,6 +393,51 @@ mod tests {
         child.wait().unwrap();
         std::fs::write(&p, format!("{dead}\n")).unwrap();
         assert!(!pidfile_names_live_process(&p));
+    }
+
+    /// The bug this module's fix closes: a spawned child that exits
+    /// quickly must not sit in the process table as a zombie for the
+    /// rest of this process's lifetime. `reap_in_background` waits on
+    /// it from a dedicated thread; poll `ps`'s reported state for the
+    /// child's pid until it's no longer `Z` (zombie) or the pid is
+    /// gone entirely (already reaped and recycled).
+    #[test]
+    fn reap_in_background_clears_a_fast_exiting_child() {
+        let child = process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        reap_in_background(child);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let state = ps_state(pid);
+            match state.as_deref() {
+                None => break,                        // pid no longer listed at all: reaped.
+                Some(s) if !s.contains('Z') => break, // no longer a zombie.
+                _ => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "pid {pid} was still a zombie after 5s — reap_in_background \
+                         did not wait() it",
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        }
+    }
+
+    /// `ps`'s reported process state for `pid`, or `None` if `ps`
+    /// no longer lists it (already reaped by *some* waiter — the OS
+    /// recycles pids, so absence is as conclusive as a non-`Z` state).
+    fn ps_state(pid: u32) -> Option<String> {
+        let output = process::Command::new("ps")
+            .args(["-o", "state=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps must be runnable in the test environment");
+        if !output.status.success() {
+            return None;
+        }
+        let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if state.is_empty() { None } else { Some(state) }
     }
 
     #[test]
