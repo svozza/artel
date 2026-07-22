@@ -18,8 +18,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as SyncMutex};
 
 use artel_protocol::transport::{self, Framed, client::connect as transport_connect};
 use artel_protocol::{
@@ -51,7 +51,37 @@ const WRITER_QUEUE_CAPACITY: usize = 64;
 /// happen, purely from the consumer not draining fast enough.
 const EVENTS_QUEUE_CAPACITY: usize = 256;
 
-type ResponseSenders = Arc<Mutex<HashMap<RequestId, oneshot::Sender<Response>>>>;
+type ResponseSenders = Arc<SyncMutex<HashMap<RequestId, oneshot::Sender<Response>>>>;
+
+/// Owns a `pending` map entry for the lifetime of a `request()` call
+/// and removes it on drop.
+///
+/// Without this, cancelling a `request()` future mid-flight — e.g. a
+/// caller wrapping the call in `tokio::time::timeout` that fires —
+/// left the entry in `pending` forever: nothing removes it except a
+/// matching `Response` frame arriving (which never happens for the
+/// op that hung) or the whole connection closing. A retry loop around
+/// a slow-but-alive daemon operation would leak one entry per
+/// cancelled attempt. The guard makes removal happen on every exit
+/// path — normal completion, early return, or the future simply being
+/// dropped — without `request()` having to enumerate them.
+struct PendingGuard<'a> {
+    pending: &'a ResponseSenders,
+    id: RequestId,
+}
+
+impl<'a> PendingGuard<'a> {
+    fn insert(pending: &'a ResponseSenders, id: RequestId, tx: oneshot::Sender<Response>) -> Self {
+        pending.lock().expect("pending mutex").insert(id, tx);
+        Self { pending, id }
+    }
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        self.pending.lock().expect("pending mutex").remove(&self.id);
+    }
+}
 
 /// Stream of asynchronous events the daemon pushes after a successful
 /// `Subscribe`.
@@ -202,7 +232,7 @@ impl Client {
         let (out_tx, out_rx) = mpsc::channel::<WireMessage>(WRITER_QUEUE_CAPACITY);
         let (events_tx, events_rx) = mpsc::channel(EVENTS_QUEUE_CAPACITY);
         let (closed_tx, closed_rx) = watch::channel(false);
-        let pending: ResponseSenders = Arc::new(Mutex::new(HashMap::new()));
+        let pending: ResponseSenders = Arc::new(SyncMutex::new(HashMap::new()));
 
         let (sink, stream) = framed.split();
         spawn_writer(sink, out_rx);
@@ -243,7 +273,11 @@ impl Client {
 
         let id = self.alloc_id();
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, tx);
+        // Guard's Drop removes the `pending` entry on every exit path
+        // below — early return, normal completion, or the whole
+        // `request()` future being cancelled by an external timeout —
+        // so none of those paths need their own explicit `.remove()`.
+        let _guard = PendingGuard::insert(&self.pending, id, tx);
 
         if self
             .out
@@ -251,7 +285,6 @@ impl Client {
             .await
             .is_err()
         {
-            self.pending.lock().await.remove(&id);
             return Err(ClientError::ConnectionClosed);
         }
 
@@ -267,7 +300,6 @@ impl Client {
             res = closed.changed() => {
                 // Either flipped to true, or the sender dropped.
                 let _ = res;
-                self.pending.lock().await.remove(&id);
                 return Err(ClientError::ConnectionClosed);
             }
         };
@@ -363,7 +395,7 @@ fn spawn_reader<IO>(
             };
             match frame {
                 WireMessage::Response { id, response } => {
-                    let tx = pending.lock().await.remove(&id);
+                    let tx = pending.lock().expect("pending mutex").remove(&id);
                     if let Some(tx) = tx {
                         // If the caller dropped its future, this fails
                         // silently and the response is discarded.
@@ -405,7 +437,7 @@ fn spawn_reader<IO>(
         // Stream ended: signal closure to any waiting requesters and
         // drop their oneshots.
         let _ = closed.send(true);
-        pending.lock().await.clear();
+        pending.lock().expect("pending mutex").clear();
         debug!("client reader: exited");
     });
 }
@@ -436,7 +468,7 @@ mod tests {
         let (a, b) = tokio::io::duplex(64 * 1024);
         let feed = transport::new(a);
         let (_sink, stream) = transport::new(b).split();
-        let pending: ResponseSenders = Arc::new(Mutex::new(HashMap::new()));
+        let pending: ResponseSenders = Arc::new(SyncMutex::new(HashMap::new()));
         let (events_tx, events_rx) = mpsc::channel(events_capacity);
         let (closed_tx, closed_rx) = watch::channel(false);
         spawn_reader(stream, Arc::clone(&pending), events_tx, closed_tx);
@@ -477,7 +509,7 @@ mod tests {
         // awaiting anything on the response side.
         let id = RequestId::new(1);
         let (tx, rx) = oneshot::channel();
-        pending.lock().await.insert(id, tx);
+        pending.lock().expect("pending mutex").insert(id, tx);
 
         feed.send(WireMessage::Event {
             event: dummy_event(),
@@ -524,7 +556,7 @@ mod tests {
 
         let id = RequestId::new(1);
         let (tx, rx) = oneshot::channel();
-        pending.lock().await.insert(id, tx);
+        pending.lock().expect("pending mutex").insert(id, tx);
 
         feed.send(WireMessage::Event {
             event: dummy_event(),
@@ -543,5 +575,70 @@ mod tests {
             .expect("reader must keep running after the events receiver is dropped")
             .expect("oneshot must not be dropped");
         assert!(matches!(response, Response::ListSessions { sessions } if sessions.is_empty()));
+    }
+
+    /// A full `Client` wired directly over a duplex pipe, plus the
+    /// peer end — kept alive by the caller for as long as the
+    /// connection should stay open (silent, never answering) rather
+    /// than `EOF`ing. `request()` can then be cancelled by an external
+    /// `tokio::time::timeout` while the connection is genuinely still
+    /// live — the exact pattern a caller reaches for to bound an op
+    /// against a daemon that hangs rather than disconnects.
+    fn client_with_silent_peer() -> (Client, tokio::io::DuplexStream) {
+        let (a, b_never_answers) = tokio::io::duplex(64 * 1024);
+        let framed = transport::new(a);
+        let client = Client::spawn(
+            framed,
+            PROTOCOL_VERSION,
+            PeerId::from_bytes([0; 32]),
+            PathBuf::from("/nonexistent"),
+        );
+        (client, b_never_answers)
+    }
+
+    /// The bug this module's fix closes: cancelling `request()` via an
+    /// external timeout must not leak its `pending` entry. Pre-fix,
+    /// only a matching `Response` or the whole connection closing ever
+    /// removed an entry — a cancelled call against an otherwise-alive
+    /// connection left it there forever.
+    #[tokio::test]
+    async fn cancelling_request_removes_its_pending_entry() {
+        let (client, _silent_peer) = client_with_silent_peer();
+
+        let result = timeout(
+            Duration::from_millis(50),
+            client.request(Request::ListSessions),
+        )
+        .await;
+        assert!(result.is_err(), "the silent peer must never answer");
+
+        assert_eq!(
+            client.pending.lock().unwrap().len(),
+            0,
+            "the cancelled request's pending entry must be cleaned up by PendingGuard's Drop, \
+             not left behind for the connection's eventual close to reap",
+        );
+    }
+
+    /// Repeated cancelled calls against the same live connection must
+    /// not accumulate — each `PendingGuard` drop cleans up its own
+    /// entry independently of the others.
+    #[tokio::test]
+    async fn repeated_cancelled_requests_do_not_accumulate() {
+        let (client, _silent_peer) = client_with_silent_peer();
+
+        for _ in 0..10 {
+            let _ = timeout(
+                Duration::from_millis(10),
+                client.request(Request::ListSessions),
+            )
+            .await;
+        }
+
+        assert_eq!(
+            client.pending.lock().unwrap().len(),
+            0,
+            "10 cancelled requests must leave 0 entries behind, not 10",
+        );
     }
 }
