@@ -2421,7 +2421,11 @@ impl Workspace {
                     tokio::select! {
                         () = cancel.cancelled() => break,
                         signal = rotation_rx.recv() => match signal {
-                            Some(s) => rotation_ws.handle_rotation_signal(s).await,
+                            Some(s) => {
+                                for sig in coalesce_rotation_batch(&mut rotation_rx, s) {
+                                    rotation_ws.handle_rotation_signal(sig).await;
+                                }
+                            }
                             None => break,
                         },
                     }
@@ -3913,6 +3917,69 @@ pub(crate) enum RotationSignal {
         namespace_epoch: u64,
         doc_ticket: String,
     },
+}
+
+/// Drain every [`RotationSignal`] already sitting in `rotation_rx`
+/// (non-blocking — `try_recv`, no sleep) and coalesce consecutive
+/// `SurvivorRotate`s down to the one with the highest epoch, dropping
+/// the superseded ones without ever calling `reimport_namespace` for
+/// them. `first` is the signal the rotation task already pulled via
+/// `recv()` before calling this.
+///
+/// Bounds the cost of a burst of `ROTATE_ACTION`s (only a compromised
+/// host can send these — see the security-review handoff) from O(N)
+/// full `reimport_namespace` calls (each tears down and respawns the
+/// watcher/applier tasks) down to O(1) for the whole burst, while
+/// preserving the channel's "never drop a signal" guarantee (C4) —
+/// this only decides which signals get *acted on*, every signal still
+/// leaves the channel. `HostEvict`s are never coalesced: each carries
+/// its own `revoke_seq` idempotency key and must be applied in
+/// received order (the survivor set a later `HostEvict` rotates
+/// against depends on every earlier one having actually run).
+fn coalesce_rotation_batch(
+    rotation_rx: &mut mpsc::UnboundedReceiver<RotationSignal>,
+    first: RotationSignal,
+) -> Vec<RotationSignal> {
+    const fn epoch_of(sig: &RotationSignal) -> Option<u64> {
+        match sig {
+            RotationSignal::SurvivorRotate {
+                namespace_epoch, ..
+            } => Some(*namespace_epoch),
+            RotationSignal::HostEvict { .. } => None,
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut pending_rotate: Option<RotationSignal> = None;
+    let mut queue = |sig: RotationSignal, out: &mut Vec<RotationSignal>| {
+        if let Some(epoch) = epoch_of(&sig) {
+            let supersedes = pending_rotate
+                .as_ref()
+                .and_then(epoch_of)
+                .is_none_or(|pending_epoch| epoch > pending_epoch);
+            if supersedes {
+                pending_rotate = Some(sig);
+            }
+        } else {
+            // A HostEvict interleaved in the burst: flush whatever
+            // survivor rotation was pending first so ordering relative
+            // to this eviction is preserved, then queue the eviction
+            // itself.
+            if let Some(rotate) = pending_rotate.take() {
+                out.push(rotate);
+            }
+            out.push(sig);
+        }
+    };
+
+    queue(first, &mut out);
+    while let Ok(sig) = rotation_rx.try_recv() {
+        queue(sig, &mut out);
+    }
+    if let Some(rotate) = pending_rotate {
+        out.push(rotate);
+    }
+    out
 }
 
 /// How [`Workspace::reimport_namespace`] obtains the rotated namespace.
@@ -6008,5 +6075,139 @@ mod tests {
                 path: PathBuf::from("/w/gone.txt"),
             },
         );
+    }
+
+    /// Unit tests for [`coalesce_rotation_batch`]: bounds the cost of a
+    /// burst of `SurvivorRotate` signals (only a compromised host can
+    /// send these) to one reimport per burst instead of one per
+    /// signal, while never coalescing or reordering `HostEvict`s
+    /// (each carries its own idempotency key and must apply in
+    /// received order).
+    mod coalesce_rotation_batch_tests {
+        use super::*;
+
+        fn rotate(epoch: u64) -> RotationSignal {
+            RotationSignal::SurvivorRotate {
+                namespace_epoch: epoch,
+                doc_ticket: format!("ticket-{epoch}"),
+            }
+        }
+
+        fn evict(seq: u64) -> RotationSignal {
+            RotationSignal::HostEvict {
+                revoked_peer: PeerId::from_bytes([0xaa; 32]),
+                revoke_seq: artel_protocol::Seq::new(seq),
+            }
+        }
+
+        fn epochs_of(out: &[RotationSignal]) -> Vec<Option<u64>> {
+            out.iter()
+                .map(|s| match s {
+                    RotationSignal::SurvivorRotate {
+                        namespace_epoch, ..
+                    } => Some(*namespace_epoch),
+                    RotationSignal::HostEvict { .. } => None,
+                })
+                .collect()
+        }
+
+        /// The common case: nothing queued behind `first`. Must return
+        /// exactly `first`, unchanged — a lone signal is not delayed
+        /// or altered by the coalescing machinery.
+        #[test]
+        fn single_signal_passes_through_unchanged() {
+            let (_tx, mut rx) = mpsc::unbounded_channel::<RotationSignal>();
+            let out = coalesce_rotation_batch(&mut rx, rotate(5));
+            assert_eq!(epochs_of(&out), vec![Some(5)]);
+        }
+
+        /// A burst of `SurvivorRotate`s already queued behind `first`
+        /// collapses to just the highest epoch — the whole point of
+        /// the fix: one `reimport_namespace` for the burst, not one
+        /// per signal.
+        #[test]
+        fn burst_of_survivor_rotates_collapses_to_highest_epoch() {
+            let (tx, mut rx) = mpsc::unbounded_channel::<RotationSignal>();
+            for epoch in [2, 3, 5, 4] {
+                tx.send(rotate(epoch)).unwrap();
+            }
+            let out = coalesce_rotation_batch(&mut rx, rotate(1));
+            assert_eq!(
+                epochs_of(&out),
+                vec![Some(5)],
+                "only the highest-epoch rotation must survive the burst",
+            );
+        }
+
+        /// Every `HostEvict` in a burst must survive, in received
+        /// order — unlike `SurvivorRotate`, they are never coalesced.
+        #[test]
+        fn burst_of_host_evicts_all_survive_in_order() {
+            let (tx, mut rx) = mpsc::unbounded_channel::<RotationSignal>();
+            for seq in [2, 3, 4] {
+                tx.send(evict(seq)).unwrap();
+            }
+            let out = coalesce_rotation_batch(&mut rx, evict(1));
+            let seqs: Vec<u64> = out
+                .iter()
+                .map(|s| match s {
+                    RotationSignal::HostEvict { revoke_seq, .. } => revoke_seq.get(),
+                    RotationSignal::SurvivorRotate { .. } => panic!("unexpected rotate"),
+                })
+                .collect();
+            assert_eq!(
+                seqs,
+                vec![1, 2, 3, 4],
+                "HostEvicts must never be dropped or reordered",
+            );
+        }
+
+        /// A `HostEvict` interleaved between `SurvivorRotate`s flushes
+        /// whatever rotation was pending *before* it, preserving
+        /// relative order — the eviction's rotation must not run
+        /// against a namespace state derived from a rotation that
+        /// arrived after it in the log.
+        #[test]
+        fn host_evict_flushes_pending_rotate_before_itself() {
+            let (tx, mut rx) = mpsc::unbounded_channel::<RotationSignal>();
+            tx.send(rotate(2)).unwrap();
+            tx.send(evict(1)).unwrap();
+            tx.send(rotate(4)).unwrap();
+            let out = coalesce_rotation_batch(&mut rx, rotate(1));
+            assert_eq!(
+                epochs_of(&out),
+                vec![Some(2), None, Some(4)],
+                "the evict must sit between the rotation pending before it \
+                 and the one queued after it, with each rotation run \
+                 having absorbed every same-side duplicate",
+            );
+        }
+
+        /// Nothing already in the channel: `try_recv` must return
+        /// immediately (no sleep, no blocking) so a lone signal incurs
+        /// zero added latency relative to the pre-fix behaviour.
+        #[test]
+        fn empty_channel_returns_first_immediately() {
+            let (_tx, mut rx) = mpsc::unbounded_channel::<RotationSignal>();
+            let start = std::time::Instant::now();
+            let out = coalesce_rotation_batch(&mut rx, evict(1));
+            assert!(
+                start.elapsed() < std::time::Duration::from_millis(50),
+                "coalescing an empty channel must not block",
+            );
+            assert_eq!(out.len(), 1);
+        }
+
+        /// A closed sender (`tx` dropped) makes `try_recv` return
+        /// `Disconnected` rather than looping forever — the drain must
+        /// terminate on a dead channel exactly as cleanly as on an
+        /// empty one.
+        #[test]
+        fn closed_channel_terminates_the_drain() {
+            let (tx, mut rx) = mpsc::unbounded_channel::<RotationSignal>();
+            drop(tx);
+            let out = coalesce_rotation_batch(&mut rx, rotate(1));
+            assert_eq!(epochs_of(&out), vec![Some(1)]);
+        }
     }
 }
