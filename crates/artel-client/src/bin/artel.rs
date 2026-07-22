@@ -231,6 +231,27 @@ async fn stop(args: StopArgs) -> ExitCode {
         return ExitCode::from(1);
     };
 
+    // Verify the pidfile's flock is still held before signaling the
+    // PID it names. `artel-daemon`'s `PidFile::acquire` takes an
+    // exclusive OS lock on this file for its entire lifetime, and the
+    // kernel releases that lock unconditionally on any exit —
+    // including SIGKILL or a crash — with no cooperation from the
+    // daemon required. If we can take the lock ourselves here, nobody
+    // holds it: the recorded PID is stale. Signaling it anyway is
+    // unsafe once the OS has recycled that PID for an unrelated
+    // process — `--force`'s SIGKILL would kill whatever now happens
+    // to hold that number. A plain liveness probe (`kill(pid, 0)`)
+    // can't tell "recycled by someone else" from "still our daemon";
+    // the flock can, because it's identity, not just existence.
+    if pidfile_lock_is_free(&pid_path) {
+        eprintln!(
+            "artel: pid file {} names pid {pid}, but nothing holds its lock — \
+             the daemon is already gone and this pid has likely been reused; refusing to signal it",
+            pid_path.display(),
+        );
+        return ExitCode::from(1);
+    }
+
     let signal = if args.force {
         Signal::SIGKILL
     } else {
@@ -254,6 +275,33 @@ async fn stop(args: StopArgs) -> ExitCode {
         args.timeout_secs
     );
     ExitCode::from(1)
+}
+
+/// Whether the OS-level exclusive lock on `pid_path` is free — i.e.
+/// nobody currently holds it, meaning no live process owns this
+/// pidfile.
+///
+/// Mirrors `artel-daemon`'s own `PidFile::acquire`: a live daemon
+/// holds `try_lock` on this exact file for as long as it runs, and
+/// the kernel drops that lock the instant the holder exits, by any
+/// means. Taking the lock ourselves and immediately releasing it
+/// (drop) is a pure probe — it never writes to or truncates the file,
+/// and never removes it; only `artel-daemon`'s own guard does that.
+/// Best-effort: any I/O error opening the file (e.g. it vanished
+/// between our earlier read and this check) is reported as "free"
+/// (lock not held) — the caller's read of the file already succeeded,
+/// so a failure here is far more likely a genuinely-gone daemon than
+/// a transient glitch, and refusing to signal is the safe default
+/// either way.
+fn pidfile_lock_is_free(pid_path: &Path) -> bool {
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(pid_path)
+    else {
+        return true;
+    };
+    file.try_lock().is_ok()
 }
 
 async fn list(args: ListArgs) -> ExitCode {
@@ -371,4 +419,92 @@ fn main() -> ExitCode {
             Command::List(args) => list(args).await,
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for `pidfile_lock_is_free`: the guard `stop` uses to
+    //! refuse signaling a PID whose pidfile's OS lock nobody holds
+    //! (see the doc comment on `pidfile_lock_is_free` for why liveness
+    //! alone — `kill(pid, 0)` — isn't enough after PID reuse).
+
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn lock_is_not_free_while_a_holder_has_it_locked() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("daemon.pid");
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        held.try_lock().unwrap();
+
+        assert!(
+            !pidfile_lock_is_free(&path),
+            "a file locked by a live holder must report as NOT free",
+        );
+
+        drop(held);
+    }
+
+    /// The bug this module's fix closes: once the holder releases the
+    /// lock (process exit, by any means, including SIGKILL — the
+    /// kernel drops `flock`s unconditionally), the file must report
+    /// as free even though its *contents* still name the old PID —
+    /// that PID may since have been recycled by the OS for an
+    /// unrelated live process.
+    #[test]
+    fn lock_is_free_after_the_holder_releases_it() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("daemon.pid");
+        {
+            let held = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            held.try_lock().unwrap();
+            // Held drops here, releasing the OS lock — simulating the
+            // daemon exiting while the pidfile's contents (never
+            // rewritten by anyone) still name its now-stale PID.
+        }
+
+        assert!(
+            pidfile_lock_is_free(&path),
+            "a file with no live holder must report as free",
+        );
+    }
+
+    #[test]
+    fn missing_pidfile_reports_free() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("never-existed.pid");
+        assert!(
+            pidfile_lock_is_free(&path),
+            "a pidfile that can't even be opened must not block on the safe-refusal path — \
+             `stop`'s earlier read_to_string already succeeded, so this is belt-and-braces",
+        );
+    }
+
+    #[test]
+    fn probing_the_lock_does_not_modify_file_contents() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("daemon.pid");
+        std::fs::write(&path, "12345\n").unwrap();
+
+        assert!(pidfile_lock_is_free(&path));
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "12345\n",
+            "the probe must not truncate or rewrite the pidfile — only \
+             artel-daemon's own PidFile guard ever touches its contents",
+        );
+    }
 }
