@@ -27,7 +27,6 @@ use artel_protocol::{
 };
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
-use tokio::net::UnixStream;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tracing::{debug, warn};
 
@@ -42,8 +41,14 @@ const WRITER_QUEUE_CAPACITY: usize = 64;
 /// Capacity of the events queue handed to the caller.
 ///
 /// Caller-controlled draining: if the consumer is slow, `Event` frames
-/// pile up here. The daemon's broadcast channel drops oldest events on
-/// lag, so worst case the client surfaces a gap rather than blocking.
+/// pile up here. Once full, the reader drops the newest event rather
+/// than blocking (see [`spawn_reader`]) — the events stream is
+/// advisory and must never stall response demultiplexing, which
+/// shares the same reader task. The daemon's own broadcast channel
+/// has an analogous drop-on-lag policy one layer up, surfaced to the
+/// consumer as [`Event::Gap`](artel_protocol::Event::Gap); this local
+/// queue is a second, independent place the same kind of loss can
+/// happen, purely from the consumer not draining fast enough.
 const EVENTS_QUEUE_CAPACITY: usize = 256;
 
 type ResponseSenders = Arc<Mutex<HashMap<RequestId, oneshot::Sender<Response>>>>;
@@ -142,10 +147,10 @@ impl Client {
         crate::spawn::connect_or_spawn(opts).await
     }
 
-    async fn handshake(
-        framed: Framed<UnixStream>,
-        socket_path: PathBuf,
-    ) -> Result<Self, ClientError> {
+    async fn handshake<IO>(framed: Framed<IO>, socket_path: PathBuf) -> Result<Self, ClientError>
+    where
+        IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
         let (mut sink, mut stream) = framed.split();
 
         // Send Hello directly on the sink so we don't need the writer
@@ -185,12 +190,15 @@ impl Client {
         ))
     }
 
-    fn spawn(
-        framed: Framed<UnixStream>,
+    fn spawn<IO>(
+        framed: Framed<IO>,
         daemon_version: ProtocolVersion,
         daemon_peer_id: PeerId,
         socket_path: PathBuf,
-    ) -> Self {
+    ) -> Self
+    where
+        IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+    {
         let (out_tx, out_rx) = mpsc::channel::<WireMessage>(WRITER_QUEUE_CAPACITY);
         let (events_tx, events_rx) = mpsc::channel(EVENTS_QUEUE_CAPACITY);
         let (closed_tx, closed_rx) = watch::channel(false);
@@ -319,10 +327,12 @@ fn unexpected(frame: WireMessage) -> ClientError {
     }
 }
 
-fn spawn_writer(
-    mut sink: SplitSink<Framed<UnixStream>, WireMessage>,
+fn spawn_writer<IO>(
+    mut sink: SplitSink<Framed<IO>, WireMessage>,
     mut out: mpsc::Receiver<WireMessage>,
-) {
+) where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+{
     tokio::spawn(async move {
         while let Some(frame) = out.recv().await {
             if let Err(err) = sink.send(frame).await {
@@ -334,12 +344,14 @@ fn spawn_writer(
     });
 }
 
-fn spawn_reader(
-    mut stream: SplitStream<Framed<UnixStream>>,
+fn spawn_reader<IO>(
+    mut stream: SplitStream<Framed<IO>>,
     pending: ResponseSenders,
     events: mpsc::Sender<Event>,
     closed: watch::Sender<bool>,
-) {
+) where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+{
     tokio::spawn(async move {
         while let Some(frame) = stream.next().await {
             let frame = match frame {
@@ -361,10 +373,28 @@ fn spawn_reader(
                     }
                 }
                 WireMessage::Event { event } => {
-                    if events.send(event).await.is_err() {
-                        // Caller dropped the events stream. Keep
-                        // running so in-flight requests can still
-                        // complete.
+                    // `try_send`, never `.await`: this task also
+                    // demultiplexes `Response` frames below, so a
+                    // blocking send here — with a slow or absent
+                    // events consumer — would stall `stream.next()`
+                    // and wedge every in-flight and future
+                    // `Client::request` on this connection, which has
+                    // no timeout of its own to escape it. Dropping the
+                    // event on a full queue (or a closed stream) keeps
+                    // the reader always making progress; the events
+                    // stream is documented as advisory, not
+                    // guaranteed delivery.
+                    if let Err(err) = events.try_send(event) {
+                        match err {
+                            mpsc::error::TrySendError::Full(_) => {
+                                warn!("client reader: events queue full; dropping event");
+                            }
+                            mpsc::error::TrySendError::Closed(_) => {
+                                // Caller dropped the events stream. Keep
+                                // running so in-flight requests can still
+                                // complete.
+                            }
+                        }
                     }
                 }
                 WireMessage::Request { .. } => {
@@ -378,4 +408,140 @@ fn spawn_reader(
         pending.lock().await.clear();
         debug!("client reader: exited");
     });
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for `spawn_reader`'s event/response demultiplexing,
+    //! driven directly over a `tokio::io::duplex` pipe (no real socket
+    //! or daemon needed — mirrors the pattern
+    //! `artel_protocol::transport::framed`'s own tests use).
+
+    use artel_protocol::{RequestId, SessionId};
+    use tokio::time::{Duration, timeout};
+
+    use super::*;
+
+    /// Wire up a `spawn_reader` against one end of a duplex pipe,
+    /// returning the other end (to feed frames in) plus the channels
+    /// the reader populates.
+    fn reader_harness(
+        events_capacity: usize,
+    ) -> (
+        Framed<tokio::io::DuplexStream>,
+        ResponseSenders,
+        mpsc::Receiver<Event>,
+        watch::Receiver<bool>,
+    ) {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let feed = transport::new(a);
+        let (_sink, stream) = transport::new(b).split();
+        let pending: ResponseSenders = Arc::new(Mutex::new(HashMap::new()));
+        let (events_tx, events_rx) = mpsc::channel(events_capacity);
+        let (closed_tx, closed_rx) = watch::channel(false);
+        spawn_reader(stream, Arc::clone(&pending), events_tx, closed_tx);
+        (feed, pending, events_rx, closed_rx)
+    }
+
+    fn dummy_event() -> Event {
+        Event::SessionClosed {
+            session: SessionId::from_bytes([7; 16]),
+        }
+    }
+
+    /// The bug this module's fix closes: with the events queue at
+    /// capacity and nobody draining it, a `Response` frame for an
+    /// unrelated in-flight request must still be demultiplexed
+    /// promptly — the reader must never block on the events send.
+    #[tokio::test]
+    async fn response_is_demuxed_even_when_events_queue_is_full() {
+        let (mut feed, pending, mut events_rx, _closed_rx) = reader_harness(1);
+
+        // Fill the events queue to capacity without draining it.
+        feed.send(WireMessage::Event {
+            event: dummy_event(),
+        })
+        .await
+        .unwrap();
+        // Give the reader task a moment to pull the frame and fill the
+        // (capacity-1) events channel.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Register a pending request the way `Client::request` does,
+        // then feed its response. Pre-fix, this would never arrive:
+        // the reader would be stuck on the full events channel's
+        // `.await` send from a *second* queued Event frame processed
+        // ahead of it. To reproduce that ordering deterministically,
+        // send another Event first, then the Response, both before
+        // awaiting anything on the response side.
+        let id = RequestId::new(1);
+        let (tx, rx) = oneshot::channel();
+        pending.lock().await.insert(id, tx);
+
+        feed.send(WireMessage::Event {
+            event: dummy_event(),
+        })
+        .await
+        .unwrap();
+        feed.send(WireMessage::Response {
+            id,
+            response: Response::ListSessions { sessions: vec![] },
+        })
+        .await
+        .unwrap();
+
+        let response = timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("reader must demux the Response without blocking on the full events queue")
+            .expect("oneshot must not be dropped");
+        assert!(matches!(response, Response::ListSessions { sessions } if sessions.is_empty()));
+
+        // The events queue is advisory: of the 2 Event frames fed in
+        // against a capacity-1 channel, only 1 must have been
+        // delivered — the second was dropped rather than buffered or
+        // blocking the reader.
+        let mut delivered = 0;
+        while timeout(Duration::from_millis(50), events_rx.recv())
+            .await
+            .is_ok_and(|item| item.is_some())
+        {
+            delivered += 1;
+        }
+        assert_eq!(
+            delivered, 1,
+            "exactly one of the two Event frames should have fit in the capacity-1 queue",
+        );
+    }
+
+    /// Once the caller drops the events receiver entirely, the reader
+    /// must keep demultiplexing responses rather than treating the
+    /// closed channel as fatal.
+    #[tokio::test]
+    async fn response_is_demuxed_after_events_receiver_is_dropped() {
+        let (mut feed, pending, events_rx, _closed_rx) = reader_harness(4);
+        drop(events_rx);
+
+        let id = RequestId::new(1);
+        let (tx, rx) = oneshot::channel();
+        pending.lock().await.insert(id, tx);
+
+        feed.send(WireMessage::Event {
+            event: dummy_event(),
+        })
+        .await
+        .unwrap();
+        feed.send(WireMessage::Response {
+            id,
+            response: Response::ListSessions { sessions: vec![] },
+        })
+        .await
+        .unwrap();
+
+        let response = timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("reader must keep running after the events receiver is dropped")
+            .expect("oneshot must not be dropped");
+        assert!(matches!(response, Response::ListSessions { sessions } if sessions.is_empty()));
+    }
 }
