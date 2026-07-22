@@ -94,6 +94,17 @@ impl ChildHandle {
 
 /// Spawn the `crash_child` bin pointed at `socket` / `root` /
 /// `state_dir`, drain its stdout into a channel.
+///
+/// Orphan-proofing, both belts (a leaked child idles in
+/// `pending()` forever — a herd of these once sat around for 44
+/// days):
+/// - `kill_on_drop`: a panic in the test (`wait_for` timeout,
+///   `wait_for_file` assert) drops the handle before the explicit
+///   `sigkill`, and tokio's default leaves the child running.
+/// - piped stdin: the child exits on stdin EOF, which the OS
+///   delivers when this process dies by any means — including the
+///   SIGTERM/SIGKILL nextest sends on a hung test, where no Drop
+///   runs at all.
 fn spawn_child(
     socket: &Path,
     root: &Path,
@@ -115,8 +126,10 @@ fn spawn_child(
             "--mode",
             mode,
         ])
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
+        .kill_on_drop(true)
         .spawn()
         .expect("spawn crash_child");
     let pid = proc.id().expect("child pid");
