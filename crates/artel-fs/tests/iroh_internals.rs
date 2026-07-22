@@ -473,11 +473,23 @@ async fn doc_ticket_round_trips_via_localhost_pkarr_dns() {
 // required.
 // =============================================================
 
-/// How long to wait for `Workspace::host_with` to surface the typed
-/// error. The substrate's internal budget for `endpoint.online()` is
-/// 30s; the harness gives a small margin so a slow CI doesn't flake
-/// on scheduling alone.
-const RELAY_HARNESS_BUDGET: Duration = Duration::from_secs(40);
+/// Harness headroom for the work `Workspace::host_with` does *before*
+/// the relay wait starts — chiefly `endpoint.bind()`. Measured
+/// 2026-07-22 (daemon sibling test): bind takes ~4.7s typically but
+/// 10–15s under full-suite parallelism (UDP/scheduler contention);
+/// 30s covers 2x the worst observed 15s.
+const BIND_ALLOWANCE: Duration = Duration::from_secs(30);
+
+/// How long the harness gives `Workspace::host_with` to surface the
+/// typed error. Against the unreachable-relay fixture the substrate's
+/// internal `endpoint.online()` wait must run its *full*
+/// [`artel_iroh_setup::HOME_RELAY_BUDGET`] before the typed error can
+/// exist, so the harness budget is derived from that constant plus
+/// [`BIND_ALLOWANCE`] — the two can't drift into racing each other.
+/// (Previously this was an independent 40s magic number that lost the
+/// race whenever bind exceeded ~10s.)
+const RELAY_HARNESS_BUDGET: Duration =
+    artel_iroh_setup::HOME_RELAY_BUDGET.saturating_add(BIND_ALLOWANCE);
 
 #[tokio::test(flavor = "multi_thread")]
 async fn host_with_unreachable_relay_returns_typed_error() {
@@ -515,9 +527,11 @@ async fn host_with_unreachable_relay_returns_typed_error() {
 
     match result {
         Err(WorkspaceError::RelayUnreachable(budget)) => {
-            assert!(
-                budget <= RELAY_HARNESS_BUDGET,
-                "internal budget {budget:?} should be at most the harness budget {RELAY_HARNESS_BUDGET:?}"
+            assert_eq!(
+                budget,
+                artel_iroh_setup::HOME_RELAY_BUDGET,
+                "the typed error must carry the substrate's internal \
+                 `endpoint.online()` budget"
             );
         }
         Ok(_) => panic!(
