@@ -1695,6 +1695,12 @@ async fn burst_of_evictions_all_rotate_no_signal_dropped() {
     // a genuine rotation per revoke.
     const BURST: u64 = 40;
 
+    // Stall window for the settle loop below: a dropped signal shows up
+    // as the epoch making NO progress for this long (one rotation takes
+    // well under a second even loaded), while a slow-but-healthy drain
+    // of any total length keeps advancing and passes.
+    const STALL_WINDOW: Duration = Duration::from_secs(15);
+
     let dns_pkarr = Arc::new(
         DnsPkarrServer::run_with_origin(artel_fs::TEST_DNS_ORIGIN.to_string())
             .await
@@ -1728,17 +1734,32 @@ async fn burst_of_evictions_all_rotate_no_signal_dropped() {
         common::revoke(&client, session, PeerId::from_bytes(bytes)).await;
     }
 
-    // The rotation task drains serially; wait for the epoch to settle at
-    // exactly BURST. Unbounded ⇒ no signal lost ⇒ every revoke rotated.
-    let deadline = Instant::now() + Duration::from_mins(1);
+    // The rotation task drains serially; wait for the epoch to reach
+    // exactly BURST. Unbounded ⇒ no signal lost ⇒ every revoke rotates.
+    //
+    // A dropped signal manifests as the epoch STALLING short of BURST —
+    // stopping and never advancing again — not as the drain being slow.
+    // So the failure condition is progress-based: bail only when the
+    // epoch hasn't moved for STALL_WINDOW. A wall-clock deadline here
+    // (formerly 60s total) misfires under full-suite parallelism, where
+    // node-lock contention stretches each rotation to ~2s and 40 healthy
+    // rotations legitimately need ~80s (observed 2026-07-22: "settled at
+    // 36/37" twice while rotations were still draining).
+    let mut last_epoch = ws.namespace_epoch();
+    let mut last_progress = Instant::now();
     loop {
         let epoch = ws.namespace_epoch();
         if epoch == BURST {
             break;
         }
+        if epoch > last_epoch {
+            last_epoch = epoch;
+            last_progress = Instant::now();
+        }
         assert!(
-            Instant::now() < deadline,
-            "epoch settled at {epoch}, expected {BURST} — a rotation signal was dropped",
+            last_progress.elapsed() < STALL_WINDOW,
+            "epoch stalled at {epoch} of {BURST} (no progress for \
+             {STALL_WINDOW:?}) — a rotation signal was dropped",
         );
         sleep(POLL_INTERVAL).await;
     }
