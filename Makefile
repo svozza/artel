@@ -10,7 +10,7 @@
 # filters them out via `not test(/_n0$/)`. See
 # docs/diagnosing-flaky-tests.md for the run-until-fail recipe.
 
-.PHONY: test test-n0 test-fallback fmt clippy doc coverage coverage-html ci-local hooks
+.PHONY: test test-n0 test-fallback fmt clippy doc coverage-html ci-local hooks
 
 # One-time setup: point git at the versioned hooks dir so the
 # pre-push gate (fmt + clippy + doc) runs before every push.
@@ -18,9 +18,32 @@ hooks:
 	git config core.hooksPath .githooks
 	@echo "core.hooksPath -> .githooks (pre-push runs fmt + clippy + doc)"
 
-# Default test target: Tier A + B (no real n0). Fast.
+# Default test target: Tier A + B (no real n0), with line/region
+# coverage as a side effect (vitest-style: one run, coverage for
+# free). Instrumentation overhead on test runtime is ~zero (measured
+# 2026-07-23: cov ≈ plain on macOS and Linux, isolated and full
+# suite); the cost is a separate instrumented build under
+# `target/llvm-cov-target` (~3 min warm, ~10 min cold). Falls back to
+# plain nextest when cargo-llvm-cov isn't installed
+# (`cargo install cargo-llvm-cov` + `rustup component add
+# llvm-tools-preview` to get coverage).
+#
+# Doctests aren't instrumented by llvm-cov on stable — they still run
+# (uninstrumented) via cargo test below; their coverage isn't counted.
+# All-features on the suite run: the test set is identical to the
+# default-features one today (each crate's self dev-dependency unifies
+# iroh + test-utils on for test builds), but all-features is the
+# strict superset — a future test gated behind an off-by-default
+# feature (e.g. artel-protocol's `signing`) can never be silently
+# skipped. It also matches the doctest invocation below. The
+# default-features build still gets compile coverage from clippy.
 test:
-	cargo nextest run --workspace
+	@if command -v cargo-llvm-cov >/dev/null 2>&1; then \
+		cargo llvm-cov nextest --workspace --all-features --summary-only; \
+	else \
+		echo "cargo-llvm-cov not installed — running without coverage"; \
+		cargo nextest run --workspace --all-features; \
+	fi
 	cargo test --workspace --doc --all-features
 
 # Real-n0 tests only. Serial within the tier (per nextest profile)
@@ -59,20 +82,12 @@ doc:
 	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 
-# Coverage via cargo-llvm-cov. Requires `cargo install
-# cargo-llvm-cov` once (instrumented binaries need llvm-tools and
-# cargo-llvm-cov drives them).
-#
-# `make coverage` prints a per-file summary + workspace total.
-# `make coverage-html` writes HTML reports under `target/llvm-cov/html/`.
-# Both run Tier A + B (default profile, same filter as `make test`).
-# Tier C (`_n0` tests) intentionally skipped: real-n0 traffic doesn't
-# trace anything coverage cares about that the hermetic suite misses,
-# and we don't want an unreachable relay flake to mask coverage drift.
-coverage:
-	cargo llvm-cov nextest --workspace --summary-only
-	cargo llvm-cov nextest --workspace --summary-only --all-features
-
+# HTML coverage report from the same instrumented run shape as
+# `make test`. Written under `target/llvm-cov/html/`. Runs Tier A + B
+# (default profile). Tier C (`_n0` tests) intentionally skipped:
+# real-n0 traffic doesn't trace anything coverage cares about that
+# the hermetic suite misses, and we don't want an unreachable relay
+# flake to mask coverage drift.
 coverage-html:
 	cargo llvm-cov nextest --workspace --html
 	@echo "HTML report: target/llvm-cov/html/index.html"
