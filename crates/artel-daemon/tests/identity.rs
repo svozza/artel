@@ -512,7 +512,22 @@ async fn addr_hint_survives_daemon_restart_via_on_disk_cache() {
 // in `tokio::time::timeout`.
 // =============================================================
 
-const RELAY_HARNESS_BUDGET: Duration = Duration::from_secs(40);
+/// Harness headroom for the work `Daemon::start` does *before* the
+/// relay wait starts — chiefly `endpoint.bind()`. Measured 2026-07-22:
+/// bind takes ~4.7s typically but 10–15s under full-suite parallelism
+/// (UDP/scheduler contention); 30s covers 2x the worst observed 15s.
+const BIND_ALLOWANCE: Duration = Duration::from_secs(30);
+
+/// How long the harness gives `Daemon::start` to surface the typed
+/// error. Against the unreachable-relay fixture the substrate's
+/// internal `endpoint.online()` wait must run its *full*
+/// [`artel_iroh_setup::HOME_RELAY_BUDGET`] before the typed error can
+/// exist, so the harness budget is derived from that constant plus
+/// [`BIND_ALLOWANCE`] — the two can't drift into racing each other.
+/// (Previously this was an independent 40s magic number that lost the
+/// race whenever bind exceeded ~10s.)
+const RELAY_HARNESS_BUDGET: Duration =
+    artel_iroh_setup::HOME_RELAY_BUDGET.saturating_add(BIND_ALLOWANCE);
 
 #[tokio::test(flavor = "multi_thread")]
 async fn daemon_start_with_unreachable_relay_returns_typed_error() {
@@ -542,9 +557,11 @@ async fn daemon_start_with_unreachable_relay_returns_typed_error() {
 
     match result {
         Err(StartError::RelayUnreachable(budget)) => {
-            assert!(
-                budget <= RELAY_HARNESS_BUDGET,
-                "internal budget {budget:?} should be at most the harness budget {RELAY_HARNESS_BUDGET:?}"
+            assert_eq!(
+                budget,
+                artel_iroh_setup::HOME_RELAY_BUDGET,
+                "the typed error must carry the substrate's internal \
+                 `endpoint.online()` budget"
             );
         }
         Ok(daemon) => {

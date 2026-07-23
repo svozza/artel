@@ -133,6 +133,27 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Resolve when the parent test process is gone.
+///
+/// The parent spawns us with `stdin(Stdio::piped())` and never
+/// writes; the OS closes the pipe when the parent exits by any
+/// means, including SIGKILL, where no parent-side cleanup runs.
+/// Without this, a parent killed mid-test leaks us idling in
+/// `pending()` forever — a herd of such orphans (44 days old) is
+/// what motivated the watchdog. Reading EOF on a closed pipe is
+/// the portable Unix parent-death signal (macOS has no
+/// `PR_SET_PDEATHSIG`).
+async fn parent_gone() {
+    let mut stdin = tokio::io::stdin();
+    let mut buf = [0u8; 32];
+    loop {
+        match tokio::io::AsyncReadExt::read(&mut stdin, &mut buf).await {
+            Ok(0) | Err(_) => return, // EOF or error: parent is gone
+            Ok(_) => {}               // parent never writes, but tolerate it
+        }
+    }
+}
+
 async fn run(args: Args) -> Result<(), String> {
     // Auth L1 fix #3 (PROTOCOL_VERSION 5): the daemon stamps its
     // own authenticated PeerId, so the child only needs to supply
@@ -176,13 +197,17 @@ async fn run(args: Args) -> Result<(), String> {
 
     match args.mode {
         Mode::Steady | Mode::MidScan => {
-            // Idle forever — the parent SIGKILLs when ready.
-            futures_util::future::pending::<()>().await;
+            // Idle until the parent SIGKILLs us — or, if the parent
+            // itself died without getting the kill off, until stdin
+            // EOF tells us it's gone.
+            parent_gone().await;
         }
         Mode::MidWrite => {
             // Drop a fresh file every 50 ms with a sequential name.
             // The parent kills us after seeing the first WROTE.
             let mut seq: u64 = 0;
+            let gone = parent_gone();
+            tokio::pin!(gone);
             loop {
                 let name = format!("live-{seq:04}.txt");
                 let path = args.root.join(&name);
@@ -192,7 +217,10 @@ async fn run(args: Args) -> Result<(), String> {
                 }
                 emit(&format!("WROTE {name}"));
                 seq += 1;
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::select! {
+                    () = &mut gone => break,
+                    () = tokio::time::sleep(Duration::from_millis(50)) => {}
+                }
             }
         }
     }

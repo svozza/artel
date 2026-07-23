@@ -240,4 +240,231 @@ mod tests {
             "a freed permit must be reusable",
         );
     }
+
+    // ---- end-to-end accept path over a real hermetic iroh connection ----
+    //
+    // The cap test above only exercises `try_begin_accept`; the actual
+    // `ProtocolHandler::accept` / `handle_accept` body (frame read,
+    // length-cap rejection, postcard decode, dispatch, ACK) needs a
+    // live `iroh::endpoint::Connection` and was previously untested at
+    // this layer — only reachable indirectly through a full
+    // `Daemon::start`. These tests dial `UpgradeProtocol` directly over
+    // two hermetic (`EndpointSetup::Testing`) endpoints sharing a
+    // localhost `DnsPkarrServer`, mirroring the pattern in
+    // `server.rs`'s own iroh test module and
+    // `artel-fs/tests/iroh_internals.rs`'s `PkarrNode`.
+    #[cfg(all(test, feature = "iroh", feature = "test-utils"))]
+    mod accept_path {
+        use std::time::Duration;
+
+        use artel_protocol::ticket::WireEndpointAddr;
+        use artel_protocol::upgrade::{DeliveryFrame, UPGRADE_ACK, UPGRADE_ALPN};
+        use artel_protocol::{Seq, SessionId};
+        use iroh::Endpoint;
+        use iroh::protocol::Router;
+        use iroh::test_utils::DnsPkarrServer;
+
+        use super::*;
+        use crate::store::{SessionKind, SessionRecord};
+
+        /// One hermetic endpoint bound against `EndpointSetup::Testing`,
+        /// publishing/resolving via the supplied localhost
+        /// `DnsPkarrServer`. Mirrors `PkarrNode::spawn` in
+        /// `artel-fs/tests/iroh_internals.rs`, minus the docs/blobs/gossip
+        /// protocols this test doesn't need.
+        async fn bind_endpoint(dns_pkarr: &Arc<DnsPkarrServer>) -> Endpoint {
+            let setup = artel_iroh_setup::EndpointSetup::Testing {
+                dns_pkarr: Arc::clone(dns_pkarr),
+            };
+            setup
+                .apply(Endpoint::builder(iroh::endpoint::presets::Empty))
+                .bind()
+                .await
+                .expect("bind hermetic endpoint")
+        }
+
+        /// Frame a `DeliveryFrame` exactly as `deliver_frame_inner`
+        /// (`server.rs`) does: postcard body, 4-byte LE length prefix.
+        fn frame_bytes(frame: &DeliveryFrame) -> Vec<u8> {
+            let body = postcard::to_allocvec(frame).expect("encode DeliveryFrame");
+            let len = u32::try_from(body.len())
+                .expect("test frame fits in u32")
+                .to_le_bytes();
+            let mut out = Vec::with_capacity(4 + body.len());
+            out.extend_from_slice(&len);
+            out.extend_from_slice(&body);
+            out
+        }
+
+        /// Registry pre-seeded with a `Remote` session whose host is
+        /// `host_peer` — the minimal state `handle_accept`'s dispatch
+        /// (via `lock_remote_session_from_host`) requires to accept a
+        /// delivery instead of rejecting it as an unknown/non-host
+        /// sender. Mirrors `session.rs`'s `remote_mirror_registry`.
+        async fn remote_registry_with_host(
+            daemon_peer: PeerId,
+            host_peer: PeerId,
+            session_id: SessionId,
+        ) -> Registry {
+            let store: crate::store::DynStore = Arc::new(crate::store::MemoryStore::new());
+            let record = SessionRecord {
+                id: session_id,
+                host: host_peer,
+                members: std::collections::HashSet::from([host_peer, daemon_peer]),
+                head: Seq::ZERO,
+                log: Vec::new(),
+                kind: SessionKind::Remote,
+                host_epoch: 0,
+                tickets: Vec::new(),
+                workspace_ticket: None,
+            };
+            store.create(&record).await.expect("seed session record");
+            Registry::load(
+                daemon_peer,
+                WireEndpointAddr::id_only(daemon_peer),
+                store,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("load registry")
+        }
+
+        /// A `Downgrade` delivery from the recognized host is accepted:
+        /// the receiver ACKs and the registry emits the synthetic
+        /// `DOWNGRADE_ACTION` event — pinning the full accept path (frame
+        /// read, decode, dispatch, ACK) rather than just the admission
+        /// cap.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn downgrade_delivery_from_host_is_accepted_and_acked() {
+            let dns_pkarr = Arc::new(
+                DnsPkarrServer::run_with_origin(artel_iroh_setup::TEST_DNS_ORIGIN.to_string())
+                    .await
+                    .expect("DnsPkarrServer::run_with_origin"),
+            );
+
+            let host_endpoint = bind_endpoint(&dns_pkarr).await;
+            let target_endpoint = bind_endpoint(&dns_pkarr).await;
+
+            let host_peer = PeerId::from_bytes(*host_endpoint.id().as_bytes());
+            let target_peer = PeerId::from_bytes(*target_endpoint.id().as_bytes());
+            let session_id = SessionId::new_random();
+
+            let registry =
+                Arc::new(remote_registry_with_host(target_peer, host_peer, session_id).await);
+            let mut sub = registry
+                .subscribe(session_id, None)
+                .await
+                .expect("subscribe before delivery");
+
+            let router = Router::builder(target_endpoint.clone())
+                .accept(UpgradeProtocol::alpn(), UpgradeProtocol::new(registry))
+                .spawn();
+
+            // Determinism gate: wait for both pkarr records to be
+            // queryable before dialing, or the connect races the publish.
+            dns_pkarr
+                .on_endpoint(&host_endpoint.id(), Duration::from_secs(5))
+                .await
+                .expect("host published");
+            dns_pkarr
+                .on_endpoint(&target_endpoint.id(), Duration::from_secs(5))
+                .await
+                .expect("target published");
+
+            let connection = host_endpoint
+                .connect(target_endpoint.id(), UPGRADE_ALPN)
+                .await
+                .expect("connect to target");
+            let (mut send, mut recv) = connection.open_bi().await.expect("open_bi");
+
+            let frame = DeliveryFrame::Downgrade { session_id };
+            send.write_all(&frame_bytes(&frame))
+                .await
+                .expect("write frame");
+            send.finish().expect("finish send stream");
+
+            let mut ack = [0u8; 1];
+            recv.read_exact(&mut ack).await.expect("read ACK");
+            assert_eq!(ack[0], UPGRADE_ACK, "receiver must ACK a valid delivery");
+
+            let ev = tokio::time::timeout(Duration::from_secs(1), sub.events.recv())
+                .await
+                .expect("event within timeout")
+                .expect("channel open");
+            match ev {
+                artel_protocol::Event::Message { session, message } => {
+                    assert_eq!(session, session_id);
+                    assert_eq!(message.action, artel_protocol::DOWNGRADE_ACTION);
+                }
+                other => panic!("expected Message, got {other:?}"),
+            }
+
+            router.shutdown().await.ok();
+            host_endpoint.close().await;
+        }
+
+        /// A delivery whose sender is not the session's recorded host is
+        /// rejected: `handle_accept` maps the registry's error into an
+        /// `AcceptError`, closing the stream without an ACK — the
+        /// spoofing-guard half of the same dispatch path exercised above.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn downgrade_delivery_from_non_host_is_rejected() {
+            let dns_pkarr = Arc::new(
+                DnsPkarrServer::run_with_origin(artel_iroh_setup::TEST_DNS_ORIGIN.to_string())
+                    .await
+                    .expect("DnsPkarrServer::run_with_origin"),
+            );
+
+            let real_host_endpoint = bind_endpoint(&dns_pkarr).await;
+            let imposter_endpoint = bind_endpoint(&dns_pkarr).await;
+            let target_endpoint = bind_endpoint(&dns_pkarr).await;
+
+            // Session records the *real* host, not the imposter dialing in.
+            let real_host_peer = PeerId::from_bytes(*real_host_endpoint.id().as_bytes());
+            let target_peer = PeerId::from_bytes(*target_endpoint.id().as_bytes());
+            let session_id = SessionId::new_random();
+
+            let registry =
+                Arc::new(remote_registry_with_host(target_peer, real_host_peer, session_id).await);
+
+            let router = Router::builder(target_endpoint.clone())
+                .accept(UpgradeProtocol::alpn(), UpgradeProtocol::new(registry))
+                .spawn();
+
+            dns_pkarr
+                .on_endpoint(&imposter_endpoint.id(), Duration::from_secs(5))
+                .await
+                .expect("imposter published");
+            dns_pkarr
+                .on_endpoint(&target_endpoint.id(), Duration::from_secs(5))
+                .await
+                .expect("target published");
+
+            let connection = imposter_endpoint
+                .connect(target_endpoint.id(), UPGRADE_ALPN)
+                .await
+                .expect("connect to target");
+            let (mut send, mut recv) = connection.open_bi().await.expect("open_bi");
+
+            let frame = DeliveryFrame::Downgrade { session_id };
+            send.write_all(&frame_bytes(&frame))
+                .await
+                .expect("write frame");
+            send.finish().expect("finish send stream");
+
+            // No ACK: the handler rejects before writing one, and the
+            // stream ends without the single ACK byte ever arriving.
+            let mut ack = [0u8; 1];
+            let result = recv.read_exact(&mut ack).await;
+            assert!(
+                result.is_err(),
+                "non-host sender must not receive an ACK, got {result:?}",
+            );
+
+            router.shutdown().await.ok();
+            imposter_endpoint.close().await;
+        }
+    }
 }
