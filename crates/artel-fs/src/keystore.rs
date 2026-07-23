@@ -106,4 +106,28 @@ mod tests {
         fs::write(&file, b"x").unwrap();
         assert!(ensure_dir(&file).is_err());
     }
+
+    #[test]
+    fn ensure_dir_propagates_non_not_found_errors() {
+        // A parent directory with no execute permission makes
+        // `fs::metadata` on a child path fail with `PermissionDenied`,
+        // not `NotFound` — exercising the generic `Err(err) => Err(err)`
+        // passthrough arm rather than the create-on-missing branch.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let locked_parent = dir.path().join("locked");
+        fs::create_dir(&locked_parent).unwrap();
+        fs::set_permissions(&locked_parent, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let child = locked_parent.join("child");
+        let err = ensure_dir(&child).unwrap_err();
+        assert_ne!(
+            err.kind(),
+            io::ErrorKind::NotFound,
+            "a permission-denied stat must not be mistaken for a missing directory",
+        );
+
+        // Restore permissions so tempdir cleanup can remove it.
+        fs::set_permissions(&locked_parent, fs::Permissions::from_mode(0o700)).unwrap();
+    }
 }

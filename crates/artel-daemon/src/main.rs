@@ -150,6 +150,49 @@ fn resolve_endpoint_setup(relay_url: Option<&str>) -> Result<artel_daemon::Endpo
     }
 }
 
+#[cfg(test)]
+mod build_config_tests {
+    use super::*;
+
+    fn args_with_state_dir(dir: PathBuf) -> Args {
+        Args {
+            socket: None,
+            state_dir: Some(dir),
+            log: None,
+        }
+    }
+
+    #[test]
+    fn state_dir_derives_socket_pid_and_sessions_under_it() {
+        // The `Some(state_dir)` branch never touches process env — no
+        // HOME/ARTEL_HOME mutation needed, so this is safe to run
+        // alongside every other test in the same process/binary.
+        let dir = PathBuf::from("/tmp/artel-daemon-test-state");
+        let args = args_with_state_dir(dir.clone());
+        let config = build_config(&args).expect("build_config");
+        assert_eq!(config.socket_path, dir.join("daemon.sock"));
+        assert_eq!(config.pid_path, dir.join("daemon.pid"));
+        assert_eq!(config.sessions_dir, dir.join("sessions"));
+        assert_eq!(config.iroh_key_path, Some(dir.join("iroh.key")));
+    }
+
+    #[test]
+    fn state_dir_with_explicit_socket_override_wins() {
+        let dir = PathBuf::from("/tmp/artel-daemon-test-state-2");
+        let mut args = args_with_state_dir(dir.clone());
+        args.socket = Some(PathBuf::from("/tmp/custom.sock"));
+        let config = build_config(&args).expect("build_config");
+        assert_eq!(
+            config.socket_path,
+            PathBuf::from("/tmp/custom.sock"),
+            "an explicit --socket must override the state-dir default",
+        );
+        // pid and sessions are still derived from state_dir regardless.
+        assert_eq!(config.pid_path, dir.join("daemon.pid"));
+        assert_eq!(config.sessions_dir, dir.join("sessions"));
+    }
+}
+
 fn init_tracing(filter: Option<&str>) -> Result<(), String> {
     let env = if let Some(f) = filter {
         EnvFilter::try_new(f).map_err(|e| format!("invalid filter: {e}"))?

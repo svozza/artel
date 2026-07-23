@@ -338,6 +338,24 @@ mod tests {
     }
 
     #[test]
+    fn rotate_payload_corrupt_bytes_rejected() {
+        let result: Result<RotatePayload, _> = postcard::from_bytes(&[0xff; 4]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn downgrade_payload_corrupt_bytes_rejected() {
+        let result: Result<DowngradePayload, _> = postcard::from_bytes(&[0xff; 4]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn upgrade_payload_corrupt_bytes_rejected() {
+        let result: Result<UpgradePayload, _> = postcard::from_bytes(&[0xff; 4]);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn delivery_frame_workspace_ticket_uses_bytes_encoding() {
         // serde_bytes ⇒ length-prefixed byte slice, not a per-element
         // seq. 16-byte session + 1 tag + ~2 length bytes + payload.

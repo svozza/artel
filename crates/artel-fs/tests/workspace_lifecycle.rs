@@ -781,6 +781,82 @@ async fn list_known_workspaces_helper_returns_typed_view() {
     harness.stop().await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn list_known_workspaces_skips_undecodeable_entry_and_keeps_valid_ones() {
+    // `list_known_workspaces` warn-and-skips a `KIND_V1` entry whose
+    // payload doesn't postcard-decode as `WorkspaceAttachmentV1` —
+    // exercised here by registering one under a session that never
+    // ran a real workspace, alongside a genuine `host_with`-registered
+    // entry. Neither the malformed entry nor the good one should be
+    // dropped from — respectively, should be dropped from / kept in —
+    // the returned list.
+    let harness = LocalDaemon::spawn().await;
+    let dns_pkarr = Arc::new(
+        DnsPkarrServer::run_with_origin(artel_fs::TEST_DNS_ORIGIN.to_string())
+            .await
+            .unwrap(),
+    );
+
+    let alice = Client::connect(&harness.socket).await.unwrap();
+
+    // A session with no real workspace, carrying a garbage KIND_V1
+    // payload — registered directly over IPC, bypassing artel-fs
+    // entirely (a real workspace could never produce undecodeable
+    // bytes; this simulates a corrupt/foreign write instead).
+    let bogus_resp = alice
+        .request(Request::HostSession {
+            display_name: "bogus".into(),
+            session: None,
+        })
+        .await
+        .unwrap();
+    let bogus_session = match bogus_resp {
+        Response::HostSession { session, .. } => session,
+        other => panic!("HostSession: got {other:?}"),
+    };
+    let register_resp = alice
+        .request(Request::RegisterAttachment {
+            session: bogus_session,
+            kind: KIND_V1.to_string(),
+            payload: b"not a postcard WorkspaceAttachmentV1".to_vec(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(register_resp, Response::AttachmentRegistered),
+        "{register_resp:?}"
+    );
+
+    // A genuine workspace, registered the normal way.
+    let ws_root = TempDir::new().unwrap();
+    let cfg = WorkspaceConfig::default().with_endpoint_setup(testing_setup(&dns_pkarr));
+    let (workspace, _events) = Workspace::host_with(
+        &alice,
+        "alice",
+        ws_root.path().to_path_buf(),
+        AttachPolicy::AllowExisting,
+        cfg,
+    )
+    .await
+    .expect("host_with");
+    let good_session = workspace.session_id();
+
+    let known = list_known_workspaces(&alice)
+        .await
+        .expect("list_known_workspaces must not fail on a malformed peer entry");
+    assert_eq!(
+        known.len(),
+        1,
+        "the undecodeable entry must be skipped, not surfaced or counted",
+    );
+    assert_eq!(known[0].session, good_session);
+    assert_eq!(known[0].attachment.local_path, canon(ws_root.path()));
+
+    workspace.shutdown().await.expect("shutdown");
+    drop(alice);
+    harness.stop().await;
+}
+
 // `used_underscore_binding`: this test rebuilds a fresh `DaemonState`
 // from `RunningDaemon._state` to give the second daemon the same
 // on-disk paths. Renaming the field would ripple through every

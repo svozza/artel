@@ -250,6 +250,41 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn real_sigint_triggers_shutdown() {
+        // Every other test in this module drives `trigger()`
+        // programmatically; none actually exercises the SIGINT/SIGTERM
+        // arms of `install_signal_handlers`'s `tokio::select!`. nextest
+        // runs each test as its own OS process, so raising a real
+        // signal here can't cross-contaminate any other test.
+        let shutdown = Arc::new(Shutdown::new());
+        shutdown.install_signal_handlers().unwrap();
+        let mut token = shutdown.token();
+
+        nix::sys::signal::raise(nix::sys::signal::Signal::SIGINT)
+            .expect("raise(SIGINT) should succeed");
+
+        timeout(Duration::from_secs(2), token.cancelled())
+            .await
+            .expect("token should resolve after a real SIGINT");
+        assert!(shutdown.is_triggered());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn real_sigterm_triggers_shutdown() {
+        let shutdown = Arc::new(Shutdown::new());
+        shutdown.install_signal_handlers().unwrap();
+        let mut token = shutdown.token();
+
+        nix::sys::signal::raise(nix::sys::signal::Signal::SIGTERM)
+            .expect("raise(SIGTERM) should succeed");
+
+        timeout(Duration::from_secs(2), token.cancelled())
+            .await
+            .expect("token should resolve after a real SIGTERM");
+        assert!(shutdown.is_triggered());
+    }
+
     #[tokio::test]
     async fn shutdown_drop_resolves_outstanding_tokens() {
         // If the source is dropped, tokens still wake up — no use
