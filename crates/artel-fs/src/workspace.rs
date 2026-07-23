@@ -2381,11 +2381,15 @@ impl Workspace {
     ///   subsequent write under [`Self::root`] reaches the watcher
     ///   (without this, writes can race ahead of the watcher and be
     ///   silently dropped on macOS `FSEvents`);
-    /// - the applier's `doc.subscribe()` has returned, so any
-    ///   `InsertRemote` / `ContentReady` fired against this
-    ///   workspace's doc reaches the applier (iroh-docs subscribers
-    ///   are push-to-vec — events fired before `subscribe()`
-    ///   completes are not replayed).
+    /// - the applier's `doc.subscribe()` has returned AND its
+    ///   one-time catch-up pass has completed, so any `InsertRemote` /
+    ///   `ContentReady` fired against this workspace's doc from this
+    ///   point on reaches the applier (iroh-docs subscribers are
+    ///   push-to-vec — events fired before `subscribe()` completes
+    ///   are not replayed), and any entry already in the replica
+    ///   before `subscribe()` — a race the push-only stream can't
+    ///   otherwise cover — has already been reconciled to disk (see
+    ///   `applier::catch_up`, issue #52).
     ///
     /// If either half fails to start (watcher init / attach, or
     /// applier subscribe), the corresponding readiness signal is

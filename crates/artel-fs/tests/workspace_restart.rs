@@ -327,26 +327,30 @@ async fn workspace_state_survives_graceful_restart() {
     let bob_ws = Arc::new(bob_ws);
     let bob_handle = Arc::clone(&bob_ws).run().await;
 
-    // Reconcile-driven delete propagates to bob. This proves the
-    // initial doc-sync (bob→alice import path) succeeded.
-    phase(
-        "p2: a.txt delete propagates to bob",
-        wait_for_missing(&bob_root.path().join("a.txt")),
-    )
-    .await;
-
-    // Gate on bidirectional gossip: bob writes a probe that alice
-    // must see. This blocks until iroh-docs' gossip neighbors are
-    // mutually registered — without it, alice's subsequent writes
-    // race the NeighborUp event and may never gossip-broadcast.
-    // Not dot-prefixed: hidden files are excluded from sync by
-    // default (WorkspaceConfig::exclude).
+    // Gate on bidirectional gossip BEFORE asserting delete propagation:
+    // bob writes a probe that alice must see. This blocks until
+    // iroh-docs' gossip neighbors are mutually registered — without
+    // it, the delete-propagation assertion below (and alice's
+    // subsequent writes) race the NeighborUp event and may never
+    // gossip-broadcast. Not dot-prefixed: hidden files are excluded
+    // from sync by default (WorkspaceConfig::exclude).
     tokio::fs::write(bob_root.path().join("sync_probe"), b"ok")
         .await
         .unwrap();
     phase(
         "p2: bob→alice gossip probe",
         wait_for_file(&alice_root.path().join("sync_probe"), b"ok"),
+    )
+    .await;
+
+    // Reconcile-driven delete propagates to bob. This proves the
+    // initial doc-sync (bob→alice import path) succeeded. Asserted
+    // only after the gossip gate above — see its comment for why
+    // ordering this first raced the readiness signal it exists to
+    // provide.
+    phase(
+        "p2: a.txt delete propagates to bob",
+        wait_for_missing(&bob_root.path().join("a.txt")),
     )
     .await;
 

@@ -1,6 +1,10 @@
 //! Apply remote doc events to disk.
 //!
 //! Subscribes to `Doc::subscribe()` and:
+//! - on subscribe: runs a one-time catch-up pass over the replica's
+//!   *latest* per-key state (see [`catch_up`]) — closes the race
+//!   where an entry synced before this subscription went live would
+//!   otherwise sit in the replica forever (issue #52),
 //! - on [`LiveEvent::InsertRemote`]: stream the entry's content to
 //!   disk under [`Workspace::root`] (temp file + atomic rename —
 //!   bounded memory at any size), guarded by [`EchoGuard`] so
@@ -14,10 +18,12 @@
 #![allow(clippy::redundant_pub_crate)]
 
 use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
 use iroh_docs::Entry;
+use iroh_docs::api::Doc;
 use iroh_docs::engine::LiveEvent;
 use iroh_docs::store::Query;
 use tokio::sync::oneshot;
@@ -49,6 +55,14 @@ use crate::{EchoGuard, keys};
 /// [`oneshot::error::RecvError`]. The cause is also surfaced via
 /// the [`WorkspaceEvent`] stream.
 ///
+/// Between `subscribe()` returning and `ready` being sent, [`catch_up`]
+/// runs a one-time reconciliation pass over the replica's current
+/// state (see its docs) — closing the race where an entry synced into
+/// the replica before this subscription went live would otherwise
+/// never reach disk (issue #52). `ready` is only sent once catch-up
+/// completes, so a caller blocked in [`Workspace::run`] observes
+/// "subscribed" and "caught up" as one atomic readiness signal.
+///
 /// [`Workspace::run`]: crate::workspace::Workspace::run
 pub(crate) async fn run(workspace: Arc<Workspace>, ready: oneshot::Sender<()>) {
     // Snapshot the current doc handle once for this task's lifetime. On
@@ -71,10 +85,6 @@ pub(crate) async fn run(workspace: Arc<Workspace>, ready: oneshot::Sender<()>) {
         root = %workspace.root.display(),
         "subscribed to doc live events"
     );
-    // Subscription is live. Signal readiness so callers blocked in
-    // `Workspace::run().await` can proceed. `send` only fails if
-    // the receiver was dropped — fine to ignore.
-    let _ = ready.send(());
 
     // A clone shares the workspace guard's state (Arc-backed), so the
     // watcher's clone observes everything we mark here.
@@ -95,6 +105,15 @@ pub(crate) async fn run(workspace: Arc<Workspace>, ready: oneshot::Sender<()>) {
     // cancels every tracker task; rotation additionally cancels them
     // via the doc token their tokens are children of.
     let mut trackers = TransferTrackers::new();
+
+    // Reconcile before declaring readiness — see `catch_up`'s docs and
+    // the `ready` doc comment above.
+    catch_up(&workspace, &doc, &guard, &filter, &mut trackers, &doc_token).await;
+
+    // Subscription is live and catch-up is complete. Signal readiness
+    // so callers blocked in `Workspace::run().await` can proceed.
+    // `send` only fails if the receiver was dropped — fine to ignore.
+    let _ = ready.send(());
 
     loop {
         tokio::select! {
@@ -139,6 +158,105 @@ pub(crate) async fn run(workspace: Arc<Workspace>, ready: oneshot::Sender<()>) {
             }
         }
     }
+}
+
+/// One-time reconciliation pass over the replica's *latest*
+/// per-key state, run once at applier startup (before `ready` is
+/// signalled) to close the race iroh-docs's push-only `LiveEvent`
+/// stream leaves open (issue #52): an entry inserted into the
+/// replica — via initial sync, gossip, or reconcile — before this
+/// subscription went live fires no `LiveEvent` for us, and with no
+/// catch-up it would sit in the replica forever without reaching
+/// disk.
+///
+/// Walks every latest-per-key entry and re-applies it through
+/// [`handle_entry`] when on-disk state doesn't already match —
+/// [`disk_matches`] stats the path and compares against the entry's
+/// declared length (see its docs for why length alone is safe here),
+/// so an already-correct path is a cheap stat-and-skip, not a
+/// re-export. A missing tombstoned path is likewise a no-op
+/// (`handle_entry`'s `remove_file` on an absent path is harmless).
+///
+/// Bounded by the same gates as live entries (filter, size cap,
+/// `ReadOnly`): this reconciles the replica against disk, it does
+/// not resurrect content this workspace was never meant to mirror.
+/// Best-effort — a per-entry `get_many` error is logged and skipped,
+/// not fatal to startup.
+async fn catch_up(
+    workspace: &Arc<Workspace>,
+    doc: &Doc,
+    guard: &EchoGuard,
+    filter: &WorkspaceFilter,
+    trackers: &mut TransferTrackers,
+    doc_token: &tokio_util::sync::CancellationToken,
+) {
+    let stream = match doc
+        .get_many(Query::single_latest_per_key().include_empty())
+        .await
+    {
+        Ok(s) => s,
+        Err(err) => {
+            warn!(target: "artel_fs::applier", %err, "catch-up: get_many failed");
+            emit_event(
+                &workspace.events,
+                WorkspaceEvent::Error(format!("catch-up get_many failed: {err}")),
+            );
+            return;
+        }
+    };
+    let mut stream = Box::pin(stream);
+    let mut scanned = 0usize;
+    let mut applied = 0usize;
+    while let Some(res) = stream.next().await {
+        let Ok(entry) = res else { continue };
+        scanned += 1;
+
+        let path = match keys::key_to_path(&workspace.root, entry.key()) {
+            Ok(p) => p,
+            Err(err) => {
+                warn!(
+                    target: "artel_fs::applier",
+                    key = %String::from_utf8_lossy(entry.key()),
+                    %err,
+                    "catch-up: invalid key"
+                );
+                continue;
+            }
+        };
+        if disk_matches(&path, &entry).await {
+            continue;
+        }
+        applied += 1;
+        handle_entry(workspace, guard, filter, trackers, doc_token, entry).await;
+    }
+    debug!(
+        target: "artel_fs::applier",
+        root = %workspace.root.display(),
+        scanned,
+        applied,
+        "catch-up scan complete"
+    );
+}
+
+/// Does the file on disk at `path` already reflect `entry`'s state?
+///
+/// A tombstone (`content_len() == 0`) matches an absent path. A
+/// content entry matches only a *regular* file whose length agrees
+/// with the entry's declared length — a cheap pre-filter before
+/// `handle_entry`'s real work (streaming export, blob-status check,
+/// echo-guard marking) runs. A length match is not a content match,
+/// but a stale entry synced before this applier's first subscription
+/// implies no watcher/applier ever ran against this doc revision on
+/// this node, so there is no plausible same-length-different-content
+/// case to miss — the false-negative cost (an unnecessary re-export
+/// on a genuine length collision) is strictly safer than the
+/// false-positive cost (skipping a real pending write).
+async fn disk_matches(path: &Path, entry: &Entry) -> bool {
+    let meta = tokio::fs::symlink_metadata(path).await;
+    if entry.content_len() == 0 {
+        return matches!(meta, Err(err) if err.kind() == std::io::ErrorKind::NotFound);
+    }
+    meta.is_ok_and(|m| m.is_file() && m.len() == entry.content_len())
 }
 
 /// Returns `true` when the entry is left *pending download*: it
@@ -657,5 +775,70 @@ mod tests {
         assert!(!deleted, "the race must be detected");
         assert!(path.exists(), "the racing write must survive");
         assert_eq!(tokio::fs::read(&path).await.unwrap(), b"raced local write");
+    }
+
+    /// A content entry (no live doc needed) with the given declared
+    /// length, for `disk_matches` tests. The hash is irrelevant —
+    /// `disk_matches` never reads it — so `iroh_blobs::Hash::EMPTY`
+    /// is fine even for a nonzero length.
+    fn content_entry(len: u64) -> Entry {
+        use iroh_docs::{AuthorId, NamespaceId, Record, RecordIdentifier};
+        let id = RecordIdentifier::new(NamespaceId::default(), AuthorId::default(), b"f.txt");
+        Entry::new(id, Record::new(iroh_blobs::Hash::EMPTY, len, 0))
+    }
+
+    /// The tombstone entry (`content_len() == 0`) `disk_matches`
+    /// treats specially.
+    fn tombstone_entry() -> Entry {
+        use iroh_docs::{AuthorId, NamespaceId, Record, RecordIdentifier};
+        let id = RecordIdentifier::new(NamespaceId::default(), AuthorId::default(), b"f.txt");
+        Entry::new(id, Record::empty(0))
+    }
+
+    #[tokio::test]
+    async fn disk_matches_tombstone_true_when_path_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("never-existed.txt");
+        assert!(disk_matches(&path, &tombstone_entry()).await);
+    }
+
+    #[tokio::test]
+    async fn disk_matches_tombstone_false_when_path_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        tokio::fs::write(&path, b"still here").await.unwrap();
+        assert!(
+            !disk_matches(&path, &tombstone_entry()).await,
+            "a present path must not be treated as already-tombstoned",
+        );
+    }
+
+    #[tokio::test]
+    async fn disk_matches_content_true_when_length_agrees() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        tokio::fs::write(&path, b"hello").await.unwrap();
+        assert!(disk_matches(&path, &content_entry(5)).await);
+    }
+
+    #[tokio::test]
+    async fn disk_matches_content_false_when_length_disagrees() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        tokio::fs::write(&path, b"hello").await.unwrap();
+        assert!(
+            !disk_matches(&path, &content_entry(999)).await,
+            "a length mismatch must be reconciled, not skipped",
+        );
+    }
+
+    #[tokio::test]
+    async fn disk_matches_content_false_when_path_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("never-existed.txt");
+        assert!(
+            !disk_matches(&path, &content_entry(5)).await,
+            "a missing file can never already match a content entry",
+        );
     }
 }
