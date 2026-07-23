@@ -84,21 +84,27 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          # llvm-tools ships the profdata/cov binaries cargo-llvm-cov
+          # drives for the instrumented `make test` run below.
+          components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@v2
         with:
-          tool: nextest
-      # Verify the default-feature config compiles (the clippy job only
-      # lints it; this catches a default-only build break). `iroh` and
-      # `test-utils` are unified on for the test build via each crate's
-      # self dev-dependency, so the *test set* is identical in both
-      # feature modes (confirmed: same 808 tests) — `--all-features` is
-      # the strict superset. We therefore run the suite ONCE, under
-      # all-features, rather than twice; the default-feature build above
-      # preserves the "does it still compile without the extras" signal
-      # without paying for a second full 800-test run.
-      - run: cargo build --workspace --all-targets
-      - run: cargo nextest run --workspace --profile ci --all-features
-      - run: cargo test --workspace --doc --all-features
+          tool: nextest,cargo-llvm-cov
+      # Verify the all-features config compiles including test targets
+      # (the clippy job lints it but a lint pass doesn't prove codegen).
+      # `iroh` and `test-utils` are unified on for the test build via
+      # each crate's self dev-dependency, so the *test set* is identical
+      # in both feature modes (confirmed: same 808 tests) — the
+      # default-feature instrumented run below is therefore not losing
+      # any tests relative to the old `--all-features` run.
+      - run: cargo build --workspace --all-targets --all-features
+      # Same entry point developers use: instrumented nextest run with
+      # a coverage summary, plus all-features doctests. The instrumented
+      # build lives in target/llvm-cov-target, which Swatinem/rust-cache
+      # picks up along with target/ — first run on a fresh cache pays a
+      # full instrumented rebuild.
+      - run: make test
