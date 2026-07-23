@@ -87,6 +87,13 @@ pub const PKARR_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Poll `path` until it contains `expected` exactly, or panic with
 /// the path on timeout.
+///
+/// The panic message names `FILE_BUDGET` explicitly: a caller that
+/// also wraps this in an outer `phase_budgeted`-style timeout (e.g.
+/// `workspace_restart.rs`'s 45s `PHASE_BUDGET`) never sees that outer
+/// bound fire — this 15s deadline always trips first — so the failure
+/// message must not let anyone assume the surrounding budget was
+/// controlling.
 pub async fn wait_for_file(path: &Path, expected: &[u8]) {
     let deadline = Instant::now() + FILE_BUDGET;
     loop {
@@ -97,7 +104,7 @@ pub async fn wait_for_file(path: &Path, expected: &[u8]) {
         }
         assert!(
             Instant::now() < deadline,
-            "never saw expected bytes at {}",
+            "never saw expected bytes at {} within FILE_BUDGET {FILE_BUDGET:?}",
             path.display(),
         );
         sleep(POLL_INTERVAL).await;
@@ -105,6 +112,10 @@ pub async fn wait_for_file(path: &Path, expected: &[u8]) {
 }
 
 /// Poll until `path` no longer exists, or panic on timeout.
+///
+/// See [`wait_for_file`]'s doc comment: the panic message names
+/// `FILE_BUDGET` explicitly since this inner deadline always fires
+/// before any outer phase-level timeout a caller wraps around it.
 pub async fn wait_for_missing(path: &Path) {
     let deadline = Instant::now() + FILE_BUDGET;
     loop {
@@ -113,7 +124,7 @@ pub async fn wait_for_missing(path: &Path) {
         }
         assert!(
             Instant::now() < deadline,
-            "{} never disappeared",
+            "{} never disappeared within FILE_BUDGET {FILE_BUDGET:?}",
             path.display(),
         );
         sleep(POLL_INTERVAL).await;
