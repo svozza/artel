@@ -94,17 +94,13 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest,cargo-llvm-cov
-      # Verify the all-features config compiles including test targets
-      # (the clippy job lints it but a lint pass doesn't prove codegen).
-      # `iroh` and `test-utils` are unified on for the test build via
-      # each crate's self dev-dependency, so the *test set* is identical
-      # in both feature modes (confirmed: same 808 tests) — the
-      # default-feature instrumented run below is therefore not losing
-      # any tests relative to the old `--all-features` run.
-      - run: cargo build --workspace --all-targets --all-features
-      # Same entry point developers use: instrumented nextest run with
-      # a coverage summary, plus all-features doctests. The instrumented
-      # build lives in target/llvm-cov-target, which Swatinem/rust-cache
-      # picks up along with target/ — first run on a fresh cache pays a
-      # full instrumented rebuild.
+      # Same entry point developers use: instrumented all-features
+      # nextest run with a coverage summary, plus all-features doctests.
+      # nextest builds everything it runs (test bins + crate bins), so
+      # no separate build step is needed; the default- and no-default-
+      # feature configs get their compile signal from the clippy and
+      # doc jobs. The instrumented build lives in
+      # target/llvm-cov-target, which Swatinem/rust-cache picks up
+      # along with target/ — first run on a fresh cache pays a full
+      # instrumented rebuild.
       - run: make test

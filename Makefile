@@ -30,12 +30,19 @@ hooks:
 #
 # Doctests aren't instrumented by llvm-cov on stable — they still run
 # (uninstrumented) via cargo test below; their coverage isn't counted.
+# All-features on the suite run: the test set is identical to the
+# default-features one today (each crate's self dev-dependency unifies
+# iroh + test-utils on for test builds), but all-features is the
+# strict superset — a future test gated behind an off-by-default
+# feature (e.g. artel-protocol's `signing`) can never be silently
+# skipped. It also matches the doctest invocation below. The
+# default-features build still gets compile coverage from clippy.
 test:
 	@if command -v cargo-llvm-cov >/dev/null 2>&1; then \
-		cargo llvm-cov nextest --workspace --summary-only; \
+		cargo llvm-cov nextest --workspace --all-features --summary-only; \
 	else \
 		echo "cargo-llvm-cov not installed — running without coverage"; \
-		cargo nextest run --workspace; \
+		cargo nextest run --workspace --all-features; \
 	fi
 	cargo test --workspace --doc --all-features
 
