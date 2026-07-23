@@ -59,6 +59,32 @@ mod tests {
     }
 
     #[test]
+    fn connect_against_stale_socket_yields_connection_refused() {
+        // A socket *file* can exist with nobody listening (the daemon
+        // died without cleaning up, or a stale file from a crash) —
+        // distinct from the NotFound case above, and the other OS
+        // error kind this module's doc comment calls out by name.
+        // `std::os::unix::net::UnixListener::drop` closes the fd but
+        // leaves the path's socket file on disk (only our `Listener`
+        // wrapper unlinks on drop), so binding via std directly and
+        // dropping it reproduces the exact "stale file, dead daemon"
+        // shape.
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("stale.sock");
+        drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+        assert!(sock.exists(), "std UnixListener must not unlink on drop");
+
+        rt().block_on(async {
+            let err = connect(&sock).await.unwrap_err();
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::ConnectionRefused,
+                "expected ConnectionRefused, got {err:?}"
+            );
+        });
+    }
+
+    #[test]
     fn end_to_end_hello_round_trip() {
         rt().block_on(async {
             let dir = tempdir().unwrap();
