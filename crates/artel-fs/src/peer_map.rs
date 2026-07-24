@@ -276,6 +276,22 @@ mod tests {
     }
 
     #[test]
+    fn malformed_capability_payload_is_ignored() {
+        let map = PeerMap::new(test_host());
+        let host = test_host();
+        let peer = test_peer();
+        let wid = test_workspace_id();
+
+        map.register(wid, peer);
+        // Not a well-formed postcard-encoded CapabilityAction: decode
+        // fails and apply_capability must leave the projection alone
+        // rather than panicking or mutating on the Err branch.
+        map.apply_capability(host, &[0xff, 0xff, 0xff]);
+
+        assert!(map.revoked_daemon_peer(wid).is_none());
+    }
+
+    #[test]
     fn non_host_authored_grant_is_ignored() {
         let map = PeerMap::new(test_host());
         let host = test_host();

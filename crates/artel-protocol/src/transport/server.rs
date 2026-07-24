@@ -388,4 +388,24 @@ mod tests {
             );
         });
     }
+
+    #[test]
+    fn bind_rejects_parent_path_that_is_a_regular_file() {
+        rt().block_on(async {
+            let dir = tempdir().unwrap();
+            // The socket's intended parent directory is actually a
+            // regular file: ensure_dir must refuse rather than trying
+            // to create a directory chain through it.
+            let not_a_dir = dir.path().join("not-a-dir");
+            fs::write(&not_a_dir, b"x").unwrap();
+            let sock = not_a_dir.join("daemon.sock");
+
+            let err = Listener::bind(&sock).await.unwrap_err();
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::AlreadyExists,
+                "expected AlreadyExists for a non-directory parent, got {err:?}",
+            );
+        });
+    }
 }

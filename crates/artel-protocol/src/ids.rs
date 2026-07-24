@@ -468,6 +468,11 @@ mod tests {
         assert_eq!(Seq::default(), Seq::ZERO);
     }
 
+    #[test]
+    fn seq_display_matches_inner_u64() {
+        assert_eq!(Seq::new(42).to_string(), "42");
+    }
+
     proptest! {
         #[test]
         fn session_id_postcard_round_trip(bytes in any::<[u8; 16]>()) {
