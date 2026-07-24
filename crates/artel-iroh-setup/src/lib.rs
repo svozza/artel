@@ -49,6 +49,8 @@
 //! [RFC 5737]: https://datatracker.ietf.org/doc/html/rfc5737
 
 pub mod key;
+#[cfg(feature = "test-utils")]
+pub mod test_fixtures;
 
 use std::time::Duration;
 
