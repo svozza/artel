@@ -1270,6 +1270,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn verify_ack_rejects_sentinel_unsigned() {
+        let key = key_a();
+        let s = sample_session_id();
+        let req = Uuid::from_u128(0x1);
+        let result = Ok(sample_ack_message());
+        assert_eq!(
+            verify_ack(&host_pubkey(&key), s, req, &result, &SIGNATURE_UNSIGNED).unwrap_err(),
+            VerifyError::SentinelUnsigned,
+        );
+    }
+
     // ---- ctrl canonical bytes / round-trip ----
 
     #[test]

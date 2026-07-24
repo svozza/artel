@@ -1928,6 +1928,20 @@ mod tests {
         assert_eq!(loaded[0], record(1));
     }
 
+    #[test]
+    fn ensure_dir_rejects_a_regular_file_at_the_target_path() {
+        let dir = tempdir().unwrap();
+        let not_a_dir = dir.path().join("not-a-dir");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+
+        let err = ensure_dir(&not_a_dir, DIR_MODE).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            ErrorKind::AlreadyExists,
+            "expected AlreadyExists for a non-directory target, got {err:?}",
+        );
+    }
+
     #[tokio::test]
     async fn delete_cascades_tickets_file_with_session_dir() {
         use artel_protocol::TicketStatus;

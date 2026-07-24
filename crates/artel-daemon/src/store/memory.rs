@@ -308,6 +308,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn add_member_to_unknown_session_errors() {
+        let store = MemoryStore::new();
+        let bob = PeerInfo::new(PeerId::from_bytes([2; 32]), "bob");
+        let err = store
+            .add_member(SessionId::from_bytes([9; 16]), &bob)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn remove_member_from_unknown_session_errors() {
+        let store = MemoryStore::new();
+        let err = store
+            .remove_member(SessionId::from_bytes([9; 16]), PeerId::from_bytes([2; 32]))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
     async fn delete_removes_session() {
         let store = MemoryStore::new();
         store.create(&record()).await.unwrap();

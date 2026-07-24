@@ -498,6 +498,23 @@ mod tests {
         }
     }
 
+    /// `spawn_detached` is generic over the launched binary, so it can
+    /// be pointed at a harmless stand-in (`true`) with `extra_args` set
+    /// to confirm the args loop actually forwards them to the child —
+    /// without needing a real daemon.
+    #[test]
+    fn spawn_detached_forwards_extra_args() {
+        let dir = tempdir().unwrap();
+        let opts = SpawnOptions::new(
+            dir.path().join("sock"),
+            dir.path().join("daemon.pid"),
+            "/usr/bin/true",
+        )
+        .with_args(["--harmless-extra-flag"]);
+
+        spawn_detached(&opts).expect("true(1) must be launchable");
+    }
+
     #[test]
     fn spawn_options_builder_sets_fields() {
         // Use a real flag the daemon CLI accepts so anyone copying

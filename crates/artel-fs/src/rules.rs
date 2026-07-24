@@ -414,6 +414,24 @@ mod tests {
     }
 
     #[test]
+    fn mode_for_curdir_component_is_skipped() {
+        // `./docs/secret/foo.txt` must match the same rule as
+        // `docs/secret/foo.txt` — a leading `./` component is dropped
+        // rather than becoming part of the matched string.
+        let r = PathRules {
+            default: Mode::ReadWrite,
+            rules: vec![PathRule {
+                glob: "docs/**".into(),
+                mode: Mode::ReadOnly,
+            }],
+        };
+        assert_eq!(
+            r.mode_for(Path::new("./docs/secret/foo.txt")),
+            Mode::ReadOnly,
+        );
+    }
+
+    #[test]
     fn mode_for_unicode_path_normalisation_consistent() {
         // "café" composed (NFC) and decomposed (NFD) must hit the same
         // rule. Mirrors the keys.rs NFC contract.

@@ -577,6 +577,52 @@ mod tests {
         assert!(matches!(response, Response::ListSessions { sessions } if sessions.is_empty()));
     }
 
+    /// Drive `Client::handshake` directly over one end of a duplex
+    /// pipe, feeding `daemon_frame` as the daemon's first (and only)
+    /// reply, and return the handshake result.
+    async fn handshake_with_reply(daemon_frame: WireMessage) -> Result<Client, ClientError> {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let mut daemon_side = transport::new(b);
+        tokio::spawn(async move {
+            // Consume the client's Hello so `send` on the client side
+            // doesn't block, then answer with the caller-supplied frame.
+            let _ = daemon_side.next().await;
+            let _ = daemon_side.send(daemon_frame).await;
+        });
+        Client::handshake(transport::new(a), PathBuf::from("/nonexistent")).await
+    }
+
+    #[tokio::test]
+    async fn handshake_surfaces_daemon_error_response() {
+        use artel_protocol::ProtocolError;
+
+        let err = handshake_with_reply(WireMessage::Response {
+            id: RequestId::ZERO,
+            response: Response::Error {
+                error: ProtocolError::Internal("boom".into()),
+            },
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, ClientError::Protocol(ProtocolError::Internal(ref msg)) if msg == "boom"),
+            "{err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_unexpected_frame_kind() {
+        let err = handshake_with_reply(WireMessage::Event {
+            event: dummy_event(),
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, ClientError::ConnectionClosed),
+            "a non-Response first frame must surface as ConnectionClosed via unexpected(), got {err:?}",
+        );
+    }
+
     /// A full `Client` wired directly over a duplex pipe, plus the
     /// peer end — kept alive by the caller for as long as the
     /// connection should stay open (silent, never answering) rather

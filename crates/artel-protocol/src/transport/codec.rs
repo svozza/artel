@@ -305,4 +305,19 @@ mod tests {
         let res = codec.decode(&mut buf).unwrap();
         assert!(res.is_none());
     }
+
+    #[test]
+    fn translate_length_error_passes_through_non_invalid_data_io_errors() {
+        // `translate_length_error` only special-cases `InvalidData`
+        // (the max-length violation); every other io::ErrorKind must
+        // come through as TransportError::Io unchanged.
+        let io_err = io::Error::from(io::ErrorKind::BrokenPipe);
+        let err = translate_length_error(io_err);
+        match err {
+            TransportError::Io(inner) => {
+                assert_eq!(inner.kind(), io::ErrorKind::BrokenPipe);
+            }
+            other => panic!("expected Io passthrough, got {other:?}"),
+        }
+    }
 }
