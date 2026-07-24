@@ -296,6 +296,30 @@ mod tests {
     }
 
     #[test]
+    fn load_unreadable_file_returns_empty() {
+        // Distinct from `load_missing_file_returns_empty`: this exercises
+        // `load`'s other `Err` arm (any `fs::read` failure that is not
+        // `NotFound`), not the not-found short-circuit.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("peer_addrs.postcard");
+        fs::write(&path, b"irrelevant").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Root (or a CI sandbox running as root) bypasses Unix
+        // permission bits; skip rather than assert a false pass.
+        if fs::read(&path).is_ok() {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            return;
+        }
+
+        let cache = PeerAddrCache::new(path.clone());
+        assert!(cache.load().is_empty());
+
+        // Restore so tempdir cleanup can remove it.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[test]
     fn save_then_load_round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("peer_addrs.postcard");
@@ -410,6 +434,34 @@ mod tests {
                 .direct_addrs
                 .contains(&"198.51.100.7:5555".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn iroh_addr_from_entry_rejects_invalid_peer_id() {
+        // [0x42; 32] is not a valid curve point (see `entry`/`entry_from_iroh`
+        // comments elsewhere in this file); `PeerId::from_bytes` itself
+        // does no curve validation, so the rejection must come from
+        // `iroh::EndpointId::from_bytes` inside the conversion.
+        let entry = CacheEntry {
+            addr: WireEndpointAddr::id_only(PeerId::from_bytes([0x42; 32])),
+            last_seen_unix_secs: 1,
+        };
+        let err = iroh_addr_from_entry(&entry).expect_err("invalid peer id must be rejected");
+        assert!(err.starts_with("peer id:"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn iroh_addr_from_entry_rejects_malformed_relay_url() {
+        let entry = CacheEntry {
+            addr: WireEndpointAddr {
+                peer_id: valid_peer_id(0x01),
+                relay_url: "not a url".to_string(),
+                direct_addrs: BTreeSet::new(),
+            },
+            last_seen_unix_secs: 1,
+        };
+        let err = iroh_addr_from_entry(&entry).expect_err("malformed relay url must be rejected");
+        assert!(err.starts_with("relay_url:"), "unexpected error: {err}");
     }
 
     #[test]

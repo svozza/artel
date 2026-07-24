@@ -169,6 +169,17 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn default_behaves_like_new() {
+        let shutdown = Shutdown::default();
+        let mut token = shutdown.token();
+        assert!(!token.is_triggered());
+        shutdown.trigger();
+        timeout(Duration::from_millis(100), token.cancelled())
+            .await
+            .expect("token should resolve");
+    }
+
+    #[tokio::test]
     async fn token_resolves_after_trigger() {
         let shutdown = Shutdown::new();
         let mut token = shutdown.token();

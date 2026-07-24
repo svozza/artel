@@ -555,6 +555,36 @@ mod tests {
     }
 
     #[test]
+    fn session_message_signature_json_rejects_wrong_length_hex() {
+        let m = sample_message();
+        let json = serde_json::to_string(&m).unwrap();
+        // Swap the 128-char hex signature for a 126-char one — the
+        // Visitor's length check must reject it distinctly from a
+        // decode-succeeds-with-wrong-bytes case.
+        let short_hex = "00".repeat(63);
+        let bad = json.replacen(&"00".repeat(64), &short_hex, 1);
+        let err = serde_json::from_str::<SessionMessage>(&bad).unwrap_err();
+        assert!(
+            err.to_string().contains("128 hex chars"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn session_message_signature_json_rejects_invalid_hex_chars() {
+        let m = sample_message();
+        let json = serde_json::to_string(&m).unwrap();
+        // Same length, but 'z' is outside the hex alphabet.
+        let bad_hex = "z".repeat(128);
+        let bad = json.replacen(&"00".repeat(64), &bad_hex, 1);
+        let err = serde_json::from_str::<SessionMessage>(&bad).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid hex"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn session_message_host_sig_round_trips_postcard() {
         // Pin the host_sig field's wire shape: a 64-byte run, distinct
         // from the author `signature`.

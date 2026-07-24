@@ -547,6 +547,23 @@ mod tests {
     }
 
     #[test]
+    fn compiled_read_write_default_is_permissive() {
+        let c = CompiledPathRules::read_write();
+        assert_eq!(c.default_mode(), Mode::ReadWrite);
+        assert_eq!(c.mode_for(Path::new("anything.txt")), Mode::ReadWrite);
+    }
+
+    #[test]
+    fn default_mode_reflects_compiled_default() {
+        let r = PathRules {
+            default: Mode::ReadOnly,
+            rules: Vec::new(),
+        };
+        let c = r.compile().expect("compile");
+        assert_eq!(c.default_mode(), Mode::ReadOnly);
+    }
+
+    #[test]
     fn compile_rejects_invalid_rules() {
         let r = PathRules {
             default: Mode::ReadWrite,

@@ -226,6 +226,26 @@ mod tests {
     }
 
     #[test]
+    fn rejects_parent_traversal_component_inside_root() {
+        // Strip_prefix only rejects paths that don't start under root;
+        // a `..` further along (e.g. `root/a/../b`) still strips to a
+        // relative path, but its component walk must still reject the
+        // `ParentDir` component rather than silently normalising it.
+        let r = root();
+        let p = r.join("a").join("..").join("b");
+        let err = path_to_key(&r, &p).expect_err("parent traversal must be rejected");
+        match err {
+            WorkspaceError::InvalidPath(msg) => {
+                assert!(
+                    msg.contains("parent traversal"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected InvalidPath, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn rejects_key_without_prefix() {
         let r = root();
         assert!(key_to_path(&r, b"src/main.rs").is_err());
