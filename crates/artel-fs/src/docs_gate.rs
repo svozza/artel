@@ -77,10 +77,10 @@ impl ProtocolHandler for DocsGate {
 mod tests {
     use std::sync::Arc;
 
+    use artel_iroh_setup::test_fixtures::{bind_loopback, dial_in};
     use artel_protocol::PeerId;
     use artel_protocol::capability::{Capability, CapabilityAction};
     use iroh::Endpoint;
-    use iroh::endpoint::presets;
     use iroh::protocol::ProtocolHandler;
     use iroh_blobs::store::mem::MemStore;
     use tokio::sync::mpsc;
@@ -112,45 +112,6 @@ mod tests {
             .spawn(endpoint.clone(), (*store).clone(), gossip)
             .await
             .expect("spawn docs")
-    }
-
-    /// Bind on IPv4 loopback only, matching iroh's own `direct_pair`
-    /// test fixture: multi-homed CI hosts otherwise advertise
-    /// addresses the test's localhost-only dial can't reach.
-    async fn bind_loopback(alpns: Vec<Vec<u8>>) -> Endpoint {
-        Endpoint::builder(presets::Minimal)
-            .alpns(alpns)
-            .clear_ip_transports()
-            .bind_addr((std::net::Ipv4Addr::LOCALHOST, 0))
-            .expect("valid loopback bind addr")
-            .bind()
-            .await
-            .expect("bind endpoint")
-    }
-
-    /// Dial `server`'s address from a fresh client endpoint and hand back
-    /// the server-side `Connection` the dial produced, so tests can drive
-    /// `DocsGate::accept` directly against a real handshake.
-    ///
-    /// `server.accept()` only resolves once the first handshake packet
-    /// arrives — completing the handshake needs a further `.accept()` +
-    /// await that must run *concurrently* with the client's `connect()`
-    /// (the client's future won't resolve until the server side responds).
-    /// Both sides are therefore driven inside one `tokio::join!`.
-    async fn dial_in(server: &Endpoint, alpn: &[u8]) -> iroh::endpoint::Connection {
-        let client = bind_loopback(vec![]).await;
-        let addr = server.addr();
-        let server_side = async {
-            let incoming = server.accept().await.expect("server accept");
-            incoming
-                .accept()
-                .expect("accept incoming")
-                .await
-                .expect("server handshake")
-        };
-        let (client_conn, server_conn) = tokio::join!(client.connect(addr, alpn), server_side);
-        client_conn.expect("client connect");
-        server_conn
     }
 
     #[tokio::test]
