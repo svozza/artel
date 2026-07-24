@@ -460,6 +460,29 @@ mod tests {
         assert!(!is_no_daemon_error(&ClientError::ConnectionClosed));
     }
 
+    #[test]
+    fn is_io_recoverable_classifies_error_kinds() {
+        let not_found = io::Error::from(io::ErrorKind::NotFound);
+        let refused = io::Error::from(io::ErrorKind::ConnectionRefused);
+        let other = io::Error::from(io::ErrorKind::PermissionDenied);
+        let not_a_socket = io::Error::from_raw_os_error(nix::errno::Errno::ENOTSOCK as i32);
+        assert!(is_io_recoverable(&not_found));
+        assert!(is_io_recoverable(&refused));
+        assert!(is_io_recoverable(&not_a_socket));
+        assert!(!is_io_recoverable(&other));
+    }
+
+    #[test]
+    fn is_socket_pending_delegates_to_is_io_recoverable() {
+        // `is_socket_pending` is a thin alias used at the `connect()`
+        // retry site in `wait_for_socket` — pin that it shares
+        // `is_io_recoverable`'s classification rather than drifting.
+        let refused = io::Error::from(io::ErrorKind::ConnectionRefused);
+        let other = io::Error::from(io::ErrorKind::PermissionDenied);
+        assert!(is_socket_pending(&refused));
+        assert!(!is_socket_pending(&other));
+    }
+
     #[tokio::test]
     async fn wait_for_socket_returns_timeout_when_socket_never_appears() {
         let dir = tempdir().unwrap();

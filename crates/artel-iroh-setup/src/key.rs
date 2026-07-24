@@ -262,6 +262,16 @@ mod tests {
     }
 
     #[test]
+    fn ensure_dir_rejects_a_path_that_is_a_regular_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("not-a-dir");
+        fs::write(&path, b"i am a file").unwrap();
+
+        let err = ensure_dir(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
     fn parent_dir_is_created_at_0700() {
         let dir = tempdir().unwrap();
         let nested = dir.path().join("a").join("b");

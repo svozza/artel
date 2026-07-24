@@ -297,6 +297,36 @@ mod tests {
     }
 
     #[test]
+    fn unlocked_file_naming_a_live_other_pid_is_refused() {
+        // Pre-lock-daemon compat: the file has no flock (nobody holds
+        // it — the lock alone would let us claim the slot), but its
+        // contents name a live process that isn't us. That's a daemon
+        // that predates the locking protocol; we must not steal the
+        // slot out from under it, even though we're able to acquire
+        // the lock itself. PID 1 (init/launchd) is always live.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("daemon.pid");
+        fs::write(&path, "1\n").unwrap();
+
+        let err = PidFile::acquire(&path).unwrap_err();
+        match err {
+            PidError::AlreadyRunning { pid } => assert_eq!(pid, 1),
+            PidError::Io(other) => panic!("expected AlreadyRunning, got {other:?}"),
+        }
+        // The pre-lock daemon's record must survive untouched.
+        let raw = fs::read_to_string(&path).unwrap();
+        assert_eq!(raw.trim(), "1");
+    }
+
+    #[test]
+    fn path_accessor_returns_the_acquired_path() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("daemon.pid");
+        let pid = PidFile::acquire(&path).unwrap();
+        assert_eq!(pid.path(), path.as_path());
+    }
+
+    #[test]
     fn corrupt_unlocked_pid_file_is_reclaimed() {
         // Pre-lock-protocol semantics surfaced garbage contents as a
         // hard `Corrupt` error. Under the lock protocol, an unlocked
