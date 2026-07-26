@@ -1070,6 +1070,7 @@ async fn legit_host_frames_accepted_n0() {
 
 #[tokio::test]
 async fn forged_session_closed_dropped_n0() {
+    common::init_tracing();
     let (daemon_a, daemon_b) = spawn_pair_n0().await;
     let attacker_peer = common::RawGossipPeer::spawn_n0(common::custom_relay_setup().await).await;
     forged_session_closed_dropped_impl(&daemon_a, &daemon_b, &attacker_peer).await;
