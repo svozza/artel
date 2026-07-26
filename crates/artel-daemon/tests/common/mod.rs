@@ -35,6 +35,34 @@ use tokio::time::timeout;
 /// pkarr record to the localhost server.
 pub const PKARR_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// One-shot tracing init for a test process. Wide `RUST_LOG` defaults
+/// so a captured failing log surfaces every layer that could
+/// plausibly cause a gossip-mesh hang. Honours `RUST_LOG`; narrow via
+/// env var when isolating a specific subsystem. Mirrors
+/// `artel-fs/tests/common/mod.rs::init_tracing` — see
+/// `docs/diagnosing-flaky-tests.md`.
+pub fn init_tracing() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| {
+            concat!(
+                "info,",
+                "iroh=debug,",
+                "iroh::discovery=trace,",
+                "iroh_gossip=debug,",
+                "artel_daemon=debug",
+            )
+            .to_string()
+        });
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+            .with_test_writer()
+            .with_target(true)
+            .try_init();
+    });
+}
+
 /// Derive a curve-valid [`PeerId`] from a single seed byte. Plain
 /// `[seed; 32]` byte arrays don't satisfy iroh's Ed25519 curve
 /// check, so tests that need a "novel but valid" peer-id (e.g. the
