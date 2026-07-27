@@ -24,13 +24,14 @@ use artel_protocol::{MessageKind, Request, Response, SendPayload};
 use tempfile::TempDir;
 use tokio::time::timeout;
 
-use common::{Pair, spawn_pair, testing_setup, wait_for_event};
+use common::{Pair, init_tracing, spawn_pair, testing_setup, wait_for_event};
 
 /// After revocation + host restart, the host's outbound dial filter
 /// prevents iroh-docs from syncing with the revoked joiner.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn host_outbound_dial_blocked_after_revocation() {
+    init_tracing();
     let Pair {
         daemon_a,
         daemon_b,
