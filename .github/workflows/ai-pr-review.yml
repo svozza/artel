@@ -1,0 +1,53 @@
+# AI PR review, consumed from smtithy (github.com/svozza/smtithy).
+#
+# The pipeline is generate → verify → execute: an untrusted model proposes a
+# review, a deterministic verifier in the pinned harness checks it against a
+# reviewable policy, and only the harness's executor (the sole holder of
+# pull-requests:write) posts it. This file stays small on purpose — the trust
+# machinery lives in the reusable workflow and is pinned by SHA below.
+#
+# ONE-TIME SETUP this repository needs before the first run (the harness
+# ENFORCES the first item in code and refuses to review without it — see
+# smtithy ADR-0006):
+#
+#   1. Environment `ai-pr-review` with at least one required reviewer.
+#      GitHub silently creates referenced environments WITHOUT protection
+#      rules, so merely running this workflow once creates a gate that gates
+#      nothing; the harness detects that and fails rather than reviewing.
+#   2. Environment `ai-pr-review-runtime` (no rules; scopes the OIDC claim).
+#   3. Model credential, one of:
+#        - deploy smtithy's infra/oidc-role.yaml against THIS repo's
+#          owner/name/environment and set the BEDROCK_ROLE_ARN secret; or
+#        - set use-bedrock: false below and add an ANTHROPIC_API_KEY secret.
+#
+# The pin is a full 40-char SHA, never a branch or tag: the harness is the
+# security boundary, and a moving ref would let it change under this file.
+# Bumping it is a reviewable one-line diff.
+
+name: AI PR review
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions: {}
+
+concurrency:
+  group: ai-pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    uses: svozza/smtithy/.github/workflows/ai-pr-review.yml@7798f12a7b0374d43f536a843cd625155beabdcf
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    with:
+      project-description: >-
+        `svozza/artel`, a Rust workspace providing peer-to-peer collaboration
+        for applications — sessions, NAT-traversed messaging, and file sync
+        between machines over iroh, with a client crate talking to a local
+        daemon over a Unix socket
+    secrets:
+      BEDROCK_ROLE_ARN: ${{ secrets.BEDROCK_ROLE_ARN }}
