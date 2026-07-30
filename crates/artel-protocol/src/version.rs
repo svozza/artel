@@ -37,6 +37,18 @@ impl ProtocolVersion {
     }
 }
 
+impl ProtocolVersion {
+    /// Whether a daemon at this version can serve a client that reported
+    /// `client`. The daemon serves same-version clients only (no N-1
+    /// compatibility in v1), but a client may connect while the daemon is
+    /// mid-upgrade, so a daemon one version ahead still refuses rather than
+    /// panicking.
+    #[must_use]
+    pub const fn supports(self, client: Self) -> bool {
+        self.0 >= client.0
+    }
+}
+
 impl fmt::Display for ProtocolVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "v{}", self.0)
@@ -101,6 +113,11 @@ mod tests {
     #[test]
     fn default_is_zero() {
         assert_eq!(ProtocolVersion::default(), ProtocolVersion::new(0));
+    }
+
+    #[test]
+    fn daemon_supports_same_version_client() {
+        assert!(PROTOCOL_VERSION.supports(PROTOCOL_VERSION));
     }
 
     #[test]
