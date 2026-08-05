@@ -40,9 +40,12 @@ on:
 
 permissions: {}
 
-concurrency:
-  group: ai-pr-review-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+# NO concurrency block here on purpose. The harness declares its own per-PR group
+# (one run per pull request, cancel-in-progress, so two runs for different head
+# SHAs cannot contend for the single sticky comment), and a caller that declares
+# the SAME group makes the two collide: the run then fails instantly with zero jobs
+# and only "this run likely failed because of a workflow file issue" to explain it.
+# Concurrency for this lane is the harness's to own, not this file's.
 
 jobs:
   review:
