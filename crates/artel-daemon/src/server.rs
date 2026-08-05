@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use artel_protocol::transport::{self, Framed, server::Listener};
 use artel_protocol::{
-    Capability, Event, PROTOCOL_VERSION, PeerInfo, ProtocolError, ProtocolVersion, Request,
+    Capability, Event, PROTOCOL_VERSION, Peer, PeerInfo, ProtocolError, ProtocolVersion, Request,
     Response, SendPayload, SessionId, SessionMessage, VersionMismatch, WireMessage,
 };
 use futures_util::{SinkExt, StreamExt, stream::SplitSink};
@@ -1621,9 +1621,12 @@ fn session_error_to_protocol(err: &SessionError) -> ProtocolError {
     err.into()
 }
 
-/// Validate the client's `Hello`. Returns `Ok` when versions match.
+/// Validate the client's `Hello`. Returns `Ok` when the daemon can serve the
+/// client, which is `ProtocolVersion::supports`' decision rather than this
+/// function's: the compatibility policy belongs beside the version type, so
+/// there is one place to change when N-1 support arrives.
 fn handle_hello(client_version: ProtocolVersion) -> Result<(), ProtocolError> {
-    if client_version != PROTOCOL_VERSION {
+    if !PROTOCOL_VERSION.supports(client_version, Peer::Client) {
         debug!(
             client = %client_version,
             daemon = %PROTOCOL_VERSION,

@@ -26,19 +26,30 @@
 
 name: AI PR review
 
+# SMOKE-TEST TRIGGER — this branch only, never main. Since 2025-12-08,
+# pull_request_target sources the workflow file from the DEFAULT branch
+# regardless of the PR's base, so an unmerged pull_request_target workflow
+# cannot fire at all. pull_request sources from the PR's merge commit, and a
+# same-repo PR still gets secrets and OIDC, so it exercises the identical
+# pipeline. The version that merges to main flips this back to
+# pull_request_target (required for fork PRs, where pull_request runs
+# credential-less).
 on:
-  pull_request_target:
+  pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
 permissions: {}
 
-concurrency:
-  group: ai-pr-review-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+# NO concurrency block here on purpose. The harness declares its own per-PR group
+# (one run per pull request, cancel-in-progress, so two runs for different head
+# SHAs cannot contend for the single sticky comment), and a caller that declares
+# the SAME group makes the two collide: the run then fails instantly with zero jobs
+# and only "this run likely failed because of a workflow file issue" to explain it.
+# Concurrency for this lane is the harness's to own, not this file's.
 
 jobs:
   review:
-    uses: svozza/smtithy/.github/workflows/ai-pr-review.yml@7798f12a7b0374d43f536a843cd625155beabdcf
+    uses: svozza/smtithy/.github/workflows/ai-pr-review.yml@0fd2f56610205eeb433b064afda935bc8609407c
     permissions:
       contents: read
       pull-requests: write
