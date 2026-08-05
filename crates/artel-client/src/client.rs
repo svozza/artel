@@ -50,7 +50,12 @@ const WRITER_QUEUE_CAPACITY: usize = 64;
 /// consumer as [`Event::Gap`](artel_protocol::Event::Gap); this local
 /// queue is a second, independent place the same kind of loss can
 /// happen, purely from the consumer not draining fast enough.
-const EVENTS_QUEUE_CAPACITY: usize = 256;
+///
+/// MUST equal the daemon's `EVENT_CHANNEL_CAPACITY` (artel-daemon's
+/// `session.rs`): the daemon sizes its per-session broadcast to that value and
+/// only emits `Event::Gap` when ITS buffer lags, so a smaller queue here drops
+/// events with no Gap marker and the consumer desyncs silently.
+const EVENTS_QUEUE_CAPACITY: usize = 64;
 
 type ResponseSenders = Arc<SyncMutex<HashMap<RequestId, oneshot::Sender<Response>>>>;
 
