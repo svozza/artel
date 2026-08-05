@@ -53,14 +53,19 @@ pub enum Peer {
 impl ProtocolVersion {
     /// Whether this version can talk to `other`, asked from `asker`'s side.
     ///
-    /// Same-version only in v1 (no N-1 compatibility), so both directions agree
-    /// today; `asker` exists so the two can diverge without every call site having
-    /// to be found again.
+    /// The two directions are deliberately NOT the same predicate, and `asker` must
+    /// name the side actually asking or the answer is about the wrong party:
+    ///
+    /// - [`Peer::Daemon`] — a daemon tolerates a client at or below its own
+    ///   version (it can still decode an older client's frames), and refuses a
+    ///   client from the future.
+    /// - [`Peer::Client`] — a client tolerates a daemon at or above its own
+    ///   version (the daemon keeps compatibility), and refuses one from the past.
     #[must_use]
     pub const fn supports(self, other: Self, asker: Peer) -> bool {
         match asker {
             Peer::Daemon => self.0 >= other.0,
-            Peer::Client => self.0 >= other.0,
+            Peer::Client => self.0 <= other.0,
         }
     }
 }

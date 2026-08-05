@@ -1626,7 +1626,7 @@ fn session_error_to_protocol(err: &SessionError) -> ProtocolError {
 /// function's: the compatibility policy belongs beside the version type, so
 /// there is one place to change when N-1 support arrives.
 fn handle_hello(client_version: ProtocolVersion) -> Result<(), ProtocolError> {
-    if !PROTOCOL_VERSION.supports(client_version, Peer::Daemon) {
+    if !PROTOCOL_VERSION.supports(client_version, Peer::Client) {
         debug!(
             client = %client_version,
             daemon = %PROTOCOL_VERSION,

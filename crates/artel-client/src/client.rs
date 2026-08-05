@@ -222,7 +222,7 @@ impl Client {
         // protocol we cannot decode should be refused at Hello rather than
         // producing decode errors mid-session. Same predicate as the daemon uses,
         // so there is one definition of "can these two talk".
-        if !PROTOCOL_VERSION.supports(daemon_version, Peer::Client) {
+        if !PROTOCOL_VERSION.supports(daemon_version, Peer::Daemon) {
             return Err(ClientError::Protocol(ProtocolError::VersionMismatch(
                 VersionMismatch {
                     client: PROTOCOL_VERSION,
