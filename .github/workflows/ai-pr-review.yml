@@ -46,7 +46,7 @@ concurrency:
 
 jobs:
   review:
-    uses: svozza/smtithy/.github/workflows/ai-pr-review.yml@7798f12a7b0374d43f536a843cd625155beabdcf
+    uses: svozza/smtithy/.github/workflows/ai-pr-review.yml@95f69425d91a22afc03a1f5895ec062f86553f7a
     permissions:
       contents: read
       pull-requests: write
