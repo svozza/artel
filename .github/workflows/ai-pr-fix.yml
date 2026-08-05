@@ -42,12 +42,13 @@ on:
 
 permissions: {}
 
-# Deliberately NOT cancel-in-progress, matching the harness's own lane: a command
-# is a discrete human instruction, so a second `/fix` must not silently discard a
-# running one.
-concurrency:
-  group: ai-pr-fix-${{ github.event.issue.number }}
-  cancel-in-progress: false
+# NO concurrency block here on purpose. The harness declares its own group for this
+# lane — per pull request, and deliberately NOT cancel-in-progress, because a command
+# is a discrete human instruction and a second `/fix` must not silently discard a
+# running one. A caller declaring the SAME group makes the two collide: the run then
+# fails in about a second with zero jobs, no annotations, and nothing but "this run
+# likely failed because of a workflow file issue" to explain it. Measured on the
+# review caller, which had exactly this bug after its pin was bumped.
 
 jobs:
   fix:
