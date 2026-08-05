@@ -23,7 +23,8 @@ use std::sync::{Arc, Mutex as SyncMutex};
 
 use artel_protocol::transport::{self, Framed, client::connect as transport_connect};
 use artel_protocol::{
-    Event, PROTOCOL_VERSION, PeerId, ProtocolVersion, Request, RequestId, Response, WireMessage,
+    Event, PROTOCOL_VERSION, PeerId, ProtocolError, ProtocolVersion, Request, RequestId, Response,
+    VersionMismatch, WireMessage,
 };
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
@@ -210,6 +211,20 @@ impl Client {
             } if id == hello_id => return Err(ClientError::Protocol(error)),
             other => return Err(unexpected(other)),
         };
+
+        // The daemon vets us in handle_hello; this is the same question asked from
+        // the client's side, and it is the client's to ask — a daemon speaking a
+        // protocol we cannot decode should be refused at Hello rather than
+        // producing decode errors mid-session. Same predicate as the daemon uses,
+        // so there is one definition of "can these two talk".
+        if !PROTOCOL_VERSION.supports(daemon_version) {
+            return Err(ClientError::Protocol(ProtocolError::VersionMismatch(
+                VersionMismatch {
+                    client: PROTOCOL_VERSION,
+                    daemon: daemon_version,
+                },
+            )));
+        }
 
         let framed = sink.reunite(stream).expect("split halves match");
         Ok(Self::spawn(
