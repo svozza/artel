@@ -1,0 +1,78 @@
+# AI PR fix, consumed from smtithy (github.com/svozza/smtithy).
+#
+# TEMPORARY, AND SCOPED TO ONE PULL REQUEST. Delete this file, or remove the
+# ALLOWED_PR guard below, when the lane has been observed working.
+#
+# Why it exists at all: `issue_comment` runs the workflow file from the DEFAULT
+# BRANCH, whoever commented and whatever branch the pull request is on. So unlike
+# the review caller — which uses `pull_request` precisely so it can be smoke-tested
+# from a branch — a `/fix` caller CANNOT fire from a feature branch. It has to be
+# here on main to run at all.
+#
+# The guard is what makes that acceptable before the lane has been seen working:
+# the job only dispatches for one pull request number, so a `/fix` comment
+# anywhere else in this repository does nothing. `issue_comment` payloads carry no
+# base ref (the harness fetches the pull request itself to resolve base and head),
+# so the number is the thing the event actually provides to filter on.
+#
+# WHAT THE HARNESS ALREADY ENFORCES, so this file does not need to re-check it
+# (smtithy ADR-0007, and the `command` job that holds no credential):
+#   - the comment body must BE the command, in one exact spelling. The
+#     `contains()` pre-filter below is a cheap runner-saver only, not a parse.
+#   - the COMMENTER must hold write-or-above. The pull request author's permission
+#     is a separate question and decides only whether a human approves first.
+#   - the issue must be a pull request, the head must not have moved, and a review
+#     this harness itself posted must exist for the SHA being commanded.
+#
+# SETUP: none beyond what the review caller already needs and this repository
+# already has — environments `ai-pr-review` (with a required reviewer) and
+# `ai-pr-review-runtime`, plus BEDROCK_ROLE_ARN. Verified present before this file
+# was added. The fix lane deliberately reuses the same gate: the plan session reads
+# contributor-authored code with a model credential in scope, which is the review
+# lane's threat exactly.
+#
+# The pin is a full 40-char SHA, never a branch or tag: the harness is the security
+# boundary, and a moving ref would let it change under this file.
+
+name: AI PR fix
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+# Deliberately NOT cancel-in-progress, matching the harness's own lane: a command
+# is a discrete human instruction, so a second `/fix` must not silently discard a
+# running one.
+concurrency:
+  group: ai-pr-fix-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  fix:
+    # Three conditions, in increasing cost to evaluate:
+    #   1. the comment is on a pull request, not a plain issue;
+    #   2. it is THE pull request this temporary caller is scoped to;
+    #   3. the body mentions the command at all.
+    # (3) is a pre-filter that stops every comment in the repository starting a
+    # runner; the exact parse is the harness's, and nothing security-relevant
+    # rests on `contains`.
+    if: >-
+      github.event.issue.pull_request
+      && github.event.issue.number == 61
+      && contains(github.event.comment.body, '/fix ')
+    uses: svozza/smtithy/.github/workflows/ai-pr-fix.yml@95f69425d91a22afc03a1f5895ec062f86553f7a
+    permissions:
+      contents: write # the stacked follow-up PR creates a branch; suggestions do not
+      pull-requests: write
+      id-token: write
+      actions: read # review.json comes from the review run's own artifact
+    with:
+      project-description: >-
+        `svozza/artel`, a Rust workspace providing peer-to-peer collaboration
+        for applications — sessions, NAT-traversed messaging, and file sync
+        between machines over iroh, with a client crate talking to a local
+        daemon over a Unix socket
+    secrets:
+      BEDROCK_ROLE_ARN: ${{ secrets.BEDROCK_ROLE_ARN }}
