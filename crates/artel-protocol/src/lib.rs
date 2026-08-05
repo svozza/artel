@@ -60,4 +60,4 @@ pub use upgrade::{
     DeliveryFrame, DowngradePayload, RotatePayload, UPGRADE_ACK, UPGRADE_ALPN, UpgradeFrame,
     UpgradePayload,
 };
-pub use version::{PROTOCOL_VERSION, ProtocolVersion, VersionMismatch};
+pub use version::{PROTOCOL_VERSION, Peer, ProtocolVersion, VersionMismatch};

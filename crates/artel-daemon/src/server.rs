@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use artel_protocol::transport::{self, Framed, server::Listener};
 use artel_protocol::{
-    Capability, Event, PROTOCOL_VERSION, PeerInfo, ProtocolError, ProtocolVersion, Request,
+    Capability, Event, PROTOCOL_VERSION, Peer, PeerInfo, ProtocolError, ProtocolVersion, Request,
     Response, SendPayload, SessionId, SessionMessage, VersionMismatch, WireMessage,
 };
 use futures_util::{SinkExt, StreamExt, stream::SplitSink};
@@ -1626,7 +1626,7 @@ fn session_error_to_protocol(err: &SessionError) -> ProtocolError {
 /// function's: the compatibility policy belongs beside the version type, so
 /// there is one place to change when N-1 support arrives.
 fn handle_hello(client_version: ProtocolVersion) -> Result<(), ProtocolError> {
-    if !PROTOCOL_VERSION.supports(client_version) {
+    if !PROTOCOL_VERSION.supports(client_version, Peer::Daemon) {
         debug!(
             client = %client_version,
             daemon = %PROTOCOL_VERSION,

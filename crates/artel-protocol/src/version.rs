@@ -37,15 +37,31 @@ impl ProtocolVersion {
     }
 }
 
+/// Which direction a compatibility question is being asked from.
+///
+/// The predicate is not symmetric once N-1 support exists — a daemon may serve an
+/// older client while that client must still refuse a newer daemon — so the caller
+/// says which side it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Peer {
+    /// The daemon asking whether it can serve a client.
+    Daemon,
+    /// The client asking whether it can talk to a daemon.
+    Client,
+}
+
 impl ProtocolVersion {
-    /// Whether a daemon at this version can serve a client that reported
-    /// `client`. The daemon serves same-version clients only (no N-1
-    /// compatibility in v1), but a client may connect while the daemon is
-    /// mid-upgrade, so a daemon one version ahead still refuses rather than
-    /// panicking.
+    /// Whether this version can talk to `other`, asked from `asker`'s side.
+    ///
+    /// Same-version only in v1 (no N-1 compatibility), so both directions agree
+    /// today; `asker` exists so the two can diverge without every call site having
+    /// to be found again.
     #[must_use]
-    pub const fn supports(self, client: Self) -> bool {
-        self.0 >= client.0
+    pub const fn supports(self, other: Self, asker: Peer) -> bool {
+        match asker {
+            Peer::Daemon => self.0 >= other.0,
+            Peer::Client => self.0 >= other.0,
+        }
     }
 }
 
@@ -117,7 +133,7 @@ mod tests {
 
     #[test]
     fn daemon_supports_same_version_client() {
-        assert!(PROTOCOL_VERSION.supports(PROTOCOL_VERSION));
+        assert!(PROTOCOL_VERSION.supports(PROTOCOL_VERSION, Peer::Daemon));
     }
 
     #[test]

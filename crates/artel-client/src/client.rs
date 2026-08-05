@@ -23,8 +23,8 @@ use std::sync::{Arc, Mutex as SyncMutex};
 
 use artel_protocol::transport::{self, Framed, client::connect as transport_connect};
 use artel_protocol::{
-    Event, PROTOCOL_VERSION, PeerId, ProtocolError, ProtocolVersion, Request, RequestId, Response,
-    VersionMismatch, WireMessage,
+    Event, PROTOCOL_VERSION, Peer, PeerId, ProtocolError, ProtocolVersion, Request, RequestId,
+    Response, VersionMismatch, WireMessage,
 };
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
@@ -55,7 +55,7 @@ const WRITER_QUEUE_CAPACITY: usize = 64;
 /// `session.rs`): the daemon sizes its per-session broadcast to that value and
 /// only emits `Event::Gap` when ITS buffer lags, so a smaller queue here drops
 /// events with no Gap marker and the consumer desyncs silently.
-const EVENTS_QUEUE_CAPACITY: usize = 64;
+const EVENTS_QUEUE_CAPACITY: usize = 256;
 
 type ResponseSenders = Arc<SyncMutex<HashMap<RequestId, oneshot::Sender<Response>>>>;
 
@@ -222,7 +222,7 @@ impl Client {
         // protocol we cannot decode should be refused at Hello rather than
         // producing decode errors mid-session. Same predicate as the daemon uses,
         // so there is one definition of "can these two talk".
-        if !PROTOCOL_VERSION.supports(daemon_version) {
+        if !PROTOCOL_VERSION.supports(daemon_version, Peer::Client) {
             return Err(ClientError::Protocol(ProtocolError::VersionMismatch(
                 VersionMismatch {
                     client: PROTOCOL_VERSION,
