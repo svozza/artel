@@ -1621,9 +1621,12 @@ fn session_error_to_protocol(err: &SessionError) -> ProtocolError {
     err.into()
 }
 
-/// Validate the client's `Hello`. Returns `Ok` when versions match.
+/// Validate the client's `Hello`. Returns `Ok` when the daemon can serve the
+/// client, which is `ProtocolVersion::supports`' decision rather than this
+/// function's: the compatibility policy belongs beside the version type, so
+/// there is one place to change when N-1 support arrives.
 fn handle_hello(client_version: ProtocolVersion) -> Result<(), ProtocolError> {
-    if client_version != PROTOCOL_VERSION {
+    if !PROTOCOL_VERSION.supports(client_version) {
         debug!(
             client = %client_version,
             daemon = %PROTOCOL_VERSION,
