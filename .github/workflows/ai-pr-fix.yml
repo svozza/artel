@@ -56,7 +56,7 @@ jobs:
     if: >-
       github.event.issue.pull_request
       && contains(github.event.comment.body, '/fix ')
-    uses: svozza/smtithy/.github/workflows/ai-pr-fix.yml@8e2526e12dc80bb03c306696576f0a8501128c9d
+    uses: svozza/smtithy/.github/workflows/ai-pr-fix.yml@185cc26fdc1035a0f77adaa34c3c45b9e8c6abca
     permissions:
       contents: write # the stacked follow-up PR creates a branch; suggestions do not
       pull-requests: write
