@@ -35,38 +35,17 @@ impl ProtocolVersion {
     pub const fn get(self) -> u32 {
         self.0
     }
-}
 
-/// Which direction a compatibility question is being asked from.
-///
-/// The predicate is not symmetric once N-1 support exists — a daemon may serve an
-/// older client while that client must still refuse a newer daemon — so the caller
-/// says which side it is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Peer {
-    /// The daemon asking whether it can serve a client.
-    Daemon,
-    /// The client asking whether it can talk to a daemon.
-    Client,
-}
-
-impl ProtocolVersion {
-    /// Whether this version can talk to `other`, asked from `asker`'s side.
+    /// Whether this version can talk to `other`.
     ///
-    /// The two directions are deliberately NOT the same predicate, and `asker` must
-    /// name the side actually asking or the answer is about the wrong party:
-    ///
-    /// - [`Peer::Daemon`] — a daemon tolerates a client at or below its own
-    ///   version (it can still decode an older client's frames), and refuses a
-    ///   client from the future.
-    /// - [`Peer::Client`] — a client tolerates a daemon at or above its own
-    ///   version (the daemon keeps compatibility), and refuses one from the past.
+    /// Strict equality, and the same question from either side. [`PROTOCOL_VERSION`]
+    /// is bumped on any wire-incompatible change and there is no partial-protocol
+    /// fallback, so a differing version always means frames this build cannot
+    /// decode — there is no direction in which skew is safe. v1 does not attempt
+    /// N-1 compatibility; when it does, this is the one place the policy changes.
     #[must_use]
-    pub const fn supports(self, other: Self, asker: Peer) -> bool {
-        match asker {
-            Peer::Daemon => self.0 == other.0,
-            Peer::Client => self.0 == other.0,
-        }
+    pub const fn supports(self, other: Self) -> bool {
+        self.0 == other.0
     }
 }
 
@@ -138,7 +117,7 @@ mod tests {
 
     #[test]
     fn daemon_supports_same_version_client() {
-        assert!(PROTOCOL_VERSION.supports(PROTOCOL_VERSION, Peer::Daemon));
+        assert!(PROTOCOL_VERSION.supports(PROTOCOL_VERSION));
     }
 
     #[test]
