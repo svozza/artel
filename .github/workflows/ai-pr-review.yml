@@ -49,7 +49,7 @@ permissions: {}
 
 jobs:
   review:
-    uses: svozza/smtithy/.github/workflows/ai-pr-review.yml@5d6499237522216955b10eaa396c5a509ba4bb26
+    uses: svozza/smtithy/.github/workflows/ai-pr-review.yml@3c7794e4e0da51afcb7c746380cc68f782d50780
     permissions:
       contents: read
       pull-requests: write
@@ -60,5 +60,12 @@ jobs:
         for applications — sessions, NAT-traversed messaging, and file sync
         between machines over iroh, with a client crate talking to a local
         daemon over a Unix socket
+      # Set explicitly, though 40 is BELOW the harness default of 50, because a
+      # value that differs from the default is the only way this file's own
+      # transcript can show the input arriving: the harness records what each
+      # attempt was granted, and a default-shaped number proves nothing about the
+      # channel. The review of the previous head exhausted the old fixed 600s
+      # ceiling twice without submitting; 40 minutes leaves the generator ~2280s.
+      agent-timeout-minutes: 40
     secrets:
       BEDROCK_ROLE_ARN: ${{ secrets.BEDROCK_ROLE_ARN }}
