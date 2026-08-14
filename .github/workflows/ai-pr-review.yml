@@ -49,7 +49,7 @@ permissions: {}
 
 jobs:
   review:
-    uses: svozza/smtithy/.github/workflows/ai-pr-review.yml@3c7794e4e0da51afcb7c746380cc68f782d50780
+    uses: svozza/smtithy/.github/workflows/ai-pr-review.yml@185cc26fdc1035a0f77adaa34c3c45b9e8c6abca
     permissions:
       contents: read
       pull-requests: write
