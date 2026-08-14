@@ -64,8 +64,8 @@ impl ProtocolVersion {
     #[must_use]
     pub const fn supports(self, other: Self, asker: Peer) -> bool {
         match asker {
-            Peer::Daemon => self.0 >= other.0,
-            Peer::Client => self.0 <= other.0,
+            Peer::Daemon => self.0 == other.0,
+            Peer::Client => self.0 == other.0,
         }
     }
 }
