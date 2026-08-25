@@ -155,9 +155,11 @@ Alpha, and moving. Working today: sessions and messaging over real n0 infrastruc
 
 ## Development
 
+Install [rustup](https://rustup.rs/) before building. It automatically installs and selects the exact compiler and components declared in `rust-toolchain.toml`, keeping local development and CI on the same Rust release.
+
 One-time setup after cloning: `make hooks` — points git at the versioned `.githooks/` directory, so a pre-push hook runs `make fmt`, `make clippy`, and `make doc` before every push (the static half of CI, locally, in about a minute).
 
-Tests run through [`cargo-nextest`](https://nexte.st) (`cargo install cargo-nextest --locked`):
+Tests run through [`cargo-nextest`](https://nexte.st). Install it separately with `cargo install cargo-nextest --locked`; Cargo subcommands are global developer tools and are not installed from this workspace's `Cargo.toml` or `Cargo.lock`. Coverage additionally uses `cargo-llvm-cov` (`cargo install cargo-llvm-cov --locked`); its `llvm-tools-preview` component is included in `rust-toolchain.toml`.
 
 - `make test` — unit + cross-peer tests against localhost infrastructure. Fast, deterministic, runs on every PR.
 - `make test-n0` — the same scenarios against real n0 infrastructure (`pkarr.iroh.computer` + production relay). Slower, opt-in. These test fns are suffixed `_n0`; the default profile filters them out.
