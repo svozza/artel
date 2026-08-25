@@ -1376,7 +1376,6 @@ fn join_to_io(err: &tokio::task::JoinError) -> io::Error {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::io::Write as _;
 
     use artel_protocol::{MessageKind, PeerInfo};
     use pretty_assertions::assert_eq;

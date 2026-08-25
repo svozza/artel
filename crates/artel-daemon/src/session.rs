@@ -1603,7 +1603,10 @@ impl Registry {
     /// the same opaque-to-the-bearer error every other ticket defect
     /// collapses to.
     #[allow(clippy::too_many_arguments)]
-    #[cfg_attr(not(feature = "iroh"), allow(clippy::unused_async))]
+    #[cfg_attr(
+        not(feature = "iroh"),
+        allow(clippy::unused_async, clippy::unused_async_trait_impl)
+    )]
     async fn materialise_remote_session(
         &self,
         session_id: SessionId,
