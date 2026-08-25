@@ -1224,9 +1224,10 @@ async fn shutdown_propagates_router_failure_and_keeps_node_consumable() {
     // `Workspace::shutdown` sees an `Err` and must NOT arm
     // `did_shutdown`. Per-instance, so a parallel test in this
     // binary running its own shutdown won't trip our fault.
-    ws.test_arm_shutdown_failure()
-        .await
-        .expect("workspace node still in slot when arming fault");
+    assert!(
+        ws.test_arm_shutdown_failure().await,
+        "workspace node still in slot when arming fault",
+    );
     let err = timeout(SHUTDOWN_BUDGET, ws.shutdown())
         .await
         .expect("forced-fail shutdown finished within budget")

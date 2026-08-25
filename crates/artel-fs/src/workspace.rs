@@ -2528,35 +2528,32 @@ impl Workspace {
     }
 
     /// Test-only: arm the next [`Self::shutdown`] on this specific
-    /// workspace to fail. Returns `Ok(())` if the node is still in
-    /// the slot (the common case — call before any other shutdown
-    /// path has consumed it), `Err(())` if the node was already
-    /// taken (shutdown ran, or rollback consumed it).
+    /// workspace to fail. Returns `true` if the node is still in the
+    /// slot (the common case — call before any other shutdown path has
+    /// consumed it), or `false` if the node was already taken
+    /// (shutdown ran, or rollback consumed it).
     ///
     /// Per-instance, by design: a process-wide static would let two
     /// parallel tests in the same integration binary trip each
     /// other's fault injection. Sole consumer is
     /// `tests/workspace_shutdown_contract.rs`.
     ///
-    /// # Errors
-    ///
-    /// Returns `Err(())` if the node slot is already empty — shutdown
-    /// has run or rollback consumed the node — so there is no
-    /// `shutdown_failure_flag` left to arm.
     #[cfg(feature = "test-utils")]
-    pub async fn test_arm_shutdown_failure(&self) -> Result<(), ()> {
+    pub async fn test_arm_shutdown_failure(&self) -> bool {
         // Clone the flag handle out from under the lock so the
         // store happens lock-free — the `Arc<AtomicBool>` is
         // designed to outlive the node's own lifetime.
-        let flag = self
+        let Some(flag) = self
             .node
             .lock()
             .await
             .as_ref()
             .map(|node| std::sync::Arc::clone(&node.shutdown_failure_flag))
-            .ok_or(())?;
+        else {
+            return false;
+        };
         flag.store(true, std::sync::atomic::Ordering::SeqCst);
-        Ok(())
+        true
     }
 
     /// Drive the applier's tombstone application for `path` directly,

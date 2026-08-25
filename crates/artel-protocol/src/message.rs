@@ -311,7 +311,7 @@ pub(crate) mod signature_serde {
                     return Err(E::invalid_length(s.len(), &self));
                 }
                 let mut out = [0u8; 64];
-                for (i, chunk) in s.as_bytes().chunks_exact(2).enumerate() {
+                for (i, chunk) in s.as_bytes().as_chunks::<2>().0.iter().enumerate() {
                     let hi = decode_nibble(chunk[0]).ok_or_else(|| E::custom("invalid hex"))?;
                     let lo = decode_nibble(chunk[1]).ok_or_else(|| E::custom("invalid hex"))?;
                     out[i] = (hi << 4) | lo;

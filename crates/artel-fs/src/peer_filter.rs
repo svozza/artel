@@ -33,31 +33,37 @@ impl PeerFilter {
 }
 
 impl EndpointHooks for PeerFilter {
-    async fn before_connect<'a>(
+    fn before_connect<'a>(
         &'a self,
         remote_addr: &'a EndpointAddr,
         _alpn: &'a [u8],
-    ) -> BeforeConnectOutcome {
-        let Some(peer) = self.peer_map.revoked_daemon_peer(remote_addr.id) else {
-            return BeforeConnectOutcome::Accept;
-        };
-        tracing::warn!(
-            target: "artel_fs::peer_filter",
-            remote_id = %remote_addr.id,
-            "blocked outbound dial to revoked peer",
-        );
-        emit_event(
-            &self.events,
-            WorkspaceEvent::RevokedPeerBlocked {
-                peer,
-                direction: Direction::Outgoing,
+    ) -> impl Future<Output = BeforeConnectOutcome> + Send + 'a {
+        let outcome = self.peer_map.revoked_daemon_peer(remote_addr.id).map_or(
+            BeforeConnectOutcome::Accept,
+            |peer| {
+                tracing::warn!(
+                    target: "artel_fs::peer_filter",
+                    remote_id = %remote_addr.id,
+                    "blocked outbound dial to revoked peer",
+                );
+                emit_event(
+                    &self.events,
+                    WorkspaceEvent::RevokedPeerBlocked {
+                        peer,
+                        direction: Direction::Outgoing,
+                    },
+                );
+                BeforeConnectOutcome::Reject
             },
         );
-        BeforeConnectOutcome::Reject
+        std::future::ready(outcome)
     }
 
-    async fn after_handshake<'a>(&'a self, conn: &'a Connection) -> AfterHandshakeOutcome {
-        if conn.side() == Side::Server
+    fn after_handshake<'a>(
+        &'a self,
+        conn: &'a Connection,
+    ) -> impl Future<Output = AfterHandshakeOutcome> + Send + 'a {
+        let outcome = if conn.side() == Side::Server
             && let Some(peer) = self.peer_map.revoked_daemon_peer(conn.remote_id())
         {
             tracing::warn!(
@@ -78,7 +84,8 @@ impl EndpointHooks for PeerFilter {
             }
         } else {
             AfterHandshakeOutcome::Accept
-        }
+        };
+        std::future::ready(outcome)
     }
 }
 
