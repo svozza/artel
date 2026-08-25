@@ -34,7 +34,7 @@ iroh-blobs = "0.103"
 iroh-docs = "0.101"
 iroh-gossip = { version = "0.101", default-features = false, features = ["net"] }
 iroh-relay = { version = "1.0", default-features = false, features = ["server"] }
-nix = { version = "0.29", default-features = false, features = ["signal", "process"] }
+nix = { version = "0.31", default-features = false, features = ["signal", "process"] }
 rand = "0.9"
 serde = { version = "1.0", features = ["derive"] }
 serde_bytes = "0.11"
