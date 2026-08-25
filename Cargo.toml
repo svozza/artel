@@ -50,7 +50,7 @@ uuid = { version = "1.10", features = ["serde", "v4"] }
 # Dev / test
 pretty_assertions = "1.4"
 proptest = "1.5"
-proptest-derive = "0.5"
+proptest-derive = "0.8"
 tempfile = "3.13"
 
 [workspace.lints.rust]
