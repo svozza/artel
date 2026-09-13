@@ -482,8 +482,10 @@ pub enum Response {
         sessions: Vec<SessionSummary>,
     },
 
-    /// Reply to [`Request::Subscribe`]. The client should expect [`Event`]
-    /// frames after this.
+    /// Acknowledges [`Request::Subscribe`], not replay completion.
+    /// The subscription forwarder runs independently, so [`Event`] frames
+    /// may arrive before this response. [`Event::ReplayComplete`] marks
+    /// the boundary between backfill and live events for the subscription.
     Subscribed {
         /// Session that was subscribed to.
         session: SessionId,
@@ -624,8 +626,8 @@ pub enum Event {
     },
 
     /// One or more events were dropped for this subscriber before they
-    /// could be delivered (the daemon's per-subscriber broadcast buffer
-    /// overflowed — see `EVENT_CHANNEL_CAPACITY`). The stream stays
+    /// could be delivered. Either the daemon's per-subscriber broadcast
+    /// buffer or the client's local event queue overflowed. The stream stays
     /// open; the daemon does **not** close the connection. The
     /// subscriber recovers by re-`Subscribe`ing from its last-seen seq
     /// (`Subscribe { since }`), which replays every logged message past
@@ -638,6 +640,17 @@ pub enum Event {
     /// `event_gap_is_appended_at_index_four` test (M3 Part B).
     Gap {
         /// Session whose stream dropped events.
+        session: SessionId,
+    },
+
+    /// The subscription's initial backfill has been sent, including when
+    /// it is empty. Ordered after replayed messages and before live events
+    /// for this subscription; not an acknowledgement that the consumer
+    /// applied them. Consumers must also account for event loss.
+    ///
+    /// Appended at postcard index 5 in protocol version 14.
+    ReplayComplete {
+        /// Session whose backfill finished.
         session: SessionId,
     },
 }
@@ -1288,6 +1301,45 @@ mod tests {
             session: SessionId::from_bytes([1; 16]),
         };
         assert_eq!(postcard::to_allocvec(&gap).unwrap()[0], 4);
+    }
+
+    #[test]
+    fn event_replay_complete_round_trip() {
+        let event = Event::ReplayComplete {
+            session: SessionId::from_bytes([8; 16]),
+        };
+        let bytes = postcard::to_allocvec(&event).unwrap();
+        assert_eq!(postcard::from_bytes::<Event>(&bytes).unwrap(), event);
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), event);
+    }
+
+    #[test]
+    fn event_postcard_indices_remain_stable() {
+        let session = SessionId::from_bytes([1; 16]);
+        let events = [
+            Event::Message {
+                session,
+                message: sample_session_message(),
+            },
+            Event::PeerJoined {
+                session,
+                peer: sample_peer(),
+            },
+            Event::PeerLeft {
+                session,
+                peer: sample_peer().id,
+            },
+            Event::SessionClosed { session },
+            Event::Gap { session },
+            Event::ReplayComplete { session },
+        ];
+        for (index, event) in events.into_iter().enumerate() {
+            assert_eq!(
+                usize::from(postcard::to_allocvec(&event).unwrap()[0]),
+                index
+            );
+        }
     }
 
     // ---- WireMessage envelope ----

@@ -316,14 +316,10 @@ pub struct WorkspaceConfig {
     /// across resumes (see plan §"persistence-first constraint").
     pub rules: Option<PathRules>,
 
-    /// Path to the daemon's IPC socket. When set, the workspace
-    /// opens a **second** [`Client`] connection to subscribe to
-    /// session events (capability grants/revokes, node-id
-    /// announcements) and project them into the `PeerMap` that
-    /// backs the docs gate. Without this, the gate still rejects
-    /// connections from already-revoked peers (seeded at
-    /// construction) but cannot observe revocations that happen
-    /// after the workspace is up.
+    /// Override the daemon socket used by the dedicated capability listener.
+    /// Defaults to the caller's [`Client::socket_path`]. Both host and joiner
+    /// restore capabilities and endpoint mappings through the replay-completion
+    /// marker before authorizing connections, then continue observing live events.
     pub daemon_socket: Option<PathBuf>,
 
     /// Consumer-owned sync exclusions (filter layer 3).
@@ -947,7 +943,12 @@ impl Workspace {
             exclude,
             max_file_size,
             &config.endpoint_setup,
-            config.daemon_socket.as_deref(),
+            Some(
+                config
+                    .daemon_socket
+                    .as_deref()
+                    .unwrap_or_else(|| client.socket_path()),
+            ),
             &mut rb,
         )
         .await
@@ -978,7 +979,7 @@ impl Workspace {
         rb: &mut WorkspaceRollback,
     ) -> Result<(Self, mpsc::Receiver<WorkspaceEvent>), WorkspaceError> {
         let daemon_peer_id = client.daemon_peer_id();
-        let peer_map = Arc::new(PeerMap::new(daemon_peer_id));
+        let peer_map = Arc::new(PeerMap::replaying(daemon_peer_id));
         // Create the event channel before the node spawns: the node's
         // transport-layer filters (PeerFilter / DocsGate) emit
         // `RevokedPeerBlocked` events on it.
@@ -1145,8 +1146,6 @@ impl Workspace {
             .await
             .map_err(|e| WorkspaceError::Doc(format!("share doc: {e}")))?;
 
-        publish_ticket(client, session_id, &ticket, &rules).await?;
-
         // Spawn the cap-listener on a second Client connection so we
         // don't consume the caller's event stream.
         let shutdown_token = CancellationToken::new();
@@ -1227,6 +1226,12 @@ impl Workspace {
             tx.clone(),
         )
         .await?;
+        rb.listener_abort = Some(cap_listener.abort_handle());
+
+        // A replayed revoke must remove its peer before the daemon fans out
+        // this current read ticket. The listener's readiness barrier also
+        // releases the transport hooks waiting on the completed projection.
+        publish_ticket(client, session_id, &ticket, &rules).await?;
 
         // All fallible work is done — pull the node out of the
         // rollback guard so it lives in the constructed Workspace.
@@ -1442,7 +1447,7 @@ impl Workspace {
         let ticket = DocTicket::from_str(&ticket_result.envelope.doc_ticket)
             .map_err(|e| WorkspaceError::Doc(format!("ticket parse: {e}")))?;
 
-        let peer_map = Arc::new(PeerMap::new(host_daemon_peer_id));
+        let peer_map = Arc::new(PeerMap::replaying(host_daemon_peer_id));
         // Register the host's workspace EndpointId from the ticket's
         // first node entry.
         if let Some(node_info) = ticket.nodes.first() {
@@ -1468,6 +1473,39 @@ impl Workspace {
         // `WorkspaceNode::spawn`) stamps our own writes once live sync
         // starts, so `AuthorId == endpoint_id`.
         let author = node.author;
+
+        // Spawn the cap-listener on its own dedicated connection so it
+        // owns the `Client` it drains, including replacement subscriptions
+        // after an EOF or gap.
+        // Prefer an explicitly-configured `daemon_socket`; otherwise
+        // dial the same socket the caller's client is on
+        // (`client.socket_path()`). The caller's own event stream
+        // (consumed by `wait_for_ticket` above) is dropped — we never
+        // reuse it for the listener.
+        let shutdown_token = CancellationToken::new();
+        let write_halted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Rotation signal channel (Slice 3e): the survivor cap-listener
+        // sends SurvivorRotate here; the rotation task in `run` drains it.
+        // Unbounded so a burst of deliveries never drops a signal (C4).
+        let (rotation_tx, rotation_rx) = mpsc::unbounded_channel::<RotationSignal>();
+        let joiner_ctx = Some(JoinerUpgradeCtx {
+            my_peer_id: client.daemon_peer_id(),
+            docs: node.docs.clone(),
+            write_halted: Arc::clone(&write_halted),
+            rotation_tx: rotation_tx.clone(),
+        });
+        let listener_socket = join_daemon_socket.unwrap_or_else(|| client.socket_path());
+        let cap_listener = spawn_cap_listener_from_socket(
+            Some(listener_socket),
+            session,
+            Arc::clone(&peer_map),
+            shutdown_token.child_token(),
+            None,
+            joiner_ctx,
+            tx.clone(),
+        )
+        .await?;
+        rb.listener_abort = Some(cap_listener.abort_handle());
 
         let (doc, live) = node
             .docs
@@ -1512,38 +1550,6 @@ impl Workspace {
             max_file_size,
             &echo_guard,
             &tx,
-        )
-        .await?;
-
-        // Spawn the cap-listener on its own dedicated connection so it
-        // owns the `Client` it drains — required for M3 recovery, which
-        // both reconnects on EOF and re-`Subscribe`s in-band on a gap.
-        // Prefer an explicitly-configured `daemon_socket`; otherwise
-        // dial the same socket the caller's client is on
-        // (`client.socket_path()`). The caller's own event stream
-        // (consumed by `wait_for_ticket` above) is dropped — we never
-        // reuse it for the listener.
-        let shutdown_token = CancellationToken::new();
-        let write_halted = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // Rotation signal channel (Slice 3e): the survivor cap-listener
-        // sends SurvivorRotate here; the rotation task in `run` drains it.
-        // Unbounded so a burst of deliveries never drops a signal (C4).
-        let (rotation_tx, rotation_rx) = mpsc::unbounded_channel::<RotationSignal>();
-        let joiner_ctx = Some(JoinerUpgradeCtx {
-            my_peer_id: client.daemon_peer_id(),
-            docs: node.docs.clone(),
-            write_halted: Arc::clone(&write_halted),
-            rotation_tx: rotation_tx.clone(),
-        });
-        let listener_socket = join_daemon_socket.unwrap_or_else(|| client.socket_path());
-        let cap_listener = spawn_cap_listener_from_socket(
-            Some(listener_socket),
-            session,
-            Arc::clone(&peer_map),
-            shutdown_token.child_token(),
-            None,
-            joiner_ctx,
-            tx.clone(),
         )
         .await?;
 
@@ -1742,6 +1748,11 @@ impl Workspace {
         let mut survivors: Vec<(Vec<u8>, iroh_blobs::Hash, u64)> = Vec::new();
         let mut drops = RotationDropCounts::default();
         while let Some(res) = stream.next().await {
+            if !self.wait_for_projection(&node.peer_map).await {
+                return Err(WorkspaceError::Doc(
+                    "rotation stopped during capability replay".into(),
+                ));
+            }
             let entry =
                 res.map_err(|e| WorkspaceError::Doc(format!("rotate: snapshot entry: {e}")))?;
             let author_endpoint = iroh::EndpointId::from_bytes(entry.author().as_bytes())
@@ -2206,6 +2217,16 @@ impl Workspace {
             );
             return;
         }
+        let peer_map = {
+            let node = self.node.lock().await;
+            node.as_ref().map(|node| Arc::clone(&node.peer_map))
+        };
+        let Some(peer_map) = peer_map else {
+            return;
+        };
+        if !self.wait_for_projection(&peer_map).await {
+            return;
+        }
         let prev = self
             .namespace_epoch
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -2281,14 +2302,18 @@ impl Workspace {
         // Distribute the new ticket to every surviving RW peer (the
         // revoked peer is already gone from the cap set, so
         // `rw_peers_except_host` excludes it).
-        let survivors = {
-            let guard = self.node.lock().await;
-            guard
-                .as_ref()
-                .map_or_else(Vec::new, |node| node.peer_map.rw_peers_except_host())
-        };
+        if !self.wait_for_projection(&peer_map).await {
+            return;
+        }
+        let survivors = peer_map.rw_peers_except_host();
         if let Some(ctx) = &self.rotation_distribute_ctx {
             for peer in survivors {
+                if !self.wait_for_projection(&peer_map).await {
+                    return;
+                }
+                if !peer_map.has_rw(peer) {
+                    continue;
+                }
                 if let Err(e) = publish_rotate(
                     &ctx.client,
                     ctx.session,
@@ -2316,6 +2341,29 @@ impl Workspace {
         let Some(ctx) = &self.rotation_distribute_ctx else {
             return;
         };
+        let peer_map = {
+            let node = self.node.lock().await;
+            node.as_ref().map(|node| Arc::clone(&node.peer_map))
+        };
+        let Some(peer_map) = peer_map else {
+            return;
+        };
+        if !self.wait_for_projection(&peer_map).await {
+            return;
+        }
+        for peer in peer_map.revoked_peers() {
+            if let Err(error) = publish_remove_member(&ctx.client, ctx.session, peer).await {
+                warn!(?peer, %error, "rotation: revoked member cleanup failed");
+                emit_event(
+                    &self.events,
+                    WorkspaceEvent::Error(format!("rotation membership cleanup failed: {error}")),
+                );
+                return;
+            }
+        }
+        if !self.wait_for_projection(&peer_map).await {
+            return;
+        }
         *ctx.upgrade_secret.lock().expect("upgrade_secret mutex") = outcome.new_secret;
         // Refresh the returning-member re-delivery cell with the rotated
         // Write ticket + epoch (read-plane analogue of the secret above).
@@ -2352,6 +2400,15 @@ impl Workspace {
                 &self.events,
                 WorkspaceEvent::Error(format!("rotation: re-publish ticket failed: {e}")),
             );
+        }
+    }
+
+    /// Wait without holding the node mutex so shutdown can release a stalled
+    /// replay while a rotation is queued or collecting its snapshot.
+    async fn wait_for_projection(&self, peer_map: &PeerMap) -> bool {
+        tokio::select! {
+            () = self.shutdown_token.cancelled() => false,
+            ready = peer_map.wait_ready() => ready,
         }
     }
 
@@ -3190,6 +3247,8 @@ async fn scan_and_publish_existing(
 /// joiner-side attachment.
 #[derive(Default)]
 struct WorkspaceRollback {
+    /// Stop an initialized listener if a later constructor step fails.
+    listener_abort: Option<tokio::task::AbortHandle>,
     /// Send `LeaveSession` for this session on rollback (cascades the
     /// attachment via the 2b `delete(session)` cascade). Set after
     /// `register_host` succeeds; left `None` on the joiner.
@@ -3206,6 +3265,7 @@ impl WorkspaceRollback {
     /// Successful path: return the node so the caller can hand it to
     /// the constructed `Workspace`. After this, no rollback fires.
     fn disarm(mut self) -> Option<WorkspaceNode> {
+        self.listener_abort = None;
         self.leave_on_rollback = None;
         self.forget_attachment = None;
         self.node.take()
@@ -3215,6 +3275,9 @@ impl WorkspaceRollback {
     /// caller is already returning a different `WorkspaceError` and
     /// rollback shouldn't mask it.
     async fn rollback(mut self, client: &Client) {
+        if let Some(listener) = self.listener_abort.take() {
+            listener.abort();
+        }
         if let Some(session) = self.leave_on_rollback.take()
             && let Err(err) = client.request(Request::LeaveSession { session }).await
         {
@@ -3244,6 +3307,26 @@ impl WorkspaceRollback {
                 error = %err,
                 "rollback: WorkspaceNode shutdown failed; iroh router may not have closed cleanly",
             );
+        }
+    }
+}
+
+impl Drop for WorkspaceRollback {
+    fn drop(&mut self) {
+        if let Some(listener) = self.listener_abort.take() {
+            listener.abort();
+        }
+        // Cancelling a constructor does not run its explicit error rollback.
+        // Close the gate synchronously, then let the runtime drain the node.
+        if let Some(node) = self.node.take() {
+            node.peer_map.close();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    if let Err(error) = node.shutdown().await {
+                        warn!(%error, "cancelled workspace constructor: node shutdown failed");
+                    }
+                });
+            }
         }
     }
 }
@@ -4342,11 +4425,8 @@ fn max_seq(prev: Option<Seq>, seq: Seq) -> Seq {
 /// Open a fresh connection to `socket`, `Subscribe { since }`, and
 /// return the owning [`Client`] plus its event stream.
 ///
-/// The cap-listener **keeps** the returned `Arc<Client>` (it is not
-/// dropped) so it can issue an in-band re-`Subscribe` on the same
-/// connection when the daemon signals a gap (M3 Part B). The held
-/// client also carries its [`Client::socket_path`], which the listener
-/// uses to reconnect from scratch on a full EOF (Part A).
+/// The cap-listener keeps the returned client and uses its
+/// [`Client::socket_path`] for a replacement subscription after EOF or a gap.
 ///
 /// A `since` of `last_seq` makes the daemon replay every logged message
 /// past the watermark, so resumption is gap-free for log-borne events.
@@ -4379,8 +4459,8 @@ async fn cap_resubscribe(
 /// Open a second [`Client`] connection, subscribe to `session`, and
 /// spawn the cap-listener task on that independent event stream.
 ///
-/// Returns a no-op handle if `socket` is `None` (the gate still
-/// rejects based on the seed state populated at construction).
+/// Returns only after the initial replay is applied. Internal callers without
+/// a socket may provide a prebuilt projection and get a no-op listener.
 async fn spawn_cap_listener_from_socket(
     socket: Option<&Path>,
     session: SessionId,
@@ -4391,14 +4471,31 @@ async fn spawn_cap_listener_from_socket(
     events_tx: mpsc::Sender<WorkspaceEvent>,
 ) -> Result<tokio::task::JoinHandle<()>, WorkspaceError> {
     let Some(socket) = socket else {
+        peer_map.finish_replay();
         return Ok(tokio::spawn(async move {
             cancel.cancelled().await;
         }));
     };
     let (client, events) = cap_resubscribe(socket, session, None).await?;
-    Ok(spawn_cap_listener(
-        client, events, session, peer_map, cancel, host_ctx, joiner_ctx, events_tx,
-    ))
+    let task = tokio_util::task::AbortOnDropHandle::new(spawn_cap_listener(
+        client,
+        events,
+        session,
+        Arc::clone(&peer_map),
+        cancel.clone(),
+        host_ctx,
+        joiner_ctx,
+        events_tx,
+    ));
+    if !peer_map.wait_ready().await {
+        cancel.cancel();
+        task.abort();
+        return Err(WorkspaceError::Iroh(
+            "capability replay ended before the workspace became ready".into(),
+        ));
+    }
+    debug!(?session, "cap-listener: initial replay complete");
+    Ok(task.detach())
 }
 
 /// What one [`Event`] meant to the cap-listener loop.
@@ -4520,7 +4617,14 @@ fn handle_node_id_message(
             ?stamp,
             "node_id re-delivery: delivering current namespace"
         );
+        let peer_map = Arc::clone(peer_map);
         tokio::spawn(async move {
+            // Historical announcements may precede a revoke in this replay.
+            // Only the complete projection can authorize key delivery.
+            if !peer_map.wait_ready().await || !peer_map.has_rw(peer) {
+                rollback_redelivery(&redelivered, peer, stamp);
+                return;
+            }
             // Run both deliveries (don't short-circuit — the rotate is
             // useful even if the upgrade failed and vice versa), tracking
             // whether either failed.
@@ -4631,8 +4735,8 @@ fn handle_capability_message(
     }
 
     // Host: on RW grant, deliver the NamespaceSecret to the promoted
-    // peer. Check has_rw AFTER apply so a grant whose peer was later
-    // revoked (during replay) is suppressed.
+    // peer. During replay the spawned task also waits for the complete
+    // projection and rechecks RW, so a later revoke suppresses delivery.
     if let Some(ctx) = host_ctx
         && let Ok(CapabilityAction::Grant {
             peer,
@@ -4644,7 +4748,11 @@ fn handle_capability_message(
         let sess = ctx.session;
         // Read the *current* secret (refreshed on rotation, C1).
         let secret = *ctx.namespace_secret.lock().expect("upgrade_secret mutex");
+        let peer_map = Arc::clone(peer_map);
         tokio::spawn(async move {
+            if !peer_map.wait_ready().await || !peer_map.has_rw(peer) {
+                return;
+            }
             if let Err(e) = publish_upgrade(&client, sess, peer, secret).await {
                 warn!(?e, ?peer, "upgrade delivery failed");
             }
@@ -4659,7 +4767,11 @@ fn handle_capability_message(
     {
         let client = Arc::clone(&ctx.client);
         let sess = ctx.session;
+        let peer_map = Arc::clone(peer_map);
         tokio::spawn(async move {
+            if !peer_map.wait_ready().await || !peer_map.is_read_only(peer) {
+                return;
+            }
             if let Err(e) = publish_downgrade(&client, sess, peer).await {
                 warn!(?e, ?peer, "downgrade delivery failed");
             }
@@ -4699,12 +4811,47 @@ fn handle_capability_message(
         // Idempotent + host-only daemon-side; best-effort spawn.
         let client = Arc::clone(&ctx.client);
         let sess = ctx.session;
+        let peer_map = Arc::clone(peer_map);
         tokio::spawn(async move {
+            if !peer_map.wait_ready().await || !peer_map.is_revoked(peer) {
+                return;
+            }
             if let Err(e) = publish_remove_member(&client, sess, peer).await {
                 warn!(?e, ?peer, "evict: remove_member IPC failed");
             }
         });
     }
+}
+
+/// Commit replay readiness only after the host's final revoked members have
+/// been removed from ticket distribution. Later gap recovery does not republish
+/// tickets and keeps using the existing membership-removal event path.
+async fn complete_cap_replay(
+    peer_map: &PeerMap,
+    host_ctx: Option<&HostUpgradeCtx>,
+    events_tx: &mpsc::Sender<WorkspaceEvent>,
+) {
+    if peer_map.is_ready() {
+        return;
+    }
+    if peer_map.is_initializing()
+        && let Some(ctx) = host_ctx
+    {
+        for peer in peer_map.revoked_peers() {
+            if let Err(error) = publish_remove_member(&ctx.client, ctx.session, peer).await {
+                warn!(session = ?ctx.session, ?peer, %error, "cap-listener: replay membership cleanup failed");
+                emit_event(
+                    events_tx,
+                    WorkspaceEvent::Error(format!(
+                        "capability replay membership cleanup failed: {error}",
+                    )),
+                );
+                peer_map.close();
+                return;
+            }
+        }
+    }
+    peer_map.finish_replay();
 }
 
 /// Apply one cap-listener [`Event`] to `peer_map` and trigger any
@@ -4737,6 +4884,12 @@ async fn handle_cap_event(
     events_tx: &mpsc::Sender<WorkspaceEvent>,
 ) -> CapOutcome {
     match ev {
+        Event::ReplayComplete {
+            session: ev_session,
+        } if ev_session == session => {
+            complete_cap_replay(peer_map, host_ctx, events_tx).await;
+            CapOutcome::Ignored
+        }
         Event::Message {
             session: ev_session,
             message,
@@ -4820,7 +4973,11 @@ async fn handle_cap_event(
                 // Read the *current* secret (refreshed on rotation, C1).
                 let secret = *ctx.namespace_secret.lock().expect("upgrade_secret mutex");
                 let peer = joined_peer.id;
+                let peer_map = Arc::clone(peer_map);
                 tokio::spawn(async move {
+                    if !peer_map.wait_ready().await || !peer_map.has_rw(peer) {
+                        return;
+                    }
                     if let Err(e) = publish_upgrade(&client, sess, peer, secret).await {
                         warn!(?e, ?peer, "upgrade re-delivery on rejoin failed");
                     }
@@ -4855,6 +5012,7 @@ async fn handle_cap_event(
 /// the loop already drains: the daemon's M4 forwarder-dedup replaces the
 /// prior forwarder for this session on re-`Subscribe`, so there is no
 /// new stream to swap in — unlike the EOF path.
+#[cfg(test)]
 fn spawn_gap_resubscribe(client: &Arc<Client>, session: SessionId, since: Option<Seq>) {
     let client = Arc::clone(client);
     tokio::spawn(async move {
@@ -4876,26 +5034,26 @@ fn spawn_gap_resubscribe(client: &Arc<Client>, session: SessionId, since: Option
     });
 }
 
+/// Closing a listener, including task abortion, must release waiting hooks.
+struct CloseProjectionOnDrop(Arc<PeerMap>);
+
+impl Drop for CloseProjectionOnDrop {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
 /// Spawn a background task that drains session events into `peer_map`.
 ///
-/// See [`handle_cap_event`] for the event types processed. The task owns
-/// `client` (the connection it drains) so it can both reconnect on EOF
-/// and re-`Subscribe` in-band on a gap.
+/// The projection starts closed to network authorization. Only the ordered
+/// [`Event::ReplayComplete`] marker releases connection and delivery tasks.
+/// The task owns its dedicated client connection and event stream.
 ///
-/// **Lag recovery (M3):** when this subscriber falls more than the
-/// broadcast capacity behind, the daemon makes the loss loud. Two
-/// recovery paths, both resuming from the last-seen `seq` so the daemon
-/// replays every logged message past the watermark:
-///
-/// - **Gap (Part B):** the daemon sends [`Event::Gap`] and keeps the
-///   connection open. The loop re-`Subscribe`s in-band on the same
-///   `client` (see [`spawn_gap_resubscribe`]); replayed + live events
-///   resume on the same stream. The common case — no reconnect.
-/// - **EOF (Part A):** if the connection actually drops (e.g. the daemon
-///   restarted, or the Part-B gap send failed and it closed), `recv()`
-///   yields `None`. The loop reconnects via [`cap_resubscribe`] on the
-///   client's [`Client::socket_path`] with bounded
-///   [`cap_reconnect_backoff`], swapping in the fresh client + stream.
+/// On EOF or [`Event::Gap`] (daemon-side or client-side loss), close the gate
+/// and replace the subscription from the last safely applied sequence. Drop
+/// the old stream so its queued messages/completion marker cannot overtake
+/// missing replay entries. This does not affect other callers' connections.
+/// A fresh replay-completion marker reopens the gate after state is restored.
 ///
 /// Recovery is gap-free for the log-borne events this loop acts on:
 /// `Capability` and `NODE_ID_ACTION` are replayed, and both
@@ -4926,7 +5084,9 @@ fn spawn_cap_listener(
     joiner_ctx: Option<JoinerUpgradeCtx>,
     events_tx: mpsc::Sender<WorkspaceEvent>,
 ) -> tokio::task::JoinHandle<()> {
+    let close_projection = CloseProjectionOnDrop(Arc::clone(&peer_map));
     tokio::spawn(async move {
+        let _close_projection = close_projection;
         let mut last_seq: Option<Seq> = None;
         'outer: loop {
             // Drain the current stream until EOF or cancellation.
@@ -4939,16 +5099,23 @@ fn spawn_cap_listener(
                             // (daemon restart, or a Part-B gap send that
                             // failed and closed). Fall through to the
                             // reconnect loop.
+                            peer_map.begin_replay();
                             break;
                         };
                         match handle_cap_event(ev, session, &peer_map, host_ctx.as_ref(), joiner_ctx.as_ref(), &events_tx)
                             .await
                         {
                             CapOutcome::Advanced(seq) => last_seq = Some(max_seq(last_seq, seq)),
-                            // In-band gap: re-Subscribe on the SAME
-                            // connection without dropping it. Replayed
-                            // events arrive on this same stream.
-                            CapOutcome::Gap => spawn_gap_resubscribe(&client, session, last_seq),
+                            // A fresh stream keeps the replay boundary
+                            // ordered after recovery of the missing entries.
+                            CapOutcome::Gap => {
+                                // Discard this stream, including its stale replay
+                                // completion marker. A fresh stream resumes at the
+                                // last safely applied message and supplies a new
+                                // ordered completion marker.
+                                peer_map.begin_replay();
+                                break;
+                            }
                             CapOutcome::Ignored => {}
                         }
                     }
@@ -5001,6 +5168,9 @@ fn spawn_cap_listener(
 
 #[cfg(test)]
 mod redelivery_tests;
+
+#[cfg(test)]
+mod replay_lifecycle_tests;
 
 #[cfg(test)]
 mod tests {

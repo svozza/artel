@@ -1527,7 +1527,7 @@ impl Drop for ForwarderSet {
 
 /// Spawn a task that forwards events from `sub.events` as
 /// [`WireMessage::Event`] frames into `sink`. Backfills `sub.replay`
-/// first.
+/// first, then emits [`Event::ReplayComplete`] before any live event.
 fn spawn_subscription_forwarder(
     session: SessionId,
     sub: Subscription,
@@ -1540,6 +1540,17 @@ fn spawn_subscription_forwarder(
             if push_message(&sink, session, message).await.is_err() {
                 return;
             }
+        }
+        if send_frame(
+            &sink,
+            WireMessage::Event {
+                event: Event::ReplayComplete { session },
+            },
+        )
+        .await
+        .is_err()
+        {
+            return;
         }
         loop {
             let next = tokio::select! {
@@ -1842,6 +1853,167 @@ mod forwarder_set_tests {
         );
     }
 
+    async fn replay_registry(
+        history: &[(&str, artel_protocol::MessageKind)],
+    ) -> (crate::session::Registry, artel_protocol::PeerInfo) {
+        use std::collections::HashSet;
+
+        use artel_protocol::message::SIGNATURE_UNSIGNED;
+        use artel_protocol::ticket::WireEndpointAddr;
+        use artel_protocol::{PeerId, PeerInfo, Seq, SessionMessage};
+
+        use crate::session::Registry;
+        use crate::store::{MemoryStore, SessionKind, SessionRecord, SessionStore};
+
+        let session = sid(1);
+        let host = PeerInfo {
+            id: PeerId::from_bytes([1; 32]),
+            display_name: "host".into(),
+        };
+        let log: Vec<_> = history
+            .iter()
+            .zip(1u64..)
+            .map(|(&(action, kind), seq)| {
+                SessionMessage::new(
+                    Seq::new(seq),
+                    seq,
+                    host.clone(),
+                    kind,
+                    action,
+                    vec![],
+                    SIGNATURE_UNSIGNED,
+                    SIGNATURE_UNSIGNED,
+                )
+            })
+            .collect();
+        let store = Arc::new(MemoryStore::new());
+        store
+            .create(&SessionRecord {
+                id: session,
+                host: host.id,
+                members: HashSet::from([host.id]),
+                head: log.last().map_or(Seq::ZERO, |message| message.seq),
+                log,
+                kind: SessionKind::Local,
+                host_epoch: 0,
+                tickets: Vec::new(),
+                workspace_ticket: None,
+            })
+            .await
+            .unwrap();
+        let registry = Registry::load(
+            host.id,
+            WireEndpointAddr::id_only(host.id),
+            store,
+            #[cfg(feature = "iroh")]
+            None,
+            #[cfg(feature = "iroh")]
+            None,
+            #[cfg(feature = "iroh")]
+            None,
+        )
+        .await
+        .unwrap();
+        (registry, host)
+    }
+
+    /// Exercise the real replay filter, then queue a live message before
+    /// the forwarder starts so ordering cannot depend on task scheduling.
+    async fn assert_replay_boundary(
+        history: &[(&str, artel_protocol::MessageKind)],
+        expected: &[&str],
+    ) {
+        use artel_protocol::{Event, MessageKind, WireMessage};
+        use futures_util::StreamExt;
+
+        use crate::session::Authoring;
+
+        let session = sid(1);
+        let (registry, host) = replay_registry(history).await;
+        let sub = registry.subscribe(session, None).await.unwrap();
+        let live = registry
+            .send(
+                session,
+                host,
+                MessageKind::Chat,
+                "live".into(),
+                vec![],
+                Authoring::Local,
+            )
+            .await
+            .unwrap();
+        let (client_io, daemon_io) = UnixStream::pair().unwrap();
+        let (sink, _stream) = artel_protocol::transport::new(daemon_io).split();
+        let shutdown = Arc::new(Shutdown::new());
+        let handle = spawn_subscription_forwarder(
+            session,
+            sub,
+            Arc::new(AsyncMutex::new(sink)),
+            shutdown.token(),
+        );
+        let mut client = artel_protocol::transport::new(client_io);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            for action in expected {
+                let frame = client.next().await.unwrap().unwrap();
+                assert!(
+                    matches!(frame, WireMessage::Event {
+                        event: Event::Message { session: got, ref message },
+                    } if got == session && message.action == *action),
+                    "expected replay action {action}, got {frame:?}",
+                );
+            }
+            assert_eq!(
+                client.next().await.unwrap().unwrap(),
+                WireMessage::Event {
+                    event: Event::ReplayComplete { session }
+                },
+            );
+            assert_eq!(
+                client.next().await.unwrap().unwrap(),
+                WireMessage::Event {
+                    event: Event::Message {
+                        session,
+                        message: live
+                    }
+                },
+            );
+        })
+        .await
+        .expect("replay, boundary and live message must arrive");
+        shutdown.trigger();
+        assert_finishes(&handle.abort_handle(), "replay forwarder on shutdown").await;
+    }
+
+    #[tokio::test]
+    async fn forwarder_marks_empty_replay_before_live() {
+        assert_replay_boundary(&[], &[]).await;
+    }
+
+    #[tokio::test]
+    async fn forwarder_marks_nonempty_replay_before_live() {
+        use artel_protocol::MessageKind::Chat;
+        assert_replay_boundary(&[("first", Chat), ("second", Chat)], &["first", "second"]).await;
+    }
+
+    #[tokio::test]
+    async fn forwarder_marks_replay_complete_after_filtered_tail() {
+        use artel_protocol::MessageKind::{Chat, System};
+        assert_replay_boundary(
+            &[
+                ("visible", Chat),
+                ("workspace.ticket", System),
+                ("workspace.upgrade", System),
+            ],
+            &["visible"],
+        )
+        .await;
+        assert_replay_boundary(
+            &[("workspace.ticket", System), ("workspace.upgrade", System)],
+            &[],
+        )
+        .await;
+    }
+
     // ---- M3 Part B: subscriber-lag → in-band Gap (connection stays up) ----
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1879,8 +2051,19 @@ mod forwarder_set_tests {
         let shutdown = Arc::new(Shutdown::new());
         let handle = spawn_subscription_forwarder(sid(1), sub, daemon_sink, shutdown.token());
 
-        // The client's first frame must be the in-band Gap signal.
+        // Empty replay completes before the live receiver reports its gap.
         let mut client = artel_protocol::transport::new(client_io);
+        let marker = tokio::time::timeout(Duration::from_secs(2), client.next())
+            .await
+            .expect("forwarder must finish empty replay")
+            .expect("connection stays open")
+            .expect("decodable frame");
+        assert_eq!(
+            marker,
+            WireMessage::Event {
+                event: Event::ReplayComplete { session: sid(1) },
+            },
+        );
         let got = tokio::time::timeout(Duration::from_secs(2), client.next())
             .await
             .expect("forwarder must send a Gap, not hang")
@@ -1902,13 +2085,14 @@ mod forwarder_set_tests {
         assert_finishes(&handle.abort_handle(), "post-gap forwarder on shutdown").await;
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn forwarder_closes_when_gap_send_fails() {
         // M3 Part B fallback: if the Gap send itself fails (the client's
         // read half is already gone), there's nothing to keep open — the
         // forwarder gives up and returns, same as any other send
-        // failure. We drop the client end first, then drive a Lagged.
-        use artel_protocol::Event;
+        // failure. Complete replay first, then drive a Lagged and close
+        // the client without yielding on this single-thread runtime.
+        use artel_protocol::{Event, WireMessage};
         use futures_util::StreamExt;
         use tokio::sync::broadcast;
 
@@ -1920,19 +2104,29 @@ mod forwarder_set_tests {
         };
 
         let (tx, rx) = broadcast::channel::<Event>(2);
-        for _ in 0..8 {
-            let _ = tx.send(Event::SessionClosed { session: sid(1) });
-        }
         let sub = Subscription {
             replay: Vec::new(),
             events: rx,
         };
 
-        // Drop the client's half so the Gap send fails.
-        drop(client_io);
-
         let shutdown = Arc::new(Shutdown::new());
         let handle = spawn_subscription_forwarder(sid(1), sub, daemon_sink, shutdown.token());
+        let mut client = artel_protocol::transport::new(client_io);
+        let marker = tokio::time::timeout(Duration::from_secs(2), client.next())
+            .await
+            .expect("forwarder must finish empty replay")
+            .expect("connection stays open")
+            .expect("decodable frame");
+        assert_eq!(
+            marker,
+            WireMessage::Event {
+                event: Event::ReplayComplete { session: sid(1) },
+            },
+        );
+        for _ in 0..8 {
+            let _ = tx.send(Event::SessionClosed { session: sid(1) });
+        }
+        drop(client);
 
         // With nowhere to send the Gap, the forwarder returns on its own
         // — no shutdown needed.

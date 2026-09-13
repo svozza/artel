@@ -11,7 +11,7 @@ use tempfile::TempDir;
 
 const BUDGET: Duration = Duration::from_secs(10);
 
-async fn spawn_daemon(
+pub(super) async fn spawn_daemon(
     root: &Path,
     dns_pkarr: Arc<DnsPkarrServer>,
 ) -> (Arc<Shutdown>, tokio::task::JoinHandle<io::Result<()>>) {

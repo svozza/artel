@@ -387,6 +387,10 @@ async fn two_clients_chat_end_to_end() {
     }
 
     // Alice observes Bob joining.
+    assert_eq!(
+        next_event(&mut alice_events).await,
+        Event::ReplayComplete { session },
+    );
     match next_event(&mut alice_events).await {
         Event::PeerJoined { session: got, peer } => {
             assert_eq!(got, session);
@@ -591,6 +595,10 @@ async fn subscribe_replays_history() {
             other => panic!("expected Message {expected_action:?}, got {other:?}"),
         }
     }
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::ReplayComplete { session },
+    );
 
     drop(alice_client);
     daemon.stop().await;

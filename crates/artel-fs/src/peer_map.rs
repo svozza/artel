@@ -11,6 +11,15 @@ use std::sync::RwLock;
 use artel_protocol::PeerId;
 use artel_protocol::capability::{Capability, CapabilityAction};
 use iroh::EndpointId;
+use tokio::sync::watch;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjectionState {
+    Initializing,
+    Replaying,
+    Ready,
+    Closed,
+}
 
 /// Verdict for a doc-entry author at namespace-rotation time (D2). Only
 /// [`Self::Rw`] carries forward; the rest are dropped, but the caller
@@ -46,10 +55,21 @@ pub(crate) struct PeerMap {
     revoked: RwLock<HashSet<PeerId>>,
     /// The host's daemon `PeerId` (cap-log root, always RW).
     host: PeerId,
+    /// Network authorization must not observe a partially replayed log.
+    readiness: watch::Sender<ProjectionState>,
 }
 
 impl PeerMap {
+    #[cfg(test)]
     pub(crate) fn new(host: PeerId) -> Self {
+        Self::with_state(host, ProjectionState::Ready)
+    }
+
+    pub(crate) fn replaying(host: PeerId) -> Self {
+        Self::with_state(host, ProjectionState::Initializing)
+    }
+
+    fn with_state(host: PeerId, state: ProjectionState) -> Self {
         let mut caps = HashMap::new();
         caps.insert(host, Capability::ReadWrite);
         Self {
@@ -57,7 +77,72 @@ impl PeerMap {
             caps: RwLock::new(caps),
             revoked: RwLock::new(HashSet::new()),
             host,
+            readiness: watch::channel(state).0,
         }
+    }
+
+    /// Wait for the complete initial projection, or reject if startup/shutdown
+    /// closed the gate. No peer connection may authorize against partial state.
+    pub(crate) async fn wait_ready(&self) -> bool {
+        let mut receiver = self.readiness.subscribe();
+        receiver
+            .wait_for(|state| matches!(state, ProjectionState::Ready | ProjectionState::Closed))
+            .await
+            .is_ok_and(|state| *state == ProjectionState::Ready)
+    }
+
+    pub(crate) fn is_ready(&self) -> bool {
+        *self.readiness.borrow() == ProjectionState::Ready
+    }
+
+    pub(crate) fn is_initializing(&self) -> bool {
+        *self.readiness.borrow() == ProjectionState::Initializing
+    }
+
+    #[cfg(test)]
+    pub(crate) fn readiness_waiter_count(&self) -> usize {
+        self.readiness.receiver_count()
+    }
+
+    pub(crate) fn finish_replay(&self) {
+        self.readiness.send_if_modified(|state| {
+            if matches!(
+                state,
+                ProjectionState::Initializing | ProjectionState::Replaying
+            ) {
+                *state = ProjectionState::Ready;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    pub(crate) fn close(&self) {
+        self.readiness.send_replace(ProjectionState::Closed);
+    }
+
+    pub(crate) fn begin_replay(&self) {
+        self.readiness.send_if_modified(|state| {
+            if *state == ProjectionState::Ready {
+                *state = ProjectionState::Replaying;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    pub(crate) fn revoked_peers(&self) -> Vec<PeerId> {
+        self.revoked.read().unwrap().iter().copied().collect()
+    }
+
+    pub(crate) fn is_revoked(&self, peer: PeerId) -> bool {
+        self.revoked.read().unwrap().contains(&peer)
+    }
+
+    pub(crate) fn is_read_only(&self, peer: PeerId) -> bool {
+        self.caps.read().unwrap().get(&peer) == Some(&Capability::Read)
     }
 
     /// Register a workspace `EndpointId` → daemon `PeerId` link.
