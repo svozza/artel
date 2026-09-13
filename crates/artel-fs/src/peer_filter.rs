@@ -33,12 +33,15 @@ impl PeerFilter {
 }
 
 impl EndpointHooks for PeerFilter {
-    fn before_connect<'a>(
-        &'a self,
-        remote_addr: &'a EndpointAddr,
-        _alpn: &'a [u8],
-    ) -> impl Future<Output = BeforeConnectOutcome> + Send + 'a {
-        let outcome = self.peer_map.revoked_daemon_peer(remote_addr.id).map_or(
+    async fn before_connect(
+        &self,
+        remote_addr: &EndpointAddr,
+        _alpn: &[u8],
+    ) -> BeforeConnectOutcome {
+        if !self.peer_map.wait_ready().await {
+            return BeforeConnectOutcome::Reject;
+        }
+        self.peer_map.revoked_daemon_peer(remote_addr.id).map_or(
             BeforeConnectOutcome::Accept,
             |peer| {
                 tracing::warn!(
@@ -55,15 +58,17 @@ impl EndpointHooks for PeerFilter {
                 );
                 BeforeConnectOutcome::Reject
             },
-        );
-        std::future::ready(outcome)
+        )
     }
 
-    fn after_handshake<'a>(
-        &'a self,
-        conn: &'a Connection,
-    ) -> impl Future<Output = AfterHandshakeOutcome> + Send + 'a {
-        let outcome = if conn.side() == Side::Server
+    async fn after_handshake(&self, conn: &Connection) -> AfterHandshakeOutcome {
+        if !self.peer_map.wait_ready().await {
+            return AfterHandshakeOutcome::Reject {
+                error_code: VarInt::from_u32(1),
+                reason: b"workspace closed before capability replay completed".to_vec(),
+            };
+        }
+        if conn.side() == Side::Server
             && let Some(peer) = self.peer_map.revoked_daemon_peer(conn.remote_id())
         {
             tracing::warn!(
@@ -84,8 +89,7 @@ impl EndpointHooks for PeerFilter {
             }
         } else {
             AfterHandshakeOutcome::Accept
-        };
-        std::future::ready(outcome)
+        }
     }
 }
 
@@ -114,6 +118,46 @@ mod tests {
 
     fn revoke_payload(peer: PeerId) -> Vec<u8> {
         CapabilityAction::Revoke { peer }.encode()
+    }
+
+    #[tokio::test]
+    async fn dial_waits_for_complete_replay_before_authorizing() {
+        let peer_map = Arc::new(PeerMap::replaying(test_host()));
+        let (filter, mut events) = make_filter(Arc::clone(&peer_map));
+        let addr = EndpointAddr::new(test_workspace_id());
+        let dial = filter.before_connect(&addr, iroh_docs::ALPN);
+        tokio::pin!(dial);
+        assert!(futures_util::poll!(&mut dial).is_pending());
+
+        // A historical grant must not authorize a dial before the later
+        // revoke in the same snapshot has been applied.
+        peer_map.register(test_workspace_id(), test_peer());
+        peer_map.apply_capability(
+            test_host(),
+            &grant_payload(test_peer(), Capability::ReadWrite),
+        );
+        assert!(futures_util::poll!(&mut dial).is_pending());
+        peer_map.apply_capability(test_host(), &revoke_payload(test_peer()));
+        assert!(futures_util::poll!(&mut dial).is_pending());
+        peer_map.finish_replay();
+
+        assert!(matches!(dial.await, BeforeConnectOutcome::Reject));
+        expect_blocked_event(&mut events, test_peer(), Direction::Outgoing);
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_a_dial_waiting_for_replay() {
+        let peer_map = Arc::new(PeerMap::replaying(test_host()));
+        let (filter, _) = make_filter(Arc::clone(&peer_map));
+        let addr = EndpointAddr::new(test_workspace_id());
+        let dial = filter.before_connect(&addr, iroh_docs::ALPN);
+        tokio::pin!(dial);
+        assert!(futures_util::poll!(&mut dial).is_pending());
+
+        peer_map.close();
+        // A late replay marker cannot reopen a shut-down workspace.
+        peer_map.finish_replay();
+        assert!(matches!(dial.await, BeforeConnectOutcome::Reject));
     }
 
     fn make_filter(peer_map: Arc<PeerMap>) -> (PeerFilter, mpsc::Receiver<WorkspaceEvent>) {

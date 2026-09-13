@@ -586,6 +586,74 @@ cargo nextest run -p artel-fs --lib \
   -E 'test(fresh_announce_redelivers_after_replay_before_listener)'
 ```
 
+## Case study: authorization before capability replay completes (2026-09-13)
+
+`host_outbound_dial_blocked_after_revocation` failed in Ubuntu CI on
+[July 26](https://github.com/svozza/artel/actions/runs/30225643897/job/89855267773),
+[August 14](https://github.com/svozza/artel/actions/runs/31823290230/job/94841391699),
+and [August 25](https://github.com/svozza/artel/actions/runs/32839155226/job/97774600716).
+The first investigation added tracing in #60 without reproducing the
+failure locally. The two subsequent failures supplied the missing trace.
+
+- **Failed phase:** after the host restarted, an explicit sync toward
+  revoked Bob never emitted `RevokedPeerBlocked { Outgoing }` within
+  15 seconds. Incoming connections were rejected later.
+- **Actual ordering:** on August 25 the restarted host began dialing at
+  10:54:15.763, replay registered Bob's workspace identity at .771184,
+  replay applied his revoke at .771331, and the connection completed
+  around .789. August 14 showed the same ordering. Docs protocol
+  processing followed; those CI traces alone did not prove file leakage.
+- **Root cause:** `host_with` started its node and sync before restoring
+  the complete capability projection. Unknown endpoint IDs were allowed.
+  A second manifestation used the same incomplete projection: replaying
+  a historical RW grant or node announcement could send current namespace
+  credentials before the later revoke was applied. `Subscribed` was only
+  an acknowledgement of subscription installation, not a replay barrier.
+  Upstream `Doc::share` itself starts sync, so moving just the explicit
+  `start_sync` call would leave another startup path open.
+- **Controlled reproduction:** ordinary local baseline runs passed
+  20/20. The new `replay_readiness` regression uses real daemons and an
+  IPC proxy to hold genuine replay frames before the messages, before
+  the revoke, and before completion. Responses bypass those gates, so
+  a held RPC response cannot manufacture a readiness wait. The previous
+  filesystem implementation failed 3/3 when rebuilt with this harness:
+  construction completed before replay, and Bob received upgrades and
+  a rotation delivery. In one capture Bob also received the private
+  post-revocation document entry. The new protocol marker was retained
+  in these control runs to make the harness's observation boundary
+  explicit; the filesystem authorization implementation was the old one.
+- **Fix:** protocol 14 adds ordered `ReplayComplete` after backfill
+  (including empty/filtered replay) and before live events. Workspace
+  transport hooks, recovery deliveries, and queued rotations wait for
+  a complete projection. Deliveries recheck the resulting capability;
+  revoked members are removed before publishing a current read ticket.
+  Host and joiner both use a dedicated listener by default.
+- **Loss and cancellation:** a client queue overflow now emits a
+  per-session `Gap` without blocking RPC responses, including when the
+  wire goes idle. EOF/gap closes the readiness gate and starts a fresh
+  subscription from the last safely applied sequence, discarding stale
+  completion markers. Dropping the old client shuts down its writer,
+  so the old subscription does not leak. Cancelling startup aborts the
+  listener, releases waiting hooks, and initiates node shutdown.
+- **Regression coverage:** the full restart test checks both the
+  readiness boundary and credential/data isolation. Focused tests cover
+  partial-replay rotation, final survivor filtering, cancellation,
+  empty/filtered replay ordering, client overflow and transport cleanup.
+- **Validation on Linux:** the original test, forced restart regression,
+  and three replay/cancellation lifecycle tests each passed all 20 final
+  repetitions. The complete hermetic suite passed 989/989, and the real-n0
+  tier passed 18/18. Formatting, all three Clippy feature configurations,
+  and both rustdoc configurations passed. Daemon and crash-helper process
+  censuses were empty after validation.
+
+The fix changes the authorization ordering, not a test timeout. Existing
+version-13 daemons must be restarted with the matching version-14 build.
+
+```sh
+cargo nextest run -p artel-fs \
+  --test outbound_dial_filter --test replay_readiness --stress-count 20
+```
+
 ## Examples from this codebase
 
 (Paths updated after the 2026-05-29 test-consolidation plan merged

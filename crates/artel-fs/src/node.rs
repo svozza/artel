@@ -245,6 +245,11 @@ impl WorkspaceNode {
         self.router.endpoint().secret_key().sign(msg)
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_endpoint(&self) -> Endpoint {
+        self.router.endpoint().clone()
+    }
+
     /// Tear the node down gracefully.
     ///
     /// Returns `Err` if `Router::shutdown` reported a teardown failure
@@ -253,6 +258,9 @@ impl WorkspaceNode {
     /// [`crate::Workspace`] Drop bomb can stay armed (a router that
     /// failed to shut down is exactly the misuse the bomb documents).
     pub(crate) async fn shutdown(self) -> Result<(), WorkspaceError> {
+        // Wake connection hooks waiting for initial replay before draining
+        // the router; otherwise an aborted constructor could strand them.
+        self.peer_map.close();
         // Test-only fault injection: when this node's flag is armed
         // (via `Workspace::test_arm_shutdown_failure`), synthesise
         // an error BEFORE touching the real router. Per-instance,

@@ -16,7 +16,7 @@
 //! between its oneshot and `closed.changed()`, so callers never wait
 //! forever for a response that will not come.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as SyncMutex};
@@ -41,14 +41,12 @@ const WRITER_QUEUE_CAPACITY: usize = 64;
 /// Capacity of the events queue handed to the caller.
 ///
 /// Caller-controlled draining: if the consumer is slow, `Event` frames
-/// pile up here. Once full, the reader drops the newest event rather
-/// than blocking (see [`spawn_reader`]) — the events stream is
-/// advisory and must never stall response demultiplexing, which
-/// shares the same reader task. The daemon's own broadcast channel
-/// has an analogous drop-on-lag policy one layer up, surfaced to the
-/// consumer as [`Event::Gap`](artel_protocol::Event::Gap); this local
-/// queue is a second, independent place the same kind of loss can
-/// happen, purely from the consumer not draining fast enough.
+/// pile up here. Once full, the reader drops events and schedules an
+/// [`Event::Gap`] for each affected session before delivering any more
+/// of that session's events. Gap delivery waits for capacity without
+/// blocking response demultiplexing (see [`spawn_reader`]). Like the
+/// daemon's broadcast buffer, this queue reports loss so consumers can
+/// recover by subscribing again.
 const EVENTS_QUEUE_CAPACITY: usize = 256;
 
 type ResponseSenders = Arc<SyncMutex<HashMap<RequestId, oneshot::Sender<Response>>>>;
@@ -372,6 +370,12 @@ fn spawn_writer<IO>(
                 break;
             }
         }
+        // Dropping SplitSink alone leaves the transport alive in the
+        // reader's SplitStream. Shut down the write half so dropping
+        // Client gives the daemon EOF and releases its subscriptions.
+        if let Err(err) = sink.close().await {
+            warn!(error = %err, "client writer: close failed");
+        }
         debug!("client writer: exited");
     });
 }
@@ -385,7 +389,32 @@ fn spawn_reader<IO>(
     IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
 {
     tokio::spawn(async move {
-        while let Some(frame) = stream.next().await {
+        // Coalesce dropped events into one gap per subscribed session,
+        // never an unbounded backlog of dropped event payloads.
+        let mut gaps = BTreeSet::new();
+        loop {
+            let frame = tokio::select! {
+                // Flush gaps first whenever capacity and wire frames are
+                // both ready. A full queue still leaves responses free
+                // to progress, and capacity wakes us even on an idle wire.
+                biased;
+                permit = events.reserve(), if !gaps.is_empty() => {
+                    match permit {
+                        Ok(permit) => {
+                            let session = gaps.pop_first().expect("pending gap");
+                            permit.send(Event::Gap { session });
+                        }
+                        // Avoid a ready-error spin after the receiver is
+                        // dropped; requests must keep working.
+                        Err(_) => gaps.clear(),
+                    }
+                    continue;
+                }
+                frame = stream.next() => {
+                    let Some(frame) = frame else { break };
+                    frame
+                }
+            };
             let frame = match frame {
                 Ok(f) => f,
                 Err(err) => {
@@ -405,21 +434,27 @@ fn spawn_reader<IO>(
                     }
                 }
                 WireMessage::Event { event } => {
-                    // `try_send`, never `.await`: this task also
-                    // demultiplexes `Response` frames below, so a
-                    // blocking send here — with a slow or absent
-                    // events consumer — would stall `stream.next()`
-                    // and wedge every in-flight and future
-                    // `Client::request` on this connection, which has
-                    // no timeout of its own to escape it. Dropping the
-                    // event on a full queue (or a closed stream) keeps
-                    // the reader always making progress; the events
-                    // stream is documented as advisory, not
-                    // guaranteed delivery.
+                    let session = match &event {
+                        Event::Message { session, .. }
+                        | Event::PeerJoined { session, .. }
+                        | Event::PeerLeft { session, .. }
+                        | Event::SessionClosed { session }
+                        | Event::Gap { session }
+                        | Event::ReplayComplete { session } => *session,
+                    };
+                    // Capacity may become available after select! picks
+                    // a frame. Never let that event (especially replay
+                    // completion) overtake its session's pending gap.
+                    if gaps.contains(&session) {
+                        continue;
+                    }
+                    // This task also demultiplexes responses, so event
+                    // delivery must never block it.
                     if let Err(err) = events.try_send(event) {
                         match err {
                             mpsc::error::TrySendError::Full(_) => {
-                                warn!("client reader: events queue full; dropping event");
+                                gaps.insert(session);
+                                warn!(?session, "client reader: events queue full; scheduling gap");
                             }
                             mpsc::error::TrySendError::Closed(_) => {
                                 // Caller dropped the events stream. Keep
@@ -481,69 +516,179 @@ mod tests {
         }
     }
 
-    /// The bug this module's fix closes: with the events queue at
-    /// capacity and nobody draining it, a `Response` frame for an
-    /// unrelated in-flight request must still be demultiplexed
-    /// promptly — the reader must never block on the events send.
-    #[tokio::test]
-    async fn response_is_demuxed_even_when_events_queue_is_full() {
-        let (mut feed, pending, mut events_rx, _closed_rx) = reader_harness(1);
-
-        // Fill the events queue to capacity without draining it.
-        feed.send(WireMessage::Event {
-            event: dummy_event(),
-        })
-        .await
-        .unwrap();
-        // Give the reader task a moment to pull the frame and fill the
-        // (capacity-1) events channel.
-        tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
-
-        // Register a pending request the way `Client::request` does,
-        // then feed its response. Pre-fix, this would never arrive:
-        // the reader would be stuck on the full events channel's
-        // `.await` send from a *second* queued Event frame processed
-        // ahead of it. To reproduce that ordering deterministically,
-        // send another Event first, then the Response, both before
-        // awaiting anything on the response side.
+    /// A response is an ordering barrier: every preceding wire event has
+    /// been processed when this returns, even with a full events queue.
+    async fn response_barrier(
+        feed: &mut Framed<tokio::io::DuplexStream>,
+        pending: &ResponseSenders,
+    ) {
         let id = RequestId::new(1);
         let (tx, rx) = oneshot::channel();
         pending.lock().expect("pending mutex").insert(id, tx);
-
-        feed.send(WireMessage::Event {
-            event: dummy_event(),
-        })
-        .await
-        .unwrap();
         feed.send(WireMessage::Response {
             id,
             response: Response::ListSessions { sessions: vec![] },
         })
         .await
         .unwrap();
-
         let response = timeout(Duration::from_secs(2), rx)
             .await
-            .expect("reader must demux the Response without blocking on the full events queue")
+            .expect("reader must demux responses without waiting for event capacity")
             .expect("oneshot must not be dropped");
         assert!(matches!(response, Response::ListSessions { sessions } if sessions.is_empty()));
+    }
 
-        // The events queue is advisory: of the 2 Event frames fed in
-        // against a capacity-1 channel, only 1 must have been
-        // delivered — the second was dropped rather than buffered or
-        // blocking the reader.
-        let mut delivered = 0;
-        while timeout(Duration::from_millis(50), events_rx.recv())
+    async fn next_event(events: &mut mpsc::Receiver<Event>) -> Event {
+        timeout(Duration::from_secs(2), events.recv())
             .await
-            .is_ok_and(|item| item.is_some())
-        {
-            delivered += 1;
+            .expect("event must arrive without further wire frames")
+            .expect("event stream must remain open")
+    }
+
+    #[tokio::test]
+    async fn overflow_emits_each_sessions_gap_without_more_frames() {
+        let (mut feed, pending, mut events, _closed) = reader_harness(EVENTS_QUEUE_CAPACITY);
+        for _ in 0..EVENTS_QUEUE_CAPACITY {
+            feed.send(WireMessage::Event {
+                event: dummy_event(),
+            })
+            .await
+            .unwrap();
         }
-        assert_eq!(
-            delivered, 1,
-            "exactly one of the two Event frames should have fit in the capacity-1 queue",
+        let sessions = [1, 2, 3].map(|n| SessionId::from_bytes([n; 16]));
+        for _ in 0..1024 {
+            for session in sessions {
+                feed.send(WireMessage::Event {
+                    event: Event::SessionClosed { session },
+                })
+                .await
+                .unwrap();
+            }
+        }
+        response_barrier(&mut feed, &pending).await;
+        eprintln!(
+            "overflow barrier complete: 256 buffered events, 3072 overflowing events processed"
         );
+
+        // Keep the transport open and idle. Capacity alone must wake the
+        // reader, with one coalesced gap per affected session.
+        for _ in 0..EVENTS_QUEUE_CAPACITY {
+            assert_eq!(next_event(&mut events).await, dummy_event());
+        }
+        let mut affected = std::collections::HashSet::new();
+        for _ in sessions {
+            let event = next_event(&mut events).await;
+            let Event::Gap { session } = event else {
+                panic!("expected overflow gap, got {event:?}");
+            };
+            assert!(affected.insert(session), "duplicate gap for {session:?}");
+        }
+        assert_eq!(affected, sessions.into_iter().collect());
+        response_barrier(&mut feed, &pending).await;
+        assert!(matches!(
+            events.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn later_events_and_replay_completion_follow_each_sessions_gap() {
+        let (mut feed, pending, mut events, _closed) = reader_harness(16);
+        for _ in 0..16 {
+            feed.send(WireMessage::Event {
+                event: dummy_event(),
+            })
+            .await
+            .unwrap();
+        }
+        let sessions = [1, 2, 3].map(|n| SessionId::from_bytes([n; 16]));
+        for session in sessions {
+            // Losing a wire gap must itself schedule a local gap.
+            feed.send(WireMessage::Event {
+                event: Event::Gap { session },
+            })
+            .await
+            .unwrap();
+            feed.send(WireMessage::Event {
+                event: Event::ReplayComplete { session },
+            })
+            .await
+            .unwrap();
+        }
+        response_barrier(&mut feed, &pending).await;
+        for _ in 0..16 {
+            assert_eq!(next_event(&mut events).await, dummy_event());
+        }
+
+        // Both capacity and new frames are ready when the reader runs.
+        // Each session's gap must precede its later events, including
+        // the marker consumers use to declare replay state complete.
+        for session in sessions {
+            feed.send(WireMessage::Event {
+                event: Event::PeerLeft {
+                    session,
+                    peer: PeerId::from_bytes([9; 32]),
+                },
+            })
+            .await
+            .unwrap();
+            feed.send(WireMessage::Event {
+                event: Event::ReplayComplete { session },
+            })
+            .await
+            .unwrap();
+        }
+        // An unaffected session still gets its events normally.
+        feed.send(WireMessage::Event {
+            event: dummy_event(),
+        })
+        .await
+        .unwrap();
+        response_barrier(&mut feed, &pending).await;
+
+        let mut gapped = std::collections::HashSet::new();
+        let mut completed = std::collections::HashSet::new();
+        let mut peer_left = std::collections::HashSet::new();
+        for _ in 0..10 {
+            match next_event(&mut events).await {
+                Event::Gap { session } => assert!(gapped.insert(session)),
+                Event::PeerLeft { session, .. } => {
+                    assert!(gapped.contains(&session), "event overtook its gap");
+                    assert!(peer_left.insert(session));
+                }
+                Event::ReplayComplete { session } => {
+                    assert!(
+                        gapped.contains(&session),
+                        "replay completion overtook its gap"
+                    );
+                    assert!(completed.insert(session));
+                }
+                event => assert_eq!(event, dummy_event()),
+            }
+        }
+        let expected = sessions.into_iter().collect();
+        assert_eq!(gapped, expected);
+        assert_eq!(completed, expected);
+        assert_eq!(peer_left, expected);
+        assert!(matches!(
+            events.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn response_is_demuxed_after_receiver_with_pending_gap_is_dropped() {
+        let (mut feed, pending, events, _closed) = reader_harness(1);
+        for _ in 0..3 {
+            feed.send(WireMessage::Event {
+                event: dummy_event(),
+            })
+            .await
+            .unwrap();
+        }
+        response_barrier(&mut feed, &pending).await;
+        drop(events);
+        response_barrier(&mut feed, &pending).await;
     }
 
     /// Once the caller drops the events receiver entirely, the reader
@@ -640,6 +785,74 @@ mod tests {
             PathBuf::from("/nonexistent"),
         );
         (client, b_never_answers)
+    }
+
+    #[tokio::test]
+    async fn dropping_client_closes_transport_with_event_stream_alive() {
+        let (client, peer) = client_with_silent_peer();
+        let mut peer = transport::new(peer);
+        let mut events = client.take_events().await.unwrap();
+        peer.send(WireMessage::Event {
+            event: dummy_event(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(next_event(&mut events).await, dummy_event());
+
+        // Keep the event receiver alive: dropping the Client itself must
+        // tell the daemon to release this connection and its forwarders.
+        drop(client);
+        eprintln!("client dropped after event delivery; waiting for peer-side EOF");
+        let frame = timeout(Duration::from_secs(2), peer.next())
+            .await
+            .expect("dropping Client must close its transport write half");
+        assert!(frame.is_none(), "expected peer-side EOF, got {frame:?}");
+
+        // Mirror the daemon closing its side after it observes EOF.
+        // The client reader must then exit and release the event sender.
+        drop(peer);
+        assert!(
+            timeout(Duration::from_secs(2), events.recv())
+                .await
+                .expect("reader must exit after peer closure")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_event_stream_keeps_client_requests_working() {
+        let (client, peer) = client_with_silent_peer();
+        let mut peer = transport::new(peer);
+        drop(client.take_events().await.unwrap());
+
+        let daemon = async {
+            peer.send(WireMessage::Event {
+                event: dummy_event(),
+            })
+            .await
+            .unwrap();
+            let Some(Ok(WireMessage::Request {
+                id,
+                request: Request::ListSessions,
+            })) = peer.next().await
+            else {
+                panic!("expected ListSessions request after dropping event stream");
+            };
+            peer.send(WireMessage::Response {
+                id,
+                response: Response::ListSessions { sessions: vec![] },
+            })
+            .await
+            .unwrap();
+        };
+        let (response, ()) = timeout(Duration::from_secs(2), async {
+            tokio::join!(client.request(Request::ListSessions), daemon)
+        })
+        .await
+        .expect("requests must still complete after dropping only the event stream");
+        assert!(
+            matches!(response.unwrap(), Response::ListSessions { sessions } if sessions.is_empty())
+        );
     }
 
     /// The bug this module's fix closes: cancelling `request()` via an

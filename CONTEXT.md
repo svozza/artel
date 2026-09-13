@@ -144,6 +144,23 @@ A peer's current authority in a session — `ReadWrite` or `Read`. Derived by
 replaying host-signed `Capability` grant/revoke messages in seq order. Absent
 peer ⇒ `Read` floor.
 
+**Replay readiness**:
+`Subscribed` acknowledges a subscription; it does not mean its backfill has
+been applied. IPC protocol 14 adds an ordered `ReplayComplete` event after all
+backfill messages, including empty or filtered replays, before live events.
+Workspace connection hooks and recovery deliveries wait for this boundary.
+Historical grant/revoke messages may temporarily change the projection during
+replay, but cannot authorize a connection or key delivery until it is complete.
+Delivery tasks recheck the final capability, and the host removes final revoked
+members before publishing its current workspace ticket.
+
+Both host and joiner use a dedicated listener, defaulting to the caller's
+daemon socket. On a gap or EOF, the listener closes the readiness gate and
+replaces its stream from the last safely applied sequence; an old stream's
+completion marker cannot certify the replacement replay. Client queue overflow
+emits an ordered, per-session `Gap` even if the wire becomes idle, without
+blocking RPC responses. Shutdown closes the gate and releases waiting hooks.
+
 **Demote**:
 A *cooperative* RW→Read downgrade of a **trusted** peer. Wire form
 `Grant{peer, Read}` (peer stays connected as read-only). It is **not** a
