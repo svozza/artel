@@ -100,8 +100,9 @@ a daemon-side lazy gossip re-subscribe: a reloaded `Remote` mirror re-subscribes
 its topic on its first post-restart send, so the `NODE_ID` announce reaches the
 host at all. Subsumes the "offline promotion" case (a peer promoted to RW while
 offline holds no prior secret — only the host knows it is now RW). `NODE_ID` is
-the ordering-safe trigger: a joiner emits it only *after* its cap-listener is
-live, so the live-only re-delivery cannot outrun its receiver. Stays entirely in
+the ordering-safe trigger for a **fresh attachment**: a joiner emits it only
+*after* its cap-listener is live. A historical replay has no such guarantee
+and may deliver before the returning workspace subscribes. Stays entirely in
 `artel-fs` (daemon couriers opaque bytes) per [[Namespace-agnostic daemon]].
 
 Two correctness conditions this path depends on:
@@ -112,12 +113,16 @@ Two correctness conditions this path depends on:
   0 — a returning host that had rotated otherwise re-delivers `epoch 0`, which a
   returning member's monotonic-epoch guard drops as stale, silently stranding it
   on the abandoned namespace.
-- **De-storm.** `NODE_ID` is a *logged, replayed* message, so a host cap-listener
-  restart replays every historical announce and would re-fan-out a unicast to
-  every RW peer that ever announced. A per-peer "epoch already re-delivered"
-  high-water mark suppresses the storm without suppressing a genuine recovery
-  (claimed up front so concurrent replays collapse; rolled back on delivery
-  failure so a transient failure never durably blocks a later retry).
+- **Announcement-aware deduplication.** `NODE_ID` is a *logged, replayed*
+  message. The host remembers `(namespace_epoch, announcement_seq)` per peer,
+  ordered by epoch first. Duplicate or older announcements at the same epoch
+  are suppressed; a fresh announcement must re-deliver even at that epoch.
+  A daemon ACK only proves receipt of a live-only broadcast, not consumption
+  by the workspace. Epoch-only deduplication can therefore suppress recovery
+  after an early historical delivery. Claims happen before spawning delivery;
+  failure rolls back only the matching claim, preserving newer attachments.
+  Distinct historical attachments may each trigger delivery during replay;
+  suppressing those solely by epoch would reopen the recovery gap.
 
 ### Layer boundary (invariant)
 

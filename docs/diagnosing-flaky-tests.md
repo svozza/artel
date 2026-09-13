@@ -521,6 +521,71 @@ and the verdict:
   — idempotency at apply time beats dedup at publish time because it
   also covers duplicates you didn't author.
 
+## Case study: replayed announcement suppresses reattach recovery (2026-09-13)
+
+The [September 13 nightly](https://github.com/svozza/artel/actions/runs/34748084494/job/103699582416)
+failed `returning_rw_member_regains_write_after_host_workspace_restart_real_n0`
+on macOS. Linux and the macOS hermetic suite passed; the previous
+nightly passed on the same commit.
+
+- **Failure phase:** after Bob's daemon and workspace rejoined, none
+  of his repeated writes reached the restarted host within 40 seconds.
+  The host had recovered epoch 1 (`fea12ba3…`), but Bob continued
+  publishing into genesis (`42afc671…`). Sync against the host returned
+  `NotFound`. His watcher still published successfully at
+  08:42:09.929423, immediately before the assertion failed, so this
+  was not a stalled runtime or watcher.
+- **Evidence:** the restarted host replayed Bob's historical node
+  announcement at 08:41:25.538484, before Bob's daemon began binding.
+  On Bob's fresh announcement at 08:41:29.579573, the host logged
+  `node_id re-delivery: already current, skipping`, epoch 1.
+  The trace proves stale-namespace writes and suppressed recovery;
+  it does not record the exact delivery-frame/ACK/listener ordering.
+- **Mechanism, reproduced locally:** the host claimed delivery by
+  `(peer, namespace_epoch)` before sending. The remote daemon ACKs
+  upgrade/rotation frames after broadcasting live-only events; it
+  does not require a workspace listener to consume them. A historical
+  announcement can therefore deliver too early, then suppress the
+  fresh announcement that actually follows listener subscription.
+  This is an `artel-fs` recovery bug. `Client::request` correctly
+  propagates daemon errors; swallowed error responses are not the cause.
+- **Deterministic regression:** `workspace::redelivery_tests::
+  fresh_announce_redelivers_after_replay_before_listener` runs two
+  real daemons against `DnsPkarrServer`. It observes the first rotate,
+  replaces the subscription, then issues a fresh signed announcement
+  at the same epoch and requires another rotate. Event ordering forces
+  the lost-delivery window without sleeps, load, or public-network
+  timing. It failed 3/3 on the unchanged implementation with the
+  same suppression log as nightly.
+- **Fix:** claim `(namespace_epoch, announcement_seq)` per peer,
+  ordered by epoch first. A fresh attachment receives the current
+  namespace even if a historical announcement already claimed that
+  epoch. Duplicate/older announcements remain suppressed, and rollback
+  compares the full claim so an older failure cannot erase a newer
+  attachment's recovery. Distinct historical announcements may each
+  trigger delivery during host replay; epoch-only suppression is unsafe.
+- **Validation on Linux:** the unmodified public-n0 test passed 10/10
+  local baseline runs, so its natural macOS timing did not reproduce
+  here. The forced regression failed 3/3 before the fix and passed
+  20/20 afterward; the five claim/rollback boundary tests also passed
+  all 20 repetitions. The original public-n0 test passed 20/20 spaced
+  runs after the fix, and all four real-n0 recovery scenarios passed
+  against the final source. The full hermetic suite passed 974/974 tests,
+  with all three Clippy feature configurations, formatting, and both
+  rustdoc configurations clean. No orphan `artel-daemon` processes
+  were present before or after measurement. The initial local launch
+  was rejected because the shell umask created group-writable temp
+  directories; measured runs used `umask 077`, matching the daemon's
+  existing private-directory requirement. The macOS runtime has not
+  been rerun locally.
+
+Reproduce the focused regression with:
+
+```sh
+cargo nextest run -p artel-fs --lib \
+  -E 'test(fresh_announce_redelivers_after_replay_before_listener)'
+```
+
 ## Examples from this codebase
 
 (Paths updated after the 2026-05-29 test-consolidation plan merged
