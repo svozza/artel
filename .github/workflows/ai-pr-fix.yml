@@ -1,4 +1,4 @@
-# AI PR fix, consumed from smtithy (github.com/svozza/smtithy).
+# AI PR fix, consumed from Aceiro (github.com/svozza/aceiro, formerly smtithy).
 #
 # Live for EVERY pull request in this repository. It was scoped to one by number
 # until the lane had been observed working, and it now has been twice: four
@@ -56,7 +56,7 @@ jobs:
     if: >-
       github.event.issue.pull_request
       && contains(github.event.comment.body, '/fix ')
-    uses: svozza/smtithy/.github/workflows/ai-pr-fix.yml@80d195c6a56d106bef59e34d6a21c9d1769ba1d6
+    uses: svozza/aceiro/.github/workflows/ai-pr-fix.yml@498feaf5bffcd1890c3616e29ea80bd7bcc68177
     permissions:
       contents: write # the stacked follow-up PR creates a branch; suggestions do not
       pull-requests: write
